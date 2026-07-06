@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
 .venv/
+app/.venv/
 venv/
+app/venv/
 .DS_Store
 data/config.json
+app/data/config.json
 *.log

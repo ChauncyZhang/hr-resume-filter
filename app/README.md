@@ -7,7 +7,7 @@
 Windows 用户双击：
 
 ```text
-启动HR简历筛选.bat
+Windows用户点我启动.bat
 ```
 
 然后浏览器会打开本地页面：
@@ -31,19 +31,19 @@ http://127.0.0.1:8765
 macOS 用户双击或运行：
 
 ```text
-start_hr_resume_filter.command
+Mac用户点我启动.command
 ```
 
 如果 macOS 提示没有执行权限，管理员执行一次：
 
 ```bash
-chmod +x start_hr_resume_filter.command
+chmod +x Mac用户点我启动.command
 ```
 
 Linux 服务器部署见：
 
 ```text
-deploy/linux/README.md
+app/deploy/linux/README.md
 ```
 
 服务器上推荐通过 systemd 启动服务，再用 Nginx 做反向代理和访问控制。
@@ -78,6 +78,7 @@ sample/
 运行：
 
 ```bash
+cd app
 python resume_filter.py --input sample/resumes --jd sample/jd.txt --output sample/candidates.csv
 ```
 
@@ -138,7 +139,7 @@ python resume_filter.py --input sample/resumes --jd sample/jd.txt --output sampl
 LLM 设置保存在：
 
 ```text
-data/config.json
+app/data/config.json
 ```
 
 默认不会保存 API Key。只有勾选“保存 API Key 到本机配置文件”时，才会把 API Key 写入本地配置文件。

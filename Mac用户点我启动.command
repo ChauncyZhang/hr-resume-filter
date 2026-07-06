@@ -1,7 +1,16 @@
 #!/bin/zsh
 set -e
 
-cd "$(dirname "$0")" || exit 1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="${SCRIPT_DIR}/app"
+
+if [ ! -d "${APP_DIR}" ]; then
+  echo "未找到 app 目录，请确认工具包没有被拆散。"
+  read -r "?按回车退出..."
+  exit 1
+fi
+
+cd "${APP_DIR}" || exit 1
 
 PORT="${HR_RESUME_PORT:-8765}"
 URL="http://127.0.0.1:${PORT}"
