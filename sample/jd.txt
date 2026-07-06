@@ -1,0 +1,3 @@
+岗位：Python 后端工程师
+必须条件：Python, FastAPI, 本科
+加分项：Docker, PostgreSQL, Redis

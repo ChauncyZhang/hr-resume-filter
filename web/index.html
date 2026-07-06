@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>HR 简历筛选工具</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <div class="topbar">
+          <div>
+            <h1>HR 简历筛选工具</h1>
+            <p>上传 JD 和已授权简历，自动生成候选人排序表。</p>
+          </div>
+          <div class="top-actions">
+            <button id="sampleBtn" class="secondary" type="button">填入 AI 工程师示例</button>
+            <button id="settingsBtn" class="secondary" type="button">设置</button>
+          </div>
+        </div>
+
+        <div class="layout">
+          <section class="panel">
+            <div class="section-title-row">
+              <h2>岗位 JD</h2>
+              <button id="saveJobBtn" class="secondary compact" type="button">保存岗位</button>
+            </div>
+            <div class="job-tools">
+              <label>
+                <span>选择已保存岗位</span>
+                <select id="jobSelect">
+                  <option value="">新岗位 / 临时 JD</option>
+                </select>
+              </label>
+              <label>
+                <span>岗位名称</span>
+                <input id="jobTitle" type="text" placeholder="例如 AI 工程师">
+              </label>
+              <button id="deleteJobBtn" class="secondary compact danger" type="button" disabled>删除岗位</button>
+            </div>
+            <textarea id="jdText" placeholder="例如：&#10;岗位：AI 工程师&#10;必须条件：Python, 机器学习, 深度学习&#10;加分项：PyTorch, LLM, RAG, Agent, Docker"></textarea>
+            <label class="file-line">
+              <span>或上传 JD 文件</span>
+              <input id="jdFile" type="file" accept=".txt,.md,.pdf,.docx">
+            </label>
+          </section>
+
+          <div class="side-stack">
+            <section class="panel">
+              <h2>简历文件</h2>
+              <label id="dropZone" class="drop-zone">
+                <input id="resumeFiles" type="file" multiple accept=".txt,.md,.csv,.pdf,.docx">
+                <span class="drop-title">选择或拖入简历</span>
+                <span class="drop-note">支持 TXT、PDF、DOCX；可一次选择多份</span>
+              </label>
+              <ul id="fileList" class="file-list"></ul>
+            </section>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="analyzeBtn" type="button">开始筛选</button>
+          <button id="downloadBtn" class="secondary" type="button" disabled>下载 CSV</button>
+          <span id="statusText" class="status">等待上传</span>
+        </div>
+
+        <section class="results">
+          <div class="results-head">
+            <h2>筛选结果</h2>
+            <span id="resultCount">0 份简历</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>文件名</th>
+                  <th>匹配分</th>
+                  <th>推荐结论</th>
+                  <th>缺失必须条件</th>
+                  <th>命中必须条件</th>
+                  <th>命中加分项</th>
+                  <th>LLM评分</th>
+                  <th>LLM结论</th>
+                  <th>LLM理由</th>
+                  <th>风险点</th>
+                  <th>面试问题</th>
+                </tr>
+              </thead>
+              <tbody id="resultBody">
+                <tr>
+                  <td colspan="11" class="empty">上传简历后，这里会显示排序结果。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+    <dialog id="settingsDialog" class="settings-dialog">
+      <form method="dialog" class="settings-panel">
+        <div class="dialog-head">
+          <div>
+            <h2>设置</h2>
+            <p>配置 LLM 语义评估。岗位 JD 仍在主页面维护。</p>
+          </div>
+          <button id="closeSettingsBtn" class="icon-button" type="button" aria-label="关闭设置">×</button>
+        </div>
+
+        <section class="settings-section">
+          <div class="section-title-row">
+            <h3>LLM 语义评估</h3>
+            <label class="switch-line">
+              <input id="llmEnabled" type="checkbox">
+              <span>启用</span>
+            </label>
+          </div>
+          <div class="llm-grid">
+            <label>
+              <span>Provider</span>
+              <select id="llmProvider">
+                <option value="openai_compatible">OpenAI 兼容接口</option>
+                <option value="ollama">Ollama 本地接口</option>
+              </select>
+            </label>
+            <label>
+              <span>模型</span>
+              <input id="llmModel" type="text" placeholder="例如 gpt-4o-mini / qwen2.5">
+            </label>
+            <label>
+              <span>Base URL</span>
+              <input id="llmBaseUrl" type="text" placeholder="https://api.openai.com/v1 或 /v1/chat/completions">
+            </label>
+            <label>
+              <span>API Key</span>
+              <input id="llmApiKey" type="password" placeholder="只在本次请求中使用">
+            </label>
+            <label class="checkbox-line">
+              <input id="saveApiKey" type="checkbox">
+              <span>保存 API Key 到本机配置文件</span>
+            </label>
+          </div>
+          <p class="privacy-note">启用后会把 JD 和简历文本发送给你填写的模型服务；请确认该服务符合公司隐私要求。</p>
+        </section>
+
+        <div class="dialog-actions">
+          <span id="llmTestStatus" class="dialog-status"></span>
+          <button id="testLlmBtn" class="secondary" type="button">测试连接</button>
+          <button id="saveSettingsBtn" type="button">保存设置</button>
+          <button id="cancelSettingsBtn" class="secondary" type="button">取消</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="/app.js"></script>
+  </body>
+</html>
