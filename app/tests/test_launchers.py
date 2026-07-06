@@ -18,7 +18,8 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("open \"${URL}\"", script)
 
     def test_windows_launcher_bootstraps_venv_and_starts_web_app(self):
-        script = (REPO_ROOT / "Windows用户点我启动.bat").read_text(encoding="utf-8")
+        script_path = REPO_ROOT / "Windows用户点我启动.bat"
+        script = script_path.read_text(encoding="ascii")
 
         self.assertIn('cd /d "%~dp0app"', script)
         self.assertIn("HRResumeFilter.exe", script)
@@ -26,6 +27,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("requirements.txt", script)
         self.assertIn("web_app.py", script)
         self.assertIn("--port", script)
+        script_path.read_bytes().decode("ascii")
 
     def test_windows_package_builder_includes_web_assets_and_launcher(self):
         script = (REPO_ROOT / "app" / "build_windows_package.ps1").read_text(encoding="utf-8")

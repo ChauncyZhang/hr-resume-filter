@@ -1,9 +1,8 @@
 @echo off
 setlocal
-chcp 65001 >nul
 
 cd /d "%~dp0app" || (
-  echo 未找到 app 目录，请确认工具包没有被拆散。
+  echo App folder was not found. Keep the app folder next to this launcher.
   pause
   exit /b 1
 )
@@ -12,18 +11,18 @@ set "PORT=8765"
 if not "%HR_RESUME_PORT%"=="" set "PORT=%HR_RESUME_PORT%"
 set "URL=http://127.0.0.1:%PORT%"
 
-echo HR 简历筛选工具
-echo 工作目录：%cd%
+echo HR Resume Filter
+echo Working directory: %cd%
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = New-Object Net.Sockets.TcpClient; try { $c.Connect('127.0.0.1', [int]$env:PORT); exit 0 } catch { exit 1 } finally { $c.Close() }" >nul 2>nul
 if not errorlevel 1 (
-  echo 工具已经在运行，正在打开页面：%URL%
+  echo The tool is already running. Opening %URL%
   start "" "%URL%"
   exit /b 0
 )
 
 if exist "HRResumeFilter.exe" (
-  echo 正在启动免安装版...
+  echo Starting portable app...
   start "" "HRResumeFilter.exe"
   exit /b 0
 )
@@ -35,8 +34,8 @@ if "%errorlevel%"=="0" (
   where python >nul 2>nul
   if not "%errorlevel%"=="0" (
     echo.
-    echo 未找到 Python。请先安装 Python 3.10 或更高版本。
-    echo 推荐安装方式：https://www.python.org/downloads/windows/
+    echo Python was not found. Please install Python 3.10 or newer.
+    echo Download: https://www.python.org/downloads/windows/
     echo.
     pause
     exit /b 1
@@ -47,17 +46,17 @@ if "%errorlevel%"=="0" (
 %PY_BOOT% -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
 if errorlevel 1 (
   echo.
-  echo Python 版本过低，请安装 Python 3.10 或更高版本。
+  echo Python is too old. Please install Python 3.10 or newer.
   echo.
   pause
   exit /b 1
 )
 
 if not exist ".venv\Scripts\python.exe" (
-  echo 首次运行：正在创建本地 Python 环境...
+  echo First run: creating local Python environment...
   %PY_BOOT% -m venv .venv
   if errorlevel 1 (
-    echo Python 环境创建失败。
+    echo Failed to create Python environment.
     pause
     exit /b 1
   )
@@ -65,22 +64,22 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "PYTHON_BIN=.venv\Scripts\python.exe"
 
-echo 检查依赖...
+echo Checking dependencies...
 "%PYTHON_BIN%" -c "import importlib.util; missing=[name for name in ('pypdf','docx') if importlib.util.find_spec(name) is None]; raise SystemExit(1 if missing else 0)"
 if errorlevel 1 (
-  echo 正在安装依赖...
+  echo Installing dependencies...
   "%PYTHON_BIN%" -m pip install -r requirements.txt
   if errorlevel 1 (
-    echo 依赖安装失败，请检查网络后重试。
+    echo Failed to install dependencies. Check the network and try again.
     pause
     exit /b 1
   )
 )
 
 echo.
-echo 正在启动网页：%URL%
-echo 如果浏览器没有自动打开，请手动访问：%URL%
-echo 关闭这个窗口即可停止工具。
+echo Starting web page: %URL%
+echo If the browser does not open automatically, visit: %URL%
+echo Close this window to stop the tool.
 echo.
 
 "%PYTHON_BIN%" web_app.py --host 127.0.0.1 --port "%PORT%"
