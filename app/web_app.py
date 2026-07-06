@@ -5,6 +5,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import tempfile
 import uuid
 import webbrowser
@@ -22,10 +23,21 @@ from urllib.parse import urlparse
 from resume_filter import CSV_COLUMNS, extract_text, score_resume
 
 
-ROOT = Path(__file__).resolve().parent
-WEB_ROOT = ROOT / "web"
-DEFAULT_CONFIG_PATH = ROOT / "data" / "config.json"
-EXAMPLE_CONFIG_PATH = ROOT / "data" / "config.example.json"
+def _resource_root() -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def _runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+RESOURCE_ROOT = _resource_root()
+RUNTIME_ROOT = _runtime_root()
+WEB_ROOT = RESOURCE_ROOT / "web"
+DEFAULT_CONFIG_PATH = RUNTIME_ROOT / "data" / "config.json"
+EXAMPLE_CONFIG_PATH = RESOURCE_ROOT / "data" / "config.example.json"
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024

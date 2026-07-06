@@ -8,3 +8,6 @@ app/venv/
 data/config.json
 app/data/config.json
 *.log
+build/
+dist/
+*.spec

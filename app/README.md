@@ -4,17 +4,19 @@
 
 ## HR 怎么使用
 
-Windows 用户双击：
+如果拿到的是 Windows 免安装交付包，HR 解压后双击：
 
 ```text
 Windows用户点我启动.bat
 ```
 
-然后浏览器会打开本地页面：
+这个交付包不要求 HR 安装 Python。脚本会启动包里的免安装程序，然后浏览器会打开本地页面：
 
 ```text
 http://127.0.0.1:8765
 ```
+
+如果拿到的是源码仓库而不是免安装交付包，Windows 电脑才需要预先安装 Python 3.10 或更高版本；脚本会自动创建 `.venv` 并安装依赖。
 
 页面流程：
 
@@ -83,6 +85,22 @@ python resume_filter.py --input sample/resumes --jd sample/jd.txt --output sampl
 ```
 
 输出 `candidates.csv` 可直接用 Excel 打开。
+
+## 生成 Windows 免安装包
+
+开发者在 Windows 电脑上运行：
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File app\build_windows_package.ps1
+```
+
+生成结果：
+
+```text
+dist/hr-resume-filter-windows.zip
+```
+
+把这个 zip 发给 HR。HR 解压后只需要双击 `Windows用户点我启动.bat`，不需要安装 Python。
 
 ## JD 写法
 

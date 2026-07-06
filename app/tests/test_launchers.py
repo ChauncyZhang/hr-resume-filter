@@ -21,10 +21,19 @@ class LauncherTests(unittest.TestCase):
         script = (REPO_ROOT / "Windows用户点我启动.bat").read_text(encoding="utf-8")
 
         self.assertIn('cd /d "%~dp0app"', script)
+        self.assertIn("HRResumeFilter.exe", script)
         self.assertIn("-m venv .venv", script)
         self.assertIn("requirements.txt", script)
         self.assertIn("web_app.py", script)
         self.assertIn("--port", script)
+
+    def test_windows_package_builder_includes_web_assets_and_launcher(self):
+        script = (REPO_ROOT / "app" / "build_windows_package.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("PyInstaller", script)
+        self.assertIn('Filter "Windows*.bat"', script)
+        self.assertIn("config.example.json", script)
+        self.assertIn("Compress-Archive", script)
 
 
 if __name__ == "__main__":

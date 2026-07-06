@@ -15,6 +15,19 @@ set "URL=http://127.0.0.1:%PORT%"
 echo HR 简历筛选工具
 echo 工作目录：%cd%
 
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = New-Object Net.Sockets.TcpClient; try { $c.Connect('127.0.0.1', [int]$env:PORT); exit 0 } catch { exit 1 } finally { $c.Close() }" >nul 2>nul
+if not errorlevel 1 (
+  echo 工具已经在运行，正在打开页面：%URL%
+  start "" "%URL%"
+  exit /b 0
+)
+
+if exist "HRResumeFilter.exe" (
+  echo 正在启动免安装版...
+  start "" "HRResumeFilter.exe"
+  exit /b 0
+)
+
 where py >nul 2>nul
 if "%errorlevel%"=="0" (
   set "PY_BOOT=py -3"
@@ -38,13 +51,6 @@ if errorlevel 1 (
   echo.
   pause
   exit /b 1
-)
-
-%PY_BOOT% -c "import socket; sock=socket.socket(); sock.settimeout(0.5); raise SystemExit(0 if sock.connect_ex(('127.0.0.1', int('%PORT%'))) == 0 else 1)"
-if not errorlevel 1 (
-  echo 工具已经在运行，正在打开页面：%URL%
-  start "" "%URL%"
-  exit /b 0
 )
 
 if not exist ".venv\Scripts\python.exe" (
