@@ -170,6 +170,16 @@ class WebAppTests(unittest.TestCase):
             "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         )
 
+    def test_bigmodel_1113_error_is_explained_as_resource_package_mismatch(self):
+        from web_app import _format_llm_http_error
+
+        detail = '{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}'
+
+        message = _format_llm_http_error(429, detail)
+
+        self.assertIn("API Key / 模型 / 资源包", message)
+        self.assertIn("coding/paas/v4", message)
+
     def test_iter_resume_analysis_events_reports_progress(self):
         uploads = [
             ("one.txt", b"Python LLM"),

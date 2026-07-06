@@ -314,7 +314,7 @@ def evaluate_with_llm(
             response_payload = json.loads(resp.read().decode("utf-8"))
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LLM 请求失败：HTTP {exc.code} {detail[:300]}") from exc
+        raise RuntimeError(_format_llm_http_error(exc.code, detail)) from exc
     except error.URLError as exc:
         raise RuntimeError(f"LLM 服务不可达：{exc.reason}") from exc
 
@@ -327,6 +327,25 @@ def evaluate_with_llm(
     if not content:
         raise RuntimeError("LLM 没有返回内容。")
     return _parse_llm_json(content)
+
+
+def _format_llm_http_error(status_code: int, detail: str) -> str:
+    try:
+        payload = json.loads(detail)
+    except json.JSONDecodeError:
+        payload = {}
+    error_payload = payload.get("error", {}) if isinstance(payload, dict) else {}
+    code = str(error_payload.get("code", ""))
+    message = str(error_payload.get("message", "")).strip()
+    if status_code == 429 and code == "1113":
+        return (
+            "LLM 请求失败：BigModel 返回 1113。通常不是本工具额度问题，而是当前 "
+            "API Key / 模型 / 资源包 不匹配，或该资源包不支持这个调用入口。"
+            "如果你买的是 GLM Coding Plan，请尝试 Base URL："
+            "https://open.bigmodel.cn/api/coding/paas/v4。"
+            f" 原始错误：{message or detail[:200]}"
+        )
+    return f"LLM 请求失败：HTTP {status_code} {detail[:300]}"
 
 
 def test_llm_connection(
