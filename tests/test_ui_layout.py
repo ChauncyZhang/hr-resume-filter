@@ -15,6 +15,14 @@ class UiLayoutTests(unittest.TestCase):
         side_stack = html.split('<div class="side-stack">', 1)[1].split("</div>", 1)[0]
         self.assertNotIn('id="llmEnabled"', side_stack)
 
+    def test_results_use_candidate_cards_not_wide_table(self):
+        html = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="resultList"', html)
+        self.assertIn('class="candidate-list"', html)
+        self.assertNotIn('id="resultBody"', html)
+        self.assertNotIn('class="table-wrap"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

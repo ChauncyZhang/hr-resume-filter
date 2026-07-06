@@ -10,7 +10,7 @@ const fileList = document.querySelector("#fileList");
 const analyzeBtn = document.querySelector("#analyzeBtn");
 const downloadBtn = document.querySelector("#downloadBtn");
 const statusText = document.querySelector("#statusText");
-const resultBody = document.querySelector("#resultBody");
+const resultList = document.querySelector("#resultList");
 const resultCount = document.querySelector("#resultCount");
 const sampleBtn = document.querySelector("#sampleBtn");
 const settingsBtn = document.querySelector("#settingsBtn");
@@ -338,31 +338,94 @@ function renderFileList() {
 
 function renderResults(rows) {
   resultCount.textContent = `${rows.length} 份简历`;
-  resultBody.innerHTML = "";
+  resultList.innerHTML = "";
   if (!rows.length) {
-    const row = document.createElement("tr");
-    row.innerHTML = '<td colspan="11" class="empty">上传简历后，这里会显示排序结果。</td>';
-    resultBody.appendChild(row);
+    const empty = document.createElement("div");
+    empty.className = "empty";
+    empty.textContent = "上传简历后，这里会显示排序结果。";
+    resultList.appendChild(empty);
     return;
   }
 
   for (const row of rows) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${escapeHtml(row["文件名"] || "")}</td>
-      <td class="score">${escapeHtml(String(row["匹配分"] ?? ""))}</td>
-      <td>${escapeHtml(row["推荐结论"] || "")}</td>
-      <td>${escapeHtml(row["缺失必须条件"] || "")}</td>
-      <td>${escapeHtml(row["命中必须条件"] || "")}</td>
-      <td>${escapeHtml(row["命中加分项"] || "")}</td>
-      <td class="score">${escapeHtml(String(row["LLM评分"] ?? ""))}</td>
-      <td>${escapeHtml(row["LLM结论"] || "")}</td>
-      <td>${escapeHtml(row["LLM理由"] || row["LLM错误"] || "")}</td>
-      <td>${escapeHtml(row["风险点"] || "")}</td>
-      <td>${escapeHtml(row["面试问题"] || "")}</td>
-    `;
-    resultBody.appendChild(tr);
+    resultList.appendChild(createCandidateCard(row));
   }
+}
+
+function createCandidateCard(row) {
+  const card = document.createElement("article");
+  card.className = "candidate-card";
+  const llmError = row["LLM错误"];
+  const llmScore = row["LLM评分"];
+
+  card.innerHTML = `
+    <div class="candidate-head">
+      <div>
+        <h3 class="candidate-title">${escapeHtml(row["文件名"] || "未命名简历")}</h3>
+        <div class="candidate-verdict">${escapeHtml(row["推荐结论"] || "待判断")}</div>
+      </div>
+      <div class="score-group">
+        ${scorePill("匹配分", row["匹配分"])}
+        ${llmScore !== undefined && llmScore !== "" ? scorePill("LLM评分", llmScore) : ""}
+      </div>
+    </div>
+    <div class="candidate-grid">
+      ${tagBlock("命中必须条件", row["命中必须条件"], "暂无命中")}
+      ${tagBlock("命中加分项", row["命中加分项"], "暂无加分项")}
+      ${tagBlock("缺失必须条件", row["缺失必须条件"], "无明显缺失", "warning")}
+    </div>
+    <div class="candidate-notes">
+      ${noteBlock("LLM结论", row["LLM结论"], "未启用或暂无结论")}
+      ${noteBlock("LLM理由", row["LLM理由"], "暂无理由")}
+      ${noteBlock("风险点", row["风险点"], "暂无明显风险")}
+      ${noteBlock("面试问题", row["面试问题"], "暂无建议问题")}
+      ${llmError ? noteBlock("LLM错误", llmError, "", "error") : ""}
+    </div>
+  `;
+  return card;
+}
+
+function scorePill(label, value) {
+  const text = value === undefined || value === null || value === "" ? "-" : String(value);
+  return `
+    <div class="score-pill">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(text)}</strong>
+    </div>
+  `;
+}
+
+function tagBlock(title, value, emptyText, tone = "") {
+  const tags = splitTerms(value);
+  const className = tone ? `tag ${tone}` : "tag";
+  return `
+    <section class="result-block">
+      <h4>${escapeHtml(title)}</h4>
+      ${
+        tags.length
+          ? `<div class="tag-list">${tags.map((tag) => `<span class="${className}">${escapeHtml(tag)}</span>`).join("")}</div>`
+          : `<p class="muted">${escapeHtml(emptyText)}</p>`
+      }
+    </section>
+  `;
+}
+
+function noteBlock(title, value, emptyText, tone = "") {
+  const text = String(value || "").trim();
+  const className = tone ? `note-block ${tone}` : "note-block";
+  return `
+    <section class="${className}">
+      <h4>${escapeHtml(title)}</h4>
+      <p>${escapeHtml(text || emptyText)}</p>
+    </section>
+  `;
+}
+
+function splitTerms(value) {
+  return String(value || "")
+    .split(/[，,、\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function toCsv(rows) {

@@ -70,29 +70,8 @@
             <h2>筛选结果</h2>
             <span id="resultCount">0 份简历</span>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>文件名</th>
-                  <th>匹配分</th>
-                  <th>推荐结论</th>
-                  <th>缺失必须条件</th>
-                  <th>命中必须条件</th>
-                  <th>命中加分项</th>
-                  <th>LLM评分</th>
-                  <th>LLM结论</th>
-                  <th>LLM理由</th>
-                  <th>风险点</th>
-                  <th>面试问题</th>
-                </tr>
-              </thead>
-              <tbody id="resultBody">
-                <tr>
-                  <td colspan="11" class="empty">上传简历后，这里会显示排序结果。</td>
-                </tr>
-              </tbody>
-            </table>
+          <div id="resultList" class="candidate-list">
+            <div class="empty">上传简历后，这里会显示排序结果。</div>
           </div>
         </section>
       </section>
