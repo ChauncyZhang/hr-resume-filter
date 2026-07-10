@@ -29,11 +29,20 @@ chmod +x Mac用户点我启动.command
 
 ## macOS 安全提示
 
-如果系统提示无法打开来自未知开发者的脚本：
+如果系统提示：
 
-1. 右键点击 `Mac用户点我启动.command`
-2. 选择“打开”
-3. 在弹窗里再次选择“打开”
+```text
+Apple 无法验证是否包含可能危害 Mac 安全或泄露隐私的恶意软件
+```
+
+这是 macOS Gatekeeper 对下载文件加了隔离标记。打开“终端”，进入解压后的工具目录，执行：
+
+```bash
+xattr -dr com.apple.quarantine .
+chmod +x Mac用户点我启动.command
+```
+
+然后再双击 `Mac用户点我启动.command`。
 
 ## Python 要求
 

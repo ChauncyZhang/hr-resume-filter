@@ -42,6 +42,15 @@ Mac用户点我启动.command
 chmod +x Mac用户点我启动.command
 ```
 
+如果 macOS 提示“Apple 无法验证是否包含可能危害 Mac 安全或泄露隐私的恶意软件”，这是 Gatekeeper 对下载脚本加了隔离标记。打开“终端”，进入解压后的工具目录，执行：
+
+```bash
+xattr -dr com.apple.quarantine .
+chmod +x Mac用户点我启动.command
+```
+
+然后再双击 `Mac用户点我启动.command`。
+
 Linux 服务器部署见：
 
 ```text
