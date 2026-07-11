@@ -220,3 +220,37 @@ Browser console errors checked: none.
 - Consolidated the prototype around the UI specification's six-level type scale: page title 24px, section title 18px, panel title 16px, body/control 14px, label 13px, and caption 12px.
 - Removed every 9px, 10px, and 11px declaration. Desktop audit reports visible text at 12px or above and all text-bearing controls at 14px.
 - Rechecked the workbench, CAN-02 interview tab, and INT-02 schedule form at 1280 desktop and 390 mobile. Body-level horizontal overflow: none. Browser console errors: none.
+
+## UX-06 Talent Pool and Reactivation QA
+
+### Evidence
+
+- TAL-01 desktop list: `talent-pools-1280x720.png`
+- TAL-01 mobile list: `talent-pools-390x844.png`
+- TAL-02 desktop detail: `talent-detail-1280x720.png`
+- TAL-02 mobile member detail: `talent-detail-390x844.png`
+- F-06 desktop reactivation: `talent-reactivate-1280x720.png`
+- F-06 mobile reactivation: `talent-reactivate-390x844.png`
+
+### UX-06 Interactions Tested
+
+- Group search, visibility filtering, summary metrics, and create-group validation
+- Talent keyword search plus role, city, owner, and follow-up filters
+- Member tags, owner, next-contact date, move/remove actions, and retention state
+- “永久不再联系” confirmation remains disabled until a reason is supplied
+- Reactivation only exposes authorized active positions and previews the new application
+- An active same-position application blocks duplicate creation and links to the existing record
+- Successful reactivation appends a new “新简历” application while preserving the original application
+- Desktop 1280 and mobile 390 rendering with no body-level horizontal overflow
+
+Browser console errors checked: none.
+
+### UX-06 Comparison History
+
+1. TAL-01 established four distinct group types: recruiting-team, position-restricted, and personal follow-up visibility.
+2. TAL-02 search was verified against name and skill context, with historical positions and latest conclusions kept in the comparison table.
+3. The duplicate-application test selected an already active AI 工程师 application. Creation was disabled until a different authorized position was selected.
+4. Reactivating 李嘉明 to Java 后端工程师 added a second application dated 2026-07-12 and retained the original AI 工程师 application dated 2026-07-11.
+5. Mobile drawers use the full 375 px content width inside a 390 px viewport; list, detail, and reactivation states remain overflow-free.
+
+Final result: passed.

@@ -25,6 +25,7 @@ import { initialPositionRecords, JobsWorkspace } from "./JobViews.jsx";
 import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
 import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
 import { initialInterviewRecords, InterviewsWorkspace } from "./InterviewViews.jsx";
+import { initialTalentMemberships, initialTalentPools, TalentPoolWorkspace } from "./TalentPoolViews.jsx";
 
 const navItems = [
   ["工作台", Home],
@@ -157,6 +158,10 @@ export function App() {
   const [selectedInterview, setSelectedInterview] = useState(null);
   const [scheduleCandidateId, setScheduleCandidateId] = useState(null);
   const [interviewOrigin, setInterviewOrigin] = useState(null);
+  const [talentMode, setTalentMode] = useState("list");
+  const [talentPools, setTalentPools] = useState(initialTalentPools);
+  const [talentMemberships, setTalentMemberships] = useState(initialTalentMemberships);
+  const [selectedPoolId, setSelectedPoolId] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [recentTask, setRecentTask] = useState(() => {
@@ -172,7 +177,7 @@ export function App() {
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
-  }, [activeNav, jobMode, candidateMode, interviewMode, Boolean(screeningTask)]);
+  }, [activeNav, jobMode, candidateMode, interviewMode, talentMode, Boolean(screeningTask)]);
 
   function notify(message) {
     setToast(message);
@@ -287,6 +292,26 @@ export function App() {
     }
   }
 
+  function addCandidatesToTalentPool(candidateIds, poolId = "POOL-FOLLOW") {
+    const pool = talentPools.find((item) => item.id === poolId) || talentPools[0];
+    const additions = candidateIds.filter((candidateId) => !talentMemberships.some((item) => item.poolId === pool.id && item.candidateId === candidateId)).map((candidateId, index) => {
+      const candidate = candidateRecords.find((item) => item.id === candidateId);
+      return { id: `MEM-NEW-${Date.now()}-${index}`, poolId: pool.id, candidateId, suitableRoles: [candidate?.position || "待确认岗位"], tags: candidate?.tags || [], owner: "张小北", joinedAt: "2026-07-12", reason: "HR 从候选人流程明确加入人才库", source: `${candidate?.position || "候选人"}申请`, nextContact: "2026-07-19", retentionUntil: "2028-07-11", recentInteraction: "刚刚加入人才库", latestConclusion: candidate?.humanConclusion || candidate?.recommendation || "待补充", status: "正常" };
+    });
+    if (!additions.length) { notify(`候选人已在“${pool.name}”中`); return; }
+    setTalentMemberships((current) => [...current, ...additions]);
+    setTalentPools((current) => current.map((item) => item.id === pool.id ? { ...item, memberIds: [...new Set([...item.memberIds, ...candidateIds])], recentActivity: "刚刚", activity: `张小北新增了 ${additions.length} 位人才` } : item));
+    setCandidateRecords((current) => current.map((candidate) => candidateIds.includes(candidate.id) ? { ...candidate, timeline: [{ time: "刚刚", actor: "张小北", action: `加入人才库：${pool.name}` }, ...candidate.timeline] } : candidate));
+    notify(`已将 ${additions.length} 位候选人加入“${pool.name}”`);
+  }
+
+  function reactivateTalent(candidateId, position, poolId, resumeVersion) {
+    const created = { position: position.name, state: "新简历", created: "2026-07-12", source: "人才库重新激活", linkedPoolId: poolId, resumeVersion };
+    setCandidateRecords((current) => current.map((candidate) => candidate.id === candidateId ? { ...candidate, applications: [created, ...candidate.applications], position: position.name, stage: "新简历", owner: position.owner, lastActivity: "刚刚", timeline: [{ time: "刚刚", actor: "张小北", action: `从人才库重新激活到${position.name}；保留历史申请` }, ...candidate.timeline] } : candidate));
+    setTalentPools((current) => current.map((pool) => pool.id === poolId ? { ...pool, recentActivity: "刚刚", activity: `重新激活候选人到${position.name}` } : pool));
+    return created;
+  }
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
@@ -305,6 +330,7 @@ export function App() {
                 setSelectedCandidate(null);
                 setInterviewOrigin(null);
                 setScheduleCandidateId(null);
+                setSelectedPoolId(null);
                 if (label === "职位") {
                   setSelectedJob(null);
                   setJobMode("list");
@@ -313,6 +339,8 @@ export function App() {
                 } else if (label === "面试") {
                   setInterviewMode("list");
                   setSelectedInterview(null);
+                } else if (label === "人才库") {
+                  setTalentMode("list");
                 } else if (label !== "工作台") {
                   notify(`${label}模块将在后续原型中展开`);
                 }
@@ -333,7 +361,7 @@ export function App() {
       <main className="workspace">
         <header className="topbar">
           <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
-          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav}</h1>
+          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav === "人才库" && talentMode === "detail" ? "人才库详情" : activeNav}</h1>
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
@@ -444,14 +472,18 @@ export function App() {
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
           <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterview={selectedInterview} setSelectedInterview={setSelectedInterview} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} setRecords={setInterviewRecords} candidates={candidateRecords} onNotify={notify} onBack={backFromInterview} onRecordSaved={syncInterviewToCandidate} />
         )}
 
-        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && (
+        {!screeningTask && activeNav === "人才库" && (
+          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={setSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} />
+        )}
+
+        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && activeNav !== "人才库" && (
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
