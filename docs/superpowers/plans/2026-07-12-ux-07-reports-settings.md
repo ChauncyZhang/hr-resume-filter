@@ -148,6 +148,6 @@ Test role matrix, user edit confirmation, protected stages, save retry, masked k
 
 Record screenshots, interaction matrix, console status, and remaining P3 findings.
 
-- [ ] **Step 4: Run final gates and merge**
+- [x] **Step 4: Run final gates and merge**
 
 Run `npm test`, `npm run build`, and `git diff --check`; commit `Add UX-07 reports and settings workflow`, merge locally to `main`, rerun tests/build, and remove the worktree.
