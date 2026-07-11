@@ -172,3 +172,43 @@ Browser console errors checked: none.
 2. The initial mobile card placed source in a 24 px grid track, causing character-by-character wrapping. Source and owner now occupy labeled metadata regions without page overflow.
 3. The original prototype opened candidates in a separate lightweight drawer. All candidate entry points now share CAN-02, preserving one candidate record and one progression history.
 4. Final browser pass found no remaining P0/P1/P2 issue across CAN-01 or CAN-02.
+
+## UX-05 Interview and Feedback QA
+
+### Evidence
+
+- Functional specification: `../../recruiting-platform-ux-spec.md`, F-04, F-05, and INT-01 through INT-03
+- INT-01 desktop list: `interview-list-1280x720.png`
+- INT-01 desktop week calendar: `interview-calendar-1280x720.png`
+- INT-01 mobile list: `interview-list-390x844.png`
+- INT-02 desktop schedule: `interview-schedule-1280x720.png`
+- INT-02 mobile schedule: `interview-schedule-390x844.png`
+- INT-03 desktop feedback: `interview-feedback-1280x720.png`
+- INT-03 mobile feedback: `interview-feedback-390x844.png`
+
+The interview workflow reuses the existing shell, typography scale, blue action hierarchy, neutral surfaces, Lucide icons, and compact ATS density. INT-01 uses a comparison table and a five-day calendar on desktop, with stable record cards on mobile. INT-02 remains a full workspace form rather than a narrow modal. INT-03 keeps the feedback form in one reading column and moves lower-priority interview context to a secondary region.
+
+### UX-05 Interactions Tested
+
+- Interview navigation, keyword/date/status/scope filters, and list/calendar switching
+- Calendar blocks include time, candidate, position, interviewer, and text status rather than color alone
+- New scheduling and rescheduling across basic information, collaboration, and invitation steps
+- Known hard conflict blocks continuation while preserving meeting link and interviewer selection
+- Conflict recovery, invitation preview, calendar output, save, and versioned reschedule messaging
+- Notification failure remains on the saved interview and supports independent retry
+- Feedback rating dimensions, strengths, risks, conclusion, notes, and visible draft state
+- Empty submit exposes seven required-field errors without clearing other input
+- First simulated network failure preserves the full draft; retry submits successfully and enters read-only state
+- Another interviewer's submitted feedback remains read-only and exposes no edit action
+- Candidate interview summaries and timelines update from saved interview/feedback records
+- Desktop 1280 and mobile 390 rendering with no body-level horizontal overflow
+
+Browser console errors checked: none.
+
+### UX-05 Comparison History
+
+1. Initial scheduling QA confirmed that a selected interviewer already booked at the same time blocks progression and retains all entered collaboration data.
+2. The seeded notification failure originally required re-creating the interview. It now exposes an isolated retry action and keeps the local schedule intact.
+3. The first feedback submission intentionally fails once to verify draft retention. Successful retry originally left the old failure notice visible; the notice is now cleared when submission succeeds.
+4. Mobile tables were converted to stable stacked records, while the week calendar uses contained horizontal paging and the feedback form keeps all required fields visible.
+5. Final browser pass found no remaining P0/P1/P2 issue across INT-01, INT-02, or INT-03.

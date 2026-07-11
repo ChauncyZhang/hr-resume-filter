@@ -24,6 +24,7 @@ import {
 import { initialPositionRecords, JobsWorkspace } from "./JobViews.jsx";
 import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
 import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
+import { initialInterviewRecords, InterviewsWorkspace } from "./InterviewViews.jsx";
 
 const navItems = [
   ["工作台", Home],
@@ -151,6 +152,11 @@ export function App() {
   const [candidateMode, setCandidateMode] = useState("list");
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
+  const [interviewMode, setInterviewMode] = useState("list");
+  const [interviewRecords, setInterviewRecords] = useState(initialInterviewRecords);
+  const [selectedInterview, setSelectedInterview] = useState(null);
+  const [scheduleCandidateId, setScheduleCandidateId] = useState(null);
+  const [interviewOrigin, setInterviewOrigin] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [recentTask, setRecentTask] = useState(() => {
@@ -166,7 +172,7 @@ export function App() {
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
-  }, [activeNav, jobMode, candidateMode, Boolean(screeningTask)]);
+  }, [activeNav, jobMode, candidateMode, interviewMode, Boolean(screeningTask)]);
 
   function notify(message) {
     setToast(message);
@@ -227,6 +233,60 @@ export function App() {
     setCandidateMode("list");
   }
 
+  function openInterviewList() {
+    setScreeningTask(null);
+    setActiveNav("面试");
+    setInterviewMode("list");
+    setSelectedInterview(null);
+    setScheduleCandidateId(null);
+    setInterviewOrigin(null);
+  }
+
+  function openScheduleInterview(candidate = null, interview = null) {
+    setInterviewOrigin(activeNav === "面试" ? null : { activeNav, candidateMode, selectedCandidate, screeningTask });
+    setScreeningTask(null);
+    setActiveNav("面试");
+    setInterviewMode("schedule");
+    setSelectedInterview(interview);
+    setScheduleCandidateId(candidate?.id || null);
+  }
+
+  function openFeedbackInterview(interviewOrId) {
+    const interview = typeof interviewOrId === "string" ? interviewRecords.find((item) => item.id === interviewOrId) : interviewOrId;
+    if (!interview) { notify("未找到对应面试记录"); return; }
+    setInterviewOrigin(activeNav === "面试" ? null : { activeNav, candidateMode, selectedCandidate, screeningTask });
+    setScreeningTask(null);
+    setActiveNav("面试");
+    setInterviewMode("feedback");
+    setSelectedInterview(interview);
+    setScheduleCandidateId(null);
+  }
+
+  function backFromInterview() {
+    if (!interviewOrigin) return;
+    setActiveNav(interviewOrigin.activeNav);
+    setCandidateMode(interviewOrigin.candidateMode);
+    setSelectedCandidate(interviewOrigin.selectedCandidate);
+    setScreeningTask(interviewOrigin.screeningTask);
+    setInterviewOrigin(null);
+  }
+
+  function syncInterviewToCandidate(interview) {
+    setCandidateRecords((current) => current.map((candidate) => {
+      if (candidate.id !== interview.candidateId) return candidate;
+      const summary = { interviewId: interview.id, round: interview.round, time: `${interview.dateLabel} ${interview.time}`, interviewer: interview.interviewers.join("、"), result: interview.feedback?.conclusion || interview.feedbackStatus, feedback: interview.feedback?.strengths || `面试状态：${interview.status}；通知：${interview.notification}` };
+      const interviews = [...candidate.interviews.filter((item) => item.interviewId !== interview.id), summary];
+      return { ...candidate, interviews, lastActivity: "刚刚", timeline: [{ time: "刚刚", actor: "系统", action: interview.feedbackStatus === "已提交" ? `收到${interview.round}反馈：${interview.feedback.conclusion}` : `更新${interview.round}安排：${interview.dateLabel} ${interview.time}` }, ...candidate.timeline] };
+    }));
+    if (selectedCandidate?.id === interview.candidateId) {
+      setSelectedCandidate((current) => {
+        if (!current) return current;
+        const summary = { interviewId: interview.id, round: interview.round, time: `${interview.dateLabel} ${interview.time}`, interviewer: interview.interviewers.join("、"), result: interview.feedback?.conclusion || interview.feedbackStatus, feedback: interview.feedback?.strengths || `面试状态：${interview.status}；通知：${interview.notification}` };
+        return { ...current, interviews: [...current.interviews.filter((item) => item.interviewId !== interview.id), summary], lastActivity: "刚刚" };
+      });
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
@@ -243,11 +303,16 @@ export function App() {
                 setScreeningTask(null);
                 setCandidateOrigin(null);
                 setSelectedCandidate(null);
+                setInterviewOrigin(null);
+                setScheduleCandidateId(null);
                 if (label === "职位") {
                   setSelectedJob(null);
                   setJobMode("list");
                 } else if (label === "候选人") {
                   setCandidateMode("list");
+                } else if (label === "面试") {
+                  setInterviewMode("list");
+                  setSelectedInterview(null);
                 } else if (label !== "工作台") {
                   notify(`${label}模块将在后续原型中展开`);
                 }
@@ -268,7 +333,7 @@ export function App() {
       <main className="workspace">
         <header className="topbar">
           <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
-          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav}</h1>
+          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav}</h1>
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
@@ -346,17 +411,17 @@ export function App() {
                 <button className="expand-link" type="button">展开 3 项<ChevronDown size={14} /></button>
               </div>
               <div className="rail-group">
-                <div className="rail-group-title"><span className="status-dot orange" />待安排面试（4）<button type="button" onClick={() => notify("已筛选待安排面试")}>查看全部</button></div>
-                {["候 D1  等待安排 1 天", "候 D2  等待安排 2 天", "候 D3  等待安排 2 天"].map((item) => <button className="rail-item" type="button" key={item} onClick={() => notify("已打开面试安排")}>{item}<small>AI 工程师 · 北京</small></button>)}
+                <div className="rail-group-title"><span className="status-dot orange" />待安排面试（4）<button type="button" onClick={openInterviewList}>查看全部</button></div>
+                {["候 D1  等待安排 1 天", "候 D2  等待安排 2 天", "候 D3  等待安排 2 天"].map((item) => <button className="rail-item" type="button" key={item} onClick={() => openScheduleInterview()}>{item}<small>AI 工程师 · 北京</small></button>)}
               </div>
               <div className="rail-group compact">
-                <div className="rail-group-title"><span className="status-dot blue" />待反馈面试（3）<button type="button" onClick={() => notify("已筛选待反馈面试")}>查看全部</button></div>
+                <div className="rail-group-title"><span className="status-dot blue" />待反馈面试（3）<button type="button" onClick={() => openFeedbackInterview("INT-002")}>查看全部</button></div>
                 <p>候 E4　07-10 二面</p><p>候 E5　07-10 一面</p><p>候 E6　07-09 三面</p>
               </div>
             </section>
 
             <section className="rail-section calendar-card">
-              <header><h3>面试日历（未来 7 天）</h3><button type="button" onClick={() => notify("日历模块将在后续原型展开")}>查看日历</button></header>
+              <header><h3>面试日历（未来 7 天）</h3><button type="button" onClick={openInterviewList}>查看日历</button></header>
               {["07-11（今天）", "07-12（明天）", "07-13（周一）", "07-14（周二）"].map((day, index) => <button type="button" className="calendar-row" key={day}><span>{day}</span><strong>{[3, 5, 6, 4][index]} 场</strong></button>)}
               <button className="more-calendar" type="button">更多<MoreHorizontal size={15} /></button>
             </section>
@@ -379,10 +444,14 @@ export function App() {
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} />
         )}
 
-        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && (
+        {!screeningTask && activeNav === "面试" && (
+          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterview={selectedInterview} setSelectedInterview={setSelectedInterview} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} setRecords={setInterviewRecords} candidates={candidateRecords} onNotify={notify} onBack={backFromInterview} onRecordSaved={syncInterviewToCandidate} />
+        )}
+
+        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && (
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
