@@ -11,3 +11,4 @@ app/data/config.json
 build/
 dist/
 *.spec
+.worktrees/
