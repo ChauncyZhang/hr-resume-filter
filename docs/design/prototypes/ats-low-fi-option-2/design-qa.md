@@ -100,4 +100,42 @@ Browser console errors checked: none. Desktop body-level horizontal overflow: no
 
 - P3: Browser text antialiasing is slightly sharper than the generated source image; retain native rendering for accessibility and implementation realism.
 
+## UX-03 Import and Screening QA
+
+### Evidence
+
+- Visual language source: `reference-option-2.png`
+- Functional specification: `../../recruiting-platform-ux-spec.md`, F-02, IMP-01, and SCR-01
+- IMP-01 desktop validation state: `import-wizard-1280x720.png`
+- IMP-01 mobile start state: `import-wizard-390x844.png`
+- SCR-01 desktop processing state: `screening-progress-1280x720.png`
+- SCR-01 desktop partial-success state: `screening-partial-1280x720.png`
+- SCR-01 mobile completed state: `screening-task-390x844.png`
+
+The workbench reference and UX-03 screens were opened together. The import wizard and task page reuse the same shell, Chinese system typography, restrained blue actions, neutral operational surfaces, semantic status colors, Lucide icons, and compact table density. No photographic or illustrative asset is required by these flows.
+
+### UX-03 Interactions Tested
+
+- Workbench and JOB-03 import entry points
+- Three-step batch information, file validation, and confirmation flow
+- Unsupported ZIP file blocks task creation until removed
+- Current filename, current stage, and completed/total progress from 0/5 to 5/5
+- Independent parse failure and LLM partial-success states
+- Human-readable error, secondary trace ID, parse retry, and LLM retry
+- Rule score remains available when LLM evaluation fails
+- All/processing/success/partial/failed result filters and keyword search
+- Completed-row selection, bulk advance, and short-lived undo
+- Recent task persistence and restore through task ID snapshot
+- Desktop 1280 and mobile 390 rendering with no body-level horizontal overflow
+
+Browser console errors checked: none.
+
+### UX-03 Comparison History
+
+1. Initial IMP-01 test exposed an unsupported ZIP file alongside valid resumes. Creation remained blocked until the invalid file was removed; valid files and batch metadata were preserved.
+2. Initial processing rows revealed their eventual scores before completion. Queued rows now show “等待处理” and blank rule/LLM scores until the file finishes.
+3. The deterministic task produced one parse failure and one LLM partial success without blocking the other three resumes. Isolated retries converted both rows to success and the task to complete.
+4. Mobile SCR-01 initially inherited the desktop result table. It now uses stacked result cards while keeping filters, progress, separate scores, evidence, risks, and actions readable.
+5. Final browser pass found no remaining P0/P1/P2 issue across IMP-01 or SCR-01.
+
 final result: passed

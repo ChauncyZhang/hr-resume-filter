@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BriefcaseBusiness,
   CalendarDays,
@@ -23,6 +23,7 @@ import {
   X,
 } from "lucide-react";
 import { initialPositionRecords, JobsWorkspace } from "./JobViews.jsx";
+import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
 
 const navItems = [
   ["工作台", Home],
@@ -143,28 +144,36 @@ export function App() {
   const [selectedCandidate, setSelectedCandidate] = useState(null);
   const [toast, setToast] = useState("");
   const [filterOnlyUrgent, setFilterOnlyUrgent] = useState(false);
-  const [importState, setImportState] = useState("idle");
   const [jobs, setJobs] = useState(Object.keys(jobData));
   const [jobMode, setJobMode] = useState("list");
   const [selectedJob, setSelectedJob] = useState(null);
   const [positionRecords, setPositionRecords] = useState(initialPositionRecords);
+  const [importOpen, setImportOpen] = useState(false);
+  const [screeningTask, setScreeningTask] = useState(null);
+  const [recentTask, setRecentTask] = useState(() => {
+    try {
+      return JSON.parse(window.localStorage.getItem("ats_recent_screening_task")) || null;
+    } catch {
+      return null;
+    }
+  });
 
   const stages = useMemo(() => jobData[activeJob]?.stages || emptyStages, [activeJob]);
   const visibleStageMeta = jobData[activeJob]?.stages ? stageMeta : stageMeta.map(([name]) => [name, 0]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
-  }, [activeNav, jobMode]);
+  }, [activeNav, jobMode, Boolean(screeningTask)]);
 
   function notify(message) {
     setToast(message);
     window.setTimeout(() => setToast(""), 2200);
   }
 
-  function completeImport() {
-    setImportState("loading");
-    window.setTimeout(() => setImportState("done"), 900);
-  }
+  const handleTaskChange = useCallback((task) => {
+    setScreeningTask(task);
+    setRecentTask(task);
+  }, []);
 
   function openJobForm() {
     setActiveNav("职位");
@@ -213,14 +222,14 @@ export function App() {
       <main className="workspace">
         <header className="topbar">
           <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
-          <h1>{activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav}</h1>
+          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav}</h1>
           <div className="top-actions">
-            {activeNav === "工作台" && <button className="button primary" type="button" onClick={() => { setModal("import"); setImportState("idle"); }}><Import size={17} />导入简历</button>}
-            {(activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
+            {!screeningTask && activeNav === "工作台" && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
+            {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
           </div>
         </header>
 
-        {activeNav === "工作台" && <div className="page-body">
+        {!screeningTask && activeNav === "工作台" && <div className="page-body">
           <section className="main-column">
             <div className="job-switcher">
               <span className="switcher-label">当前职位</span>
@@ -308,7 +317,7 @@ export function App() {
           </aside>
         </div>}
 
-        {activeNav === "职位" && (
+        {!screeningTask && activeNav === "职位" && (
           <JobsWorkspace
             mode={jobMode}
             setMode={setJobMode}
@@ -317,15 +326,17 @@ export function App() {
             records={positionRecords}
             setRecords={setPositionRecords}
             onNotify={notify}
-            onImport={() => { setActiveJob(selectedJob?.name || activeJob); setModal("import"); setImportState("idle"); }}
+            onImport={() => { setActiveJob(selectedJob?.name || activeJob); setImportOpen(true); }}
             onOpenCandidate={setSelectedCandidate}
             onCreateJob={registerJob}
           />
         )}
 
-        {activeNav !== "工作台" && activeNav !== "职位" && (
+        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && (
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
+
+        {screeningTask && <ScreeningTaskView task={screeningTask} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={setSelectedCandidate} onNotify={notify} />}
       </main>
 
       {selectedCandidate && (
@@ -340,14 +351,7 @@ export function App() {
         </aside>
       )}
 
-      {modal === "import" && (
-        <Modal title="导入简历" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>取消</button><button className="button primary" type="button" onClick={completeImport} disabled={importState === "loading"}>{importState === "loading" ? "解析中..." : "开始导入"}</button></>}>
-          <label className="form-label">导入到职位<select value={activeJob} onChange={(event) => setActiveJob(event.target.value)}>{jobs.map((job) => <option key={job}>{job}</option>)}</select></label>
-          <button className="dropzone" type="button" onClick={() => setImportState("ready")}><Import size={27} /><strong>{importState === "ready" ? "已选择 5 份简历" : "选择或拖入简历文件"}</strong><span>支持 PDF、DOCX，单次最多 100 份</span></button>
-          {importState === "loading" && <div className="progress"><span /></div>}
-          {importState === "done" && <p className="success-message"><Check size={17} />5 份简历已导入，正在进行 AI 初筛</p>}
-        </Modal>
-      )}
+      {importOpen && <ImportWizard activeJob={activeJob} jobs={jobs} recentTask={recentTask} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} />}
 
       {modal === "duplicates" && (
         <Modal title="处理重复候选人" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>暂不处理</button><button className="button primary" type="button" onClick={() => { setModal(null); notify("2 组候选人已合并"); }}>确认合并</button></>}>
