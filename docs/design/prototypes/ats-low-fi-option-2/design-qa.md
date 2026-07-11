@@ -139,3 +139,36 @@ Browser console errors checked: none.
 5. Final browser pass found no remaining P0/P1/P2 issue across IMP-01 or SCR-01.
 
 final result: passed
+
+## UX-04 Candidate Review and Progression QA
+
+### Evidence
+
+- Functional specification: `../../recruiting-platform-ux-spec.md`, F-03, CAN-01, and CAN-02
+- CAN-01 desktop: `candidate-list-1280x720.png`
+- CAN-01 mobile: `candidate-list-390x844.png`
+- CAN-02 desktop screening evidence: `candidate-detail-1280x720.png`
+- CAN-02 mobile profile: `candidate-detail-390x844.png`
+
+The candidate workspace reuses the existing navigation, compact operational typography, neutral surfaces, restrained blue actions, Lucide icons, and 5-6 px radii. CAN-01 uses a comparison table on desktop and stable record cards on mobile. CAN-02 keeps identity, current application, state, owner, and next action visible while separating rule evidence, LLM advice, and human judgment.
+
+### UX-04 Interactions Tested
+
+- Candidate navigation, keyword/position/stage/owner/score filters, clear action, row selection, and bulk actions
+- Workbench, JOB-03, and SCR-01 entries route into the same candidate profile
+- Profile, applications, screening evidence, interview feedback, and timeline tabs
+- Masked contact display plus copy/download feedback
+- Notes, tags, and human conclusion persistence
+- Allowed-next-state mapping and timeline append after progression
+- Rejection blocked until a reason is entered
+- Simulated concurrent update shows the latest server state and recovery actions without silent overwrite
+- Desktop 1280 and mobile 390 rendering with no body-level horizontal overflow
+
+Browser console errors checked: none.
+
+### UX-04 Comparison History
+
+1. The initial desktop candidate table required horizontal scrolling at 1280 px and clipped the next-action column. Column constraints were tightened while preserving all comparison fields; the final table fits its panel.
+2. The initial mobile card placed source in a 24 px grid track, causing character-by-character wrapping. Source and owner now occupy labeled metadata regions without page overflow.
+3. The original prototype opened candidates in a separate lightweight drawer. All candidate entry points now share CAN-02, preserving one candidate record and one progression history.
+4. Final browser pass found no remaining P0/P1/P2 issue across CAN-01 or CAN-02.

@@ -6,7 +6,6 @@ import {
   ChevronDown,
   ChevronRight,
   CircleAlert,
-  Clock3,
   FileText,
   Filter,
   Home,
@@ -24,6 +23,7 @@ import {
 } from "lucide-react";
 import { initialPositionRecords, JobsWorkspace } from "./JobViews.jsx";
 import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
+import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
 
 const navItems = [
   ["工作台", Home],
@@ -148,6 +148,9 @@ export function App() {
   const [jobMode, setJobMode] = useState("list");
   const [selectedJob, setSelectedJob] = useState(null);
   const [positionRecords, setPositionRecords] = useState(initialPositionRecords);
+  const [candidateMode, setCandidateMode] = useState("list");
+  const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
+  const [candidateOrigin, setCandidateOrigin] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [recentTask, setRecentTask] = useState(() => {
@@ -163,7 +166,7 @@ export function App() {
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
-  }, [activeNav, jobMode, Boolean(screeningTask)]);
+  }, [activeNav, jobMode, candidateMode, Boolean(screeningTask)]);
 
   function notify(message) {
     setToast(message);
@@ -186,6 +189,44 @@ export function App() {
     setActiveJob(record.name);
   }
 
+  function openCandidate(summary) {
+    let candidate = candidateRecords.find((item) => item.name === summary.name);
+    if (!candidate) {
+      candidate = {
+        ...initialCandidateRecords[0],
+        id: `CAN-DEMO-${Date.now()}`,
+        name: summary.name,
+        role: summary.role || "候选人",
+        company: summary.company || "暂无",
+        position: activeJob,
+        stage: "待复核",
+        score: 82,
+        ruleScore: 82,
+        llmScore: 79,
+        source: summary.tag?.replace("来自 ", "") || "当前流程",
+        applications: [{ position: activeJob, state: "待复核", created: "2026-07-11", source: "当前流程" }],
+        timeline: [{ time: "刚刚", actor: "系统", action: "从当前招聘流程打开候选人档案" }],
+        version: 1,
+      };
+      setCandidateRecords((current) => [...current, candidate]);
+    }
+    setCandidateOrigin(activeNav === "候选人" && !screeningTask ? null : { activeNav, screeningTask });
+    setScreeningTask(null);
+    setActiveNav("候选人");
+    setSelectedCandidate(candidate);
+    setCandidateMode("detail");
+  }
+
+  function backFromCandidateDetail() {
+    if (candidateOrigin) {
+      setActiveNav(candidateOrigin.activeNav);
+      setScreeningTask(candidateOrigin.screeningTask);
+      setCandidateOrigin(null);
+    }
+    setSelectedCandidate(null);
+    setCandidateMode("list");
+  }
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
@@ -199,9 +240,14 @@ export function App() {
               onClick={() => {
                 setActiveNav(label);
                 setMenuOpen(false);
+                setScreeningTask(null);
+                setCandidateOrigin(null);
+                setSelectedCandidate(null);
                 if (label === "职位") {
                   setSelectedJob(null);
                   setJobMode("list");
+                } else if (label === "候选人") {
+                  setCandidateMode("list");
                 } else if (label !== "工作台") {
                   notify(`${label}模块将在后续原型中展开`);
                 }
@@ -222,7 +268,7 @@ export function App() {
       <main className="workspace">
         <header className="topbar">
           <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
-          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav}</h1>
+          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav}</h1>
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
@@ -260,7 +306,7 @@ export function App() {
                       <header><strong>{name}</strong><span>{filterOnlyUrgent ? Math.min(count, 3) : count}</span></header>
                       <div className="stage-list">
                         {stages[index].slice(0, filterOnlyUrgent ? 2 : 5).map((candidate) => (
-                          <CandidateCard key={candidate.name} candidate={candidate} onOpen={setSelectedCandidate} />
+                          <CandidateCard key={candidate.name} candidate={candidate} onOpen={openCandidate} />
                         ))}
                       </div>
                       <button className="load-more" type="button" onClick={() => notify(`${name}已加载更多候选人`)}><Plus size={14} />加载更多 ({Math.max(0, count - stages[index].length)})</button>
@@ -271,7 +317,7 @@ export function App() {
                 <div className="list-view">
                   <div className="list-head"><span>候选人</span><span>当前阶段</span><span>最近进展</span><span>操作</span></div>
                   {stages.flat().slice(0, 10).map((candidate, index) => (
-                    <button type="button" className="list-row" key={candidate.name} onClick={() => setSelectedCandidate(candidate)}>
+                    <button type="button" className="list-row" key={candidate.name} onClick={() => openCandidate(candidate)}>
                       <span><span className="avatar-mini"><UserRound size={11} /></span><strong>{candidate.name}</strong></span>
                       <span>{visibleStageMeta.find((_, stageIndex) => stages[stageIndex].includes(candidate))?.[0]}</span>
                       <span>{candidate.age || candidate.schedule || candidate.note}</span>
@@ -327,29 +373,21 @@ export function App() {
             setRecords={setPositionRecords}
             onNotify={notify}
             onImport={() => { setActiveJob(selectedJob?.name || activeJob); setImportOpen(true); }}
-            onOpenCandidate={setSelectedCandidate}
+            onOpenCandidate={openCandidate}
             onCreateJob={registerJob}
           />
         )}
 
-        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && (
+        {!screeningTask && activeNav === "候选人" && (
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} />
+        )}
+
+        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && (
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
-        {screeningTask && <ScreeningTaskView task={screeningTask} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={setSelectedCandidate} onNotify={notify} />}
+        {screeningTask && <ScreeningTaskView task={screeningTask} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} />}
       </main>
-
-      {selectedCandidate && (
-        <aside className="detail-drawer" aria-label="候选人详情">
-          <header><div><span className="profile-avatar"><UserRound size={20} /></span><div><h2>{selectedCandidate.name}</h2><p>{selectedCandidate.role}</p></div></div><IconButton label="关闭" onClick={() => setSelectedCandidate(null)}><X size={20} /></IconButton></header>
-          <div className="drawer-body">
-            <section><h3>候选人概览</h3><dl><div><dt>最近公司</dt><dd>{selectedCandidate.company || "暂无"}</dd></div><div><dt>应聘职位</dt><dd>{activeJob}</dd></div><div><dt>当前阶段</dt><dd>待复核</dd></div></dl></section>
-            <section><h3>AI 简历评估</h3><div className="score-row"><strong>82</strong><span>匹配度较高<br />建议进入沟通阶段</span></div><p>具备算法与模型应用经验，核心技能与岗位要求基本匹配。建议重点确认项目深度与到岗时间。</p></section>
-            <section><h3>最近动态</h3><p className="timeline"><Clock3 size={15} />今天 10:28　系统完成简历解析</p><p className="timeline"><Check size={15} />今天 10:30　AI 初筛通过</p></section>
-          </div>
-          <footer><button className="button secondary" type="button" onClick={() => notify("已加入人才库")}>加入人才库</button><button className="button primary" type="button" onClick={() => { setSelectedCandidate(null); notify("候选人已推进至待沟通"); }}>推进到待沟通</button></footer>
-        </aside>
-      )}
 
       {importOpen && <ImportWizard activeJob={activeJob} jobs={jobs} recentTask={recentTask} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} />}
 
