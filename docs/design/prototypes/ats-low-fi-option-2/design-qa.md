@@ -212,3 +212,11 @@ Browser console errors checked: none.
 3. The first feedback submission intentionally fails once to verify draft retention. Successful retry originally left the old failure notice visible; the notice is now cleared when submission succeeds.
 4. Mobile tables were converted to stable stacked records, while the week calendar uses contained horizontal paging and the feedback form keeps all required fields visible.
 5. Final browser pass found no remaining P0/P1/P2 issue across INT-01, INT-02, or INT-03.
+
+## Cross-page Typography and Interview Fix QA
+
+- Reproduced the CAN-02 “面试与反馈” white screen and captured `ReferenceError: CalendarDays is not defined`; added the missing Lucide import and verified the tab renders its empty state and scheduling actions without console errors.
+- Replaced the browser-native `input[type=time]` with explicit hour and minute selects. Hours are 08–21 and minutes are 00/15/30/45, removing browser-specific wheel gaps while preserving the existing `HH:mm` data format.
+- Consolidated the prototype around the UI specification's six-level type scale: page title 24px, section title 18px, panel title 16px, body/control 14px, label 13px, and caption 12px.
+- Removed every 9px, 10px, and 11px declaration. Desktop audit reports visible text at 12px or above and all text-bearing controls at 14px.
+- Rechecked the workbench, CAN-02 interview tab, and INT-02 schedule form at 1280 desktop and 390 mobile. Body-level horizontal overflow: none. Browser console errors: none.
