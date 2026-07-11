@@ -29,20 +29,20 @@
 - Consumes: candidate records containing `name`, `role`, `company`, `city`, `phone`, `email`, `summary`, `skills`, `experience`, and `education`.
 - Produces: `buildResumeDocument(candidate)` returning `{ fileName, mimeType, pages, downloadText }`.
 
-- [ ] **Step 1: Write failing helper tests**
+- [x] **Step 1: Write failing helper tests**
 
 Assert that `buildResumeDocument(candidate)` returns `{name}_简历.txt`, two candidate-specific preview pages, UTF-8 plain-text MIME metadata, and download text containing the candidate's summary, skills, experience, and education.
 
-- [ ] **Step 2: Run tests and confirm RED**
+- [x] **Step 2: Run tests and confirm RED**
 
 Run: `npm test`
 Expected: FAIL because `resumeDocument.js` does not exist.
 
-- [ ] **Step 3: Implement the minimal helper**
+- [x] **Step 3: Implement the minimal helper**
 
 Create the stable document object using only candidate fields and no browser APIs.
 
-- [ ] **Step 4: Run tests and confirm GREEN**
+- [x] **Step 4: Run tests and confirm GREEN**
 
 Run: `npm test`
 Expected: all résumé document tests pass.
@@ -58,19 +58,19 @@ Expected: all résumé document tests pass.
 - Consumes: `buildResumeDocument(candidate)` and `onNotify(message)`.
 - Produces: `ResumeFileActions`, `ResumePreviewDrawer`, preview open/close state, and browser Blob download behavior.
 
-- [ ] **Step 1: Add file actions**
+- [x] **Step 1: Add file actions**
 
 Replace the plain current-résumé value with a file row containing a clickable filename plus Lucide preview and download buttons.
 
-- [ ] **Step 2: Add the stacked preview drawer**
+- [x] **Step 2: Add the stacked preview drawer**
 
 Render metadata and two scrollable preview pages above the retained member drawer. Support close from header/footer without resetting member state.
 
-- [ ] **Step 3: Add download behavior**
+- [x] **Step 3: Add download behavior**
 
 Create an object URL from `downloadText`, trigger an anchor download, revoke the URL, and send success/failure through `onNotify`.
 
-- [ ] **Step 4: Add responsive styles**
+- [x] **Step 4: Add responsive styles**
 
 Keep file actions readable at desktop width and stack controls at 390px without body-level horizontal overflow.
 
@@ -85,19 +85,19 @@ Keep file actions readable at desktop width and stack controls at 390px without 
 - Consumes: the completed talent résumé flow.
 - Produces: verified interaction evidence and a focused commit.
 
-- [ ] **Step 1: Verify desktop interactions**
+- [x] **Step 1: Verify desktop interactions**
 
 Open a talent member, launch preview from filename and preview button, verify two pages and download action, then close and confirm the member drawer remains.
 
-- [ ] **Step 2: Verify mobile layout**
+- [x] **Step 2: Verify mobile layout**
 
 At 390x844, verify 375px drawer width, visible file controls, full-width preview drawer, and no body-level horizontal overflow.
 
-- [ ] **Step 3: Run final checks**
+- [x] **Step 3: Run final checks**
 
 Run: `npm test`, `npm run build`, and `git diff --check`.
 Expected: all commands pass and browser console has no errors.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Commit message: `Add talent resume preview and download`.

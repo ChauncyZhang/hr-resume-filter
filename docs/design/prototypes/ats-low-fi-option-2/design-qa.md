@@ -254,3 +254,27 @@ Browser console errors checked: none.
 5. Mobile drawers use the full 375 px content width inside a 390 px viewport; list, detail, and reactivation states remain overflow-free.
 
 Final result: passed.
+
+## Talent Resume Preview and Download QA
+
+### Evidence
+
+- User reference: `talent-resume-row-reference.png`
+- Desktop preview: `talent-resume-preview-1280x720.png`
+- Mobile preview: `talent-resume-preview-390x844.png`
+
+The member header, summary, masked contact hierarchy, and compact typography remain consistent with the supplied reference. The former plain “当前简历” value now keeps the same row position while adding a linked filename and explicit preview/download actions. The preview drawer continues the existing right-side drawer language instead of introducing a separate route or browser window.
+
+### Interactions Tested
+
+- Linked filename and “预览” button open the same résumé preview drawer
+- Two candidate-specific preview pages show profile, summary, skills, experience, and education
+- Preview metadata exposes file type, page count, parse quality, and prototype status
+- Download from the preview drawer triggers the “简历下载已开始” confirmation
+- Closing preview preserves the underlying talent member drawer and its controls
+- Desktop 1280px uses a 560px preview drawer with no body-level horizontal overflow
+- Mobile 390px uses the full 375px content width with no body-level horizontal overflow
+
+Browser console errors checked: none.
+
+Final result: passed.
