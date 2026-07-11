@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   BriefcaseBusiness,
   CalendarDays,
@@ -15,7 +15,6 @@ import {
   Menu,
   MoreHorizontal,
   Plus,
-  Search,
   Settings,
   SlidersHorizontal,
   Users,
@@ -23,6 +22,7 @@ import {
   UserRoundSearch,
   X,
 } from "lucide-react";
+import { initialPositionRecords, JobsWorkspace } from "./JobViews.jsx";
 
 const navItems = [
   ["工作台", Home],
@@ -42,6 +42,8 @@ const stageMeta = [
   ["面试中", 5],
   ["待决策", 3],
 ];
+
+const emptyStages = stageMeta.map(() => []);
 
 const jobData = {
   "AI 工程师": {
@@ -142,10 +144,17 @@ export function App() {
   const [toast, setToast] = useState("");
   const [filterOnlyUrgent, setFilterOnlyUrgent] = useState(false);
   const [importState, setImportState] = useState("idle");
-  const [newJobName, setNewJobName] = useState("");
   const [jobs, setJobs] = useState(Object.keys(jobData));
+  const [jobMode, setJobMode] = useState("list");
+  const [selectedJob, setSelectedJob] = useState(null);
+  const [positionRecords, setPositionRecords] = useState(initialPositionRecords);
 
-  const stages = useMemo(() => jobData[activeJob]?.stages || jobData["AI 工程师"].stages, [activeJob]);
+  const stages = useMemo(() => jobData[activeJob]?.stages || emptyStages, [activeJob]);
+  const visibleStageMeta = jobData[activeJob]?.stages ? stageMeta : stageMeta.map(([name]) => [name, 0]);
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }, [activeNav, jobMode]);
 
   function notify(message) {
     setToast(message);
@@ -157,14 +166,15 @@ export function App() {
     window.setTimeout(() => setImportState("done"), 900);
   }
 
-  function createJob() {
-    const name = newJobName.trim();
-    if (!name) return;
-    setJobs((current) => [...current, name]);
-    setActiveJob(name);
-    setNewJobName("");
-    setModal(null);
-    notify("职位已创建");
+  function openJobForm() {
+    setActiveNav("职位");
+    setSelectedJob(null);
+    setJobMode("form");
+  }
+
+  function registerJob(record) {
+    setJobs((current) => current.includes(record.name) ? current : [...current, record.name]);
+    setActiveJob(record.name);
   }
 
   return (
@@ -177,7 +187,16 @@ export function App() {
               key={label}
               type="button"
               className={activeNav === label ? "nav-item active" : "nav-item"}
-              onClick={() => { setActiveNav(label); setMenuOpen(false); if (label !== "工作台") notify(`${label}模块将在后续原型中展开`); }}
+              onClick={() => {
+                setActiveNav(label);
+                setMenuOpen(false);
+                if (label === "职位") {
+                  setSelectedJob(null);
+                  setJobMode("list");
+                } else if (label !== "工作台") {
+                  notify(`${label}模块将在后续原型中展开`);
+                }
+              }}
             >
               <Icon size={19} />
               <span>{label}</span>
@@ -194,14 +213,14 @@ export function App() {
       <main className="workspace">
         <header className="topbar">
           <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
-          <h1>{activeNav}</h1>
+          <h1>{activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav}</h1>
           <div className="top-actions">
-            <button className="button primary" type="button" onClick={() => { setModal("import"); setImportState("idle"); }}><Import size={17} />导入简历</button>
-            <button className="button secondary" type="button" onClick={() => setModal("job")}><Plus size={17} />新建职位</button>
+            {activeNav === "工作台" && <button className="button primary" type="button" onClick={() => { setModal("import"); setImportState("idle"); }}><Import size={17} />导入简历</button>}
+            {(activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
           </div>
         </header>
 
-        <div className="page-body">
+        {activeNav === "工作台" && <div className="page-body">
           <section className="main-column">
             <div className="job-switcher">
               <span className="switcher-label">当前职位</span>
@@ -227,7 +246,7 @@ export function App() {
 
               {view === "board" ? (
                 <div className="kanban" aria-label="候选人招聘阶段">
-                  {stageMeta.map(([name, count], index) => (
+                  {visibleStageMeta.map(([name, count], index) => (
                     <section className="stage" key={name}>
                       <header><strong>{name}</strong><span>{filterOnlyUrgent ? Math.min(count, 3) : count}</span></header>
                       <div className="stage-list">
@@ -245,7 +264,7 @@ export function App() {
                   {stages.flat().slice(0, 10).map((candidate, index) => (
                     <button type="button" className="list-row" key={candidate.name} onClick={() => setSelectedCandidate(candidate)}>
                       <span><span className="avatar-mini"><UserRound size={11} /></span><strong>{candidate.name}</strong></span>
-                      <span>{stageMeta.find((_, stageIndex) => stages[stageIndex].includes(candidate))?.[0]}</span>
+                      <span>{visibleStageMeta.find((_, stageIndex) => stages[stageIndex].includes(candidate))?.[0]}</span>
                       <span>{candidate.age || candidate.schedule || candidate.note}</span>
                       <ChevronRight size={16} />
                     </button>
@@ -287,7 +306,26 @@ export function App() {
               <button className="more-calendar" type="button">更多<MoreHorizontal size={15} /></button>
             </section>
           </aside>
-        </div>
+        </div>}
+
+        {activeNav === "职位" && (
+          <JobsWorkspace
+            mode={jobMode}
+            setMode={setJobMode}
+            selectedJob={selectedJob}
+            setSelectedJob={setSelectedJob}
+            records={positionRecords}
+            setRecords={setPositionRecords}
+            onNotify={notify}
+            onImport={() => { setActiveJob(selectedJob?.name || activeJob); setModal("import"); setImportState("idle"); }}
+            onOpenCandidate={setSelectedCandidate}
+            onCreateJob={registerJob}
+          />
+        )}
+
+        {activeNav !== "工作台" && activeNav !== "职位" && (
+          <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
+        )}
       </main>
 
       {selectedCandidate && (
@@ -308,14 +346,6 @@ export function App() {
           <button className="dropzone" type="button" onClick={() => setImportState("ready")}><Import size={27} /><strong>{importState === "ready" ? "已选择 5 份简历" : "选择或拖入简历文件"}</strong><span>支持 PDF、DOCX，单次最多 100 份</span></button>
           {importState === "loading" && <div className="progress"><span /></div>}
           {importState === "done" && <p className="success-message"><Check size={17} />5 份简历已导入，正在进行 AI 初筛</p>}
-        </Modal>
-      )}
-
-      {modal === "job" && (
-        <Modal title="新建职位" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>取消</button><button className="button primary" type="button" onClick={createJob}>创建职位</button></>}>
-          <label className="form-label">职位名称<input value={newJobName} onChange={(event) => setNewJobName(event.target.value)} placeholder="例如：前端工程师" autoFocus /></label>
-          <div className="form-grid"><label className="form-label">工作地点<select><option>北京</option><option>上海</option><option>深圳</option></select></label><label className="form-label">所属部门<select><option>技术部</option><option>产品部</option></select></label></div>
-          <label className="form-label">职位描述<textarea rows="5" placeholder="粘贴 JD，后续可用于 AI 简历筛选" /></label>
         </Modal>
       )}
 

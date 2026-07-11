@@ -54,7 +54,47 @@ Browser console errors checked: none.
 
 ## Findings
 
-No actionable P0, P1, or P2 differences remain. The final implementation is suitable as a low-fidelity UX-01 prototype rather than a production visual specification.
+No actionable P0, P1, or P2 differences remain. The final implementation is suitable as a low-fidelity UX-01/UX-02 prototype rather than a production visual specification.
+
+## UX-02 Position Flow QA
+
+### Evidence
+
+- Visual language source: `reference-option-2.png`
+- Functional specification: `../../recruiting-platform-ux-spec.md`, UX-02 and pages JOB-01/JOB-02/JOB-03
+- JOB-01 desktop: `job-list-1440x1024.png`
+- JOB-01 mobile: `job-list-390x844.png`
+- JOB-02 desktop: `job-form-1440x1024.png`
+- JOB-03 desktop: `job-detail-1280x720.png`
+- JOB-03 mobile: `job-detail-390x844.png`
+
+The reference workbench and the three position screens were opened together. The position flow reuses the selected shell, typography scale, blue action color, neutral surfaces, 5–6 px radii, Lucide icon style, and dense operational layout. JOB-01 uses a desktop data table and mobile record cards; JOB-02 uses segmented form sections with a sticky completion summary; JOB-03 uses compact metrics, tabs, a funnel strip, and candidate records.
+
+### UX-02 Interactions Tested
+
+- Position navigation from the global sidebar
+- Keyword, status, department, and owner filtering
+- Position list → detail → edit → list navigation
+- Required-field validation for position name and public JD
+- AI criterion extraction loading and success states
+- Unsaved-form continue/edit, discard, and save-draft dialog
+- Publish position and return to its detail view
+- Pause and restore recruiting
+- Candidate, position information, collaboration activity, and settings tabs
+- Resume import entry from position detail
+- New position zero-candidate funnel and empty state
+- Scroll restoration when moving from a scrolled list to position detail
+- Desktop widths at 1440 and 1280; mobile width at 390
+
+Browser console errors checked: none. Desktop body-level horizontal overflow: none at 1440. Mobile body-level horizontal overflow: none at 390; funnel uses intentional contained horizontal scrolling.
+
+### UX-02 Comparison History
+
+1. Initial JOB-01 implementation duplicated the primary “新建职位” action in the top bar and page heading. The page-level duplicate was removed, leaving one context-aware primary action.
+2. Initial mobile JOB-03 retained the list scroll position and used a wide candidate table. Added route-state scroll restoration and converted mobile candidate rows into stacked cards.
+3. Initial newly published positions incorrectly displayed the AI 工程师 sample funnel and candidates. Added zeroed funnel counts and an explicit empty state for positions without candidates; the workbench now also uses empty stages for unknown positions.
+4. Non-AI positions initially reused AI candidate backgrounds. Added position-specific synthetic profiles for Java, product, frontend, and recruiting operations roles.
+5. Final browser pass found no remaining P0/P1/P2 issue across JOB-01, JOB-02, or JOB-03.
 
 ## Follow-up Polish
 
