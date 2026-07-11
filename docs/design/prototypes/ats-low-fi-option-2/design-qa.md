@@ -255,6 +255,35 @@ Browser console errors checked: none.
 
 Final result: passed.
 
+## UX-07 Reports and Settings QA
+
+### Evidence
+
+- REP-01 desktop overview: `report-overview-1280x720.png`
+- REP-01 mobile overview: `report-overview-390x844.png`
+- SET-01 desktop organization: `settings-organization-1280x720.png`
+- SET-01 mobile organization: `settings-organization-390x844.png`
+- SET-03 desktop AI settings: `settings-ai-1280x720.png`
+- SET-03 mobile AI settings: `settings-ai-390x844.png`
+- SET-04 desktop audit and retention: `settings-audit-1280x720.png`
+
+### Interactions Tested
+
+- Report time, position, department, and owner filters; applied-condition removal and clear-all recovery
+- Funnel stage drill-down into the existing candidate list with position and stage filters preserved
+- Loading, empty, module-error, retry, and interviewer no-permission report states
+- Organization search/filter, user detail editing, and confirmation before expanding position visibility
+- Protected in-use recruitment stages plus simulated template-save failure, retained draft, and retry
+- Masked API key, Provider enablement confirmation, HTTP 404 connection failure, and successful retest
+- Dirty AI settings expose continue editing, discard, and save-draft-and-leave choices; saved drafts restore on return
+- Audit filtering, masked IP, Trace ID, detail drawer, and confirmation before shortening retention
+- Administrator edit access, HR read-only access, and interviewer denial or interview-template-only access
+- Desktop 1280 and mobile 390 rendering with no body-level horizontal overflow
+
+Browser console errors checked: none. Domain tests, Vite build, and whitespace validation passed.
+
+Final result: passed.
+
 ## Talent Resume Preview and Download QA
 
 ### Evidence

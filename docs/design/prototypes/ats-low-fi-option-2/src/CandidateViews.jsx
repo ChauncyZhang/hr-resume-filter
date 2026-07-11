@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ArrowLeft,
   BriefcaseBusiness,
@@ -56,13 +56,18 @@ function StageTag({ stage }) {
   return <span className={`candidate-stage ${terminal ? "terminal" : ""}`}>{stage}</span>;
 }
 
-function CandidateList({ records, onOpen, onUpdate, onNotify, onAddToTalentPool }) {
+function CandidateList({ records, onOpen, onUpdate, onNotify, onAddToTalentPool, initialFilters }) {
   const [query, setQuery] = useState("");
-  const [position, setPosition] = useState("全部职位");
-  const [stage, setStage] = useState("全部阶段");
+  const [position, setPosition] = useState(initialFilters?.position || "全部职位");
+  const [stage, setStage] = useState(initialFilters?.stage || "全部阶段");
   const [owner, setOwner] = useState("全部负责人");
   const [minScore, setMinScore] = useState("不限分数");
   const [selected, setSelected] = useState([]);
+
+  useEffect(() => {
+    setPosition(initialFilters?.position || "全部职位");
+    setStage(initialFilters?.stage || "全部阶段");
+  }, [initialFilters]);
 
   const filtered = useMemo(() => records.filter((candidate) => {
     const text = `${candidate.name}${candidate.role}${candidate.company}${candidate.phone}${candidate.email}`.toLowerCase();
@@ -165,8 +170,8 @@ function CandidateDetail({ candidate, onBack, onUpdate, onNotify, onScheduleInte
   </div>;
 }
 
-export function CandidatesWorkspace({ mode, setMode, selectedCandidate, setSelectedCandidate, records, setRecords, onNotify, onBackDetail, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool }) {
+export function CandidatesWorkspace({ mode, setMode, selectedCandidate, setSelectedCandidate, records, setRecords, onNotify, onBackDetail, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, initialFilters }) {
   function updateCandidate(updated) { setRecords((current) => current.map((item) => item.id === updated.id ? updated : item)); setSelectedCandidate(updated); }
   if (mode === "detail" && selectedCandidate) return <CandidateDetail candidate={selectedCandidate} onBack={onBackDetail || (() => { setSelectedCandidate(null); setMode("list"); })} onUpdate={updateCandidate} onNotify={onNotify} onScheduleInterview={onScheduleInterview} onOpenInterviewFeedback={onOpenInterviewFeedback} onAddToTalentPool={onAddToTalentPool} />;
-  return <CandidateList records={records} onOpen={(candidate) => { setSelectedCandidate(candidate); setMode("detail"); }} onUpdate={setRecords} onNotify={onNotify} onAddToTalentPool={onAddToTalentPool} />;
+  return <CandidateList records={records} onOpen={(candidate) => { setSelectedCandidate(candidate); setMode("detail"); }} onUpdate={setRecords} onNotify={onNotify} onAddToTalentPool={onAddToTalentPool} initialFilters={initialFilters} />;
 }

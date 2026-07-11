@@ -29,19 +29,19 @@
 - Consumes: candidate records, report filters, and role strings `招聘管理员 | HR | 面试官`.
 - Produces: `filterReportCandidates`, `buildReportMetrics`, `getRoleCapabilities`, and `isPermissionExpansion`.
 
-- [ ] **Step 1: Write failing domain tests**
+- [x] **Step 1: Write failing domain tests**
 
 Cover candidate filtering, metric consistency, interviewer report denial, HR read-only settings, administrator edit rights, and permission-expansion detection.
 
-- [ ] **Step 2: Run `npm test` and confirm RED**
+- [x] **Step 2: Run `npm test` and confirm RED**
 
 Expected: failure because `ux07Domain.js` does not exist.
 
-- [ ] **Step 3: Implement minimal pure helpers**
+- [x] **Step 3: Implement minimal pure helpers**
 
 Return deterministic metrics and explicit capability flags without browser or React dependencies.
 
-- [ ] **Step 4: Run `npm test` and confirm GREEN**
+- [x] **Step 4: Run `npm test` and confirm GREEN**
 
 Expected: all domain and existing résumé tests pass.
 
@@ -56,19 +56,19 @@ Expected: all domain and existing résumé tests pass.
 - Consumes: `candidates`, `positions`, `currentRole`, `onDrillDown({ position, stage })`, and `onNotify`.
 - Produces: report filters, KPI metrics, funnel, stage efficiency, screening quality, interview efficiency, data tables, and report states.
 
-- [ ] **Step 1: Build unified filters and applied-condition summary**
+- [x] **Step 1: Build unified filters and applied-condition summary**
 
 Add date, position, department, and owner controls; clear filters restores the default dataset.
 
-- [ ] **Step 2: Build metrics and accessible report sections**
+- [x] **Step 2: Build metrics and accessible report sections**
 
 Render KPI values, funnel buttons, duration bars, screening rates, interview metrics, legends, and matching data tables.
 
-- [ ] **Step 3: Add drill-down and role states**
+- [x] **Step 3: Add drill-down and role states**
 
 Route funnel clicks into the existing candidate list with position/stage filters. Interviewers see a no-permission state; HR sees only owned scope.
 
-- [ ] **Step 4: Add loading, empty, and module-error demonstrations**
+- [x] **Step 4: Add loading, empty, and module-error demonstrations**
 
 Use stable skeletons, clear-filter recovery, and module-level retry without clearing filters.
 
@@ -83,19 +83,19 @@ Use stable skeletons, clear-filter recovery, and module-level retry without clea
 - Consumes: `currentRole`, `onRoleChange`, `onNotify`, and permission helpers.
 - Produces: settings secondary navigation, organization tables, user editor, department view, workflow templates, rejection reasons, and interview templates.
 
-- [ ] **Step 1: Build settings shell and role simulator**
+- [x] **Step 1: Build settings shell and role simulator**
 
 Keep the global page title and add a left secondary navigation with role switching and contextual permission notices.
 
-- [ ] **Step 2: Build organization and permission management**
+- [x] **Step 2: Build organization and permission management**
 
 Support user search/filter, edit drawer, department data, disabled users, and confirmation before expanding position scope.
 
-- [ ] **Step 3: Build workflow and evaluation templates**
+- [x] **Step 3: Build workflow and evaluation templates**
 
 Support stage editing, protected in-use stages, rejection reasons, interview dimensions, simulated save failure, retained draft, and retry.
 
-- [ ] **Step 4: Enforce read-only and denied role states**
+- [x] **Step 4: Enforce read-only and denied role states**
 
 HR receives read-only organization/templates; interviewers receive only read-only interview-template access.
 
@@ -109,19 +109,19 @@ HR receives read-only organization/templates; interviewers receive only read-onl
 - Consumes: current role, synthetic provider config, audit records, and retention policies.
 - Produces: masked API configuration, connection testing, external-provider confirmation, audit filters/details, retention edit, and shortening confirmation.
 
-- [ ] **Step 1: Build AI settings and masked secret behavior**
+- [x] **Step 1: Build AI settings and masked secret behavior**
 
 Show enablement, Provider, model, Base URL, masked key, replacement input, authorized positions, and nearby test states.
 
-- [ ] **Step 2: Build Provider risk confirmation and unsaved state**
+- [x] **Step 2: Build Provider risk confirmation and unsaved state**
 
 Enabling an external Provider requires impact confirmation; leaving dirty settings offers continue, discard, or save draft.
 
-- [ ] **Step 3: Build audit table and detail drawer**
+- [x] **Step 3: Build audit table and detail drawer**
 
 Filter by time, actor, action, and object; expose result, masked IP, Trace ID, and change summary.
 
-- [ ] **Step 4: Build retention policies and shortening confirmation**
+- [x] **Step 4: Build retention policies and shortening confirmation**
 
 Show policy scopes and cycles; shorter retention displays affected records and irreversible impact before save.
 
@@ -136,15 +136,15 @@ Show policy scopes and cycles; shorter retention displays affected records and i
 - Consumes: completed REP-01 and SET-01 through SET-04.
 - Produces: verified UX-07 workflow, evidence, and merged main-branch commit.
 
-- [ ] **Step 1: Verify report desktop/mobile flows**
+- [x] **Step 1: Verify report desktop/mobile flows**
 
 Test filters, data consistency, drill-down, loading/empty/error/permission states, and 1280/390 layouts.
 
-- [ ] **Step 2: Verify all settings flows**
+- [x] **Step 2: Verify all settings flows**
 
 Test role matrix, user edit confirmation, protected stages, save retry, masked key, Provider confirmation, audit detail, and retention confirmation.
 
-- [ ] **Step 3: Update documentation and evidence**
+- [x] **Step 3: Update documentation and evidence**
 
 Record screenshots, interaction matrix, console status, and remaining P3 findings.
 

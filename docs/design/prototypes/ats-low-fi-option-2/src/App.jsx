@@ -26,6 +26,8 @@ import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
 import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
 import { initialInterviewRecords, InterviewsWorkspace } from "./InterviewViews.jsx";
 import { initialTalentMemberships, initialTalentPools, TalentPoolWorkspace } from "./TalentPoolViews.jsx";
+import { ReportWorkspace } from "./ReportViews.jsx";
+import { SettingsWorkspace } from "./SettingsViews.jsx";
 
 const navItems = [
   ["工作台", Home],
@@ -153,6 +155,8 @@ export function App() {
   const [candidateMode, setCandidateMode] = useState("list");
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
+  const [candidatePreset, setCandidatePreset] = useState(null);
+  const [currentRole, setCurrentRole] = useState("招聘管理员");
   const [interviewMode, setInterviewMode] = useState("list");
   const [interviewRecords, setInterviewRecords] = useState(initialInterviewRecords);
   const [selectedInterview, setSelectedInterview] = useState(null);
@@ -182,6 +186,13 @@ export function App() {
   function notify(message) {
     setToast(message);
     window.setTimeout(() => setToast(""), 2200);
+  }
+
+  function drillDownReport({ position, stage }) {
+    setCandidatePreset({ position: position === "全部职位" ? "全部职位" : position, stage });
+    setSelectedCandidate(null);
+    setCandidateMode("list");
+    setActiveNav("候选人");
   }
 
   const handleTaskChange = useCallback((task) => {
@@ -336,12 +347,13 @@ export function App() {
                   setJobMode("list");
                 } else if (label === "候选人") {
                   setCandidateMode("list");
+                  setCandidatePreset(null);
                 } else if (label === "面试") {
                   setInterviewMode("list");
                   setSelectedInterview(null);
                 } else if (label === "人才库") {
                   setTalentMode("list");
-                } else if (label !== "工作台") {
+                } else if (!['工作台', '报表', '设置'].includes(label)) {
                   notify(`${label}模块将在后续原型中展开`);
                 }
               }}
@@ -472,7 +484,7 @@ export function App() {
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
@@ -483,7 +495,15 @@ export function App() {
           <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={setSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} onNotify={notify} />
         )}
 
-        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && activeNav !== "人才库" && (
+        {!screeningTask && activeNav === "报表" && (
+          <ReportWorkspace candidates={candidateRecords} positions={positionRecords} currentRole={currentRole} onRoleChange={setCurrentRole} onDrillDown={drillDownReport} onNotify={notify} />
+        )}
+
+        {!screeningTask && activeNav === "设置" && (
+          <SettingsWorkspace currentRole={currentRole} onRoleChange={setCurrentRole} onNotify={notify} />
+        )}
+
+        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && activeNav !== "人才库" && activeNav !== "报表" && activeNav !== "设置" && (
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
