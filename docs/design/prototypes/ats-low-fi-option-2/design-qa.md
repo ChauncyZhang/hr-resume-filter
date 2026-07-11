@@ -6,6 +6,7 @@
 - Implementation: `http://127.0.0.1:4174/`
 - Browser-rendered desktop screenshot: `implementation-1440x1024-final.png`
 - Browser-rendered mobile screenshot: `implementation-390x844-final.png`
+- User feedback crops: `feedback-candidate-text.png`, `feedback-task-text.png`
 - Viewport: 1440 × 1024 desktop; 390 × 844 mobile
 - State: 工作台、AI 工程师、候选人看板默认状态
 
@@ -49,6 +50,7 @@ Browser console errors checked: none.
 2. Increased pipeline and task-rail height, adjusted footer spacing to remove desktop overflow, and added candidates B5, C5, and E5.
 3. Re-captured the implementation at 1440 × 1024 and repeated full-view and focused-region comparison. Earlier density and content mismatches are resolved.
 4. User review identified text that was too small and a narrow task rail. Candidate and task text was increased by 1–2 px, metadata contrast was strengthened, and the rail was widened from 220 px to 260 px. The revised desktop capture remains overflow-free and the mobile layout remains usable.
+5. A second user review identified the candidate-card copy and right-rail task copy as still too small. Candidate names were raised to 14 px, role text to 13 px, and metadata to 12 px; task-group headings were raised to 14 px, task rows to 13 px, and supporting text to 12 px. Card and row spacing was rebalanced so the 1440 × 1024 desktop remains overflow-free.
 
 ## Findings
 
