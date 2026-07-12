@@ -274,7 +274,20 @@ Final result: passed.
 
 ### Evidence Boundary
 
-The UX-08 expert report distinguishes automated/static evidence from browser evidence. Desktop, mobile, keyboard, focus, and screenshot rows remain open until they are executed in the selected in-app browser; none are represented as real-user findings.
+The UX-08 expert report distinguishes automated/browser evidence from real-user research. The repeatable Playwright audit passed 15/15 checks across F-01 through F-06, administrator governance, interviewer restrictions, empty state, keyboard entry, and four 390px mobile screens. This remains expert simulation, not real-user findings.
+
+### UX-08 Evidence
+
+- Default desktop/mobile: `ux-08-evidence/ux08-default-workbench-1280x720.png`, `ux-08-evidence/ux08-default-workbench-390x844.png`
+- Position publish: `ux-08-evidence/ux08-position-published-1280x720.png`
+- Screening recovery: `ux-08-evidence/ux08-screening-recovered-1280x720.png`, `ux-08-evidence/ux08-partial-screening-390x844.png`
+- Candidate deduplication: `ux-08-evidence/ux08-candidate-single-application-1280x720.png`
+- Interview and feedback: `ux-08-evidence/ux08-interview-scheduled-1280x720.png`, `ux-08-evidence/ux08-feedback-submitted-1280x720.png`, `ux-08-evidence/ux08-feedback-390x844.png`
+- Talent reactivation: `ux-08-evidence/ux08-talent-reactivated-1280x720.png`
+- Permissions and governance: `ux-08-evidence/ux08-interviewer-restricted-1280x720.png`, `ux-08-evidence/ux08-interviewer-restricted-390x844.png`, `ux-08-evidence/ux08-admin-governance-1280x720.png`
+- Machine-readable result: `ux-08-evidence/ux08-browser-audit-results.json`
+
+Browser console/page errors: none. Body-level horizontal overflow: none at 1280x720 and tested 390x844 screens. Final open issue count: P0=0, P1=0, P2=0.
 
 ## UX-07 Reports and Settings QA
 

@@ -190,19 +190,19 @@ After screening, scheduling, feedback, and reactivation, report totals and funne
 
 Include privacy instructions, role cards, 12 task cards, observer fields, five-point task difficulty, completion time, failure reason, and final feedback. State that only bundled synthetic resumes may be used.
 
-- [ ] **Step 2: Execute six end-to-end flows in the in-app browser**
+- [x] **Step 2: Execute six end-to-end flows in the browser**
 
 Capture accepted evidence for F-01 through F-06. For each action, use a fresh DOM snapshot before interaction and inspect every saved screenshot.
 
-- [ ] **Step 3: Execute role, error, and recovery tasks**
+- [x] **Step 3: Execute role, error, and recovery tasks**
 
 Test administrator, HR, and interviewer boundaries; partial screening retry; notification failure retention; feedback draft retry; permission expansion; AI dirty-state recovery; and retention shortening confirmation.
 
-- [ ] **Step 4: Verify responsive and keyboard behavior**
+- [x] **Step 4: Verify responsive and keyboard behavior**
 
 At 1280×720 and 390×844, verify body-level horizontal overflow is absent. Check navigation, dialogs, drawers, tables/cards, focus visibility, and text containment.
 
-- [ ] **Step 5: Record and fix findings**
+- [x] **Step 5: Record and fix findings**
 
 Every finding receives an ID, severity, evidence, expected behavior, actual behavior, fix, and retest result. Do not close P2 without a fix or explicit accepted-risk reason.
 

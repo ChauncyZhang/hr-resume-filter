@@ -1,0 +1,81 @@
+{
+  "generatedAt": "2026-07-12T03:36:04.433Z",
+  "baseUrl": "http://127.0.0.1:4174/",
+  "results": [
+    {
+      "id": "F-01-default-workbench",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "F-01-create-and-publish-position",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "F-02-partial-screening-recovery",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "F-03-screening-undo-and-promote",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "F-05-feedback-draft-and-retry",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "F-04-schedule-interview",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "F-06-talent-reactivation",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "ADMIN-settings-governance",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "ROLE-interviewer-boundary",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "EMPTY-empty-state",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "A11Y-keyboard-focus",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "MOBILE-default",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "MOBILE-partial-screening",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "MOBILE-feedback",
+      "status": "passed",
+      "detail": ""
+    },
+    {
+      "id": "MOBILE-restricted",
+      "status": "passed",
+      "detail": ""
+    }
+  ]
+}

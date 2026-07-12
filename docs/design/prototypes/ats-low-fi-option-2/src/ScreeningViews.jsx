@@ -253,10 +253,11 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
       return;
     }
     const selectedFiles = task.files.filter((file) => selected.includes(file.id));
-    const previousState = onApplyResults?.({ action: label, files: selectedFiles, task });
-    setUndo({ label, count: selected.length, previousState });
+    const result = onApplyResults?.({ action: label, files: selectedFiles, task });
+    const affectedCount = result?.affectedCount ?? selected.length;
+    setUndo({ label, count: affectedCount, previousState: result?.previousState ?? result });
     setSelected([]);
-    onNotify(`已对 ${selected.length} 位候选人执行“${label}”`);
+    onNotify(`已对 ${affectedCount} 位候选人执行“${label}”`);
     window.setTimeout(() => setUndo(null), 6000);
   }
 

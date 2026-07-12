@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "test": "node --test src/*.test.js",
+    "test:ux08": "node scripts/ux08-browser-audit.cjs",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -15,5 +16,8 @@
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "vite": "6.4.2"
+  },
+  "devDependencies": {
+    "playwright": "1.61.1"
   }
 }

@@ -41,6 +41,13 @@ npm install
 npm run dev
 ```
 
+另开终端执行 UX-08 浏览器验收：
+
+```bash
+npx playwright install chromium
+npm run test:ux08
+```
+
 原型使用模拟数据，不连接生产服务，也不包含真实候选人个人信息。
 
 ## UX-08 验收材料
@@ -49,5 +56,7 @@ npm run dev
 - 可用性测试脚本：`../../ux-08-usability-test-script.md`
 - 专家模拟结果：`../../ux-08-expert-test-results.md`
 - 问题日志：`../../ux-08-issue-log.md`
+- 可重复浏览器验收：`scripts/ux08-browser-audit.cjs`
+- 桌面/移动证据：`ux-08-evidence/`
 
 本轮结果属于专家模拟和自动化验证，不代表已完成真实 HR 用户研究。后续真实用户测试也只能使用仓库内置的合成简历。

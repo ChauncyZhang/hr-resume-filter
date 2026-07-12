@@ -269,7 +269,7 @@ export function App() {
     if (action === "加入人才库") next = addTalentMemberships(next, { candidateIds, poolId: "POOL-FOLLOW", actor: roleIdentity.name });
     if (action === "添加标签") next.candidates = next.candidates.map((candidate) => candidateIds.includes(candidate.id) && !candidate.tags.includes("批量复核") ? { ...candidate, tags: [...candidate.tags, "批量复核"] } : candidate);
     applyWorkflowState(next);
-    return previous;
+    return { previousState: previous, affectedCount: new Set(candidateIds).size };
   }
 
   function resetScenario(scenario) {
