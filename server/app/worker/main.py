@@ -2,8 +2,8 @@ import asyncio
 import logging
 import signal
 
-from server.app.core.probes import ReadinessProbe
 from server.app.core.logging import configure_logging
+from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
 
 
@@ -32,9 +32,7 @@ class Worker:
         while not self._shutdown.is_set():
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(
-                        self._database_probe.check(), self._storage_probe.check()
-                    ),
+                    check_readiness(self._database_probe, self._storage_probe),
                     timeout=self._readiness_timeout_seconds,
                 )
             except Exception as error:
@@ -63,6 +61,9 @@ async def _run() -> None:
                 settings.object_storage_access_key,
                 settings.object_storage_secret_key,
                 secure=settings.object_storage_secure,
+                connect_timeout_seconds=settings.object_storage_connect_timeout_seconds,
+                read_timeout_seconds=settings.object_storage_read_timeout_seconds,
+                total_timeout_seconds=settings.object_storage_total_timeout_seconds,
             ),
             settings.object_storage_bucket,
         ),

@@ -7,7 +7,7 @@ from server.app.core.settings import Settings
 def production_settings(**overrides: object) -> Settings:
     values = {
         "environment": "production",
-        "database_url": "postgresql+asyncpg://app:real-password@postgres/app",
+        "database_url": "postgresql+asyncpg://app:S3cureValue%21@postgres/app",
         "object_storage_endpoint": "minio:9000",
         "object_storage_access_key": "real-access-key",
         "object_storage_secret_key": "real-secret-key",
@@ -41,6 +41,28 @@ def test_production_rejects_placeholder_secrets(field: str, value: str) -> None:
 def test_production_rejects_database_url_without_password(database_url: str) -> None:
     with pytest.raises(ValidationError):
         production_settings(database_url=database_url)
+
+
+@pytest.mark.parametrize(
+    "password",
+    [
+        "secret",
+        "safe-secret-value",
+        "password",
+        "safe-password-value",
+        "change-me",
+        "safe-change%2Dme-value",
+        "example",
+        "%73ecret",
+    ],
+)
+def test_production_rejects_decoded_placeholder_database_password(
+    password: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(
+            database_url=f"postgresql+asyncpg://app:{password}@postgres/app"
+        )
 
 
 def test_production_rejects_wildcard_cors() -> None:

@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from server.app.core.logging import configure_logging
-from server.app.core.probes import ReadinessProbe
+from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
 
 
@@ -41,6 +41,9 @@ def create_app(
                 settings.object_storage_access_key,
                 settings.object_storage_secret_key,
                 secure=settings.object_storage_secure,
+                connect_timeout_seconds=settings.object_storage_connect_timeout_seconds,
+                read_timeout_seconds=settings.object_storage_read_timeout_seconds,
+                total_timeout_seconds=settings.object_storage_total_timeout_seconds,
             ),
             settings.object_storage_bucket,
         )
@@ -87,7 +90,7 @@ def create_app(
     async def ready(request: Request):  # type: ignore[no-untyped-def]
         try:
             await asyncio.wait_for(
-                asyncio.gather(database_probe.check(), storage_probe.check()),
+                check_readiness(database_probe, storage_probe),
                 timeout=settings.readiness_timeout_seconds,
             )
         except Exception as error:

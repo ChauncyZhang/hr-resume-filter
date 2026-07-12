@@ -42,6 +42,12 @@ Only Nginx publishes a host port. Development uses HTTP on `http://localhost:808
 Production TLS must terminate upstream or use externally managed certificates mounted into
 Nginx with a production-specific server block. Never expose API, PostgreSQL, or MinIO ports.
 
+Readiness probes run concurrently and cancel siblings after a failure. The worker dependency
+cycle is bounded by `READINESS_TIMEOUT_SECONDS` (5 seconds by default). MinIO uses explicit
+1-second connect, 3-second read, and 4-second total network deadlines with retries disabled.
+Cancelling the async wrapper does not stop a running OS thread instantly; the underlying MinIO
+network deadline provides the finite bound required for worker process shutdown.
+
 ## Production requirements
 
 Set `APP_ENVIRONMENT=production`, a non-placeholder PostgreSQL password, distinct MinIO
