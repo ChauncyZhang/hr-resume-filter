@@ -80,14 +80,21 @@ function candidateFromFile(task, file, stage) {
 
 export function recalculatePositionCounts(positions, candidates) {
   return positions.map((position) => {
-    const scoped = candidates.filter((candidate) => candidate.position === position.name);
+    const scoped = candidates.flatMap((candidate) => candidate.applications || [])
+      .filter((application) => application.position === position.name);
     return {
       ...position,
-      candidates: scoped.filter((candidate) => ACTIVE_STAGES.has(candidate.stage)).length,
-      review: scoped.filter((candidate) => candidate.stage === "待复核").length,
-      interview: scoped.filter((candidate) => candidate.stage === "面试中").length,
+      candidates: scoped.filter((application) => ACTIVE_STAGES.has(application.state)).length,
+      review: scoped.filter((application) => application.state === "待复核").length,
+      interview: scoped.filter((application) => application.state === "面试中").length,
     };
   });
+}
+
+function updateCurrentApplication(candidate, state) {
+  const applications = candidate.applications || [];
+  const currentIndex = applications.findIndex((application) => application.position === candidate.position);
+  return applications.map((application, index) => index === currentIndex ? { ...application, state } : application);
 }
 
 function withCounts(state) {
@@ -106,7 +113,10 @@ export function applyScreeningResults(state, { task, files, targetStage = "待�
     }
     const current = next.candidates[index];
     const appId = applicationId(task, file);
-    const existingApplication = current.applications?.some((application) => application.id === appId);
+    const existingApplication = current.applications?.some((application) => (
+      application.id === appId
+      || (application.screeningTaskId === task.id && application.position === task.position)
+    ));
     const application = {
       id: appId,
       position: task.position,
@@ -136,7 +146,7 @@ export function transitionCandidate(state, candidateIdValue, target, metadata = 
   const next = cloneState(state);
   next.candidates = next.candidates.map((candidate) => {
     if (candidate.id !== candidateIdValue) return candidate;
-    const applications = (candidate.applications || []).map((application, index) => index === 0 ? { ...application, state: target } : application);
+    const applications = updateCurrentApplication(candidate, target);
     return {
       ...candidate,
       stage: target,
@@ -167,7 +177,7 @@ export function saveInterview(state, interview) {
   next.candidates = next.candidates.map((candidate) => {
     if (candidate.id !== interview.candidateId) return candidate;
     const interviews = [...(candidate.interviews || []).filter((item) => item.interviewId !== interview.id), interviewSummary(interview)];
-    const applications = (candidate.applications || []).map((application, index) => index === 0 ? { ...application, state: "面试中" } : application);
+    const applications = updateCurrentApplication(candidate, "面试中");
     return {
       ...candidate,
       stage: "面试中",
@@ -184,12 +194,12 @@ export function submitInterviewFeedback(state, interviewId, feedback) {
   const interview = state.interviews.find((item) => item.id === interviewId);
   if (!interview) return state;
   const updated = { ...interview, status: "已完成", feedbackStatus: "已提交", feedback: { ...feedback } };
-  let next = saveInterview(state, updated);
+  let next = cloneState(state);
+  next.interviews = next.interviews.map((item) => item.id === interviewId ? updated : item);
   next = transitionCandidate(next, interview.candidateId, "待决策", {
     actor: feedback.submittedBy || "面试官",
     action: `收到${interview.round}反馈：${feedback.conclusion || "待 HR 决策"}`,
   });
-  next.interviews = next.interviews.map((item) => item.id === interviewId ? updated : item);
   next.candidates = next.candidates.map((candidate) => candidate.id === interview.candidateId ? {
     ...candidate,
     interviews: (candidate.interviews || []).map((item) => item.interviewId === interviewId ? interviewSummary(updated) : item),
@@ -229,7 +239,7 @@ export function addTalentMemberships(state, { candidateIds, poolId, actor = "张
   return next;
 }
 
-export function reactivateTalentCandidate(state, { candidateId: id, position, poolId, resumeVersion }) {
+export function reactivateTalentCandidate(state, { candidateId: id, position, poolId, resumeVersion, actor = "张小北" }) {
   const candidate = state.candidates.find((item) => item.id === id);
   if (!candidate || !position) return { state, created: false, reason: "not-found" };
   const duplicate = (candidate.applications || []).some((application) => application.position === position.name && ACTIVE_STAGES.has(application.state));
@@ -253,7 +263,7 @@ export function reactivateTalentCandidate(state, { candidateId: id, position, po
     stage: "新简历",
     owner: position.owner,
     lastActivity: nowLabel(),
-    timeline: [{ time: nowLabel(), actor: "张小北", action: `从人才库重新激活到${position.name}；保留历史申请` }, ...(item.timeline || [])],
+    timeline: [{ time: nowLabel(), actor, action: `从人才库重新激活到${position.name}；保留历史申请` }, ...(item.timeline || [])],
   } : item);
   next.pools = next.pools.map((pool) => pool.id === poolId ? { ...pool, recentActivity: nowLabel(), activity: `重新激活候选人到${position.name}` } : pool);
   return { state: withCounts(next), created: true, application: createdApplication };

@@ -28,6 +28,10 @@ import { initialInterviewRecords, InterviewsWorkspace } from "./InterviewViews.j
 import { initialTalentMemberships, initialTalentPools, TalentPoolWorkspace } from "./TalentPoolViews.jsx";
 import { ReportWorkspace } from "./ReportViews.jsx";
 import { SettingsWorkspace } from "./SettingsViews.jsx";
+import { Ux08ScenarioPanel } from "./Ux08ScenarioPanel.jsx";
+import { syntheticResumeFilesFor } from "./syntheticResumeFixtures.js";
+import { canPerformAction, getAllowedNavItems, getRoleIdentity } from "./roleCapabilities.js";
+import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts, saveInterview, submitInterviewFeedback, validateWorkflowState } from "./ux08Workflow.js";
 
 const navItems = [
   ["工作台", Home],
@@ -151,12 +155,13 @@ export function App() {
   const [jobs, setJobs] = useState(Object.keys(jobData));
   const [jobMode, setJobMode] = useState("list");
   const [selectedJob, setSelectedJob] = useState(null);
-  const [positionRecords, setPositionRecords] = useState(initialPositionRecords);
+  const [positionRecords, setPositionRecords] = useState(() => recalculatePositionCounts(initialPositionRecords, initialCandidateRecords));
   const [candidateMode, setCandidateMode] = useState("list");
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
   const [candidatePreset, setCandidatePreset] = useState(null);
   const [currentRole, setCurrentRole] = useState("招聘管理员");
+  const [currentScenario, setCurrentScenario] = useState("default");
   const [interviewMode, setInterviewMode] = useState("list");
   const [interviewRecords, setInterviewRecords] = useState(initialInterviewRecords);
   const [selectedInterview, setSelectedInterview] = useState(null);
@@ -176,8 +181,44 @@ export function App() {
     }
   });
 
-  const stages = useMemo(() => jobData[activeJob]?.stages || emptyStages, [activeJob]);
-  const visibleStageMeta = jobData[activeJob]?.stages ? stageMeta : stageMeta.map(([name]) => [name, 0]);
+  const stages = useMemo(() => stageMeta.map(([stage]) => candidateRecords.filter((candidate) => candidate.position === activeJob && candidate.stage === stage).map((candidate) => {
+    const latestInterview = candidate.interviews?.at(-1);
+    return { name: candidate.name, role: candidate.role, company: candidate.company, age: candidate.lastActivity, tag: candidate.stage === "待安排" ? "待安排面试" : `来自 ${candidate.source}`, schedule: latestInterview?.time, interviewer: latestInterview?.interviewer ? `面试官：${latestInterview.interviewer}` : null, note: candidate.stage === "待决策" ? "等待 HR 决策" : null };
+  })), [activeJob, candidateRecords]);
+  const visibleStageMeta = stageMeta.map(([name], index) => [name, stages[index].length]);
+  const pendingScheduleCandidates = useMemo(() => candidateRecords.filter((candidate) => candidate.stage === "待安排"), [candidateRecords]);
+  const pendingFeedbackInterviews = useMemo(() => interviewRecords.filter((interview) => interview.feedbackStatus === "待反馈"), [interviewRecords]);
+  const upcomingInterviewDays = useMemo(() => {
+    const labels = new Map();
+    interviewRecords
+      .filter((interview) => interview.date >= "2026-07-11" && interview.status !== "已取消")
+      .forEach((interview) => {
+        const label = interview.dateLabel || interview.date;
+        labels.set(label, (labels.get(label) || 0) + 1);
+      });
+    return [...labels.entries()].sort(([left], [right]) => left.localeCompare(right)).slice(0, 4);
+  }, [interviewRecords]);
+  const duplicateCandidateGroups = useMemo(() => {
+    const identityCounts = new Map();
+    candidateRecords.forEach((candidate) => {
+      const identity = candidate.email || candidate.phone || candidate.name;
+      identityCounts.set(identity, (identityCounts.get(identity) || 0) + 1);
+    });
+    return [...identityCounts.values()].filter((count) => count > 1).length;
+  }, [candidateRecords]);
+  const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
+  const roleIdentity = getRoleIdentity(currentRole) || { name: "未知用户", title: currentRole };
+  const myPendingFeedbackInterviews = pendingFeedbackInterviews.filter((item) => item.interviewers.includes(roleIdentity.name));
+  const screeningSummary = useMemo(() => {
+    if (!recentTask?.files?.length) return null;
+    return {
+      total: recentTask.files.length,
+      success: recentTask.files.filter((file) => file.status === "success").length,
+      partial: recentTask.files.filter((file) => file.status === "partial").length,
+      failed: recentTask.files.filter((file) => file.status === "failed").length,
+    };
+  }, [recentTask]);
+  const workflowValidation = useMemo(() => validateWorkflowState({ positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships }), [candidateRecords, interviewRecords, positionRecords, talentMemberships, talentPools]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
@@ -200,6 +241,103 @@ export function App() {
     setRecentTask(task);
   }, []);
 
+  const updateCandidateRecords = useCallback((update) => {
+    setCandidateRecords((current) => {
+      const next = typeof update === "function" ? update(current) : update;
+      setPositionRecords((positions) => recalculatePositionCounts(positions, next));
+      return next;
+    });
+  }, []);
+
+  function workflowState() {
+    return { positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships };
+  }
+
+  function applyWorkflowState(next) {
+    setPositionRecords(next.positions);
+    setCandidateRecords(next.candidates);
+    setInterviewRecords(next.interviews);
+    setTalentPools(next.pools);
+    setTalentMemberships(next.memberships);
+  }
+
+  function applyScreeningAction({ action, files, task }) {
+    const previous = workflowState();
+    const targetStage = action === "标记淘汰" ? "已淘汰" : "待复核";
+    let next = applyScreeningResults(previous, { task, files, targetStage });
+    const candidateIds = files.map((file) => next.candidates.find((candidate) => file.email ? candidate.email === file.email : candidate.name === file.candidate)?.id).filter(Boolean);
+    if (action === "加入人才库") next = addTalentMemberships(next, { candidateIds, poolId: "POOL-FOLLOW", actor: roleIdentity.name });
+    if (action === "添加标签") next.candidates = next.candidates.map((candidate) => candidateIds.includes(candidate.id) && !candidate.tags.includes("批量复核") ? { ...candidate, tags: [...candidate.tags, "批量复核"] } : candidate);
+    applyWorkflowState(next);
+    return previous;
+  }
+
+  function resetScenario(scenario) {
+    const baseCandidates = structuredClone(initialCandidateRecords);
+    const basePositions = recalculatePositionCounts(structuredClone(initialPositionRecords), baseCandidates);
+    const baseInterviews = structuredClone(initialInterviewRecords);
+    const basePools = structuredClone(initialTalentPools);
+    const baseMemberships = structuredClone(initialTalentMemberships);
+    setCandidateRecords(baseCandidates);
+    setPositionRecords(basePositions);
+    setInterviewRecords(baseInterviews);
+    setTalentPools(basePools);
+    setTalentMemberships(baseMemberships);
+    setCurrentRole("招聘管理员");
+    setActiveNav("工作台");
+    setActiveJob("AI 工程师");
+    setScreeningTask(null);
+    setRecentTask(null);
+    setSelectedCandidate(null);
+    setCandidateMode("list");
+    setSelectedInterview(null);
+    setInterviewMode("list");
+    setScheduleCandidateId(null);
+    setSelectedPoolId(null);
+    setTalentMode("list");
+    setSelectedJob(null);
+    setJobMode("list");
+    setImportOpen(false);
+    window.localStorage.removeItem("ats_recent_screening_task");
+
+    if (scenario === "new-position") {
+      setActiveNav("职位");
+      setSelectedJob(basePositions.find((position) => position.name === "AI 工程师"));
+      setJobMode("detail");
+    }
+    if (scenario === "partial-screening") {
+      const files = syntheticResumeFilesFor("AI 工程师").map((file) => ({ ...file, status: file.expectedParseStatus === "failed" ? "failed" : file.expectedLlmStatus === "failed" ? "partial" : "success", traceId: file.expectedParseStatus === "failed" ? "TR-PARSE-4081" : file.expectedLlmStatus === "failed" ? "TR-LLM-4297" : null, error: file.expectedParseStatus === "failed" ? "PDF 文本层损坏，未能提取有效内容" : file.expectedLlmStatus === "failed" ? "LLM 请求额度暂时不可用，已保留规则评分" : null }));
+      const task = { id: "SCR-UX08-PARTIAL", position: "AI 工程师", source: "UX-08 合成数据", note: "部分失败恢复验收", llmEnabled: true, creator: "张小北", createdAt: "刚刚", status: "partial", stage: "已完成", completed: files.length, elapsed: 56, files };
+      setScreeningTask(task);
+      setRecentTask(task);
+    }
+    if (scenario === "pending-feedback") {
+      setCurrentRole("面试官");
+      setActiveNav("面试");
+      setSelectedInterview(baseInterviews.find((interview) => interview.id === "INT-002"));
+      setInterviewMode("feedback");
+    }
+    if (scenario === "talent-reactivation") {
+      setActiveNav("人才库");
+      setSelectedPoolId("POOL-FOLLOW");
+      setTalentMode("detail");
+    }
+    if (scenario === "empty") {
+      setCandidateRecords([]);
+      setPositionRecords(recalculatePositionCounts(basePositions, []));
+      setInterviewRecords([]);
+      setTalentMemberships([]);
+      setTalentPools(basePools.map((pool) => ({ ...pool, memberIds: [] })));
+      setActiveNav("候选人");
+    }
+    if (scenario === "restricted") {
+      setCurrentRole("面试官");
+      setActiveNav("报表");
+    }
+    setCurrentScenario(scenario);
+    notify(`已切换到“${scenario}”验收场景`);
+  }
+
   function openJobForm() {
     setActiveNav("职位");
     setSelectedJob(null);
@@ -212,25 +350,11 @@ export function App() {
   }
 
   function openCandidate(summary) {
-    let candidate = candidateRecords.find((item) => item.name === summary.name);
+    let candidate = candidateRecords.find((item) => (summary.fileId && item.sourceFileId === summary.fileId) || (summary.email && item.email === summary.email))
+      || candidateRecords.find((item) => item.name === summary.name);
     if (!candidate) {
-      candidate = {
-        ...initialCandidateRecords[0],
-        id: `CAN-DEMO-${Date.now()}`,
-        name: summary.name,
-        role: summary.role || "候选人",
-        company: summary.company || "暂无",
-        position: activeJob,
-        stage: "待复核",
-        score: 82,
-        ruleScore: 82,
-        llmScore: 79,
-        source: summary.tag?.replace("来自 ", "") || "当前流程",
-        applications: [{ position: activeJob, state: "待复核", created: "2026-07-11", source: "当前流程" }],
-        timeline: [{ time: "刚刚", actor: "系统", action: "从当前招聘流程打开候选人档案" }],
-        version: 1,
-      };
-      setCandidateRecords((current) => [...current, candidate]);
+      notify("请先将该结果推进到候选人，再查看完整档案");
+      return;
     }
     setCandidateOrigin(activeNav === "候选人" && !screeningTask ? null : { activeNav, screeningTask });
     setScreeningTask(null);
@@ -288,39 +412,28 @@ export function App() {
   }
 
   function syncInterviewToCandidate(interview) {
-    setCandidateRecords((current) => current.map((candidate) => {
-      if (candidate.id !== interview.candidateId) return candidate;
-      const summary = { interviewId: interview.id, round: interview.round, time: `${interview.dateLabel} ${interview.time}`, interviewer: interview.interviewers.join("、"), result: interview.feedback?.conclusion || interview.feedbackStatus, feedback: interview.feedback?.strengths || `面试状态：${interview.status}；通知：${interview.notification}` };
-      const interviews = [...candidate.interviews.filter((item) => item.interviewId !== interview.id), summary];
-      return { ...candidate, interviews, lastActivity: "刚刚", timeline: [{ time: "刚刚", actor: "系统", action: interview.feedbackStatus === "已提交" ? `收到${interview.round}反馈：${interview.feedback.conclusion}` : `更新${interview.round}安排：${interview.dateLabel} ${interview.time}` }, ...candidate.timeline] };
-    }));
-    if (selectedCandidate?.id === interview.candidateId) {
-      setSelectedCandidate((current) => {
-        if (!current) return current;
-        const summary = { interviewId: interview.id, round: interview.round, time: `${interview.dateLabel} ${interview.time}`, interviewer: interview.interviewers.join("、"), result: interview.feedback?.conclusion || interview.feedbackStatus, feedback: interview.feedback?.strengths || `面试状态：${interview.status}；通知：${interview.notification}` };
-        return { ...current, interviews: [...current.interviews.filter((item) => item.interviewId !== interview.id), summary], lastActivity: "刚刚" };
-      });
-    }
+    const next = interview.feedbackStatus === "已提交" && interview.feedback
+      ? submitInterviewFeedback(workflowState(), interview.id, interview.feedback)
+      : saveInterview(workflowState(), interview);
+    applyWorkflowState(next);
+    if (selectedCandidate?.id === interview.candidateId) setSelectedCandidate(next.candidates.find((candidate) => candidate.id === interview.candidateId));
   }
 
   function addCandidatesToTalentPool(candidateIds, poolId = "POOL-FOLLOW") {
     const pool = talentPools.find((item) => item.id === poolId) || talentPools[0];
-    const additions = candidateIds.filter((candidateId) => !talentMemberships.some((item) => item.poolId === pool.id && item.candidateId === candidateId)).map((candidateId, index) => {
-      const candidate = candidateRecords.find((item) => item.id === candidateId);
-      return { id: `MEM-NEW-${Date.now()}-${index}`, poolId: pool.id, candidateId, suitableRoles: [candidate?.position || "待确认岗位"], tags: candidate?.tags || [], owner: "张小北", joinedAt: "2026-07-12", reason: "HR 从候选人流程明确加入人才库", source: `${candidate?.position || "候选人"}申请`, nextContact: "2026-07-19", retentionUntil: "2028-07-11", recentInteraction: "刚刚加入人才库", latestConclusion: candidate?.humanConclusion || candidate?.recommendation || "待补充", status: "正常" };
-    });
-    if (!additions.length) { notify(`候选人已在“${pool.name}”中`); return; }
-    setTalentMemberships((current) => [...current, ...additions]);
-    setTalentPools((current) => current.map((item) => item.id === pool.id ? { ...item, memberIds: [...new Set([...item.memberIds, ...candidateIds])], recentActivity: "刚刚", activity: `张小北新增了 ${additions.length} 位人才` } : item));
-    setCandidateRecords((current) => current.map((candidate) => candidateIds.includes(candidate.id) ? { ...candidate, timeline: [{ time: "刚刚", actor: "张小北", action: `加入人才库：${pool.name}` }, ...candidate.timeline] } : candidate));
-    notify(`已将 ${additions.length} 位候选人加入“${pool.name}”`);
+    const before = talentMemberships.length;
+    const next = addTalentMemberships(workflowState(), { candidateIds, poolId: pool.id, actor: roleIdentity.name });
+    const additions = next.memberships.length - before;
+    if (!additions) { notify(`候选人已在“${pool.name}”中`); return; }
+    applyWorkflowState(next);
+    notify(`已将 ${additions} 位候选人加入“${pool.name}”`);
   }
 
   function reactivateTalent(candidateId, position, poolId, resumeVersion) {
-    const created = { position: position.name, state: "新简历", created: "2026-07-12", source: "人才库重新激活", linkedPoolId: poolId, resumeVersion };
-    setCandidateRecords((current) => current.map((candidate) => candidate.id === candidateId ? { ...candidate, applications: [created, ...candidate.applications], position: position.name, stage: "新简历", owner: position.owner, lastActivity: "刚刚", timeline: [{ time: "刚刚", actor: "张小北", action: `从人才库重新激活到${position.name}；保留历史申请` }, ...candidate.timeline] } : candidate));
-    setTalentPools((current) => current.map((pool) => pool.id === poolId ? { ...pool, recentActivity: "刚刚", activity: `重新激活候选人到${position.name}` } : pool));
-    return created;
+    const result = reactivateTalentCandidate(workflowState(), { candidateId, position, poolId, resumeVersion, actor: roleIdentity.name });
+    if (!result.created) return null;
+    applyWorkflowState(result.state);
+    return result.application;
   }
 
   return (
@@ -328,7 +441,7 @@ export function App() {
       <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
         <div className="brand">招聘协同平台</div>
         <nav aria-label="主导航">
-          {navItems.map(([label, Icon]) => (
+          {navItems.filter(([label]) => allowedNavItems.has(label)).map(([label, Icon]) => (
             <button
               key={label}
               type="button"
@@ -365,7 +478,7 @@ export function App() {
         </nav>
         <div className="profile">
           <span className="profile-avatar"><UserRound size={20} /></span>
-          <div><strong>张小北</strong><span>HR 招聘专员</span></div>
+          <div><strong>{roleIdentity.name}</strong><span>{roleIdentity.title}</span></div>
           <ChevronDown size={17} />
         </div>
       </aside>
@@ -375,19 +488,25 @@ export function App() {
           <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
           <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav === "人才库" && talentMode === "detail" ? "人才库详情" : activeNav}</h1>
           <div className="top-actions">
-            {!screeningTask && activeNav === "工作台" && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
-            {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
+            {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
+            {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && canPerformAction(currentRole, "新建职位") && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
           </div>
         </header>
 
-        {!screeningTask && activeNav === "工作台" && <div className="page-body">
+        {!screeningTask && activeNav === "工作台" && currentRole === "面试官" && <div className="interviewer-workbench">
+          <header><div><h2>我的面试工作台</h2><p>仅展示你参与的面试和待提交反馈。</p></div><span>{myPendingFeedbackInterviews.length} 项待反馈</span></header>
+          <section><h3>待提交反馈</h3>{myPendingFeedbackInterviews.map((interview) => <button type="button" key={interview.id} onClick={() => openFeedbackInterview(interview)}><span><strong>{interview.candidate}</strong><small>{interview.position} · {interview.round}</small></span><span>{interview.dateLabel} {interview.time}<ChevronRight size={16} /></span></button>)}{myPendingFeedbackInterviews.length === 0 && <p>暂无待提交反馈</p>}</section>
+          <section><h3>我的面试</h3>{interviewRecords.filter((item) => item.interviewers.includes(roleIdentity.name) && item.feedbackStatus !== "待反馈").slice(0, 6).map((interview) => <button type="button" key={interview.id} onClick={() => openFeedbackInterview(interview)}><span><strong>{interview.candidate}</strong><small>{interview.position} · {interview.round}</small></span><span>{interview.dateLabel} {interview.time}<ChevronRight size={16} /></span></button>)}</section>
+        </div>}
+
+        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && <div className="page-body">
           <section className="main-column">
             <div className="job-switcher">
               <span className="switcher-label">当前职位</span>
               <div className="job-tabs">
                 {jobs.slice(0, 3).map((job) => (
                   <button key={job} type="button" className={activeJob === job ? "job-tab selected" : "job-tab"} onClick={() => setActiveJob(job)}>
-                    <strong>{job}</strong><span>{jobData[job]?.count || 0} 人进行中</span>
+                    <strong>{job}</strong><span>{candidateRecords.filter((candidate) => candidate.position === job && !["已录用", "已淘汰", "已撤回"].includes(candidate.stage)).length} 人进行中</span>
                   </button>
                 ))}
                 <button className="more-jobs" type="button" onClick={() => notify("已展示全部在招职位")}>更多职位<ChevronDown size={15} /></button>
@@ -432,12 +551,12 @@ export function App() {
                 </div>
               )}
 
-              <div className="duplicate-alert">
+              {duplicateCandidateGroups > 0 && <div className="duplicate-alert">
                 <CircleAlert size={19} />
-                <div><strong>发现重复候选人</strong><span>系统检测到 2 组重复候选人，建议合并以避免重复跟进。</span></div>
-                <button className="button small secondary" type="button" onClick={() => setModal("duplicates")}>去处理（2）</button>
+                <div><strong>发现重复候选人</strong><span>系统检测到 {duplicateCandidateGroups} 组重复候选人，建议合并以避免重复跟进。</span></div>
+                <button className="button small secondary" type="button" onClick={() => setModal("duplicates")}>去处理（{duplicateCandidateGroups}）</button>
                 <IconButton label="忽略提醒" onClick={() => notify("本次提醒已忽略")}><X size={17} /></IconButton>
-              </div>
+              </div>}
             </section>
             <footer className="updated">更新时间：2026-07-11 11:05 <button type="button" onClick={() => notify("数据已刷新")}>刷新</button></footer>
           </section>
@@ -451,18 +570,21 @@ export function App() {
                 <button className="expand-link" type="button">展开 3 项<ChevronDown size={14} /></button>
               </div>
               <div className="rail-group">
-                <div className="rail-group-title"><span className="status-dot orange" />待安排面试（4）<button type="button" onClick={openInterviewList}>查看全部</button></div>
-                {["候 D1  等待安排 1 天", "候 D2  等待安排 2 天", "候 D3  等待安排 2 天"].map((item) => <button className="rail-item" type="button" key={item} onClick={() => openScheduleInterview()}>{item}<small>AI 工程师 · 北京</small></button>)}
+                <div className="rail-group-title"><span className="status-dot orange" />待安排面试（{pendingScheduleCandidates.length}）<button type="button" onClick={openInterviewList}>查看全部</button></div>
+                {pendingScheduleCandidates.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.id} onClick={() => openScheduleInterview(candidate)}>{candidate.name}　等待安排<small>{candidate.position} · {candidate.city}</small></button>)}
+                {pendingScheduleCandidates.length === 0 && <p>暂无待安排面试</p>}
               </div>
               <div className="rail-group compact">
-                <div className="rail-group-title"><span className="status-dot blue" />待反馈面试（3）<button type="button" onClick={() => openFeedbackInterview("INT-002")}>查看全部</button></div>
-                <p>候 E4　07-10 二面</p><p>候 E5　07-10 一面</p><p>候 E6　07-09 三面</p>
+                <div className="rail-group-title"><span className="status-dot blue" />待反馈面试（{pendingFeedbackInterviews.length}）<button type="button" onClick={openInterviewList}>查看全部</button></div>
+                {pendingFeedbackInterviews.slice(0, 3).map((interview) => <button className="rail-item" type="button" key={interview.id} onClick={() => openFeedbackInterview(interview)}>{interview.candidate}　{interview.dateLabel} {interview.round}</button>)}
+                {pendingFeedbackInterviews.length === 0 && <p>暂无待提交反馈</p>}
               </div>
             </section>
 
             <section className="rail-section calendar-card">
               <header><h3>面试日历（未来 7 天）</h3><button type="button" onClick={openInterviewList}>查看日历</button></header>
-              {["07-11（今天）", "07-12（明天）", "07-13（周一）", "07-14（周二）"].map((day, index) => <button type="button" className="calendar-row" key={day}><span>{day}</span><strong>{[3, 5, 6, 4][index]} 场</strong></button>)}
+              {upcomingInterviewDays.map(([day, count]) => <button type="button" className="calendar-row" key={day} onClick={openInterviewList}><span>{day}</span><strong>{count} 场</strong></button>)}
+              {upcomingInterviewDays.length === 0 && <div className="calendar-empty-slot">未来 7 天暂无面试</div>}
               <button className="more-calendar" type="button">更多<MoreHorizontal size={15} /></button>
             </section>
           </aside>
@@ -484,11 +606,11 @@ export function App() {
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={setCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
-          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterview={selectedInterview} setSelectedInterview={setSelectedInterview} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} setRecords={setInterviewRecords} candidates={candidateRecords} onNotify={notify} onBack={backFromInterview} onRecordSaved={syncInterviewToCandidate} />
+          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterview={selectedInterview} setSelectedInterview={setSelectedInterview} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} setRecords={setInterviewRecords} candidates={candidateRecords} onNotify={notify} onBack={backFromInterview} onRecordSaved={syncInterviewToCandidate} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} />
         )}
 
         {!screeningTask && activeNav === "人才库" && (
@@ -496,7 +618,7 @@ export function App() {
         )}
 
         {!screeningTask && activeNav === "报表" && (
-          <ReportWorkspace candidates={candidateRecords} positions={positionRecords} currentRole={currentRole} onRoleChange={setCurrentRole} onDrillDown={drillDownReport} onNotify={notify} />
+          <ReportWorkspace candidates={candidateRecords} positions={positionRecords} screeningSummary={screeningSummary} currentRole={currentRole} onRoleChange={setCurrentRole} onDrillDown={drillDownReport} onNotify={notify} />
         )}
 
         {!screeningTask && activeNav === "设置" && (
@@ -507,10 +629,10 @@ export function App() {
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
-        {screeningTask && <ScreeningTaskView task={screeningTask} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} />}
+        {screeningTask && <ScreeningTaskView task={screeningTask} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
       </main>
 
-      {importOpen && <ImportWizard activeJob={activeJob} jobs={jobs} recentTask={recentTask} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} />}
+      {importOpen && <ImportWizard activeJob={activeJob} jobs={jobs} recentTask={recentTask} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} actorName={roleIdentity.name} />}
 
       {modal === "duplicates" && (
         <Modal title="处理重复候选人" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>暂不处理</button><button className="button primary" type="button" onClick={() => { setModal(null); notify("2 组候选人已合并"); }}>确认合并</button></>}>
@@ -519,6 +641,7 @@ export function App() {
         </Modal>
       )}
 
+      {import.meta.env.DEV && <Ux08ScenarioPanel currentScenario={currentScenario} validation={workflowValidation} onSelect={resetScenario} />}
       {menuOpen && <button className="mobile-scrim" type="button" aria-label="关闭菜单" onClick={() => setMenuOpen(false)} />}
       {toast && <div className="toast" role="status"><Check size={16} />{toast}</div>}
     </div>

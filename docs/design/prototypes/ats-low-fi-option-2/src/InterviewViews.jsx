@@ -21,6 +21,52 @@ import {
   Users,
 } from "lucide-react";
 
+/* feedback-draft-helpers:start */
+export const INTERVIEW_FEEDBACK_DRAFT_PREFIX = "ats.interview-feedback-draft.v1:";
+
+export function getInterviewFeedbackDraftKey(interviewId) {
+  return `${INTERVIEW_FEEDBACK_DRAFT_PREFIX}${interviewId}`;
+}
+
+function defaultDraftStorage() {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+export function loadInterviewFeedbackDraft(record, storage = defaultDraftStorage()) {
+  if (!record?.id || record.feedback || !storage) return null;
+  try {
+    const value = storage.getItem(getInterviewFeedbackDraftKey(record.id));
+    return value ? JSON.parse(value) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveInterviewFeedbackDraft(interviewId, draft, storage = defaultDraftStorage()) {
+  if (!interviewId || !storage) return false;
+  try {
+    storage.setItem(getInterviewFeedbackDraftKey(interviewId), JSON.stringify(draft));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function clearInterviewFeedbackDraft(interviewId, storage = defaultDraftStorage()) {
+  if (!interviewId || !storage) return false;
+  try {
+    storage.removeItem(getInterviewFeedbackDraftKey(interviewId));
+    return true;
+  } catch {
+    return false;
+  }
+}
+/* feedback-draft-helpers:end */
+
 export const initialInterviewRecords = [
   { id: "INT-001", candidateId: "CAN-003", candidate: "赵宁", role: "大模型应用工程师", position: "AI 工程师", round: "一面", date: "2026-07-11", dateLabel: "07-11 今天", time: "15:00", duration: 60, method: "视频面试", timezone: "Asia/Shanghai", interviewers: ["张小北", "王磊"], location: "https://meeting.example.com/ai-001", status: "已安排", notification: "已发送", feedbackStatus: "未开始", owner: "张小北", jdPriorities: ["RAG 生产经验", "Agent 工程能力", "系统设计"], suggestedQuestions: ["如何评估 RAG 召回质量？", "Agent 工具调用失败如何降级？"], summary: "6 年 NLP 与大模型应用经验，负责过百万级知识库问答系统。", history: [] },
   { id: "INT-002", candidateId: "CAN-005", candidate: "孙悦", role: "AI 产品经理", position: "产品经理", round: "一面", date: "2026-07-11", dateLabel: "07-11 今天", time: "14:00", duration: 45, method: "视频面试", timezone: "Asia/Shanghai", interviewers: ["张小北", "王磊"], location: "https://meeting.example.com/pm-002", status: "已完成", notification: "已发送", feedbackStatus: "待反馈", owner: "张小北", jdPriorities: ["B 端产品方法", "AI 产品理解", "跨团队协作"], suggestedQuestions: ["如何定义 AI 功能的成功指标？", "如何处理模型能力与用户预期差距？"], summary: "5 年企业服务产品经验，熟悉 AI 产品从需求到商业化的完整过程。", history: [] },
@@ -45,17 +91,17 @@ function StatusTag({ status }) {
   return <span className={`interview-status ${tone}`}>{status}</span>;
 }
 
-function InterviewList({ records, onSchedule, onFeedback, onUpdate, onNotify }) {
+function InterviewList({ records, onSchedule, onFeedback, onUpdate, onNotify, canSchedule = true, interviewerName = "张小北" }) {
   const [view, setView] = useState("list");
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("全部状态");
   const [date, setDate] = useState("本周");
-  const [mineOnly, setMineOnly] = useState(false);
+  const [mineOnly, setMineOnly] = useState(!canSchedule);
 
   const filtered = useMemo(() => records.filter((item) => {
     const text = `${item.candidate}${item.position}${item.round}${item.interviewers.join("")}`.toLowerCase();
-    return (!query || text.includes(query.toLowerCase())) && (status === "全部状态" || item.status === status || item.feedbackStatus === status) && (!mineOnly || item.interviewers.includes("张小北")) && (date === "全部日期" || item.date >= "2026-07-11");
-  }), [date, mineOnly, query, records, status]);
+    return (!query || text.includes(query.toLowerCase())) && (status === "全部状态" || item.status === status || item.feedbackStatus === status) && (!(mineOnly || !canSchedule) || item.interviewers.includes(interviewerName)) && (date === "全部日期" || item.date >= "2026-07-11");
+  }), [canSchedule, date, interviewerName, mineOnly, query, records, status]);
 
   function retryNotification(record) {
     onUpdate({ ...record, notification: "已发送", history: [{ time: "刚刚", action: "重试候选人通知成功" }, ...record.history] });
@@ -63,9 +109,9 @@ function InterviewList({ records, onSchedule, onFeedback, onUpdate, onNotify }) 
   }
 
   return <div className="interview-page interview-list-page">
-    <div className="interview-page-heading"><div><h2>面试</h2><p>统一查看排期、冲突、通知状态和待反馈任务。</p></div><button className="button primary" type="button" onClick={() => onSchedule(null)}><CalendarPlus size={17} />安排面试</button></div>
+    <div className="interview-page-heading"><div><h2>面试</h2><p>{canSchedule ? "统一查看排期、冲突、通知状态和待反馈任务。" : "仅展示你参与的面试和待反馈任务。"}</p></div>{canSchedule && <button className="button primary" type="button" onClick={() => onSchedule(null)}><CalendarPlus size={17} />安排面试</button>}</div>
     <section className="interview-list-panel">
-      <div className="interview-toolbar"><div className="segmented-control" aria-label="面试视图"><button type="button" className={view === "list" ? "active" : ""} onClick={() => setView("list")}><List size={15} />列表</button><button type="button" className={view === "calendar" ? "active" : ""} onClick={() => setView("calendar")}><CalendarDays size={15} />周日历</button></div><label className="interview-search"><Search size={16} /><input aria-label="搜索面试" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索候选人、职位或面试官" /></label><label className="interview-select"><select aria-label="日期筛选" value={date} onChange={(event) => setDate(event.target.value)}><option>本周</option><option>全部日期</option></select><ChevronDown size={14} /></label><label className="interview-select"><select aria-label="状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option><option>已安排</option><option>待确认</option><option>已完成</option><option>待反馈</option><option>已提交</option></select><ChevronDown size={14} /></label><label className="mine-toggle"><input type="checkbox" checked={mineOnly} onChange={(event) => setMineOnly(event.target.checked)} />仅看我的面试</label></div>
+      <div className="interview-toolbar"><div className="segmented-control" aria-label="面试视图"><button type="button" className={view === "list" ? "active" : ""} onClick={() => setView("list")}><List size={15} />列表</button><button type="button" className={view === "calendar" ? "active" : ""} onClick={() => setView("calendar")}><CalendarDays size={15} />周日历</button></div><label className="interview-search"><Search size={16} /><input aria-label="搜索面试" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索候选人、职位或面试官" /></label><label className="interview-select"><select aria-label="日期筛选" value={date} onChange={(event) => setDate(event.target.value)}><option>本周</option><option>全部日期</option></select><ChevronDown size={14} /></label><label className="interview-select"><select aria-label="状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option>全部状态</option><option>已安排</option><option>待确认</option><option>已完成</option><option>待反馈</option><option>已提交</option></select><ChevronDown size={14} /></label>{canSchedule && <label className="mine-toggle"><input type="checkbox" checked={mineOnly} onChange={(event) => setMineOnly(event.target.checked)} />仅看我的面试</label>}</div>
       {view === "list" ? <div className="interview-table"><div className="interview-table-head"><span>候选人</span><span>职位与轮次</span><span>时间与方式</span><span>面试官</span><span>面试状态</span><span>通知/反馈</span><span>下一步</span></div>{filtered.map((record) => <div className="interview-table-row" key={record.id}><span className="interview-person"><span>{record.candidate.slice(-1)}</span><span><strong>{record.candidate}</strong><small>{record.role}</small></span></span><span><strong>{record.position}</strong><small>{record.round}</small></span><span><strong>{record.dateLabel} {record.time}</strong><small>{record.method} · {record.duration} 分钟</small></span><span><strong>{record.interviewers.join("、")}</strong><small>{record.location}</small></span><span><StatusTag status={record.status} /></span><span className="interview-state-stack"><StatusTag status={record.notification} /><StatusTag status={record.feedbackStatus} /></span><span className="interview-row-actions">{record.notification === "发送失败" && <button type="button" onClick={() => retryNotification(record)}><RefreshCw size={14} />重试</button>}{record.feedbackStatus === "待反馈" || record.feedbackStatus === "已提交" ? <button type="button" onClick={() => onFeedback(record)}>{record.feedbackStatus === "已提交" ? "查看反馈" : "填写反馈"}<ChevronRight size={14} /></button> : record.status !== "已完成" && <button type="button" onClick={() => onSchedule(record)}>改期<ChevronRight size={14} /></button>}</span></div>)}{filtered.length === 0 && <div className="interview-empty"><CalendarDays size={24} /><strong>没有符合条件的面试</strong><span>调整筛选条件或安排新的面试。</span></div>}</div> : <div className="week-calendar">{dayColumns.map(([value, label, weekday]) => { const items = filtered.filter((item) => item.date === value); return <section key={value}><header><strong>{label}</strong><span>{weekday} · {items.length} 场</span></header><div>{items.map((item) => <button type="button" className={`calendar-interview ${item.status === "已完成" ? "complete" : item.notification === "发送失败" ? "failed" : ""}`} key={item.id} onClick={() => item.feedbackStatus === "待反馈" || item.feedbackStatus === "已提交" ? onFeedback(item) : onSchedule(item)}><span><Clock3 size={13} />{item.time} · {item.duration} 分钟</span><strong>{item.candidate}</strong><small>{item.position} · {item.round}</small><small><Users size={12} />{item.interviewers.join("、")}</small><StatusTag status={item.feedbackStatus === "待反馈" ? "待反馈" : item.status} /></button>)}{items.length === 0 && <div className="calendar-empty-slot">暂无面试</div>}</div></section>; })}</div>}
     </section>
   </div>;
@@ -120,22 +166,29 @@ function ScheduleInterview({ record, candidateId, candidates, records, onBack, o
 
 const ratingOptions = ["待评价", "需提升", "一般", "良好", "优秀"];
 
-function FeedbackForm({ record, onBack, onSubmit, onNotify }) {
+function FeedbackForm({ record, onBack, onSubmit, onNotify, actorName = "张小北" }) {
   const existing = record.feedback;
-  const [editing, setEditing] = useState(!existing);
+  const ownsFeedback = record.interviewers.includes(actorName) && (!existing || existing.submittedBy === actorName);
+  const [editing, setEditing] = useState(!existing && ownsFeedback);
   const [editReason, setEditReason] = useState("");
   const [draftState, setDraftState] = useState(existing ? "已提交" : "草稿已保存");
   const [errors, setErrors] = useState({});
   const [submitError, setSubmitError] = useState("");
   const [failOnce, setFailOnce] = useState(record.id === "INT-002");
-  const [form, setForm] = useState(() => existing || { ratings: { professional: "待评价", problem: "待评价", communication: "待评价", fit: "待评价" }, strengths: "", risks: "", conclusion: "", notes: "" });
+  const [form, setForm] = useState(() => existing || loadInterviewFeedbackDraft(record) || { ratings: { professional: "待评价", problem: "待评价", communication: "待评价", fit: "待评价" }, strengths: "", risks: "", conclusion: "", notes: "" });
 
   useEffect(() => {
     if (!editing) return undefined;
     setDraftState("保存中...");
-    const timer = window.setTimeout(() => setDraftState("草稿已保存"), 450);
-    return () => window.clearTimeout(timer);
-  }, [editing, form]);
+    const timer = window.setTimeout(() => {
+      saveInterviewFeedbackDraft(record.id, form);
+      setDraftState("草稿已保存");
+    }, 450);
+    return () => {
+      window.clearTimeout(timer);
+      saveInterviewFeedbackDraft(record.id, form);
+    };
+  }, [editing, form, record.id]);
 
   function update(field, value) { setForm((current) => ({ ...current, [field]: value })); setErrors((current) => ({ ...current, [field]: "" })); setSubmitError(""); }
   function rate(field, value) { setForm((current) => ({ ...current, ratings: { ...current.ratings, [field]: value } })); setErrors((current) => ({ ...current, [field]: "" })); }
@@ -147,24 +200,25 @@ function FeedbackForm({ record, onBack, onSubmit, onNotify }) {
     if (!form.conclusion) next.conclusion = "请选择面试结论";
     if (existing && !editReason.trim()) next.editReason = "修改已提交反馈必须填写原因";
     setErrors(next); if (Object.keys(next).length) return;
-    if (failOnce) { setFailOnce(false); setSubmitError("网络连接中断，草稿仍保存在本机。请重试提交。"); return; }
+    if (failOnce) { saveInterviewFeedbackDraft(record.id, form); setFailOnce(false); setSubmitError("网络连接中断，草稿仍保存在本机。请重试提交。"); return; }
     setSubmitError("");
-    onSubmit({ ...record, status: "已完成", feedbackStatus: "已提交", feedback: { ...form, submittedBy: "张小北", submittedAt: "刚刚", canEdit: true }, history: [{ time: "刚刚", action: existing ? `修改面试反馈；原因：${editReason}` : "提交结构化面试反馈" }, ...record.history] });
+    clearInterviewFeedbackDraft(record.id);
+    onSubmit({ ...record, status: "已完成", feedbackStatus: "已提交", feedback: { ...form, submittedBy: actorName, submittedAt: "刚刚", canEdit: true }, history: [{ time: "刚刚", action: existing ? `修改面试反馈；原因：${editReason}` : "提交结构化面试反馈" }, ...record.history] });
     setEditing(false); setDraftState("已提交"); onNotify("面试反馈已提交，下一步由 HR 张小北处理");
   }
 
   const dimensions = [["professional", "专业能力"], ["problem", "问题解决"], ["communication", "沟通协作"], ["fit", "岗位匹配"]];
-  return <div className="interview-page feedback-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回面试列表</button><header className="feedback-header"><div className="feedback-candidate"><span>{record.candidate.slice(-1)}</span><div><div><h2>{record.candidate}</h2><StatusTag status={draftState} /></div><p>{record.position} · {record.round} · {record.dateLabel} {record.time}</p></div></div><div className="feedback-header-actions"><span><CheckCircle2 size={14} />{draftState}</span>{existing && !editing && existing.canEdit && <button className="button secondary" type="button" onClick={() => setEditing(true)}>修改反馈</button>}</div></header>
+  return <div className="interview-page feedback-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回面试列表</button><header className="feedback-header"><div className="feedback-candidate"><span>{record.candidate.slice(-1)}</span><div><div><h2>{record.candidate}</h2><StatusTag status={draftState} /></div><p>{record.position} · {record.round} · {record.dateLabel} {record.time}</p></div></div><div className="feedback-header-actions"><span><CheckCircle2 size={14} />{draftState}</span>{existing && !editing && ownsFeedback && <button className="button secondary" type="button" onClick={() => setEditing(true)}>修改反馈</button>}</div></header>
     <div className="feedback-layout"><main className="feedback-main"><section className="feedback-material"><header><h3>本次面试重点</h3><button type="button" onClick={() => onNotify("候选人简历已打开") }><FileText size={14} />查看脱敏简历</button></header><div className="feedback-priorities">{record.jdPriorities.map((item) => <span key={item}>{item}</span>)}</div><p>{record.summary}</p><details><summary>建议问题（{record.suggestedQuestions.length}）</summary>{record.suggestedQuestions.map((item) => <p key={item}>· {item}</p>)}</details></section>
       <section className="feedback-form-section"><header><h3>结构化评价</h3><p>仅当前面试官可编辑自己的草稿和反馈。</p></header>{dimensions.map(([key, label]) => <div className="rating-row" key={key}><strong>{label}<span>*</span></strong><div>{ratingOptions.slice(1).map((option) => <button type="button" disabled={!editing} className={form.ratings[key] === option ? "active" : ""} key={option} onClick={() => rate(key, option)}>{option}</button>)}</div>{errors[key] && <small className="field-error">{errors[key]}</small>}</div>)}<label>候选人优点 <span>*</span><textarea disabled={!editing} rows="4" value={form.strengths} onChange={(event) => update("strengths", event.target.value)} placeholder="记录与岗位相关的优势和证据" />{errors.strengths && <small className="field-error">{errors.strengths}</small>}</label><label>风险与待确认项 <span>*</span><textarea disabled={!editing} rows="4" value={form.risks} onChange={(event) => update("risks", event.target.value)} placeholder="记录风险、信息缺口或后续建议" />{errors.risks && <small className="field-error">{errors.risks}</small>}</label><div className="feedback-conclusion"><strong>面试结论 <span>*</span></strong><div>{["强烈推荐", "推荐", "保留", "不推荐"].map((option) => <button type="button" disabled={!editing} className={form.conclusion === option ? "active" : ""} key={option} onClick={() => update("conclusion", option)}>{option}</button>)}</div>{errors.conclusion && <small className="field-error">{errors.conclusion}</small>}</div><label>补充说明<textarea disabled={!editing} rows="3" value={form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="可选：给 HR 或下一轮面试官的建议" /></label>{existing && editing && <label className="edit-reason">修改原因 <span>*</span><input value={editReason} onChange={(event) => { setEditReason(event.target.value); setErrors((current) => ({ ...current, editReason: "" })); }} placeholder="说明为什么需要修改已提交反馈" />{errors.editReason && <small className="field-error">{errors.editReason}</small>}</label>}{submitError && <div className="feedback-submit-error"><CircleAlert size={18} /><div><strong>反馈提交失败</strong><p>{submitError}</p></div><button type="button" onClick={submit}><RefreshCw size={14} />重试提交</button></div>}{editing && <footer><span><Check size={14} />{draftState}</span><button className="button primary" type="button" onClick={submit}><Send size={16} />提交反馈</button></footer>}</section></main><aside className="feedback-aside"><section><h3>面试信息</h3><dl><div><dt>方式</dt><dd>{record.method}</dd></div><div><dt>时长</dt><dd>{record.duration} 分钟</dd></div><div><dt>面试官</dt><dd>{record.interviewers.join("、")}</dd></div><div><dt>负责人</dt><dd>{record.owner}</dd></div></dl></section><section><h3>提交后</h3><p>HR 将汇总本轮反馈，并决定推进、追加面试、淘汰或加入人才库。</p></section>{existing && !existing.canEdit && <section className="permission-note"><AlertTriangle size={17} /><div><strong>只读反馈</strong><p>该反馈由 {existing.submittedBy} 提交，你没有修改权限。</p></div></section>}</aside></div></div>;
 }
 
-export function InterviewsWorkspace({ mode, setMode, selectedInterview, setSelectedInterview, scheduleCandidateId, records, setRecords, candidates, onNotify, onBack, onRecordSaved }) {
-  function updateRecord(updated) { setRecords((current) => current.map((item) => item.id === updated.id ? updated : item)); setSelectedInterview(updated); }
-  function openSchedule(record) { setSelectedInterview(record); setMode("schedule"); }
+export function InterviewsWorkspace({ mode, setMode, selectedInterview, setSelectedInterview, scheduleCandidateId, records, setRecords, candidates, onNotify, onBack, onRecordSaved, canSchedule = true, actorName = "张小北" }) {
+  function updateRecord(updated) { if (!canSchedule && updated.feedbackStatus !== "已提交") { onNotify("当前角色无权修改面试安排"); return; } setRecords((current) => current.map((item) => item.id === updated.id ? updated : item)); setSelectedInterview(updated); }
+  function openSchedule(record) { if (!canSchedule) { onNotify("面试官不能创建或改期面试"); return; } setSelectedInterview(record); setMode("schedule"); }
   function openFeedback(record) { setSelectedInterview(record); setMode("feedback"); }
   function backToList() { setSelectedInterview(null); setMode("list"); if (onBack) onBack(); }
-  if (mode === "schedule") return <ScheduleInterview record={selectedInterview} candidateId={scheduleCandidateId} candidates={candidates} records={records} onBack={backToList} onSave={(saved) => { setRecords((current) => current.some((item) => item.id === saved.id) ? current.map((item) => item.id === saved.id ? saved : item) : [saved, ...current]); if (onRecordSaved) onRecordSaved(saved); setSelectedInterview(null); setMode("list"); }} onNotify={onNotify} />;
-  if (mode === "feedback" && selectedInterview) return <FeedbackForm record={selectedInterview} onBack={backToList} onSubmit={(updated) => { updateRecord(updated); if (onRecordSaved) onRecordSaved(updated); }} onNotify={onNotify} />;
-  return <InterviewList records={records} onSchedule={openSchedule} onFeedback={openFeedback} onUpdate={updateRecord} onNotify={onNotify} />;
+  if (mode === "schedule" && canSchedule) return <ScheduleInterview record={selectedInterview} candidateId={scheduleCandidateId} candidates={candidates} records={records} onBack={backToList} onSave={(saved) => { setRecords((current) => current.some((item) => item.id === saved.id) ? current.map((item) => item.id === saved.id ? saved : item) : [saved, ...current]); if (onRecordSaved) onRecordSaved(saved); setSelectedInterview(null); setMode("list"); }} onNotify={onNotify} />;
+  if (mode === "feedback" && selectedInterview) return <FeedbackForm record={selectedInterview} onBack={backToList} onSubmit={(updated) => { updateRecord(updated); if (onRecordSaved) onRecordSaved(updated); }} onNotify={onNotify} actorName={actorName} />;
+  return <InterviewList records={records} onSchedule={openSchedule} onFeedback={openFeedback} onUpdate={updateRecord} onNotify={onNotify} canSchedule={canSchedule} interviewerName={actorName} />;
 }

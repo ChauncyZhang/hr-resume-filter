@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Bot,
@@ -23,6 +23,7 @@ import {
   Users,
   X,
 } from "lucide-react";
+import { syntheticResumeFilesFor } from "./syntheticResumeFixtures.js";
 
 const demoFiles = [
   { id: "f1", name: "AI工程师_李嘉明.pdf", size: "1.4 MB", type: "PDF", valid: true },
@@ -56,7 +57,7 @@ function fileStatusClass(status) {
   return status === "success" ? "success" : status === "partial" ? "partial" : status === "failed" ? "failed" : "running";
 }
 
-export function ImportWizard({ activeJob, jobs, recentTask, onClose, onCreateTask, onResumeTask }) {
+export function ImportWizard({ activeJob, jobs, recentTask, onClose, onCreateTask, onResumeTask, actorName = "张小北" }) {
   const [step, setStep] = useState(1);
   const [position, setPosition] = useState(activeJob);
   const [source, setSource] = useState("BOSS 直聘");
@@ -64,9 +65,39 @@ export function ImportWizard({ activeJob, jobs, recentTask, onClose, onCreateTas
   const [files, setFiles] = useState([]);
   const [llmEnabled, setLlmEnabled] = useState(true);
   const [error, setError] = useState("");
+  const fileInputRef = useRef(null);
 
   const validFiles = files.filter((file) => file.valid);
   const invalidFiles = files.filter((file) => !file.valid);
+
+  function loadSyntheticSamples() {
+    setFiles(syntheticResumeFilesFor(position));
+    setError("");
+  }
+
+  function selectLocalFiles(event) {
+    const selectedFiles = [...event.target.files].map((file, index) => {
+      const extension = file.name.split(".").pop()?.toLowerCase();
+      const valid = ["pdf", "docx", "txt"].includes(extension);
+      const candidate = file.name.replace(/\.(pdf|docx|txt)$/i, "").split(/[_-]/).pop() || `候选人 ${index + 1}`;
+      return {
+        id: `LOCAL-${Date.now()}-${index}`,
+        name: file.name,
+        candidate,
+        email: `local-${index + 1}@example.com`,
+        phone: `138****${String(index + 1).padStart(4, "0")}`,
+        size: file.size > 1024 * 1024 ? `${(file.size / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(file.size / 1024))} KB`,
+        type: extension?.toUpperCase() || "未知",
+        valid,
+        error: valid ? null : "不支持该文件格式，请仅上传 PDF、DOCX 或 TXT",
+        expectedParseStatus: "success",
+        expectedLlmStatus: "success",
+      };
+    });
+    setFiles(selectedFiles);
+    setError("");
+    event.target.value = "";
+  }
 
   function next() {
     if (step === 1 && !source) {
@@ -93,13 +124,13 @@ export function ImportWizard({ activeJob, jobs, recentTask, onClose, onCreateTas
       source,
       note,
       llmEnabled,
-      creator: "张小北",
+      creator: actorName,
       createdAt: "刚刚",
       status: "running",
       stage: "解析中",
       completed: 0,
       elapsed: 0,
-      files: validFiles.map((file, index) => ({ ...file, ...resultProfiles[index], status: "queued", traceId: null })),
+      files: validFiles.map((file, index) => ({ ...file, ...(file.candidate ? {} : resultProfiles[index % resultProfiles.length]), status: "queued", traceId: null })),
     };
     onCreateTask(task);
   }
@@ -128,8 +159,9 @@ export function ImportWizard({ activeJob, jobs, recentTask, onClose, onCreateTas
           </div>}
 
           {step === 2 && <div className="wizard-section">
-            {files.length === 0 ? <button className="wizard-dropzone" type="button" onClick={() => setFiles(demoFiles)}><Import size={28} /><strong>选择演示简历</strong><span>模拟选择 PDF、DOCX 和一个不支持的 ZIP 文件</span></button> : <>
-              <div className="file-summary"><span><strong>{validFiles.length}</strong> 份有效简历</span><span>总大小 6.1 MB</span><span className={invalidFiles.length ? "has-error" : "is-valid"}>{invalidFiles.length ? `${invalidFiles.length} 个文件需处理` : "全部文件可导入"}</span><button type="button" onClick={() => setFiles(demoFiles)}><Plus size={15} />重新选择</button></div>
+            <input ref={fileInputRef} className="visually-hidden" type="file" accept=".pdf,.docx,.txt" multiple onChange={selectLocalFiles} />
+            {files.length === 0 ? <div className="wizard-dropzone-group"><button className="wizard-dropzone" type="button" onClick={loadSyntheticSamples}><Import size={28} /><strong>载入 UX-08 合成样本</strong><span>使用当前岗位的隐私安全测试简历</span></button><button className="button secondary" type="button" onClick={() => fileInputRef.current?.click()}><Plus size={16} />选择本地简历</button><button className="text-button" type="button" onClick={() => setFiles(demoFiles)}>查看格式错误示例</button></div> : <>
+              <div className="file-summary"><span><strong>{validFiles.length}</strong> 份有效简历</span><span>{files.some((file) => file.synthetic) ? "UX-08 合成数据" : "本地选择"}</span><span className={invalidFiles.length ? "has-error" : "is-valid"}>{invalidFiles.length ? `${invalidFiles.length} 个文件需处理` : "全部文件可导入"}</span><button type="button" onClick={() => fileInputRef.current?.click()}><Plus size={15} />重新选择</button></div>
               <div className="import-file-list">{files.map((file) => <div className={file.valid ? "" : "invalid"} key={file.id}><span className="file-icon">{file.valid ? <FileText size={18} /> : <FileArchive size={18} />}</span><span><strong>{file.name}</strong><small>{file.type} · {file.size}{file.error ? ` · ${file.error}` : ""}</small></span><span className={file.valid ? "valid-label" : "invalid-label"}>{file.valid ? "可导入" : "不支持"}</span><button type="button" aria-label={`移除 ${file.name}`} onClick={() => setFiles((current) => current.filter((item) => item.id !== file.id))}><Trash2 size={16} /></button></div>)}</div>
             </>}
           </div>}
@@ -157,7 +189,7 @@ export function ImportWizard({ activeJob, jobs, recentTask, onClose, onCreateTas
   );
 }
 
-export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onOpenCandidate, onNotify }) {
+export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onOpenCandidate, onNotify, onApplyResults, onUndoResults }) {
   const [task, setTask] = useState(initialTask);
   const [filter, setFilter] = useState("全部");
   const [query, setQuery] = useState("");
@@ -177,8 +209,8 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
         if (index >= current.files.length) return current;
         const files = current.files.map((file, fileIndex) => {
           if (fileIndex !== index) return file;
-          if (index === 3) return { ...file, status: "failed", recommendation: "待重试", traceId: "TR-PARSE-4081", error: "PDF 文本层损坏，未能提取有效内容" };
-          if (index === 4 && current.llmEnabled) return { ...file, status: "partial", traceId: "TR-LLM-4297", error: "LLM 请求额度暂时不可用，已保留规则评分" };
+          if (file.expectedParseStatus === "failed" || (!file.expectedParseStatus && index === 3)) return { ...file, status: "failed", recommendation: "待重试", traceId: "TR-PARSE-4081", error: "PDF 文本层损坏，未能提取有效内容" };
+          if ((file.expectedLlmStatus === "failed" || (!file.expectedLlmStatus && index === 4)) && current.llmEnabled) return { ...file, status: "partial", traceId: "TR-LLM-4297", error: "LLM 请求额度暂时不可用，已保留规则评分" };
           return { ...file, status: "success" };
         });
         const completed = index + 1;
@@ -220,7 +252,9 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
       onNotify("请先选择已完成的候选人");
       return;
     }
-    setUndo({ label, count: selected.length });
+    const selectedFiles = task.files.filter((file) => selected.includes(file.id));
+    const previousState = onApplyResults?.({ action: label, files: selectedFiles, task });
+    setUndo({ label, count: selected.length, previousState });
     setSelected([]);
     onNotify(`已对 ${selected.length} 位候选人执行“${label}”`);
     window.setTimeout(() => setUndo(null), 6000);
@@ -252,7 +286,7 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
           <div className="screening-table-head"><label><input type="checkbox" checked={allSelected} onChange={() => setSelected(allSelected ? selected.filter((id) => !selectableIds.includes(id)) : [...new Set([...selected, ...selectableIds])])} /></label><span>候选人 / 文件</span><span>状态</span><span>建议</span><span>规则分</span><span>LLM 分</span><span>命中 / 缺失</span><span>风险与操作</span></div>
           {filtered.map((file) => <div className="screening-row" key={file.id}>
             <label><input type="checkbox" disabled={!['success','partial'].includes(file.status)} checked={selected.includes(file.id)} onChange={() => setSelected((current) => current.includes(file.id) ? current.filter((id) => id !== file.id) : [...current, file.id])} /></label>
-            <button className="screening-identity" type="button" onClick={() => onOpenCandidate({ name: file.candidate, role: task.position, company: "", age: "本批次" })}><strong>{file.candidate}</strong><small>{file.name}</small></button>
+            <button className="screening-identity" type="button" disabled={!['success','partial'].includes(file.status)} title={!['success','partial'].includes(file.status) ? "处理成功后可查看候选人" : undefined} onClick={() => onOpenCandidate({ name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ruleScore: file.ruleScore, llmScore: file.llmScore, recommendation: file.recommendation, matched: file.matched, missing: file.missing, risk: file.risk })}><strong>{file.candidate}</strong><small>{file.name}</small></button>
             <span><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{file.status === "failed" && <X size={13} />}{statusLabel(file.status)}</span></span>
             <span className="recommendation-cell">{file.status === "queued" ? "等待处理" : file.recommendation}</span>
             <span className="score-source"><strong>{file.status === "queued" ? "—" : (file.ruleScore ?? "—")}</strong><small>规则</small></span>
@@ -263,7 +297,7 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
         </div>
       </section>
 
-      {undo && <div className="undo-toast"><Check size={16} />已完成“{undo.label}”，影响 {undo.count} 人<button type="button" onClick={() => { setUndo(null); onNotify("已撤销上一步批量操作"); }}>撤销</button></div>}
+      {undo && <div className="undo-toast"><Check size={16} />已完成“{undo.label}”，影响 {undo.count} 人<button type="button" onClick={() => { if (undo.previousState) onUndoResults?.(undo.previousState); setUndo(null); onNotify("已撤销上一步批量操作"); }}>撤销</button></div>}
     </div>
   );
 }

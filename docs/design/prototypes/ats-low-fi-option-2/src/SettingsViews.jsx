@@ -25,6 +25,7 @@ const auditRows = [
 ];
 
 function RoleSwitch({ value, onChange }) {
+  if (value !== "招聘管理员") return null;
   return <div className="role-switch" aria-label="当前角色">{["招聘管理员", "HR", "面试官"].map((role) => <button type="button" key={role} className={value === role ? "active" : ""} onClick={() => onChange(role)}>{role}</button>)}</div>;
 }
 

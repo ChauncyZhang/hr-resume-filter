@@ -1,0 +1,62 @@
+const RECRUITING_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "人才库", "报表", "设置"];
+const INTERVIEWER_NAV_ITEMS = ["工作台", "面试"];
+
+const RECRUITING_ACTIONS = [
+  "导入简历",
+  "新建职位",
+  "编辑职位",
+  "候选人搜索",
+  "推进候选人",
+  "安排面试",
+  "提交面试反馈",
+  "管理人才库",
+  "查看报表",
+];
+
+const ROLE_CAPABILITIES = {
+  招聘管理员: {
+    identity: { name: "周明", title: "招聘管理员" },
+    navItems: RECRUITING_NAV_ITEMS,
+    actions: RECRUITING_ACTIONS,
+    settingsAccess: "完整",
+  },
+  "HR 招聘专员": {
+    identity: { name: "张小北", title: "HR 招聘专员" },
+    navItems: RECRUITING_NAV_ITEMS,
+    actions: RECRUITING_ACTIONS,
+    settingsAccess: "有限",
+  },
+  HR: {
+    identity: { name: "张小北", title: "HR 招聘专员" },
+    navItems: RECRUITING_NAV_ITEMS,
+    actions: RECRUITING_ACTIONS,
+    settingsAccess: "有限",
+  },
+  面试官: {
+    identity: { name: "王磊", title: "技术面试官" },
+    navItems: INTERVIEWER_NAV_ITEMS,
+    actions: ["提交面试反馈"],
+    settingsAccess: "无",
+  },
+};
+
+export function getAllowedNavItems(role) {
+  return [...(ROLE_CAPABILITIES[role]?.navItems || [])];
+}
+
+export function canAccessNav(role, navItem) {
+  return getAllowedNavItems(role).includes(navItem);
+}
+
+export function canPerformAction(role, action) {
+  return ROLE_CAPABILITIES[role]?.actions.includes(action) || false;
+}
+
+export function getSettingsAccess(role) {
+  return ROLE_CAPABILITIES[role]?.settingsAccess || "无";
+}
+
+export function getRoleIdentity(role) {
+  const identity = ROLE_CAPABILITIES[role]?.identity;
+  return identity ? { ...identity } : null;
+}

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import re
+import zipfile
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 from docx import Document
@@ -17,6 +20,7 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +39,7 @@ def fixture(
     skills: tuple[str, ...] = (),
     missing: str = "无明显缺失",
     email_suffix: str | None = None,
+    llm_status: str = "success",
 ) -> dict:
     extension = "pdf" if file_format in {"pdf", "scan_pdf", "corrupt_pdf"} else file_format
     return {
@@ -44,6 +49,7 @@ def fixture(
         "format": file_format,
         "targetPosition": position,
         "expectedParseStatus": parse_status,
+        "expectedLlmStatus": llm_status,
         "expectedScoreRange": score,
         "scenarioTags": list(tags),
         "skills": list(skills),
@@ -61,7 +67,7 @@ FIXTURES = [
     fixture("SYN-0004", "顾言川", "AI 工程师", "scan_pdf", "68-76", tags=("扫描版", "缺少教育信息"), skills=("Python", "OCR", "OpenCV"), missing="教育经历"),
     fixture("SYN-0005", "许知远", "AI 工程师", "pdf", "48-58", tags=("低匹配",), skills=("数据分析", "SQL"), missing="大模型项目经验"),
     fixture("SYN-0006", "林启舟", "AI 工程师", "docx", "85-92", tags=("重复候选人", "新版简历"), skills=("Python", "RAG", "Agent", "PyTorch"), email_suffix="syn-0001"),
-    fixture("SYN-0007", "程星野", "AI 工程师", "pdf", "70-78", tags=("缺少量化结果",), skills=("Python", "LangChain", "向量数据库"), missing="项目量化结果"),
+    fixture("SYN-0007", "程星野", "AI 工程师", "pdf", "70-78", tags=("缺少量化结果", "LLM 部分失败"), skills=("Python", "LangChain", "向量数据库"), missing="项目量化结果", llm_status="failed"),
     fixture("SYN-0008", "唐予安", "AI 工程师", "corrupt_pdf", "不可评分", parse_status="failed", tags=("损坏文件",), skills=()),
     fixture("SYN-0009", "陆谨言", "Java 后端工程师", "pdf", "84-90", tags=("高匹配",), skills=("Java", "Spring Boot", "MySQL", "Redis")),
     fixture("SYN-0010", "沈嘉禾", "Java 后端工程师", "docx", "70-78", tags=("中等匹配",), skills=("Java", "Spring Cloud", "MySQL"), missing="高并发量化结果"),
@@ -133,9 +139,24 @@ def configure_docx(document: Document) -> None:
         style.font.color.rgb = RGBColor.from_string(color)
 
 
+def normalize_docx(path: Path) -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(path, "r") as source, zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for name in sorted(source.namelist()):
+            info = zipfile.ZipInfo(name, date_time=(2026, 7, 12, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o600 << 16
+            target.writestr(info, source.read(name))
+    path.write_bytes(buffer.getvalue())
+
+
 def write_docx(item: dict, path: Path) -> None:
     document = Document()
     configure_docx(document)
+    fixed_time = datetime(2026, 7, 12, tzinfo=timezone.utc)
+    document.core_properties.author = "UX-08 Synthetic Data Generator"
+    document.core_properties.created = fixed_time
+    document.core_properties.modified = fixed_time
     title = document.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.LEFT
     title.paragraph_format.space_after = Pt(4)
@@ -158,6 +179,7 @@ def write_docx(item: dict, path: Path) -> None:
     footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
     set_run_font(footer.add_run(f"UX-08 SYNTHETIC RESUME | {item['id']}"), size=9, color="777777")
     document.save(path)
+    normalize_docx(path)
 
 
 def register_pdf_font() -> str:
@@ -170,7 +192,7 @@ def register_pdf_font() -> str:
 
 def write_text_pdf(item: dict, path: Path) -> None:
     font_name = register_pdf_font()
-    pdf = canvas.Canvas(str(path), pagesize=LETTER)
+    pdf = canvas.Canvas(str(path), pagesize=LETTER, invariant=1)
     width, height = LETTER
     y = height - 64
     pdf.setFont(font_name, 20)
@@ -222,7 +244,12 @@ def write_scan_pdf(item: dict, path: Path) -> None:
                 y += 34
         y += 22
     draw.text((90, 1570), f"UX-08 SYNTHETIC RESUME | {item['id']}", font=body_font, fill="#777777")
-    image.save(path, "PDF", resolution=144.0)
+    image_buffer = io.BytesIO()
+    image.save(image_buffer, "PNG")
+    image_buffer.seek(0)
+    pdf = canvas.Canvas(str(path), pagesize=(1275, 1650), invariant=1)
+    pdf.drawImage(ImageReader(image_buffer), 0, 0, width=1275, height=1650)
+    pdf.save()
 
 
 def write_txt(item: dict, path: Path) -> None:
@@ -230,7 +257,7 @@ def write_txt(item: dict, path: Path) -> None:
     for heading, values in resume_sections(item):
         lines.extend(["", heading, *[f"- {value}" for value in values]])
     lines.append(f"\nFixture ID: {item['id']} | synthetic=true")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    path.write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
 def write_fixture(item: dict, path: Path) -> None:
@@ -251,22 +278,23 @@ def write_fixture(item: dict, path: Path) -> None:
 def write_metadata() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_DIR / "manifest.json").write_text(json.dumps(FIXTURES, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with (OUTPUT_DIR / "manifest.json").open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(FIXTURES, ensure_ascii=False, indent=2) + "\n")
     with (OUTPUT_DIR / "expected-results.csv").open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.writer(handle)
+        writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(["编号", "文件名", "目标岗位", "预期解析状态", "预期匹配分区间", "场景标签", "合成数据"])
         for item in FIXTURES:
             writer.writerow([item["id"], item["filename"], item["targetPosition"], item["expectedParseStatus"], item["expectedScoreRange"], "、".join(item["scenarioTags"]), "是"])
-    (OUTPUT_DIR / "README.md").write_text(
-        "# UX-08 合成简历测试包\n\n"
-        "本目录包含 18 份完全虚构的招聘流程测试简历。所有姓名、单位、学校、项目、邮箱和电话均为合成数据。\n\n"
-        "- 仅用于 UX-08 原型、解析和可用性测试。\n"
-        "- 不得替换为生产候选人简历。\n"
-        "- 真实用户测试时只能使用本目录文件。\n"
-        "- `manifest.json` 是程序清单，`expected-results.csv` 是中文人工对照表。\n"
-        "- 损坏 PDF 为故意构造的错误样本，不应被正常解析。\n",
-        encoding="utf-8",
-    )
+    with (OUTPUT_DIR / "README.md").open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            "# UX-08 合成简历测试包\n\n"
+            "本目录包含 18 份完全虚构的招聘流程测试简历。所有姓名、单位、学校、项目、邮箱和电话均为合成数据。\n\n"
+            "- 仅用于 UX-08 原型、解析和可用性测试。\n"
+            "- 不得替换为生产候选人简历。\n"
+            "- 真实用户测试时只能使用本目录文件。\n"
+            "- `manifest.json` 是程序清单，`expected-results.csv` 是中文人工对照表。\n"
+            "- 损坏 PDF 为故意构造的错误样本，不应被正常解析。\n"
+        )
 
 
 def generate_output() -> None:

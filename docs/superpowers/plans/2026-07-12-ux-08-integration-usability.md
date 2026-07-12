@@ -116,23 +116,23 @@ Expected: existing tests and all UX-08 workflow tests pass.
 - `ScreeningTaskView` adds `onApplyResults({ action, files, task })`.
 - `App.jsx` applies successful/partial results through `applyScreeningResults` and updates candidates and position counts together.
 
-- [ ] **Step 1: Add synthetic fixture metadata to the prototype**
+- [x] **Step 1: Add synthetic fixture metadata to the prototype**
 
 Export the same stable candidate IDs, filenames, positions, expected scores, and failure types used by `manifest.json`.
 
-- [ ] **Step 2: Add actual file selection and synthetic sample loading**
+- [x] **Step 2: Add actual file selection and synthetic sample loading**
 
 The dropzone must expose an accessible file input accepting `.pdf,.docx,.txt`. A separate `载入 UX-08 合成样本` action loads deterministic fixtures without a system picker.
 
-- [ ] **Step 3: Make screening bulk actions update shared state**
+- [x] **Step 3: Make screening bulk actions update shared state**
 
 `推进到待复核` creates or updates candidates, appends a screening timeline event, and updates the target position counters. `加入人才库` first creates missing candidates, then creates memberships.
 
-- [ ] **Step 4: Preserve screening origin and return paths**
+- [x] **Step 4: Preserve screening origin and return paths**
 
 Opening a candidate from a screening result and returning must restore the same task, filter state, and selected position.
 
-- [ ] **Step 5: Run targeted tests and build**
+- [x] **Step 5: Run targeted tests and build**
 
 Run: `npm test` and `npm run build`.
 
@@ -152,23 +152,23 @@ Expected: all tests pass and Vite builds without warnings that affect behavior.
 - Talent add/reactivate use the Task 2 helpers and return explicit duplicate outcomes.
 - `Ux08ScenarioPanel` consumes `currentScenario`, `validation`, `onSelect`, and `onReset`.
 
-- [ ] **Step 1: Synchronize scheduling and feedback**
+- [x] **Step 1: Synchronize scheduling and feedback**
 
 Saving an interview moves the candidate to `面试中`, appends timeline data, and updates counters. Submitting feedback moves the candidate to `待决策` and makes the result visible from candidate detail.
 
-- [ ] **Step 2: Synchronize talent membership and reactivation**
+- [x] **Step 2: Synchronize talent membership and reactivation**
 
 Adding a member preserves prior applications. Reactivation creates a linked `新简历` application and keeps duplicate creation disabled when an active same-position application exists.
 
-- [ ] **Step 3: Add a development-only scenario panel**
+- [x] **Step 3: Add a development-only scenario panel**
 
 Show a compact `验收场景` control only when `import.meta.env.DEV`. Switching scenarios requires confirmation and restores deterministic data for default, partial screening, pending feedback, talent reactivation, empty, and restricted states.
 
-- [ ] **Step 4: Expose workflow validation**
+- [x] **Step 4: Expose workflow validation**
 
 The scenario panel displays `数据一致` only when `validateWorkflowState` returns no errors; otherwise it lists the first error and provides reset.
 
-- [ ] **Step 5: Verify report drill-down after state changes**
+- [x] **Step 5: Verify report drill-down after state changes**
 
 After screening, scheduling, feedback, and reactivation, report totals and funnel stages must match candidate records and drill down to the same records.
 
@@ -186,7 +186,7 @@ After screening, scheduling, feedback, and reactivation, report totals and funne
 - Consumes: the integrated prototype and synthetic resume pack.
 - Produces: 12 expert task records, a real-user test kit, issue log, and desktop/mobile evidence.
 
-- [ ] **Step 1: Write the real-user test kit**
+- [x] **Step 1: Write the real-user test kit**
 
 Include privacy instructions, role cards, 12 task cards, observer fields, five-point task difficulty, completion time, failure reason, and final feedback. State that only bundled synthetic resumes may be used.
 
@@ -206,7 +206,7 @@ At 1280×720 and 390×844, verify body-level horizontal overflow is absent. Chec
 
 Every finding receives an ID, severity, evidence, expected behavior, actual behavior, fix, and retest result. Do not close P2 without a fix or explicit accepted-risk reason.
 
-- [ ] **Step 6: Run final gates**
+- [x] **Step 6: Run final gates**
 
 Run:
 

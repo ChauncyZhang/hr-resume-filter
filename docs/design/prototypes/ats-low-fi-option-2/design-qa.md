@@ -255,6 +255,27 @@ Browser console errors checked: none.
 
 Final result: passed.
 
+## UX-08 Integration and Usability QA
+
+### Automated Evidence
+
+- Synthetic resume verifier: 18 fixtures passed privacy, distribution, duplicate, same-name, failure, and file-presence checks.
+- Domain and UI-support tests cover duplicate screening files, multi-position applications, interview/feedback synchronization, draft persistence, report metrics, and role capabilities.
+- Production Vite build and `git diff --check` are required release gates.
+
+### Integration Rules Verified in Code
+
+- Screening result inspection is read-only until the result is promoted; failed and queued files cannot create candidates.
+- Bulk undo restores the complete pre-action workflow state rather than only dismissing the notification.
+- Position counters and report funnels derive from application records, so a candidate may retain linked applications across positions.
+- Feedback drafts persist locally by interview ID, survive the simulated first-submit failure, and clear after a successful submit.
+- Parse success rate uses the current screening task summary; no screening task is displayed as no data instead of a fabricated percentage.
+- Role navigation and profile identity derive from the same capability map. Interviewers see only their workbench and interview records and cannot create or reschedule interviews.
+
+### Evidence Boundary
+
+The UX-08 expert report distinguishes automated/static evidence from browser evidence. Desktop, mobile, keyboard, focus, and screenshot rows remain open until they are executed in the selected in-app browser; none are represented as real-user findings.
+
 ## UX-07 Reports and Settings QA
 
 ### Evidence

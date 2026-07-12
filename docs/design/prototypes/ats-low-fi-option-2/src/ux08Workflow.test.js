@@ -7,6 +7,7 @@ import {
   reactivateTalentCandidate,
   saveInterview,
   submitInterviewFeedback,
+  transitionCandidate,
   validateWorkflowState,
 } from "./ux08Workflow.js";
 
@@ -27,10 +28,12 @@ test("screening results create one candidate per successful file", () => {
   const task = { id: "SCR-1", position: "AI 工程师", source: "合成测试", creator: "张小北" };
   const files = [
     { id: "SYN-1", candidate: "林启舟", email: "lin@example.com", status: "success", ruleScore: 88, llmScore: 84, recommendation: "优先沟通" },
+    { id: "SYN-1-V2", candidate: "林启舟", email: "lin@example.com", status: "success", ruleScore: 90, llmScore: 86, recommendation: "优先沟通" },
     { id: "SYN-2", candidate: "唐予安", email: "tang@example.com", status: "failed" },
   ];
   const next = applyScreeningResults(stateFixture(), { task, files, targetStage: "待复核" });
   assert.equal(next.candidates.length, 1);
+  assert.equal(next.candidates[0].applications.length, 1);
   assert.equal(next.candidates[0].stage, "待复核");
   assert.equal(next.positions[0].candidates, 1);
   assert.equal(next.positions[0].review, 1);
@@ -84,6 +87,118 @@ test("reactivation creates a linked application and blocks an active duplicate",
   const duplicate = reactivateTalentCandidate(created.state, { candidateId: "CAN-SYN-1", position: base.positions[1], poolId: "POOL-1", resumeVersion: "v2" });
   assert.equal(duplicate.created, false);
   assert.equal(duplicate.reason, "active-duplicate");
+});
+
+test("reactivation counts every active application under its own position", () => {
+  const base = applyScreeningResults(stateFixture(), {
+    task: { id: "SCR-1", position: "AI 工程师", source: "合成测试", creator: "张小北" },
+    files: [{ id: "SYN-1", candidate: "林启舟", email: "lin@example.com", status: "success" }],
+    targetStage: "待复核",
+  });
+  const created = reactivateTalentCandidate(base, {
+    candidateId: "CAN-SYN-1",
+    position: base.positions[1],
+    poolId: "POOL-1",
+    resumeVersion: "v2",
+  });
+
+  assert.equal(created.state.positions[0].candidates, 1);
+  assert.equal(created.state.positions[0].review, 1);
+  assert.equal(created.state.positions[1].candidates, 1);
+  assert.equal(created.state.positions[1].review, 0);
+});
+
+test("validator reports application-derived position count mismatches", () => {
+  const base = applyScreeningResults(stateFixture(), {
+    task: { id: "SCR-1", position: "AI 工程师", source: "合成测试", creator: "张小北" },
+    files: [{ id: "SYN-1", candidate: "林启舟", email: "lin@example.com", status: "success" }],
+    targetStage: "待复核",
+  });
+  const created = reactivateTalentCandidate(base, {
+    candidateId: "CAN-SYN-1",
+    position: base.positions[1],
+    poolId: "POOL-1",
+    resumeVersion: "v2",
+  });
+  const inconsistent = {
+    ...created.state,
+    positions: created.state.positions.map((position) => position.id === "JOB-AI"
+      ? { ...position, candidates: 0, review: 0 }
+      : position),
+  };
+
+  assert.match(validateWorkflowState(inconsistent).join("\n"), /JOB-AI/);
+});
+
+test("feedback updates only the current application and adds one feedback event", () => {
+  const original = applyScreeningResults(stateFixture(), {
+    task: { id: "SCR-1", position: "AI 工程师", source: "合成测试", creator: "张小北" },
+    files: [{ id: "SYN-1", candidate: "林启舟", email: "lin@example.com", status: "success" }],
+    targetStage: "待复核",
+  });
+  const reactivated = reactivateTalentCandidate(original, {
+    candidateId: "CAN-SYN-1",
+    position: original.positions[1],
+    poolId: "POOL-1",
+    resumeVersion: "v2",
+  }).state;
+  const scheduled = saveInterview(reactivated, {
+    id: "INT-2",
+    candidateId: "CAN-SYN-1",
+    round: "一面",
+    dateLabel: "明天",
+    time: "10:00",
+    interviewers: ["王磊"],
+    status: "已安排",
+    feedbackStatus: "待提交",
+  });
+  const beforeTimelineLength = scheduled.candidates[0].timeline.length;
+  const next = submitInterviewFeedback(scheduled, "INT-2", {
+    conclusion: "推荐",
+    strengths: "技术基础扎实",
+    submittedBy: "王磊",
+  });
+  const candidate = next.candidates[0];
+
+  assert.equal(candidate.applications.find((application) => application.position === "Java 后端工程师").state, "待决策");
+  assert.equal(candidate.applications.find((application) => application.position === "AI 工程师").state, "待复核");
+  assert.equal(candidate.timeline.length, beforeTimelineLength + 1);
+  assert.equal(candidate.timeline.filter((event) => event.action.includes("更新一面安排")).length, 1);
+  assert.equal(candidate.timeline.filter((event) => event.action.includes("收到一面反馈")).length, 1);
+});
+
+test("candidate workflow updates leave an older application for the same position unchanged", () => {
+  const original = applyScreeningResults(stateFixture(), {
+    task: { id: "SCR-OLD", position: "AI 工程师", source: "合成测试", creator: "张小北" },
+    files: [{ id: "SYN-1", candidate: "林启舟", email: "lin@example.com", status: "success" }],
+    targetStage: "已淘汰",
+  });
+  const reactivated = reactivateTalentCandidate(original, {
+    candidateId: "CAN-SYN-1",
+    position: original.positions[0],
+    poolId: "POOL-1",
+    resumeVersion: "v2",
+  }).state;
+  const transitioned = transitionCandidate(reactivated, "CAN-SYN-1", "待安排");
+  const scheduled = saveInterview(transitioned, {
+    id: "INT-SAME-POSITION",
+    candidateId: "CAN-SYN-1",
+    round: "一面",
+    dateLabel: "明天",
+    time: "10:00",
+    interviewers: ["王磊"],
+    status: "已安排",
+    feedbackStatus: "待提交",
+  });
+  const next = submitInterviewFeedback(scheduled, "INT-SAME-POSITION", {
+    conclusion: "推荐",
+    strengths: "技术基础扎实",
+    submittedBy: "王磊",
+  });
+  const [currentApplication, oldApplication] = next.candidates[0].applications;
+
+  assert.equal(currentApplication.state, "待决策");
+  assert.equal(oldApplication.state, "已淘汰");
 });
 
 test("validator reports no dangling interview or membership references", () => {

@@ -6,6 +6,7 @@
     "format": "pdf",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "85-92",
     "scenarioTags": [
       "高匹配"
@@ -28,6 +29,7 @@
     "format": "docx",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "72-80",
     "scenarioTags": [
       "中等匹配"
@@ -49,6 +51,7 @@
     "format": "txt",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "80-88",
     "scenarioTags": [
       "同名不同人"
@@ -70,6 +73,7 @@
     "format": "scan_pdf",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "68-76",
     "scenarioTags": [
       "扫描版",
@@ -92,6 +96,7 @@
     "format": "pdf",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "48-58",
     "scenarioTags": [
       "低匹配"
@@ -112,6 +117,7 @@
     "format": "docx",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "85-92",
     "scenarioTags": [
       "重复候选人",
@@ -135,9 +141,11 @@
     "format": "pdf",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "failed",
     "expectedScoreRange": "70-78",
     "scenarioTags": [
-      "缺少量化结果"
+      "缺少量化结果",
+      "LLM 部分失败"
     ],
     "skills": [
       "Python",
@@ -156,6 +164,7 @@
     "format": "corrupt_pdf",
     "targetPosition": "AI 工程师",
     "expectedParseStatus": "failed",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "不可评分",
     "scenarioTags": [
       "损坏文件"
@@ -173,6 +182,7 @@
     "format": "pdf",
     "targetPosition": "Java 后端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "84-90",
     "scenarioTags": [
       "高匹配"
@@ -195,6 +205,7 @@
     "format": "docx",
     "targetPosition": "Java 后端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "70-78",
     "scenarioTags": [
       "中等匹配"
@@ -216,6 +227,7 @@
     "format": "txt",
     "targetPosition": "Java 后端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "50-60",
     "scenarioTags": [
       "低匹配"
@@ -236,6 +248,7 @@
     "format": "pdf",
     "targetPosition": "Java 后端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "76-84",
     "scenarioTags": [
       "缺少教育信息"
@@ -257,6 +270,7 @@
     "format": "pdf",
     "targetPosition": "产品经理",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "78-86",
     "scenarioTags": [
       "同名不同人"
@@ -278,6 +292,7 @@
     "format": "docx",
     "targetPosition": "产品经理",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "68-76",
     "scenarioTags": [
       "中等匹配"
@@ -298,6 +313,7 @@
     "format": "scan_pdf",
     "targetPosition": "产品经理",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "45-55",
     "scenarioTags": [
       "扫描版",
@@ -318,6 +334,7 @@
     "format": "pdf",
     "targetPosition": "前端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "82-89",
     "scenarioTags": [
       "高匹配"
@@ -340,6 +357,7 @@
     "format": "docx",
     "targetPosition": "前端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "74-82",
     "scenarioTags": [
       "超长文件"
@@ -361,6 +379,7 @@
     "format": "txt",
     "targetPosition": "前端工程师",
     "expectedParseStatus": "success",
+    "expectedLlmStatus": "success",
     "expectedScoreRange": "52-62",
     "scenarioTags": [
       "低匹配"
