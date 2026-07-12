@@ -1,0 +1,123 @@
+name: ux09
+
+x-app-environment: &app-environment
+  APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  OBJECT_STORAGE_ENDPOINT: minio:9000
+  OBJECT_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER}
+  OBJECT_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-resumes}
+  CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:8080"]}
+
+x-app-service: &app-service
+  build:
+    context: ..
+    dockerfile: server/Dockerfile
+  environment: *app-environment
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  restart: unless-stopped
+  networks: [private]
+
+services:
+  proxy:
+    image: nginx:1.28.0-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/static:/usr/share/nginx/html:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks: [private]
+
+  api:
+    <<: *app-service
+    command: ["uvicorn", "server.app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    <<: *app-service
+    command: ["python", "-m", "server.app.worker.main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  postgres:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [edge, private]
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [private]
+
+  backup:
+    image: postgres:16.9-alpine
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    command: ["sh", "-c", "while true; do pg_dump -Fc -f /backups/ux09-$$(date +%Y%m%d-%H%M%S).dump; sleep 86400; done"]
+    volumes:
+      - backup-data:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h postgres -U $$PGUSER -d $$PGDATABASE"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks: [private]
+
+networks:
+  edge:
+  private:
+    internal: true
+
+volumes:
+  postgres-data:
+  minio-data:
+  backup-data:

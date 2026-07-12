@@ -1,0 +1,54 @@
+import json
+import logging
+
+from fastapi.testclient import TestClient
+
+from server.app.core.logging import JsonFormatter, redact
+from server.app.main import create_app
+
+
+class HealthyProbe:
+    async def check(self) -> None:
+        return None
+
+
+def test_trace_id_is_returned() -> None:
+    response = TestClient(
+        create_app(database_probe=HealthyProbe(), storage_probe=HealthyProbe())
+    ).get("/health/live")
+
+    assert len(response.headers["x-trace-id"]) == 32
+
+
+def test_invalid_caller_trace_id_is_replaced() -> None:
+    response = TestClient(
+        create_app(database_probe=HealthyProbe(), storage_probe=HealthyProbe())
+    ).get("/health/live", headers={"X-Trace-ID": "../../invalid trace"})
+
+    assert response.headers["x-trace-id"] != "../../invalid trace"
+    assert len(response.headers["x-trace-id"]) == 32
+
+
+def test_redact_removes_sensitive_keys_recursively() -> None:
+    value = {
+        "password": "one",
+        "nested": {"api_key": "two", "safe": "visible"},
+        "items": [{"authorization": "three"}],
+    }
+
+    assert redact(value) == {
+        "password": "[REDACTED]",
+        "nested": {"api_key": "[REDACTED]", "safe": "visible"},
+        "items": [{"authorization": "[REDACTED]"}],
+    }
+
+
+def test_json_formatter_redacts_structured_context() -> None:
+    record = logging.LogRecord("test", logging.INFO, "", 0, "request", (), None)
+    record.context = {"cookie": "session", "path": "/health/live"}
+
+    payload = json.loads(JsonFormatter().format(record))
+
+    assert payload["context"]["cookie"] == "[REDACTED]"
+    assert payload["context"]["path"] == "/health/live"
+

@@ -1,0 +1,7 @@
+.git
+.superpowers
+app
+docs
+server/.venv
+server/**/__pycache__
+server/**/*.pyc
