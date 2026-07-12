@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKeyConstraint, Index, Integer, LargeBinary, String, Text, UniqueConstraint, Uuid, text
+from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, ForeignKeyConstraint, Index, Integer, LargeBinary, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from server.app.identity.models import Base
@@ -54,7 +54,7 @@ class Resume(Record, Base):
     file_object_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     version_number: Mapped[int] = mapped_column(Integer)
     parsed_text: Mapped[str | None] = mapped_column(Text)
-    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "candidate_id", "version_number"), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "file_object_id"], ["file_objects.organization_id", "file_objects.id"]))
+    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "candidate_id", "version_number"), UniqueConstraint("organization_id", "id", "candidate_id"), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "file_object_id"], ["file_objects.organization_id", "file_objects.id"]))
 
 
 class VersionRecord(Record):
@@ -90,7 +90,7 @@ class Application(Record, Base):
     human_conclusion: Mapped[str | None] = mapped_column(Text)
     version: Mapped[int] = mapped_column(Integer, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
-    __table_args__ = (UniqueConstraint("organization_id", "id"), Index("uq_applications_active", "organization_id", "candidate_id", "job_id", unique=True, postgresql_where=text("stage not in ('hired','rejected','withdrawn')"), sqlite_where=text("stage not in ('hired','rejected','withdrawn')")), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "job_id"], ["jobs.organization_id", "jobs.id"]), ForeignKeyConstraint(["organization_id", "resume_id"], ["resumes.organization_id", "resumes.id"]), ForeignKeyConstraint(["organization_id", "source_application_id"], ["applications.organization_id", "applications.id"]), ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]))
+    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "id", "candidate_id", "job_id"), CheckConstraint("stage in ('new','review','contact','interview_pending','interviewing','decision','passed','hired','rejected','withdrawn')", name="ck_applications_stage"), Index("uq_applications_active", "organization_id", "candidate_id", "job_id", unique=True, postgresql_where=text("stage not in ('hired','rejected','withdrawn')"), sqlite_where=text("stage not in ('hired','rejected','withdrawn')")), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "job_id"], ["jobs.organization_id", "jobs.id"]), ForeignKeyConstraint(["organization_id", "resume_id", "candidate_id"], ["resumes.organization_id", "resumes.id", "resumes.candidate_id"]), ForeignKeyConstraint(["organization_id", "source_application_id", "candidate_id", "job_id"], ["applications.organization_id", "applications.id", "applications.candidate_id", "applications.job_id"]), ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]))
 
 
 class EventRecord(Record):

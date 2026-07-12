@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 from uuid import uuid4
@@ -13,6 +13,8 @@ from server.app.identity.models import Organization, User, UserStatus
 from server.app.identity.security import PasswordService
 from server.app.identity.service import AuthenticationFailed, Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
+from server.app.recruiting.models import CandidateEvent
+from server.app.recruiting.service import (IdempotencyConflict, ResourceVersionConflict, TicketInvalid, consume_download_ticket_record, issue_download_ticket_record, persisted_idempotent, transition_application_record, transition_job_record)
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
@@ -28,13 +30,35 @@ def pg_store():
     subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "downgrade", "base"], check=True, env=env)
 
 
-def seed_pg_user(store):
+def seed_pg_user(store, slug="concurrent"):
     with store.sync_session() as db:
-        organization = Organization(slug="concurrent", name="Concurrent", status="active")
+        organization = Organization(slug=slug, name="Concurrent", status="active")
         user = User(organization=organization, email="user@example.test", normalized_email="user@example.test", display_name="User", password_hash=PasswordService().hash("correct"), status=UserStatus.ACTIVE)
         db.add(user)
         db.commit()
         return user.id, organization.id
+
+
+def seed_recruiting_graph(store, slug="concurrent"):
+    user_id, organization_id = seed_pg_user(store, slug)
+    ids = {name: uuid4() for name in ("candidate", "job", "file", "resume", "application")}
+    with store.engine.begin() as connection:
+        connection.execute(text("insert into candidates(id,organization_id,display_name,owner_id) values (:candidate,:org,'Candidate',:user)"), {**ids, "org": organization_id, "user": user_id})
+        connection.execute(text("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:job,:org,'Role',:user,'draft',now(),now())"), {**ids, "org": organization_id, "user": user_id})
+        connection.execute(text("insert into file_objects(id,organization_id,storage_key,original_filename,mime_type,size_bytes,sha256,uploaded_by) values (:file,:org,:key,'resume.pdf','application/pdf',1,:sha,:user)"), {**ids, "org": organization_id, "user": user_id, "key": str(ids["file"]), "sha": "1" * 64})
+        connection.execute(text("insert into resumes(id,organization_id,candidate_id,file_object_id,version_number) values (:resume,:org,:candidate,:file,1)"), {**ids, "org": organization_id})
+        connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage) values (:application,:org,:candidate,:job,:resume,:user,'new')"), {**ids, "org": organization_id, "user": user_id})
+    return organization_id, user_id, ids
+
+
+class FixedRecruitingClock:
+    def __init__(self): self.now = datetime(2026, 7, 12, tzinfo=timezone.utc)
+    def current_time(self): return self.now
+
+
+class FixedToken:
+    def __init__(self, value): self.value = value
+    def new_token(self): return self.value
 
 
 def test_five_concurrent_failures_reliably_lock_account(pg_store) -> None:
@@ -158,3 +182,139 @@ def test_recruiting_immutable_rows_reject_update_and_delete(pg_store) -> None:
         with pytest.raises(OperationalError):
             with pg_store.engine.begin() as connection:
                 connection.execute(text(statement), {"id": version_id})
+
+
+def test_concurrent_stale_application_and_job_writers_only_emit_one_success(pg_store) -> None:
+    organization_id, user_id, ids = seed_recruiting_graph(pg_store)
+
+    def race(kind):
+        barrier = Barrier(2, timeout=10)
+        def worker(_):
+            with pg_store.sync_session() as db:
+                barrier.wait()
+                try:
+                    if kind == "application":
+                        transition_application_record(db, ids["application"], "review", expected_version=1, actor_user_id=user_id, trace_id="race")
+                    else:
+                        transition_job_record(db, ids["job"], "open", expected_version=1, actor_user_id=user_id, trace_id="race")
+                    db.commit()
+                    return "success"
+                except ResourceVersionConflict:
+                    db.rollback()
+                    return "conflict"
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            assert sorted(executor.map(worker, range(2))) == ["conflict", "success"]
+
+    race("application")
+    race("job")
+    with pg_store.engine.begin() as connection:
+        assert connection.execute(text("select version from applications where id=:id"), {"id": ids["application"]}).scalar_one() == 2
+        assert connection.execute(text("select count(*) from application_stage_events where application_id=:id"), {"id": ids["application"]}).scalar_one() == 1
+        assert connection.execute(text("select count(*) from audit_logs where trace_id='race'" )).scalar_one() == 2
+
+
+def test_concurrent_first_use_idempotency_serializes_winner_replay_and_conflict(pg_store) -> None:
+    organization_id, user_id, ids = seed_recruiting_graph(pg_store)
+
+    def run_pair(key, bodies):
+        barrier = Barrier(2, timeout=10)
+        def worker(body):
+            with pg_store.sync_session() as db:
+                barrier.wait()
+                try:
+                    def action():
+                        db.add(CandidateEvent(organization_id=organization_id, candidate_id=ids["candidate"], actor_user_id=user_id, event_type="idempotent.side_effect", payload={"body": body}))
+                        return 201, {"winner": body}
+                    result = persisted_idempotent(db, organization_id, user_id, "test", key, {"body": body}, action)
+                    db.commit()
+                    return "success", result
+                except IdempotencyConflict:
+                    db.rollback()
+                    return "conflict", None
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            return list(executor.map(worker, bodies))
+
+    same = run_pair("same", ["one", "one"])
+    assert [status for status, _ in same] == ["success", "success"]
+    assert same[0][1] == same[1][1]
+    different = run_pair("different", ["one", "two"])
+    assert sorted(status for status, _ in different) == ["conflict", "success"]
+    with pg_store.engine.begin() as connection:
+        assert connection.execute(text("select count(*) from candidate_events where event_type='idempotent.side_effect'" )).scalar_one() == 2
+        assert connection.execute(text("select count(*) from idempotency_records" )).scalar_one() == 2
+
+
+def test_persisted_download_ticket_binding_expiry_and_concurrent_single_use(pg_store) -> None:
+    organization_id, user_id, ids = seed_recruiting_graph(pg_store)
+    clock = FixedRecruitingClock()
+    with pg_store.sync_session() as db:
+        raw = issue_download_ticket_record(db, organization_id, user_id, ids["resume"], clock, FixedToken("race-ticket"))
+        expired = issue_download_ticket_record(db, organization_id, user_id, ids["resume"], clock, FixedToken("expired-ticket"))
+        db.commit()
+    for binding in ((uuid4(), user_id, ids["resume"]), (organization_id, uuid4(), ids["resume"]), (organization_id, user_id, uuid4())):
+        with pg_store.sync_session() as db, pytest.raises(TicketInvalid):
+            consume_download_ticket_record(db, raw, *binding, clock)
+    clock.now += timedelta(seconds=61)
+    with pg_store.sync_session() as db, pytest.raises(TicketInvalid):
+        consume_download_ticket_record(db, expired, organization_id, user_id, ids["resume"], clock)
+    clock.now -= timedelta(seconds=61)
+    barrier = Barrier(2, timeout=10)
+    def consume(_):
+        with pg_store.sync_session() as db:
+            barrier.wait()
+            try:
+                consume_download_ticket_record(db, raw, organization_id, user_id, ids["resume"], clock)
+                db.commit()
+                return "success"
+            except TicketInvalid:
+                db.rollback()
+                return "invalid"
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assert sorted(executor.map(consume, range(2))) == ["invalid", "success"]
+
+
+def test_application_relationships_cross_tenant_and_all_immutable_tables_are_enforced(pg_store) -> None:
+    org1, user1, ids1 = seed_recruiting_graph(pg_store)
+    org2, user2, ids2 = seed_recruiting_graph(pg_store, "concurrent-two")
+    same_org_candidate, same_org_file, same_org_resume = uuid4(), uuid4(), uuid4()
+    with pg_store.engine.begin() as connection:
+        connection.execute(text("insert into candidates(id,organization_id,display_name,owner_id) values (:id,:org,'Second',:user)"), {"id": same_org_candidate, "org": org1, "user": user1})
+        connection.execute(text("insert into file_objects(id,organization_id,storage_key,original_filename,mime_type,size_bytes,sha256,uploaded_by) values (:id,:org,:key,'second.pdf','application/pdf',1,:sha,:user)"), {"id": same_org_file, "org": org1, "key": str(same_org_file), "sha": "3" * 64, "user": user1})
+        connection.execute(text("insert into resumes(id,organization_id,candidate_id,file_object_id,version_number) values (:id,:org,:candidate,:file,1)"), {"id": same_org_resume, "org": org1, "candidate": same_org_candidate, "file": same_org_file})
+    invalid = [
+        ("insert into candidates(id,organization_id,display_name,owner_id) values (:id,:org,'bad',:owner)", {"id": uuid4(), "org": org1, "owner": user2}),
+        ("insert into resumes(id,organization_id,candidate_id,file_object_id,version_number) values (:id,:org,:candidate,:file,2)", {"id": uuid4(), "org": org1, "candidate": ids1["candidate"], "file": ids2["file"]}),
+        ("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage) values (:id,:org,:candidate,:job,:resume,:user,'new')", {"id": uuid4(), "org": org1, "candidate": ids1["candidate"], "job": ids1["job"], "resume": ids2["resume"], "user": user1}),
+        ("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage) values (:id,:org,:candidate,:job,:resume,:user,'rejected')", {"id": uuid4(), "org": org1, "candidate": same_org_candidate, "job": ids1["job"], "resume": ids1["resume"], "user": user1}),
+        ("insert into candidate_events(id,organization_id,candidate_id,actor_user_id,event_type,payload) values (:id,:org,:candidate,:actor,'bad','{}')", {"id": uuid4(), "org": org1, "candidate": ids2["candidate"], "actor": user1}),
+        ("insert into candidate_notes(id,organization_id,candidate_id,actor_user_id,event_type,payload) values (:id,:org,:candidate,:actor,'bad','{}')", {"id": uuid4(), "org": org1, "candidate": ids2["candidate"], "actor": user1}),
+        ("insert into application_stage_events(id,organization_id,application_id,actor_user_id,event_type,payload) values (:id,:org,:application,:actor,'bad','{}')", {"id": uuid4(), "org": org1, "application": ids2["application"], "actor": user1}),
+        ("insert into download_tickets(id,organization_id,token_hash,user_id,resume_id,expires_at) values (:id,:org,:hash,:user,:resume,now())", {"id": uuid4(), "org": org1, "hash": "2" * 64, "user": user1, "resume": ids2["resume"]}),
+    ]
+    for statement, params in invalid:
+        with pytest.raises(IntegrityError):
+            with pg_store.engine.begin() as connection: connection.execute(text(statement), params)
+    with pytest.raises(IntegrityError):
+        with pg_store.engine.begin() as connection:
+            connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage,source_application_id) values (:id,:org,:candidate,:job,:resume,:user,'rejected',:source)"), {"id": uuid4(), "org": org1, "candidate": ids1["candidate"], "job": ids1["job"], "resume": ids1["resume"], "user": user1, "source": ids1["application"]})
+    with pg_store.engine.begin() as connection:
+        connection.execute(text("update applications set stage='rejected' where id=:id"), {"id": ids1["application"]})
+    with pytest.raises(IntegrityError):
+        with pg_store.engine.begin() as connection:
+            connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage,source_application_id) values (:id,:org,:candidate,:job,:resume,:user,'rejected',:source)"), {"id": uuid4(), "org": org1, "candidate": same_org_candidate, "job": ids1["job"], "resume": same_org_resume, "user": user1, "source": ids1["application"]})
+    with pytest.raises(IntegrityError):
+        with pg_store.engine.begin() as connection:
+            connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage,source_application_id) values (:id,:org,:candidate,:job,:resume,:user,'new',:source)"), {"id": uuid4(), "org": org1, "candidate": ids2["candidate"], "job": ids1["job"], "resume": ids1["resume"], "user": user1, "source": ids1["application"]})
+    with pg_store.engine.begin() as connection:
+        immutable_ids = {name: uuid4() for name in ("job_jd_versions", "screening_rule_versions", "application_stage_events", "candidate_notes", "candidate_events")}
+        for table in ("job_jd_versions", "screening_rule_versions"):
+            connection.execute(text(f"insert into {table}(id,organization_id,job_id,version_number,content,created_by) values (:id,:org,:job,1,'{{}}',:user)"), {"id": immutable_ids[table], "org": org1, "job": ids1["job"], "user": user1})
+        connection.execute(text("insert into application_stage_events(id,organization_id,application_id,actor_user_id,event_type,payload) values (:id,:org,:app,:user,'test','{}')"), {"id": immutable_ids["application_stage_events"], "org": org1, "app": ids1["application"], "user": user1})
+        for table in ("candidate_notes", "candidate_events"):
+            connection.execute(text(f"insert into {table}(id,organization_id,candidate_id,actor_user_id,event_type,payload) values (:id,:org,:candidate,:user,'test','{{}}')"), {"id": immutable_ids[table], "org": org1, "candidate": ids1["candidate"], "user": user1})
+        immutable_ids["resumes"] = ids1["resume"]
+    for table, row_id in immutable_ids.items():
+        for statement in (f"update {table} set created_at=created_at where id=:id", f"delete from {table} where id=:id"):
+            with pytest.raises(OperationalError):
+                with pg_store.engine.begin() as connection:
+                    connection.execute(text(statement), {"id": row_id})

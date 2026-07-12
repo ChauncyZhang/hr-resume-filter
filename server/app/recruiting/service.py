@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 
 class InvalidStateTransition(Exception): pass
@@ -13,6 +13,7 @@ class ResourceVersionConflict(Exception): pass
 class IdempotencyConflict(Exception): pass
 class ActiveApplicationExists(Exception): pass
 class TicketInvalid(Exception): pass
+class InvalidAggregateRelationship(Exception): pass
 
 
 class SystemClock:
@@ -95,7 +96,7 @@ class RecruitingService:
         return stored
 
 
-def transition_application(db, application, target, *, actor_user_id, trace_id, reason_code=None, reason_text=None):
+def _apply_application_transition(db, application, target, *, actor_user_id, trace_id, reason_code=None, reason_text=None):
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import ApplicationStageEvent
 
@@ -113,10 +114,38 @@ def transition_application(db, application, target, *, actor_user_id, trace_id, 
     return application
 
 
-def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):
+def transition_application_record(db, application_id, target, *, expected_version, actor_user_id, trace_id, reason_code=None, reason_text=None):
     from server.app.recruiting.models import Application
 
-    related = list(db.scalars(select(Application).where(Application.organization_id == organization_id, Application.candidate_id == candidate_id, Application.job_id == job_id).order_by(Application.created_at.desc())))
+    application = db.scalar(select(Application).where(Application.id == application_id).with_for_update())
+    if application is None or application.version != expected_version:
+        raise ResourceVersionConflict
+    return _apply_application_transition(db, application, target, actor_user_id=actor_user_id, trace_id=trace_id, reason_code=reason_code, reason_text=reason_text)
+
+
+def transition_job_record(db, job_id, target, *, expected_version, actor_user_id, trace_id):
+    from server.app.identity.models import AuditLog, Job
+
+    job = db.scalar(select(Job).where(Job.id == job_id).with_for_update())
+    if job is None or job.version != expected_version:
+        raise ResourceVersionConflict
+    source = job.status
+    RecruitingService().transition_job_state(source, target)
+    job.status = target
+    job.version += 1
+    job.updated_at = datetime.now(timezone.utc)
+    db.add(AuditLog(organization_id=job.organization_id, actor_user_id=actor_user_id, event_type="job.stage_changed", outcome="success", trace_id=trace_id, metadata_json={"from_stage": source, "to_stage": target}))
+    db.flush()
+    return job
+
+
+def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):
+    from server.app.recruiting.models import Application, Resume
+
+    resume = db.scalar(select(Resume).where(Resume.organization_id == organization_id, Resume.id == resume_id))
+    if resume is None or resume.candidate_id != candidate_id:
+        raise InvalidAggregateRelationship
+    related = list(db.scalars(select(Application).where(Application.organization_id == organization_id, Application.candidate_id == candidate_id, Application.job_id == job_id).order_by(Application.created_at.desc(), Application.id.desc())))
     if any(item.stage not in RecruitingService.TERMINAL for item in related):
         raise ActiveApplicationExists
     application = Application(organization_id=organization_id, candidate_id=candidate_id, job_id=job_id, resume_id=resume_id, owner_id=owner_id, source=source, stage="new", source_application_id=related[0].id if related else None)
@@ -149,6 +178,9 @@ def persisted_idempotent(db, organization_id, user_id, operation, key, body, act
     from server.app.recruiting.models import IdempotencyRecord
 
     request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    if db.get_bind().dialect.name == "postgresql":
+        lock_key = f"{organization_id}:{user_id}:{operation}:{key}"
+        db.execute(text("select pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key})
     record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.organization_id == organization_id, IdempotencyRecord.user_id == user_id, IdempotencyRecord.operation == operation, IdempotencyRecord.idempotency_key == key).with_for_update())
     if record:
         if record.request_hash != request_hash:

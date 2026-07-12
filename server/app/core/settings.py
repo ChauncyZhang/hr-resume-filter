@@ -1,9 +1,11 @@
 import json
 import os
+import base64
+import re
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 
 PLACEHOLDERS = {
@@ -27,8 +29,8 @@ class Settings(BaseModel):
     object_storage_access_key: str = "change-me"
     object_storage_secret_key: str = "change-me"
     object_storage_bucket: str = "resumes"
-    contact_encryption_key: str = "change-me"
-    contact_lookup_secret: str = "change-me"
+    contact_encryption_key: SecretStr = SecretStr("change-me")
+    contact_lookup_secret: SecretStr = SecretStr("change-me")
     object_storage_secure: bool = False
     object_storage_connect_timeout_seconds: float = Field(default=1, gt=0)
     object_storage_read_timeout_seconds: float = Field(default=3, gt=0)
@@ -44,8 +46,8 @@ class Settings(BaseModel):
         credentials = (
             self.object_storage_access_key.strip().lower(),
             self.object_storage_secret_key.strip().lower(),
-            self.contact_encryption_key.strip().lower(),
-            self.contact_lookup_secret.strip().lower(),
+            self.contact_encryption_key.get_secret_value().strip().lower(),
+            self.contact_lookup_secret.get_secret_value().strip().lower(),
         )
         database_url = urlsplit(self.database_url)
         if not database_url.scheme or not database_url.hostname:
@@ -60,6 +62,19 @@ class Settings(BaseModel):
             raise ValueError("production credentials must not use placeholders")
         if not all(credentials):
             raise ValueError("production credentials are required")
+        contact_values = [self.contact_encryption_key.get_secret_value(), self.contact_lookup_secret.get_secret_value()]
+        if any(re.fullmatch(r"[A-Za-z0-9_-]{43}=", value) is None for value in contact_values):
+            raise ValueError("contact keys must use padded base64url")
+        try:
+            decoded = [base64.b64decode(value, altchars=b"-_", validate=True) for value in contact_values]
+        except (ValueError, base64.binascii.Error):
+            raise ValueError("contact keys must be base64url") from None
+        if any(len(value) != 32 for value in decoded):
+            raise ValueError("contact keys must decode to 32 bytes")
+        if any(len(set(value)) < 16 for value in decoded):
+            raise ValueError("contact keys must be high entropy")
+        if decoded[0] == decoded[1]:
+            raise ValueError("contact keys must be independent")
         if "*" in self.cors_origins:
             raise ValueError("wildcard CORS is forbidden in production")
         if any(not origin.startswith("https://") for origin in self.cors_origins):

@@ -4,6 +4,7 @@ import hmac
 from dataclasses import dataclass
 
 from cryptography.fernet import Fernet
+from email_validator import EmailNotValidError, validate_email
 
 
 @dataclass(frozen=True, repr=False)
@@ -18,16 +19,31 @@ class ProtectedContact:
 
 class ContactCipher:
     def __init__(self, encryption_key: bytes, lookup_secret: bytes) -> None:
-        key = base64.urlsafe_b64encode(hashlib.sha256(encryption_key).digest())
-        self._cipher = Fernet(key)
+        try:
+            encryption_material = base64.urlsafe_b64decode(encryption_key)
+        except (ValueError, base64.binascii.Error):
+            raise ValueError("invalid encryption key") from None
+        if len(lookup_secret) != 32 or hmac.compare_digest(encryption_material, lookup_secret):
+            raise ValueError("lookup key must be an independent 32-byte key")
+        self._cipher = Fernet(encryption_key)
         self._lookup_secret = lookup_secret
 
     @staticmethod
     def normalize(kind: str, value: str) -> str:
+        kind = kind.strip().casefold()
         value = value.strip()
-        if kind.strip().casefold() == "email":
-            return value.casefold()
-        return "".join(character for character in value if character.isdigit() or character == "+")
+        if kind not in {"email", "phone"}:
+            raise ValueError("unsupported contact kind")
+        if kind == "email":
+            try:
+                return validate_email(value, check_deliverability=False).normalized.casefold()
+            except EmailNotValidError:
+                raise ValueError("invalid email") from None
+        normalized = ("+" if value.startswith("+") else "") + "".join(character for character in value if character.isdigit())
+        digits = normalized.lstrip("+")
+        if not 7 <= len(digits) <= 15:
+            raise ValueError("invalid phone length")
+        return normalized
 
     @staticmethod
     def mask(kind: str, value: str) -> str:

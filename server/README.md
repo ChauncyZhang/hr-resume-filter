@@ -55,7 +55,12 @@ access and secret keys, and explicit HTTPS CORS origins. Startup rejects placeho
 wildcard CORS. Buckets are private and must be provisioned separately; the application never
 enables anonymous/public access. Rotate secrets through the deployment environment, not Git.
 
-Candidate contacts require separate `CONTACT_ENCRYPTION_KEY` and `CONTACT_LOOKUP_SECRET`
-values. Rotation is an offline maintenance boundary: stop writes, decrypt and re-encrypt all
+Candidate contacts require separate high-entropy 32-byte base64url
+`CONTACT_ENCRYPTION_KEY` and `CONTACT_LOOKUP_SECRET` values. Generate them independently;
+the encryption value is a Fernet key and neither value is committed. Rotation is an offline
+maintenance boundary: stop writes, decrypt and re-encrypt all
 contacts, recompute lookup hashes, reconcile row counts and duplicate constraints, then deploy
 both new values atomically. Online dual-key rotation is outside Phase 2.
+
+Candidate notes are append-only MVP facts, matching JD, rule, resume, stage-event, and
+candidate-event history. Corrections create a new note/event instead of editing prior text.

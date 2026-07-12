@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+from pydantic import SecretStr
 
 from server.app.core.settings import Settings
 
@@ -12,8 +13,8 @@ def production_settings(**overrides: object) -> Settings:
         "object_storage_access_key": "real-access-key",
         "object_storage_secret_key": "real-secret-key",
         "object_storage_bucket": "resumes",
-        "contact_encryption_key": "32-bytes-or-more-encryption-material",
-        "contact_lookup_secret": "independent-lookup-secret-material",
+        "contact_encryption_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+        "contact_lookup_secret": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
         "cors_origins": ["https://hr.example.com"],
     }
     values.update(overrides)
@@ -94,8 +95,18 @@ def test_production_rejects_placeholder_contact_secrets(field: str, value: str) 
 
 
 def test_production_accepts_deployment_supplied_contact_secrets() -> None:
-    settings = production_settings(
-        contact_encryption_key="32-bytes-or-more-encryption-material",
-        contact_lookup_secret="independent-lookup-secret-material",
-    )
-    assert settings.contact_encryption_key.startswith("32-bytes")
+    settings = production_settings()
+    assert isinstance(settings.contact_encryption_key, SecretStr)
+    assert "AAECAw" not in repr(settings)
+
+
+@pytest.mark.parametrize("value", ["short", "not base64!", "+" * 43 + "=", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "Y2hhbmdlLW1l", "MDEyMzQ1Njc4OWFiY2RlZg=="])
+def test_production_rejects_malformed_or_short_contact_keys(value: str) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(contact_encryption_key=value)
+
+
+def test_production_rejects_equal_contact_keys() -> None:
+    key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    with pytest.raises(ValidationError):
+        production_settings(contact_encryption_key=key, contact_lookup_secret=key)

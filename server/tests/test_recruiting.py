@@ -7,16 +7,18 @@ from sqlalchemy.orm import Session
 
 from server.app.identity.models import AuditLog, Base
 from server.app.recruiting.cursor import CursorCodec, InvalidCursor
-from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate
+from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, Resume
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.service import (
     ActiveApplicationExists,
     IdempotencyConflict,
     InvalidStateTransition,
+    InvalidAggregateRelationship,
     RecruitingService,
     ResourceVersionConflict,
     TicketInvalid,
-    transition_application,
+    transition_application_record,
+    transition_job_record,
     consume_download_ticket_record,
     create_application_record,
     issue_download_ticket_record,
@@ -79,7 +81,7 @@ def test_application_state_machine_terminal_rules_and_rejection_reason():
 
 
 def test_contact_encryption_normalization_masking_and_duplicate_hash():
-    cipher = ContactCipher(b"0123456789abcdef0123456789abcdef", b"lookup-secret-not-placeholder")
+    cipher = ContactCipher(b"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", b"fedcba9876543210fedcba9876543210")
     first = cipher.protect(" Email ", " Alice.Example@Example.COM ")
     second = cipher.protect("email", "alice.example@example.com")
     assert first.ciphertext != b"Alice.Example@Example.COM"
@@ -88,6 +90,21 @@ def test_contact_encryption_normalization_masking_and_duplicate_hash():
     assert first.masked_value == "a***@example.com"
     rendered = repr(first)
     assert "Alice.Example" not in rendered and "alice.example" not in rendered
+
+
+@pytest.mark.parametrize(("kind", "value"), [("fax", "1234567890"), ("email", "missing-at"), ("phone", "---"), ("phone", "12345"), ("phone", "+" + "1" * 20)])
+def test_contact_validation_rejects_unsupported_or_malformed_values(kind: str, value: str):
+    cipher = ContactCipher(b"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", b"fedcba9876543210fedcba9876543210")
+    with pytest.raises(ValueError):
+        cipher.protect(kind, value)
+
+
+def test_contact_cipher_rejects_short_or_reused_lookup_key():
+    encryption = b"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    with pytest.raises(ValueError):
+        ContactCipher(encryption, b"short")
+    with pytest.raises(ValueError):
+        ContactCipher(encryption, b"0123456789abcdef0123456789abcdef")
 
 
 def test_optimistic_concurrency_and_idempotency_contracts():
@@ -130,6 +147,7 @@ def test_candidate_schema_has_no_job_or_stage_and_all_recruiting_tables_are_mapp
     assert {"job_id", "stage"}.isdisjoint(Candidate.__table__.columns.keys())
     required = {"job_jd_versions", "screening_rule_versions", "candidates", "candidate_contacts", "file_objects", "resumes", "applications", "application_stage_events", "candidate_notes", "candidate_events", "download_tickets", "idempotency_records"}
     assert required <= set(Base.metadata.tables)
+    assert any("stage in" in str(constraint.sqltext) for constraint in Application.__table__.constraints if hasattr(constraint, "sqltext"))
 
 
 def test_cursor_is_opaque_tenant_and_sort_bound_and_rejects_tampering():
@@ -149,7 +167,7 @@ def test_persisted_transition_increments_version_and_writes_timeline_and_audit_a
         application = Application(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="new", source="manual")
         db.add(application)
         db.flush()
-        transition_application(db, application, "review", actor_user_id=application.owner_id, trace_id="trace")
+        transition_application_record(db, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
         db.commit()
         assert application.stage == "review" and application.version == 2
         assert db.query(ApplicationStageEvent).count() == 1
@@ -170,7 +188,7 @@ def test_transition_rolls_back_aggregate_and_timeline_when_audit_insert_fails():
         event.listen(AuditLog, "before_insert", reject_audit)
         try:
             with pytest.raises(RuntimeError, match="injected audit failure"):
-                transition_application(db, application, "review", actor_user_id=application.owner_id, trace_id="trace")
+                transition_application_record(db, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
             db.rollback()
         finally:
             event.remove(AuditLog, "before_insert", reject_audit)
@@ -178,11 +196,31 @@ def test_transition_rolls_back_aggregate_and_timeline_when_audit_insert_fails():
         assert db.query(ApplicationStageEvent).count() == 0
 
 
+def test_persisted_transitions_require_expected_version_and_increment_once():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    from server.app.identity.models import Job
+    with Session(engine) as db:
+        application = Application(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="new", source="manual")
+        job = Job(organization_id=UUID(int=1), title="Role", owner_id=UUID(int=5), status="draft")
+        db.add_all([application, job])
+        db.flush()
+        transition_application_record(db, application.id, "review", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
+        transition_job_record(db, job.id, "open", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
+        with pytest.raises(ResourceVersionConflict):
+            transition_application_record(db, application.id, "contact", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
+        with pytest.raises(ResourceVersionConflict):
+            transition_job_record(db, job.id, "paused", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
+        assert application.version == job.version == 2
+
+
 def test_persisted_application_duplicate_and_linked_reapplication():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         args = dict(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5))
+        db.add(Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1))
+        db.flush()
         first = create_application_record(db, **args)
         db.commit()
         with pytest.raises(ActiveApplicationExists):
@@ -191,6 +229,28 @@ def test_persisted_application_duplicate_and_linked_reapplication():
         db.commit()
         later = create_application_record(db, **args)
         assert later.source_application_id == first.id
+
+
+def test_reapplication_selects_latest_terminal_source_deterministically_by_created_at_and_id():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        args = dict(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="rejected", source="manual", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        db.add(Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1))
+        db.add_all([Application(id=UUID(int=10), **args), Application(id=UUID(int=11), **args)])
+        db.commit()
+        later = create_application_record(db, **{key: args[key] for key in ("organization_id", "candidate_id", "job_id", "resume_id", "owner_id")})
+        assert later.source_application_id == UUID(int=11)
+
+
+def test_application_service_rejects_resume_from_another_candidate():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=99), file_object_id=UUID(int=8), version_number=1))
+        db.commit()
+        with pytest.raises(InvalidAggregateRelationship):
+            create_application_record(db, organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5))
 
 
 def test_persisted_ticket_never_stores_raw_value_and_is_bound_single_use():
