@@ -6,13 +6,14 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from server.app.core.settings import Settings
+from server.app.identity.models import Base
 
 
 config = context.config
 if config.config_file_name:
     fileConfig(config.config_file_name)
 config.set_main_option("sqlalchemy.url", Settings.from_environment().database_url)
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:

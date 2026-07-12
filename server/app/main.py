@@ -12,6 +12,9 @@ from fastapi.responses import JSONResponse
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
+from server.app.identity.api import router as identity_router
+from server.app.identity.service import Clock, IdentityService, TokenSource
+from server.app.identity.store import IdentityStore
 
 
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -27,6 +30,9 @@ def create_app(
     *,
     database_probe: ReadinessProbe | None = None,
     storage_probe: ReadinessProbe | None = None,
+    clock: Clock | None = None,
+    token_source: TokenSource | None = None,
+    initialize_identity_schema: bool = False,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
 
@@ -51,9 +57,17 @@ def create_app(
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         configure_logging()
+        if initialize_identity_schema:
+            app.state.identity_store.create_schema()
         yield
 
     app = FastAPI(title="UX-09 Recruiting API", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.identity_store = IdentityStore(settings.database_url)
+    app.state.identity_service = IdentityService(
+        app.state.identity_store, clock or Clock(), token_source or TokenSource()
+    )
+    app.include_router(identity_router)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
