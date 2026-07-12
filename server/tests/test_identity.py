@@ -315,6 +315,51 @@ def test_authenticated_wrong_csrf_creates_redacted_audit(identity_app) -> None:
         assert audit.metadata_json.keys() == {"network_id"}
 
 
+@pytest.mark.parametrize(
+    ("invalid_kind", "expected_reason"),
+    [
+        ("stale_authorization", "authorization_version_stale"),
+        ("disabled_user", "user_disabled"),
+        ("expired", "idle_expired"),
+    ],
+)
+def test_state_changing_request_revokes_known_invalid_session_once(identity_app, invalid_kind, expected_reason) -> None:
+    app, client, clock = identity_app
+    user_id = seed_user(app)
+    login(client)
+    with app.state.identity_store.sync_session() as session:
+        if invalid_kind == "stale_authorization":
+            session.get(User, user_id).authorization_version += 1
+        elif invalid_kind == "disabled_user":
+            session.get(User, user_id).status = UserStatus.DISABLED
+        session.commit()
+    if invalid_kind == "expired":
+        clock.advance(minutes=31)
+
+    headers = {"Origin": "https://hr.example.test", "X-CSRF-Token": "wrong"}
+    assert client.post("/api/v1/unknown-write", headers=headers).status_code == 403
+    assert client.post("/api/v1/unknown-write", headers=headers).status_code == 403
+
+    with app.state.identity_store.sync_session() as session:
+        stored = session.query(app.state.identity_store.SessionModel).one()
+        assert stored.revoked_at is not None
+        assert stored.revocation_reason == expected_reason
+        events = session.query(app.state.identity_store.AuditModel).filter_by(event_type="session.invalidated").all()
+        assert len(events) == 1
+        assert events[0].actor_user_id == user_id
+        assert events[0].metadata_json.keys() == {"network_id"}
+
+
+def test_state_changing_request_with_unknown_token_creates_no_rows(identity_app) -> None:
+    app, client, _ = identity_app
+    client.cookies.set("hr_session", "random-unknown-token")
+    headers = {"Origin": "https://hr.example.test", "X-CSRF-Token": "wrong"}
+    assert client.post("/api/v1/unknown-write", headers=headers).status_code == 403
+    with app.state.identity_store.sync_session() as session:
+        assert session.query(app.state.identity_store.SessionModel).count() == 0
+        assert session.query(app.state.identity_store.AuditModel).count() == 0
+
+
 def test_audit_events_do_not_contain_credentials_tokens_or_full_ip(identity_app) -> None:
     app, client, _ = identity_app
     seed_user(app)

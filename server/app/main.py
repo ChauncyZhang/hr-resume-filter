@@ -94,7 +94,7 @@ def create_app(
             if response is None and request.url.path != "/api/v1/auth/login":
                 token = session_token(request)
                 csrf = request.headers.get("x-csrf-token")
-                if not token or not csrf or not service.validate_csrf(token, csrf):
+                if not token or not csrf or not service.validate_csrf(token, csrf, trace_id=trace_id, network=network):
                     event = "authentication.logout" if request.url.path == "/api/v1/auth/logout" else "csrf.denied"
                     audited = service.audit_denial(event, token=token, trace_id=trace_id, network=network)
                     if not audited:

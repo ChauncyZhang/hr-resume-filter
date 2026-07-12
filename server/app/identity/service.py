@@ -112,29 +112,53 @@ class IdentityService:
     def _aware(value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
-    def _load_session(self, db, token: str) -> UserSession:
-        record = db.scalar(select(UserSession).options(selectinload(UserSession.user).selectinload(User.roles), selectinload(UserSession.user).selectinload(User.organization)).where(UserSession.token_hash == hash_token(token)))
-        now = self.clock.current_time()
-        invalid = not record or record.revoked_at is not None
-        if record and not invalid:
-            invalid = (
-                self._aware(record.idle_expires_at) <= now
-                or self._aware(record.absolute_expires_at) <= now
-                or record.user.status != UserStatus.ACTIVE
-                or record.authorization_version != record.user.authorization_version
+    def _resolve_session(self, db, token: str, *, trace_id: str | None = None, network: str | None = None) -> UserSession:
+        record = db.scalar(
+            select(UserSession)
+            .options(
+                selectinload(UserSession.user).selectinload(User.roles),
+                selectinload(UserSession.user).selectinload(User.organization),
             )
-        if invalid:
-            if record and record.revoked_at is None:
-                record.revoked_at = now
-                record.revocation_reason = "invalidated"
-                self._audit(db, "session.invalidated", "revoked", organization_id=record.organization_id, user_id=record.user_id)
-                db.commit()
+            .where(UserSession.token_hash == hash_token(token))
+            .with_for_update(of=UserSession)
+        )
+        if record is None:
             raise InvalidSession
-        return record
+        if record.revoked_at is not None:
+            raise InvalidSession
+        reason = self._session_invalid_reason(record)
+        if reason is None:
+            return record
+        now = self.clock.current_time()
+        record.revoked_at = now
+        record.revocation_reason = reason
+        self._audit(
+            db,
+            "session.invalidated",
+            "revoked",
+            organization_id=record.organization_id,
+            user_id=record.user_id,
+            trace_id=trace_id,
+            network=network,
+        )
+        db.commit()
+        raise InvalidSession
+
+    def _session_invalid_reason(self, record: UserSession) -> str | None:
+        now = self.clock.current_time()
+        if self._aware(record.absolute_expires_at) <= now:
+            return "absolute_expired"
+        if self._aware(record.idle_expires_at) <= now:
+            return "idle_expired"
+        if record.user.status != UserStatus.ACTIVE:
+            return "user_disabled"
+        if record.authorization_version != record.user.authorization_version:
+            return "authorization_version_stale"
+        return None
 
     def me(self, token: str):
         with self.store.sync_session() as db:
-            record = self._load_session(db, token)
+            record = self._resolve_session(db, token)
             now = self.clock.current_time()
             csrf = self.tokens.new_token()
             record.csrf_token_hash = hash_token(csrf)
@@ -153,7 +177,7 @@ class IdentityService:
 
     def logout(self, token: str, csrf: str, *, trace_id: str, network: str | None) -> None:
         with self.store.sync_session() as db:
-            record = self._load_session(db, token)
+            record = self._resolve_session(db, token, trace_id=trace_id, network=network)
             if not tokens_match(record.csrf_token_hash, csrf):
                 raise CsrfFailed
             record.revoked_at = self.clock.current_time()
@@ -161,14 +185,11 @@ class IdentityService:
             self._audit(db, "authentication.logout", "success", organization_id=record.organization_id, user_id=record.user_id, trace_id=trace_id, network=network)
             db.commit()
 
-    def validate_csrf(self, token: str, csrf: str) -> bool:
+    def validate_csrf(self, token: str, csrf: str, *, trace_id: str, network: str | None) -> bool:
         with self.store.sync_session() as db:
-            record = db.scalar(
-                select(UserSession)
-                .options(selectinload(UserSession.user))
-                .where(UserSession.token_hash == hash_token(token))
-            )
-            if not self._valid_session_record(record):
+            try:
+                record = self._resolve_session(db, token, trace_id=trace_id, network=network)
+            except InvalidSession:
                 return False
             return tokens_match(record.csrf_token_hash, csrf)
 
@@ -176,27 +197,13 @@ class IdentityService:
         if not token:
             return False
         with self.store.sync_session() as db:
-            record = db.scalar(
-                select(UserSession)
-                .options(selectinload(UserSession.user))
-                .where(UserSession.token_hash == hash_token(token))
-            )
-            if not self._valid_session_record(record):
+            try:
+                record = self._resolve_session(db, token, trace_id=trace_id, network=network)
+            except InvalidSession:
                 return False
             self._audit(db, event, "denied", organization_id=record.organization_id, user_id=record.user_id, trace_id=trace_id, network=network)
             db.commit()
             return True
-
-    def _valid_session_record(self, record: UserSession | None) -> bool:
-        if record is None or record.revoked_at is not None:
-            return False
-        now = self.clock.current_time()
-        return (
-            self._aware(record.idle_expires_at) > now
-            and self._aware(record.absolute_expires_at) > now
-            and record.user.status == UserStatus.ACTIVE
-            and record.authorization_version == record.user.authorization_version
-        )
 
     @staticmethod
     def permission_summary(roles) -> list[str]:
