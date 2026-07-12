@@ -38,6 +38,11 @@ class Settings(BaseModel):
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost"])
     worker_check_interval_seconds: float = Field(default=30, ge=0)
     readiness_timeout_seconds: float = Field(default=5, gt=0)
+    worker_id: str = Field(default="worker", min_length=1, max_length=200)
+    worker_lease_seconds: int = Field(default=60, gt=0)
+    worker_heartbeat_seconds: int = Field(default=20, gt=0)
+    worker_poll_interval_seconds: float = Field(default=1, ge=0)
+    worker_shutdown_timeout_seconds: float = Field(default=30, gt=0)
 
     @model_validator(mode="after")
     def validate_production_safety(self) -> "Settings":
@@ -99,6 +104,11 @@ class Settings(BaseModel):
             "OBJECT_STORAGE_TOTAL_TIMEOUT_SECONDS": "object_storage_total_timeout_seconds",
             "WORKER_CHECK_INTERVAL_SECONDS": "worker_check_interval_seconds",
             "READINESS_TIMEOUT_SECONDS": "readiness_timeout_seconds",
+            "WORKER_ID": "worker_id",
+            "WORKER_LEASE_SECONDS": "worker_lease_seconds",
+            "WORKER_HEARTBEAT_SECONDS": "worker_heartbeat_seconds",
+            "WORKER_POLL_INTERVAL_SECONDS": "worker_poll_interval_seconds",
+            "WORKER_SHUTDOWN_TIMEOUT_SECONDS": "worker_shutdown_timeout_seconds",
         }
         for env_name, field_name in mapping.items():
             if env_name in os.environ:
