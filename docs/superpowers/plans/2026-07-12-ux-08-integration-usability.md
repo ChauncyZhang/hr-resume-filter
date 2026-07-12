@@ -218,6 +218,6 @@ git diff --check
 
 Expected: all pass; issue log reports `P0=0`, `P1=0`.
 
-- [ ] **Step 7: Commit and integrate**
+- [x] **Step 7: Commit and integrate**
 
 Commit with `Add UX-08 integrated usability workflow`, merge to `main`, rerun tests/build, and remove the temporary worktree.
