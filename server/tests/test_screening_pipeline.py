@@ -14,14 +14,21 @@ from server.tests.test_screening_api import app_and_seed,login
 
 @dataclass
 class MemoryPipelineStorage:
-    objects:dict[str,bytes]=field(default_factory=dict); calls:list[str]=field(default_factory=list); delete_ok:bool=True
-    async def open(self,key,max_bytes): self.calls.append("open"); return io.BytesIO(self.objects[key])
+    objects:dict[str,bytes]=field(default_factory=dict); calls:list[str]=field(default_factory=list); delete_ok:bool=True; streams:list=field(default_factory=list); open_error:Exception|None=None
+    async def open(self,key,max_bytes):
+        self.calls.append("open")
+        if self.open_error: raise self.open_error
+        stream=TrackingStream(self.objects[key]); self.streams.append(stream); return stream
     async def copy(self,source,target,max_bytes): self.calls.append("copy"); self.objects[target]=self.objects[source]
     async def delete(self,key): self.calls.append("delete"); self.objects.pop(key,None) if self.delete_ok else None; return self.delete_ok
 
 class Scanner:
     def __init__(self,result=ScanResult.CLEAN): self.result=result; self.calls=[]
     async def scan(self,stream,max_bytes): self.calls.append("scan"); return self.result
+
+class TrackingStream(io.BytesIO):
+    def __init__(self,data): super().__init__(data); self.close_count=0
+    def close(self): self.close_count+=1; super().close()
 
 def seeded_pipeline(tmp_path,text=b"required: Python\nPython 5 years",filename="Alice.txt",mime="text/plain"):
     app,upload_storage,job_id=app_and_seed(tmp_path)
@@ -33,16 +40,19 @@ def seeded_pipeline(tmp_path,text=b"required: Python\nPython 5 years",filename="
 
 def test_clean_parse_then_score_is_replay_safe_and_never_auto_advances(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path)
-    asyncio.run(pipeline.parse_item(job)); asyncio.run(pipeline.parse_item(job))
+    asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db: first_started=db.get(ScreeningItem,uuid.UUID(item["id"])).started_at
+    asyncio.run(pipeline.parse_item(job))
     assert scanner.calls==["scan"] and storage.calls[:3]==["open","copy","delete"]
+    assert storage.streams and all(stream.close_count==1 for stream in storage.streams)
     with app.state.identity_store.sync_session() as db:
-        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); assert stored.status=="parsed" and stored.candidate_id and stored.resume_id and stored.application_id
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); assert stored.status=="parsed" and stored.attempts==1 and stored.started_at==first_started and stored.finished_at is None and stored.candidate_id and stored.resume_id and stored.application_id
         score_job=SimpleNamespace(organization_id=stored.organization_id,payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(db.get(ScreeningRun,uuid.UUID(run["id"])).jd_version_id),"rule_version_id":str(db.get(ScreeningRun,uuid.UUID(run["id"])).rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
     asyncio.run(pipeline.score_item(score_job)); asyncio.run(pipeline.score_item(score_job))
     with app.state.identity_store.sync_session() as db:
         assert db.scalar(select(func.count(Candidate.id)))==1 and db.scalar(select(func.count(Resume.id)))==1 and db.scalar(select(func.count(Application.id)))==1 and db.scalar(select(func.count(ScreeningResult.id)))==1
         application=db.scalar(select(Application)); result=db.scalar(select(ScreeningResult)); completed=db.get(ScreeningRun,uuid.UUID(run["id"]))
-        assert application.stage=="new" and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1
+        assert application.stage=="new" and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1 and db.scalar(select(ScreeningItem.finished_at)).isoformat()
 
 def test_infected_is_terminal_without_parse_or_identity(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); scanner.result=ScanResult.INFECTED
@@ -50,6 +60,7 @@ def test_infected_is_terminal_without_parse_or_identity(tmp_path):
     with app.state.identity_store.sync_session() as db:
         assert db.get(ScreeningItem,uuid.UUID(item["id"])).safe_error_code=="malware_detected" and db.scalar(select(func.count(Candidate.id)))==0 and db.get(ScreeningRun,uuid.UUID(run["id"])).status=="failed"
     assert "copy" not in storage.calls
+    assert [stream.close_count for stream in storage.streams]==[1]
 
 def test_clean_promotion_retains_cleanup_marker_when_source_delete_fails(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); storage.delete_ok=False
@@ -65,7 +76,25 @@ def test_retryable_scan_failure_then_exhaustion_leaves_terminal_progress(tmp_pat
     with pytest.raises(PermanentJobError): asyncio.run(pipeline.parse_item(job))
     with app.state.identity_store.sync_session() as db:
         stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"]))
-        assert stored.status=="failed" and stored.safe_error_code=="scanner_unavailable" and aggregate.status=="failed" and aggregate.processed_count==1
+        assert stored.status=="failed" and stored.safe_error_code=="scanner_unavailable" and stored.attempts==3 and stored.started_at and stored.finished_at and aggregate.status=="failed" and aggregate.processed_count==1
+    assert all(stream.close_count==1 for stream in storage.streams)
+
+def test_storage_size_violation_is_permanent_not_unavailable(tmp_path):
+    from server.app.screening.storage import StorageWriteFailed
+    app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); storage.open_error=StorageWriteFailed("file_too_large")
+    asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db: assert db.get(ScreeningItem,uuid.UUID(item["id"])).safe_error_code=="file_too_large"
+
+def test_pipeline_cancellation_closes_stream_and_kills_parser(tmp_path):
+    from server.app.screening.isolated_parser import IsolatedParser
+    app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); parser=IsolatedParser(timeout_seconds=30,worker_module="server.tests.parser_hang_worker"); pipeline.parser=parser
+    async def scenario():
+        task=asyncio.create_task(pipeline.parse_item(job));
+        while parser.last_pid is None: await asyncio.sleep(.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError): await task
+    asyncio.run(scenario()); assert all(stream.close_count==1 for stream in storage.streams)
+    with pytest.raises(ProcessLookupError): __import__("os").kill(parser.last_pid,0)
 
 @pytest.mark.parametrize(("filename","mime","content","version"),[
     ("resume.txt","text/plain",b"Python","txt-v1"),
@@ -81,3 +110,28 @@ def test_run_aggregation_is_partial_for_mixed_terminal_facts(tmp_path):
     with app.state.identity_store.sync_session() as db:
         first=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); first.status="scored"; extra_file=FileObject(organization_id=first.organization_id,storage_key=f"quarantine/{first.organization_id}/{aggregate.id}/{uuid.uuid4()}",original_filename="failed.txt",mime_type="text/plain",size_bytes=1,sha256="0"*64,uploaded_by=aggregate.created_by,storage_state="rejected",detected_type="txt",scan_status="rejected"); db.add(extra_file); db.flush(); db.add(ScreeningItem(organization_id=first.organization_id,run_id=aggregate.id,file_object_id=extra_file.id,status="failed",safe_error_code="malware_detected",attempts=1)); aggregate.total_count=2; db.flush(); pipeline._aggregate(db,aggregate); db.commit()
         assert aggregate.status=="partial" and aggregate.processed_count==2 and aggregate.succeeded_count==1 and aggregate.failed_count==1
+
+def test_score_handler_uses_exact_rule_version_and_rejects_malformed_snapshot(tmp_path):
+    from server.app.recruiting.models import ScreeningRuleVersion
+    app,uploads,job_id=app_and_seed(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        first=db.scalar(select(ScreeningRuleVersion).where(ScreeningRuleVersion.job_id==job_id)); first.content={"required_terms":["Python"],"bonus_terms":[]}; second=ScreeningRuleVersion(organization_id=first.organization_id,job_id=job_id,version_number=2,content={"required_terms":["Rust"],"bonus_terms":[]},created_by=first.created_by); db.add(second); db.commit(); first_id,second_id=first.id,second.id
+    runs=[]; items=[]
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        for index,rule_id in enumerate((first_id,second_id)):
+            run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={"rule_version_id":str(rule_id)},headers={**headers,"Idempotency-Key":f"run-{index}"}).json()["data"]; item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"candidate-{index}.txt",b"Python 5 years","text/plain")},headers={**headers,"Idempotency-Key":f"item-{index}"}).json()["data"]; runs.append(run); items.append(item)
+    storage=MemoryPipelineStorage(dict(uploads.objects)); pipeline=ScreeningPipeline(app.state.identity_store.sync_session,storage,Scanner(),app.state.settings); scores=[]
+    for run,item in zip(runs,items):
+        parse_job=SimpleNamespace(payload={"organization_id":next(iter(storage.objects)).split("/")[1],"screening_item_id":item["id"],"parser_version":"parser-v1"},attempts=1,max_attempts=3,trace_id="rules"); asyncio.run(pipeline.parse_item(parse_job))
+        with app.state.identity_store.sync_session() as db:
+            stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
+        asyncio.run(pipeline.score_item(score_job))
+        with app.state.identity_store.sync_session() as db: scores.append(db.scalar(select(ScreeningResult.rule_score).where(ScreeningResult.item_id==uuid.UUID(item["id"]))))
+    assert scores[0]!=scores[1]
+    root=tmp_path/"bad"; root.mkdir(); app,pipeline,storage,scanner,job,run,item=seeded_pipeline(root); asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); db.get(__import__("server.app.recruiting.models",fromlist=["ScreeningRuleVersion"]).ScreeningRuleVersion,aggregate.rule_version_id).content={"required_terms":"secret text"}; db.commit(); score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
+    with pytest.raises(PermanentJobError) as raised: asyncio.run(pipeline.score_item(score_job))
+    assert raised.value.safe_code=="rule_snapshot_invalid"
+    with app.state.identity_store.sync_session() as db: assert db.get(ScreeningItem,uuid.UUID(item["id"])).safe_error_code=="rule_snapshot_invalid"

@@ -50,6 +50,7 @@ class Settings(BaseModel):
     parser_docx_max_entries: int = Field(default=1000, ge=10, le=10000)
     parser_docx_max_uncompressed_bytes: int = Field(default=50 * 1024 * 1024, ge=1024, le=500 * 1024 * 1024)
     parser_docx_max_compression_ratio: int = Field(default=100, ge=1, le=1000)
+    parser_hard_timeout_seconds: float = Field(default=15, gt=0, le=120)
     clamav_host: str = Field(default="clamav", min_length=1, max_length=253)
     clamav_port: int = Field(default=3310, ge=1, le=65535)
     clamav_connect_timeout_seconds: float = Field(default=2, gt=0, le=30)
@@ -140,6 +141,7 @@ class Settings(BaseModel):
             "PARSER_DOCX_MAX_ENTRIES": "parser_docx_max_entries",
             "PARSER_DOCX_MAX_UNCOMPRESSED_BYTES": "parser_docx_max_uncompressed_bytes",
             "PARSER_DOCX_MAX_COMPRESSION_RATIO": "parser_docx_max_compression_ratio",
+            "PARSER_HARD_TIMEOUT_SECONDS": "parser_hard_timeout_seconds",
             "CLAMAV_HOST": "clamav_host",
             "CLAMAV_PORT": "clamav_port",
             "CLAMAV_CONNECT_TIMEOUT_SECONDS": "clamav_connect_timeout_seconds",

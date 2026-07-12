@@ -1,12 +1,25 @@
 import re
 from dataclasses import dataclass
-from collections.abc import Iterable
+from collections.abc import Iterable,Mapping
 
 ENGINE_VERSION = "rule-v1"
 
 @dataclass(frozen=True)
 class RuleSnapshot:
     jd_text: str
+    required_terms: tuple[str,...]|None=None
+    bonus_terms: tuple[str,...]|None=None
+    @classmethod
+    def from_content(cls,jd_text:str,content:object):
+        if not isinstance(content,Mapping) or not set(content)<={"required_terms","bonus_terms"}: raise RuleSnapshotError
+        def terms(name):
+            value=content.get(name)
+            if value is None: return None
+            if not isinstance(value,list) or len(value)>50 or any(not isinstance(term,str) or not 1<=len(term.strip())<=100 for term in value): raise RuleSnapshotError
+            return tuple(_unique(term.strip() for term in value))
+        return cls(jd_text,terms("required_terms"),terms("bonus_terms"))
+
+class RuleSnapshotError(ValueError): pass
 
 @dataclass(frozen=True)
 class RuleResult:
@@ -15,8 +28,8 @@ class RuleResult:
     estimated_years: int; risks: list[str]; questions: list[str]
 
 def score_resume(resume_text: str, snapshot: RuleSnapshot) -> RuleResult:
-    required = _extract_terms(snapshot.jd_text, ("必须条件", "硬性要求", "必备条件", "required")) or _top_keywords(snapshot.jd_text)
-    bonus = _extract_terms(snapshot.jd_text, ("加分项", "优先", "bonus", "preferred"))
+    required = list(snapshot.required_terms) if snapshot.required_terms is not None else (_extract_terms(snapshot.jd_text, ("必须条件", "硬性要求", "必备条件", "required")) or _top_keywords(snapshot.jd_text))
+    bonus = list(snapshot.bonus_terms) if snapshot.bonus_terms is not None else _extract_terms(snapshot.jd_text, ("加分项", "优先", "bonus", "preferred"))
     required_hits = _matched_terms(resume_text, required); bonus_hits = _matched_terms(resume_text, bonus)
     missing = [term for term in required if term not in required_hits]; years = _estimate_years(resume_text)
     score = round((len(required_hits) / len(required) if required else 0) * 75 + (len(bonus_hits) / len(bonus) if bonus else 0) * 15 + min(years, 5) / 5 * 10)

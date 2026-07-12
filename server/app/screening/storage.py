@@ -1,7 +1,8 @@
 import asyncio
 from tempfile import SpooledTemporaryFile
 from minio.commonconfig import CopySource
-class StorageWriteFailed(Exception): pass
+class StorageWriteFailed(Exception):
+    def __init__(self,safe_code): self.safe_code=safe_code; super().__init__(safe_code)
 class QuarantineStorage:
     """Keys are UUID-only quarantine prefixes, enabling deterministic orphan sweeps."""
     def __init__(self,client,bucket): self.client=client; self.bucket=bucket

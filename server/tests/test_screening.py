@@ -4,7 +4,7 @@ import zipfile
 import pytest
 
 from server.app.screening.parsers import ParserError, ParserLimits, parse_document
-from server.app.screening.rules import ENGINE_VERSION, RuleSnapshot, score_resume
+from server.app.screening.rules import ENGINE_VERSION, RuleSnapshot, RuleSnapshotError, score_resume
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, UnsafePayload
 import uuid
 from types import SimpleNamespace
@@ -46,6 +46,14 @@ def test_rule_weights_are_exactly_75_15_10(jd: str, resume: str, score: int, rec
     result = score_resume(resume, RuleSnapshot(jd_text=jd))
     assert result.score == score
     assert result.recommendation == recommendation
+
+def test_rule_snapshot_overrides_are_immutable_validated_and_change_results() -> None:
+    first=RuleSnapshot.from_content("required: Python",{"required_terms":["Python"],"bonus_terms":["Docker"]})
+    second=RuleSnapshot.from_content("required: Python",{"required_terms":["Rust"],"bonus_terms":[]})
+    assert score_resume("Python Docker 5 years",first).score > score_resume("Python Docker 5 years",second).score
+    assert first.required_terms==("Python",) and first.bonus_terms==("Docker",)
+    for malformed in ({"required_terms":"Python"},{"required_terms":["x"*101]},{"unknown":[]}):
+        with pytest.raises(RuleSnapshotError): RuleSnapshot.from_content("required: Python",malformed)
 
 
 def docx_bytes(text: str) -> bytes:

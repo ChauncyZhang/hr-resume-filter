@@ -1,23 +1,30 @@
-import asyncio,uuid
+import uuid
+from datetime import datetime,timezone
 from pathlib import PurePath
 from sqlalchemy import and_,func,select
 from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError,RetryableJobError
 from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
-from server.app.screening.parsers import ParserError,ParserLimits,parse_document
-from server.app.screening.rules import ENGINE_VERSION,RuleSnapshot,score_resume
+from server.app.screening.parsers import ParserLimits
+from server.app.screening.isolated_parser import IsolatedParser,IsolatedParserError
+from server.app.screening.rules import ENGINE_VERSION,RuleSnapshot,RuleSnapshotError,score_resume
 from server.app.screening.scanner import ScanResult
+from server.app.screening.storage import StorageWriteFailed
 
 _RETRYABLE={"scanner_unavailable","scanner_error","storage_unavailable"}
 def _uuid(item_id,name): return uuid.uuid5(uuid.UUID(str(item_id)),name)
 
 class ScreeningPipeline:
-    def __init__(self,sessions,storage,scanner,settings): self.sessions,self.storage,self.scanner,self.settings=sessions,storage,scanner,settings
+    def __init__(self,sessions,storage,scanner,settings,parser=None): self.sessions,self.storage,self.scanner,self.settings=sessions,storage,scanner,settings; self.parser=parser or IsolatedParser(settings.parser_hard_timeout_seconds)
     def _limits(self):
         s=self.settings; return ParserLimits(s.parser_max_source_bytes,s.parser_max_text_chars,s.parser_pdf_max_pages,s.parser_docx_max_entries,s.parser_docx_max_uncompressed_bytes,s.parser_docx_max_compression_ratio)
     async def parse_item(self,job):
         organization_id=uuid.UUID(str(job.payload["organization_id"])); item_id=uuid.UUID(str(job.payload["screening_item_id"])); limits=self._limits()
+        with self.sessions() as db:
+            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
+            if not item: raise PermanentJobError("screening_item_missing")
+            item.attempts=max(item.attempts,getattr(job,"attempts",1)); item.started_at=item.started_at or datetime.now(timezone.utc); db.commit()
         with self.sessions() as db:
             row=db.execute(select(ScreeningItem,FileObject).join(FileObject,and_(FileObject.organization_id==ScreeningItem.organization_id,FileObject.id==ScreeningItem.file_object_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id)).one_or_none()
             if not row: raise PermanentJobError("screening_item_missing")
@@ -25,8 +32,14 @@ class ScreeningPipeline:
             if item.status in {"parsed","scored","cancelled"} or (item.status=="failed" and item.safe_error_code not in _RETRYABLE): return
             key,mime,filename,scan_status=stored.storage_key,stored.mime_type,stored.original_filename,stored.scan_status
         if scan_status!="clean":
+            source=None
             try: source=await self.storage.open(key,limits.max_source_bytes); scan=await self.scanner.scan(source,limits.max_source_bytes)
+            except StorageWriteFailed as error:
+                if error.safe_code=="file_too_large": self._fail_terminal(organization_id,item_id,error.safe_code); return
+                return await self._retry_or_finish(job,organization_id,item_id,"storage_unavailable")
             except Exception: return await self._retry_or_finish(job,organization_id,item_id,"storage_unavailable")
+            finally:
+                if source is not None: source.close()
             if scan==ScanResult.INFECTED:
                 self._fail_terminal(organization_id,item_id,"malware_detected",file_state=("rejected","rejected")); await self.storage.delete(key); return
             if scan!=ScanResult.CLEAN: return await self._retry_or_finish(job,organization_id,item_id,"scanner_unavailable" if scan==ScanResult.UNAVAILABLE else "scanner_error")
@@ -40,11 +53,17 @@ class ScreeningPipeline:
                 with self.sessions() as db:
                     current=db.scalar(select(FileObject).where(FileObject.organization_id==organization_id,FileObject.id==stored.id).with_for_update()); current.quarantine_cleanup_key=None; db.commit()
             key=clean_key
+        stream=None
         try:
             stream=await self.storage.open(key,limits.max_source_bytes)
-            parsed=await asyncio.to_thread(parse_document,stream,extension=PurePath(filename).suffix,mime_type=mime,limits=limits)
-        except ParserError as error: self._fail_terminal(organization_id,item_id,error.safe_code); return
+            parsed=await self.parser.parse(stream,extension=PurePath(filename).suffix,mime_type=mime,limits=limits)
+        except StorageWriteFailed as error:
+            if error.safe_code=="file_too_large": self._fail_terminal(organization_id,item_id,error.safe_code); return
+            return await self._retry_or_finish(job,organization_id,item_id,"storage_unavailable")
+        except IsolatedParserError as error: self._fail_terminal(organization_id,item_id,error.safe_code); return
         except Exception: return await self._retry_or_finish(job,organization_id,item_id,"storage_unavailable")
+        finally:
+            if stream is not None: stream.close()
         with self.sessions() as db:
             item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
             if item.status in {"parsed","scored"}: return
@@ -66,23 +85,26 @@ class ScreeningPipeline:
             item,run,resume,jd,rule=row
             if item.status=="scored": return
             text=resume.parsed_text or ""; jd_text=str(jd.content.get("text",jd.content.get("jd_text","")))
-        result=await asyncio.to_thread(score_resume,text,RuleSnapshot(jd_text))
+            try: snapshot=RuleSnapshot.from_content(jd_text,rule.content)
+            except RuleSnapshotError:
+                self._fail_terminal(organization_id,item_id,"rule_snapshot_invalid"); raise PermanentJobError("rule_snapshot_invalid") from None
+        result=score_resume(text,snapshot)
         with self.sessions() as db:
             item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update())
             existing=db.scalar(select(ScreeningResult).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id,ScreeningResult.rule_engine_version==result.engine_version))
             if not existing: db.add(ScreeningResult(organization_id=organization_id,item_id=item.id,application_id=item.application_id,resume_id=item.resume_id,rule_engine_version=result.engine_version,rule_score=result.score,recommendation=result.recommendation,required_hits=result.required_hits,required_missing=result.required_missing,bonus_hits=result.bonus_hits,estimated_years=result.estimated_years,risks=result.risks,questions=result.questions))
-            item.status="scored"; item.safe_error_code=None; self._aggregate(db,run); db.commit()
+            item.status="scored"; item.safe_error_code=None; item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,run); db.commit()
     async def _retry_or_finish(self,job,organization_id,item_id,code):
         final=getattr(job,"attempts",1)>=getattr(job,"max_attempts",3)
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); item.status="failed"; item.safe_error_code=code
-            if final: self._aggregate(db,db.get(ScreeningRun,item.run_id))
+            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); item.status="failed"; item.safe_error_code=code; item.attempts=max(item.attempts,getattr(job,"attempts",1))
+            if final: item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,db.get(ScreeningRun,item.run_id))
             db.commit()
         if final: raise PermanentJobError(code)
         raise RetryableJobError(code)
     def _fail_terminal(self,organization_id,item_id,code,file_state=None):
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); item.status="failed"; item.safe_error_code=code
+            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); item.status="failed"; item.safe_error_code=code; item.finished_at=item.finished_at or datetime.now(timezone.utc)
             if file_state:
                 stored=db.get(FileObject,item.file_object_id); stored.storage_state,stored.scan_status=file_state
             self._aggregate(db,db.get(ScreeningRun,item.run_id)); db.commit()
