@@ -5,19 +5,21 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from server.app.queue.models import BackgroundJob, JobAttempt, OutboxEvent
-from server.app.queue.payloads import sanitize_payload
-from server.app.queue.service import retry_delay
+from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, PayloadPolicyRegistry
+from server.app.queue.service import normalize_safe_code, retry_delay
 
 class LeaseRejected(RuntimeError): pass
 
 class QueueRepository:
-    def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0) -> None: self.session, self.jitter = session, jitter
+    def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES) -> None: self.session, self.jitter, self.policies = session, jitter, policies
     def database_now(self) -> datetime: return self.session.scalar(select(text("CURRENT_TIMESTAMP")))
 
     def enqueue(self, organization_id: uuid.UUID, job_type: str, payload: Mapping[str, object], *, priority: int = 0, max_attempts: int = 3, run_after: datetime | None = None, dedupe_key: str | None = None, trace_id: str | None = None) -> BackgroundJob:
+        job_type = self.policies.validate_type(job_type); dedupe_key = self.policies.validate_identifier(dedupe_key, field="dedupe_key"); trace_id = self.policies.validate_identifier(trace_id, field="trace_id")
+        validated = self.policies.validate_job(job_type, payload)
         query = select(BackgroundJob).where(BackgroundJob.organization_id == organization_id, BackgroundJob.type == job_type, BackgroundJob.dedupe_key == dedupe_key, BackgroundJob.status.in_(("queued", "running")))
         if dedupe_key and (existing := self.session.scalar(query)): return existing
-        now = self.database_now(); job = BackgroundJob(organization_id=organization_id, type=job_type, payload=sanitize_payload(payload), priority=priority, max_attempts=max_attempts, run_after=run_after or now, dedupe_key=dedupe_key, trace_id=trace_id, created_at=now, updated_at=now)
+        now = self.database_now(); job = BackgroundJob(organization_id=organization_id, type=job_type, payload=validated, priority=priority, max_attempts=max_attempts, run_after=run_after or now, dedupe_key=dedupe_key, trace_id=trace_id, created_at=now, updated_at=now)
         savepoint = self.session.begin_nested()
         try:
             self.session.add(job); self.session.flush(); savepoint.commit()
@@ -55,6 +57,7 @@ class QueueRepository:
     def succeed(self, organization_id, job_id, worker_id) -> None:
         job, attempt, now = self._owned(organization_id, job_id, worker_id); self._finish_attempt(attempt, now, "succeeded"); job.status = "succeeded"; self._clear_lease(job, now)
     def fail(self, organization_id, job_id, worker_id, *, safe_code: str, retryable: bool) -> None:
+        safe_code = normalize_safe_code(safe_code)
         job, attempt, now = self._owned(organization_id, job_id, worker_id); self._finish_attempt(attempt, now, "failed", safe_code); job.last_error_code = safe_code; self._clear_lease(job, now)
         if retryable and job.attempts < job.max_attempts: job.status = "queued"; job.run_after = now + retry_delay(job.attempts, jitter=self.jitter)
         else: job.status = "dead_letter"
@@ -73,18 +76,24 @@ class QueueRepository:
         job.status = "cancelled"; self._clear_lease(job, now); return True
 
     def append_outbox(self, organization_id, topic, aggregate_type, aggregate_id, payload, *, max_attempts=5):
-        now = self.database_now(); event = OutboxEvent(organization_id=organization_id, topic=topic, aggregate_type=aggregate_type, aggregate_id=aggregate_id, payload=sanitize_payload(payload), available_at=now, max_attempts=max_attempts, created_at=now); self.session.add(event); self.session.flush(); return event
+        topic = self.policies.validate_type(topic); aggregate_type = self.policies.validate_identifier(aggregate_type, field="aggregate_type")
+        validated = self.policies.validate_topic(topic, payload)
+        now = self.database_now(); event = OutboxEvent(organization_id=organization_id, topic=topic, aggregate_type=aggregate_type, aggregate_id=aggregate_id, payload=validated, status="queued", available_at=now, max_attempts=max_attempts, created_at=now, updated_at=now); self.session.add(event); self.session.flush(); return event
     def claim_outbox(self, organization_id, worker_id, *, lease_seconds):
-        now = self.database_now(); event = self.session.scalar(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, OutboxEvent.published_at.is_(None), OutboxEvent.available_at <= now, (OutboxEvent.lease_owner.is_(None) | (OutboxEvent.lease_expires_at < now)), OutboxEvent.attempts < OutboxEvent.max_attempts).order_by(OutboxEvent.available_at, OutboxEvent.created_at).limit(1).with_for_update(skip_locked=True))
-        if event: event.lease_owner = worker_id; event.lease_expires_at = now + timedelta(seconds=lease_seconds); event.attempts += 1; self.session.flush()
+        now = self.database_now(); event = self.session.scalar(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, ((OutboxEvent.status == "queued") & (OutboxEvent.available_at <= now)) | ((OutboxEvent.status == "running") & (OutboxEvent.lease_expires_at < now)), OutboxEvent.attempts < OutboxEvent.max_attempts).order_by(OutboxEvent.available_at, OutboxEvent.created_at).limit(1).with_for_update(skip_locked=True))
+        if event:
+            if event.status == "running": event.safe_error_code = "lease_expired"
+            event.status = "running"; event.lease_owner = worker_id; event.lease_expires_at = now + timedelta(seconds=lease_seconds); event.heartbeat_at = now; event.attempts += 1; event.updated_at = now; self.session.flush()
         return event
     def publish_outbox(self, organization_id, event_id, worker_id):
-        event, now = self._owned_outbox(organization_id, event_id, worker_id); event.published_at = now; event.lease_owner = None; event.lease_expires_at = None; event.safe_error_code = None
+        event, now = self._owned_outbox(organization_id, event_id, worker_id); event.status = "published"; event.published_at = now; event.lease_owner = None; event.lease_expires_at = None; event.heartbeat_at = None; event.safe_error_code = None; event.updated_at = now
     def fail_outbox(self, organization_id, event_id, worker_id, *, safe_code, retryable):
-        event, now = self._owned_outbox(organization_id, event_id, worker_id); event.safe_error_code = safe_code; event.lease_owner = None; event.lease_expires_at = None
-        if retryable and event.attempts < event.max_attempts: event.available_at = now + retry_delay(event.attempts, jitter=self.jitter)
-        else: event.attempts = event.max_attempts
+        safe_code = normalize_safe_code(safe_code); event, now = self._owned_outbox(organization_id, event_id, worker_id); event.safe_error_code = safe_code; event.lease_owner = None; event.lease_expires_at = None; event.heartbeat_at = None; event.updated_at = now
+        if retryable and event.attempts < event.max_attempts: event.status = "queued"; event.available_at = now + retry_delay(event.attempts, jitter=self.jitter)
+        else: event.status = "failed"; event.failed_at = now
+    def heartbeat_outbox(self, organization_id, event_id, worker_id, *, lease_seconds):
+        event, now = self._owned_outbox(organization_id, event_id, worker_id); event.heartbeat_at = now; event.lease_expires_at = now + timedelta(seconds=lease_seconds); event.updated_at = now
     def _owned_outbox(self, organization_id, event_id, worker_id):
         now = self.database_now(); event = self.session.scalar(select(OutboxEvent).where(OutboxEvent.id == event_id, OutboxEvent.organization_id == organization_id).with_for_update())
-        if not event or event.published_at or event.lease_owner != worker_id or not event.lease_expires_at or event.lease_expires_at <= now: raise LeaseRejected("outbox lease is no longer owned")
+        if not event or event.status != "running" or event.lease_owner != worker_id or not event.lease_expires_at or event.lease_expires_at <= now: raise LeaseRejected("outbox lease is no longer owned")
         return event, now

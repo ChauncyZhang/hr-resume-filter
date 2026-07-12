@@ -5,7 +5,7 @@ from datetime import timedelta
 
 import pytest
 
-from server.app.queue.payloads import UnsafePayload, sanitize_payload
+from server.app.queue.payloads import IntegerField, OpaqueIdField, PayloadPolicyRegistry, PayloadSchema, UnsafePayload
 from server.app.queue.service import PermanentJobError, RetryableJobError, retry_delay
 from server.app.queue.outbox import OutboxDispatcher
 from server.app.worker.main import Worker
@@ -13,19 +13,14 @@ from server.app.worker.main import Worker
 
 def test_payloads_are_schema_limited_and_reject_sensitive_fields() -> None:
     candidate_id = str(uuid.uuid4())
-    assert sanitize_payload({"candidate_id": candidate_id, "count": 2}) == {
+    policies = PayloadPolicyRegistry(); policies.register_job("test.work", PayloadSchema({"candidate_id": OpaqueIdField(), "count": IntegerField(0, 10)}))
+    assert policies.validate_job("test.work", {"candidate_id": candidate_id, "count": 2}) == {
         "candidate_id": candidate_id,
         "count": 2,
     }
-    for payload in (
-        {"resume_text": "secret"},
-        {"email": "person@example.test"},
-        {"api_key": "key"},
-        {"session_token": "token"},
-        {"error": RuntimeError("raw")},
-    ):
+    for payload in ({"candidate_id": candidate_id, "count": 2, "resume_text": "secret"}, {"candidate_id": "person@example.test", "count": 2}, {"candidate_id": candidate_id, "count": RuntimeError("raw")}):
         with pytest.raises(UnsafePayload):
-            sanitize_payload(payload)
+            policies.validate_job("test.work", payload)
 
 
 def test_retry_delay_is_bounded_and_accepts_deterministic_jitter() -> None:
@@ -44,6 +39,7 @@ class Claimed:
     attempt_no = 1
     attempts = 1
     trace_id = "trace-1"
+    topic = "test.event"
 
 
 class FakeQueue:
@@ -52,14 +48,16 @@ class FakeQueue:
         self.successes = 0
         self.failures = 0
 
-    async def claim(self, **_: object):
+    async def claim_job(self, **_: object):
         return self.claims.pop(0) if self.claims else None
+    async def claim_outbox(self, **_: object): return None
 
     async def succeed(self, *_: object, **__: object) -> None:
         self.successes += 1
 
     async def fail(self, *_: object, **__: object) -> None:
         self.failures += 1
+    async def heartbeat(self, *_: object, **__: object) -> None: await asyncio.Event().wait()
 
 
 def test_worker_survives_handler_failure_and_unknown_type_is_safe(caplog: pytest.LogCaptureFixture) -> None:
@@ -70,7 +68,7 @@ def test_worker_survives_handler_failure_and_unknown_type_is_safe(caplog: pytest
 
     worker = Worker(
         Probe(), Probe(), interval_seconds=0, queue=queue,
-        handlers={"known": broken}, worker_id="worker-1", lease_seconds=30,
+        handlers={"known": broken}, worker_id="worker-1", lease_seconds=30, heartbeat_seconds=10,
     )
 
     async def exercise() -> None:
@@ -99,7 +97,7 @@ def test_worker_shutdown_timeout_leaves_current_job_uncompleted() -> None:
         started.set()
         await asyncio.Event().wait()
 
-    worker = Worker(Probe(), Probe(), interval_seconds=0, queue=queue, handlers={"known": hanging}, worker_id="w", lease_seconds=1, shutdown_timeout_seconds=0.01)
+    worker = Worker(Probe(), Probe(), interval_seconds=0, queue=queue, handlers={"known": hanging}, worker_id="w", lease_seconds=3, heartbeat_seconds=1, shutdown_timeout_seconds=0.01, cancel_timeout_seconds=0.01, hard_stop=lambda: None)
 
     async def exercise() -> None:
         task = asyncio.create_task(worker.run())
@@ -116,7 +114,7 @@ def test_outbox_dispatcher_rejects_unknown_topics_without_calling_code() -> None
     class Event:
         topic = "unknown.topic"
     class Outbox:
-        async def fail_outbox(self, _event, *, safe_code: str, retryable: bool) -> None:
+        async def fail_outbox(self, _event, _worker_id: str, *, safe_code: str, retryable: bool) -> None:
             calls.append((safe_code, retryable))
-    asyncio.run(OutboxDispatcher(Outbox(), {}).dispatch(Event()))
+    asyncio.run(OutboxDispatcher(Outbox(), {}, "worker-1").dispatch(Event()))
     assert calls == [("unknown_outbox_topic", False)]

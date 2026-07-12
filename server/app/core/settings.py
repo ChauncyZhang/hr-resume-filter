@@ -43,6 +43,17 @@ class Settings(BaseModel):
     worker_heartbeat_seconds: int = Field(default=20, gt=0)
     worker_poll_interval_seconds: float = Field(default=1, ge=0)
     worker_shutdown_timeout_seconds: float = Field(default=30, gt=0)
+    worker_cancel_timeout_seconds: float = Field(default=5, gt=0, le=30)
+
+    @model_validator(mode="after")
+    def validate_worker_timing(self) -> "Settings":
+        if self.worker_heartbeat_seconds * 3 > self.worker_lease_seconds:
+            raise ValueError("worker heartbeat must be no more than one-third of lease duration")
+        if not 0 < self.worker_poll_interval_seconds <= 60:
+            raise ValueError("worker poll interval must be between 0 and 60 seconds")
+        if self.worker_shutdown_timeout_seconds > 300:
+            raise ValueError("worker shutdown timeout must be at most 300 seconds")
+        return self
 
     @model_validator(mode="after")
     def validate_production_safety(self) -> "Settings":
@@ -109,6 +120,7 @@ class Settings(BaseModel):
             "WORKER_HEARTBEAT_SECONDS": "worker_heartbeat_seconds",
             "WORKER_POLL_INTERVAL_SECONDS": "worker_poll_interval_seconds",
             "WORKER_SHUTDOWN_TIMEOUT_SECONDS": "worker_shutdown_timeout_seconds",
+            "WORKER_CANCEL_TIMEOUT_SECONDS": "worker_cancel_timeout_seconds",
         }
         for env_name, field_name in mapping.items():
             if env_name in os.environ:

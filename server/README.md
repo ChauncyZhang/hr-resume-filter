@@ -39,6 +39,11 @@ docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --qu
 ```
 
 Only Nginx publishes a host port. Development uses HTTP on `http://localhost:8080`.
+
+Outbox delivery is at-least-once. Every allowlisted topic handler receives the durable
+`outbox_events.id` UUID as its mandatory idempotency key. External side effects must use
+that key for deduplication because a crash after the side effect and before publication
+can replay the same event. The system does not claim externally exactly-once delivery.
 Production TLS must terminate upstream or use externally managed certificates mounted into
 Nginx with a production-specific server block. Never expose API, PostgreSQL, or MinIO ports.
 

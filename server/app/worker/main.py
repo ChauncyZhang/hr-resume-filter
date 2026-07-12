@@ -1,159 +1,138 @@
 import asyncio
 import logging
+import os
 import signal
 from collections.abc import Awaitable, Callable, Mapping
 
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
-from server.app.queue.service import PermanentJobError, RetryableJobError
-
+from server.app.queue.service import PermanentJobError, RetryableJobError, normalize_safe_code
 
 logger = logging.getLogger(__name__)
 
 
 class Worker:
-    def __init__(
-        self,
-        database_probe: ReadinessProbe,
-        storage_probe: ReadinessProbe,
-        *,
-        interval_seconds: float,
-        readiness_timeout_seconds: float = 5,
-        queue: object | None = None,
-        handlers: Mapping[str, Callable[[object], Awaitable[None]]] | None = None,
-        worker_id: str = "worker",
-        lease_seconds: int = 60,
-        shutdown_timeout_seconds: float = 30,
-        heartbeat_seconds: float = 20,
-    ) -> None:
-        self._database_probe = database_probe
-        self._storage_probe = storage_probe
-        self._interval_seconds = interval_seconds
-        self._readiness_timeout_seconds = readiness_timeout_seconds
-        self._shutdown = asyncio.Event()
-        self._queue = queue
-        self._handlers = dict(handlers or {})
-        self._worker_id = worker_id
-        self._lease_seconds = lease_seconds
-        self._shutdown_timeout_seconds = shutdown_timeout_seconds
-        self._heartbeat_seconds = heartbeat_seconds
+    def __init__(self, database_probe: ReadinessProbe, storage_probe: ReadinessProbe, *, interval_seconds: float,
+                 readiness_timeout_seconds: float = 5, queue: object | None = None,
+                 handlers: Mapping[str, Callable[[object], Awaitable[None]]] | None = None,
+                 outbox_handlers: Mapping[str, Callable[[object, object], Awaitable[None]]] | None = None,
+                 worker_id: str = "worker", lease_seconds: int = 60, shutdown_timeout_seconds: float = 30,
+                 cancel_timeout_seconds: float = 5, heartbeat_seconds: float = 20,
+                 hard_stop: Callable[[], None] | None = None) -> None:
+        self._database_probe = database_probe; self._storage_probe = storage_probe
+        self._interval_seconds = interval_seconds; self._readiness_timeout_seconds = readiness_timeout_seconds
+        self._queue = queue; self._handlers = dict(handlers or {}); self._outbox_handlers = dict(outbox_handlers or {})
+        self._worker_id = worker_id; self._lease_seconds = lease_seconds; self._shutdown_timeout_seconds = shutdown_timeout_seconds
+        self._cancel_timeout_seconds = cancel_timeout_seconds; self._heartbeat_seconds = heartbeat_seconds
+        self._hard_stop = hard_stop or (lambda: os._exit(1)); self._shutdown = asyncio.Event(); self._next_kind = "job"
+        self._active_handler: asyncio.Task[None] | None = None
 
-    def request_shutdown(self) -> None:
-        self._shutdown.set()
+    def request_shutdown(self) -> None: self._shutdown.set()
 
     async def run(self) -> None:
-        ready = False
         while not self._shutdown.is_set():
-            try:
-                await asyncio.wait_for(
-                    check_readiness(self._database_probe, self._storage_probe),
-                    timeout=self._readiness_timeout_seconds,
-                )
-                ready = True
-            except Exception as error:
-                logger.warning(
-                    "worker_dependency_readiness_failed",
-                    extra={"context": {"error_type": type(error).__name__}},
-                )
-                ready = False
-            if ready and self._queue is not None:
-                processing = asyncio.create_task(self._process_one())
-                shutdown = asyncio.create_task(self._shutdown.wait())
-                done, _ = await asyncio.wait((processing, shutdown), return_when=asyncio.FIRST_COMPLETED)
-                if shutdown in done and not processing.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(processing), self._shutdown_timeout_seconds)
-                    except TimeoutError:
-                        processing.cancel()
-                        await asyncio.gather(processing, return_exceptions=True)
-                    return
-                shutdown.cancel()
-                await asyncio.gather(shutdown, return_exceptions=True)
-                await processing
-            try:
-                await asyncio.wait_for(
-                    self._shutdown.wait(), timeout=self._interval_seconds
-                )
-            except TimeoutError:
-                continue
+            if not await self._ready():
+                await self._pause(); continue
+            processing = asyncio.create_task(self._poll_once())
+            stopping = asyncio.create_task(self._shutdown.wait())
+            done, _ = await asyncio.wait((processing, stopping), return_when=asyncio.FIRST_COMPLETED)
+            if stopping in done and not processing.done():
+                try: await asyncio.wait_for(asyncio.shield(processing), self._shutdown_timeout_seconds)
+                except TimeoutError:
+                    if self._active_handler is not None:
+                        self._active_handler.cancel()
+                        try: await asyncio.wait_for(asyncio.shield(self._active_handler), self._cancel_timeout_seconds)
+                        except TimeoutError: self._hard_stop()
+                        except asyncio.CancelledError: pass
+                    processing.cancel(); await asyncio.gather(processing, return_exceptions=True)
+                return
+            stopping.cancel(); await asyncio.gather(stopping, return_exceptions=True)
+            await asyncio.gather(processing, return_exceptions=True)
+            await self._pause()
 
-    async def _process_one(self) -> None:
-        job = await self._queue.claim(worker_id=self._worker_id, lease_seconds=self._lease_seconds)
-        if job is None:
-            return
-        context = {"job_id": str(job.id), "job_type": job.type, "attempt": job.attempts, "trace_id": job.trace_id}
-        handler = self._handlers.get(job.type)
-        if handler is None:
-            await self._queue.fail(job, self._worker_id, safe_code="unknown_job_type", retryable=False)
-            logger.error("worker_job_failed", extra={"context": {**context, "safe_error_code": "unknown_job_type"}})
-            return
+    async def _ready(self) -> bool:
         try:
-            heartbeat = asyncio.create_task(self._heartbeat(job))
-            await handler(job)
-        except RetryableJobError as error:
-            await self._queue.fail(job, self._worker_id, safe_code=error.safe_code, retryable=True)
-            logger.error("worker_job_failed", extra={"context": {**context, "safe_error_code": error.safe_code}})
-        except PermanentJobError as error:
-            await self._queue.fail(job, self._worker_id, safe_code=error.safe_code, retryable=False)
-            logger.error("worker_job_failed", extra={"context": {**context, "safe_error_code": error.safe_code}})
-        except Exception:
-            await self._queue.fail(job, self._worker_id, safe_code="handler_failed", retryable=True)
-            logger.error("worker_job_failed", extra={"context": {**context, "safe_error_code": "handler_failed"}})
-        else:
-            await self._queue.succeed(job, self._worker_id)
-        finally:
-            if 'heartbeat' in locals():
-                heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
+            await asyncio.wait_for(check_readiness(self._database_probe, self._storage_probe), self._readiness_timeout_seconds)
+            return True
+        except Exception as error:
+            logger.warning("worker_dependency_readiness_failed", extra={"context": {"error_type": type(error).__name__}}); return False
 
-    async def _heartbeat(self, job: object) -> None:
-        if not hasattr(self._queue, "heartbeat"):
-            return
+    async def _pause(self) -> None:
+        if self._shutdown.is_set(): return
+        try: await asyncio.wait_for(self._shutdown.wait(), self._interval_seconds)
+        except TimeoutError: pass
+
+    async def _poll_once(self) -> None:
+        if self._queue is None or self._shutdown.is_set(): return
+        first = self._next_kind; second = "outbox" if first == "job" else "job"; self._next_kind = second
+        for kind in (first, second):
+            if self._shutdown.is_set(): return
+            try:
+                claim = self._queue.claim_job if kind == "job" else self._queue.claim_outbox
+                item = await claim(worker_id=self._worker_id, lease_seconds=self._lease_seconds)
+            except Exception:
+                logger.error("worker_claim_failed", extra={"context": {"safe_error_code": "queue_unavailable", "kind": kind}}); continue
+            if item is not None:
+                await self._process(item, kind); return
+
+    async def _process(self, item: object, kind: str) -> None:
+        handler = self._handlers.get(item.type) if kind == "job" else self._outbox_handlers.get(item.topic)
+        if handler is None:
+            await self._safe_failure(item, kind, "unknown_job_type" if kind == "job" else "unknown_outbox_topic", False); return
+        async def invoke() -> None:
+            if kind == "job": await handler(item)
+            else: await handler(item, item.id)
+        handling = asyncio.create_task(invoke()); self._active_handler = handling
+        heartbeat = asyncio.create_task(self._heartbeat(item, kind))
+        done, _ = await asyncio.wait((handling, heartbeat), return_when=asyncio.FIRST_COMPLETED)
+        if heartbeat in done and heartbeat.exception() is not None:
+            if not handling.done(): handling.cancel()
+            try: await asyncio.wait_for(asyncio.shield(handling), self._cancel_timeout_seconds)
+            except (TimeoutError, asyncio.CancelledError): pass
+            self._active_handler = None
+            logger.error("worker_lease_lost", extra={"context": self._context(item, kind, "lease_lost")}); return
+        heartbeat.cancel(); await asyncio.gather(heartbeat, return_exceptions=True)
+        try: await handling
+        except RetryableJobError as error: await self._safe_failure(item, kind, error.safe_code, True)
+        except PermanentJobError as error: await self._safe_failure(item, kind, error.safe_code, False)
+        except asyncio.CancelledError: raise
+        except Exception: await self._safe_failure(item, kind, "handler_failed", True)
+        else:
+            try:
+                if kind == "job": await self._queue.succeed(item, self._worker_id)
+                else: await self._queue.publish_outbox(item, self._worker_id)
+            except Exception: logger.error("worker_completion_rejected", extra={"context": self._context(item, kind, "lease_lost")})
+        finally: self._active_handler = None
+
+    async def _heartbeat(self, item: object, kind: str) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_seconds)
-            await self._queue.heartbeat(job, self._worker_id, lease_seconds=self._lease_seconds)
+            method = self._queue.heartbeat if kind == "job" else self._queue.heartbeat_outbox
+            await method(item, self._worker_id, lease_seconds=self._lease_seconds)
+
+    async def _safe_failure(self, item: object, kind: str, code: str, retryable: bool) -> None:
+        code = normalize_safe_code(code)
+        try:
+            method = self._queue.fail if kind == "job" else self._queue.fail_outbox
+            await method(item, self._worker_id, safe_code=code, retryable=retryable)
+        except Exception: logger.error("worker_failure_record_rejected", extra={"context": self._context(item, kind, "lease_lost")})
+
+    @staticmethod
+    def _context(item: object, kind: str, code: str) -> dict[str, object]:
+        return {"item_id": str(item.id), "kind": kind, "attempt": item.attempts, "trace_id": getattr(item, "trace_id", None), "safe_error_code": normalize_safe_code(code)}
 
 
 async def _run() -> None:
     from server.app.core.storage import ObjectStorageProbe, create_storage_client
     from server.app.db.session import DatabaseProbe, create_engine
     from server.app.queue.runtime import DatabaseQueueGateway
-
-    settings = Settings.from_environment()
-    worker = Worker(
-        DatabaseProbe(create_engine(settings.database_url)),
-        ObjectStorageProbe(
-            create_storage_client(
-                settings.object_storage_endpoint,
-                settings.object_storage_access_key,
-                settings.object_storage_secret_key,
-                secure=settings.object_storage_secure,
-                connect_timeout_seconds=settings.object_storage_connect_timeout_seconds,
-                read_timeout_seconds=settings.object_storage_read_timeout_seconds,
-                total_timeout_seconds=settings.object_storage_total_timeout_seconds,
-            ),
-            settings.object_storage_bucket,
-        ),
-        interval_seconds=settings.worker_poll_interval_seconds,
-        readiness_timeout_seconds=settings.readiness_timeout_seconds,
-        worker_id=settings.worker_id,
-        lease_seconds=settings.worker_lease_seconds,
-        shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds,
-        heartbeat_seconds=settings.worker_heartbeat_seconds,
-        queue=DatabaseQueueGateway(settings.database_url),
-        handlers={},
-    )
+    settings = Settings.from_environment(); gateway = DatabaseQueueGateway(settings.database_url)
+    worker = Worker(DatabaseProbe(create_engine(settings.database_url)), ObjectStorageProbe(create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds), settings.object_storage_bucket), interval_seconds=settings.worker_poll_interval_seconds, readiness_timeout_seconds=settings.readiness_timeout_seconds, worker_id=settings.worker_id, lease_seconds=settings.worker_lease_seconds, shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds, cancel_timeout_seconds=settings.worker_cancel_timeout_seconds, heartbeat_seconds=settings.worker_heartbeat_seconds, queue=gateway, handlers={}, outbox_handlers={})
     loop = asyncio.get_running_loop()
-    for event in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(event, worker.request_shutdown)
+    for event in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(event, worker.request_shutdown)
     await worker.run()
 
 
-def main() -> None:
-    configure_logging()
-    asyncio.run(_run())
-
-
-if __name__ == "__main__":
-    main()
+def main() -> None: configure_logging(); asyncio.run(_run())
+if __name__ == "__main__": main()
