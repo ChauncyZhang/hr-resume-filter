@@ -27,7 +27,7 @@ def test_postgres_100_item_restart_replay_has_no_duplicates_or_lost_progress():
         for item_id in item_ids: queue.enqueue(org.id,"screening.parse_item",{"organization_id":str(org.id),"screening_item_id":str(item_id),"parser_version":"parser-v1"},dedupe_key=f"parse:{item_id}",trace_id="bulk",max_attempts=3)
         db.commit(); org_id,run_id=org.id,run.id
     pipeline=ScreeningPipeline(app.state.identity_store.sync_session,storage,scanner,app.state.settings)
-    with app.state.identity_store.sync_session() as db: abandoned=QueueRepository(db).claim(org_id,"old-worker",lease_seconds=60); abandoned_id=abandoned.id; db.commit()
+    with app.state.identity_store.sync_session() as db: abandoned=QueueRepository(db).claim(org_id,"old-worker",lease_seconds=60); abandoned_id=abandoned.id; reclaimed_item_id=uuid.UUID(abandoned.payload["screening_item_id"]); db.commit()
     with app.state.identity_store.sync_session() as db: stale=db.get(BackgroundJob,abandoned_id); stale.lease_expires_at=stale.lease_expires_at-timedelta(seconds=120); db.commit()
     async def drain():
         worker=Worker(Probe(),Probe(),interval_seconds=0,queue=DatabaseQueueGateway(url),handlers={"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item},outbox_handlers={},worker_id="fresh-worker",lease_seconds=60,heartbeat_seconds=20)
@@ -39,4 +39,5 @@ def test_postgres_100_item_restart_replay_has_no_duplicates_or_lost_progress():
         assert set(db.scalars(select(Application.stage)))=={"new"}
         assert db.scalar(select(func.count(BackgroundJob.id)).where(BackgroundJob.status=="succeeded"))==200
         assert db.scalar(select(func.count(JobAttempt.id)))==201 and len(set(db.execute(select(JobAttempt.job_id,JobAttempt.attempt_no)).all()))==201
+        items=list(db.scalars(select(ScreeningItem))); assert all(item.status=="scored" and item.started_at and item.finished_at for item in items); assert next(item for item in items if item.id==reclaimed_item_id).attempts==2; assert all(item.attempts==1 for item in items if item.id!=reclaimed_item_id)
     assert len(storage.streams)==200 and all(stream.close_count==1 for stream in storage.streams)

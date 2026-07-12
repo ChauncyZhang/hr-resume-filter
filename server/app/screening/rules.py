@@ -11,6 +11,7 @@ class RuleSnapshot:
     bonus_terms: tuple[str,...]|None=None
     @classmethod
     def from_content(cls,jd_text:str,content:object):
+        if not isinstance(jd_text,str) or len(jd_text)>500_000: raise RuleSnapshotError
         if not isinstance(content,Mapping) or not set(content)<={"required_terms","bonus_terms"}: raise RuleSnapshotError
         def terms(name):
             value=content.get(name)

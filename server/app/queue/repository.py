@@ -9,9 +9,12 @@ from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, PayloadPolicyReg
 from server.app.queue.service import normalize_safe_code, retry_delay
 
 class LeaseRejected(RuntimeError): pass
+SCREENING_TERMINAL_TYPES={"screening.parse_item","screening.score_item"}
 
 class QueueRepository:
-    def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES) -> None: self.session, self.jitter, self.policies = session, jitter, policies
+    def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES, terminal_callbacks: Mapping[str,Callable] | None = None) -> None:
+        self.session,self.jitter,self.policies=session,jitter,policies; self.terminal_callbacks=dict(terminal_callbacks or {})
+        if not set(self.terminal_callbacks)<=SCREENING_TERMINAL_TYPES: raise ValueError("terminal callback type is not allowlisted")
     def database_now(self) -> datetime:
         value=self.session.scalar(select(text("CURRENT_TIMESTAMP")))
         return datetime.fromisoformat(value) if isinstance(value,str) else value
@@ -37,6 +40,7 @@ class QueueRepository:
             attempt = self.session.scalar(select(JobAttempt).where(JobAttempt.job_id == job.id, JobAttempt.attempt_no == job.attempts, JobAttempt.finished_at.is_(None)).with_for_update())
             if attempt: self._finish_attempt(attempt, now, "abandoned", "lease_expired")
             job.status = "queued" if job.attempts < job.max_attempts else "dead_letter"; job.last_error_code = "lease_expired"; job.run_after = now; self._clear_lease(job, now)
+            if job.status=="dead_letter": self._terminal(job,"lease_expired",now)
         self.session.flush()
 
     def claim(self, organization_id: uuid.UUID, worker_id: str, *, lease_seconds: int) -> BackgroundJob | None:
@@ -62,7 +66,10 @@ class QueueRepository:
         safe_code = normalize_safe_code(safe_code)
         job, attempt, now = self._owned(organization_id, job_id, worker_id); self._finish_attempt(attempt, now, "failed", safe_code); job.last_error_code = safe_code; self._clear_lease(job, now)
         if retryable and job.attempts < job.max_attempts: job.status = "queued"; job.run_after = now + retry_delay(job.attempts, jitter=self.jitter)
-        else: job.status = "dead_letter"
+        else: job.status = "dead_letter"; self._terminal(job,safe_code,now)
+    def _terminal(self,job,safe_code,now):
+        callback=self.terminal_callbacks.get(job.type)
+        if callback: callback(self.session,job,safe_code,now)
     @staticmethod
     def _finish_attempt(attempt, now, result, safe_code=None): attempt.finished_at = now; attempt.result = result; attempt.safe_error_code = safe_code; attempt.duration_ms = max(0, int((now-attempt.started_at).total_seconds()*1000))
     @staticmethod

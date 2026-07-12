@@ -72,12 +72,37 @@ def test_clean_promotion_retains_cleanup_marker_when_source_delete_fails(tmp_pat
 def test_retryable_scan_failure_then_exhaustion_leaves_terminal_progress(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); scanner.result=ScanResult.UNAVAILABLE
     with pytest.raises(RetryableJobError): asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        retrying=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); assert retrying.status=="queued" and retrying.safe_error_code=="scanner_unavailable" and retrying.finished_at is None and aggregate.processed_count==0
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); listing=client.get(f"/api/v1/screening-runs/{run['id']}/items?status=queued",headers=headers); progress=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers); assert listing.status_code==200 and listing.json()["data"][0]["status"]=="queued" and progress.json()["data"]["processed_count"]==0
     job.attempts=job.max_attempts
     with pytest.raises(PermanentJobError): asyncio.run(pipeline.parse_item(job))
     with app.state.identity_store.sync_session() as db:
         stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"]))
         assert stored.status=="failed" and stored.safe_error_code=="scanner_unavailable" and stored.attempts==3 and stored.started_at and stored.finished_at and aggregate.status=="failed" and aggregate.processed_count==1
     assert all(stream.close_count==1 for stream in storage.streams)
+
+def test_parse_and_score_attempt_states_are_truthful_and_score_retry_returns_parsed(tmp_path,monkeypatch):
+    app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); observed=[]
+    original_scan=scanner.scan
+    async def inspect_scan(stream,max_bytes):
+        with app.state.identity_store.sync_session() as db: observed.append(db.get(ScreeningItem,uuid.UUID(item["id"])).status)
+        return await original_scan(stream,max_bytes)
+    scanner.scan=inspect_scan; asyncio.run(pipeline.parse_item(job)); assert observed==["parsing"]
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
+    def fail_score(*args):
+        with app.state.identity_store.sync_session() as db: observed.append(db.get(ScreeningItem,uuid.UUID(item["id"])).status)
+        raise RuntimeError("private score failure")
+    monkeypatch.setattr("server.app.screening.pipeline.score_resume",fail_score)
+    with pytest.raises(RetryableJobError) as retry: asyncio.run(pipeline.score_item(score_job))
+    assert retry.value.safe_code=="scoring_failed" and observed[-1]=="scoring"
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); assert stored.status=="parsed" and stored.safe_error_code=="scoring_failed" and stored.finished_at is None and aggregate.processed_count==0
+    score_job.attempts=3
+    with pytest.raises(PermanentJobError): asyncio.run(pipeline.score_item(score_job))
+    with app.state.identity_store.sync_session() as db: assert db.get(ScreeningItem,uuid.UUID(item["id"])).status=="failed" and db.get(ScreeningRun,uuid.UUID(run["id"])).processed_count==1
 
 def test_storage_size_violation_is_permanent_not_unavailable(tmp_path):
     from server.app.screening.storage import StorageWriteFailed
@@ -135,3 +160,11 @@ def test_score_handler_uses_exact_rule_version_and_rejects_malformed_snapshot(tm
     with pytest.raises(PermanentJobError) as raised: asyncio.run(pipeline.score_item(score_job))
     assert raised.value.safe_code=="rule_snapshot_invalid"
     with app.state.identity_store.sync_session() as db: assert db.get(ScreeningItem,uuid.UUID(item["id"])).safe_error_code=="rule_snapshot_invalid"
+
+def test_score_handler_rejects_malformed_jd_snapshot_permanently(tmp_path):
+    from server.app.recruiting.models import JobJdVersion
+    app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); db.get(JobJdVersion,aggregate.jd_version_id).content={"text":["private"]}; db.commit(); score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
+    with pytest.raises(PermanentJobError) as raised: asyncio.run(pipeline.score_item(score_job))
+    assert raised.value.safe_code=="rule_snapshot_invalid"
