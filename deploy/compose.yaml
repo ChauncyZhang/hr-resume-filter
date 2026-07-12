@@ -13,6 +13,7 @@ x-app-service: &app-service
   build:
     context: ..
     dockerfile: server/Dockerfile
+    target: runtime
   environment: *app-environment
   depends_on:
     postgres:
@@ -39,7 +40,7 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
-    networks: [private]
+    networks: [edge, private]
 
   api:
     <<: *app-service
@@ -73,7 +74,7 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    networks: [edge, private]
+    networks: [private]
 
   minio:
     image: minio/minio:RELEASE.2025-07-23T15-54-02Z

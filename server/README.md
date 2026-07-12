@@ -4,11 +4,15 @@ Python 3.12 is required. The existing `app/web_app.py` remains a separate local 
 
 ## Local tests
 
+The reproducible test path uses the project's Python 3.12 Docker target:
+
 ```powershell
-python -m venv server/.venv
-server/.venv/Scripts/python -m pip install -r server/requirements-dev.txt
-server/.venv/Scripts/python -m pytest server/tests
+docker build --target test -t ux09-server-test -f server/Dockerfile .
+docker run --rm ux09-server-test
 ```
+
+When a local Python 3.12 interpreter is available, installing
+`server/requirements-dev.txt` and running `python -m pytest server/tests` is equivalent.
 
 ## Migrations
 
@@ -26,6 +30,12 @@ Copy `deploy/.env.example` to `deploy/.env`, replace every `change-me` value, th
 
 ```powershell
 docker compose --env-file deploy/.env -f deploy/compose.yaml up --build -d
+```
+
+Validate the example topology without starting services:
+
+```powershell
+docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet
 ```
 
 Only Nginx publishes a host port. Development uses HTTP on `http://localhost:8080`.

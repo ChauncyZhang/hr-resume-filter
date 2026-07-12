@@ -47,6 +47,8 @@ class Settings(BaseModel):
             raise ValueError("production credentials are required")
         if "*" in self.cors_origins:
             raise ValueError("wildcard CORS is forbidden in production")
+        if any(not origin.startswith("https://") for origin in self.cors_origins):
+            raise ValueError("production CORS origins must use HTTPS")
         return self
 
     @classmethod

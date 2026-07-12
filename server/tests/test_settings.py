@@ -36,6 +36,11 @@ def test_production_rejects_wildcard_cors() -> None:
         production_settings(cors_origins=["*"])
 
 
+def test_production_rejects_insecure_cors_origin() -> None:
+    with pytest.raises(ValidationError):
+        production_settings(cors_origins=["http://hr.example.com"])
+
+
 def test_production_accepts_explicit_origins_and_non_placeholder_secrets() -> None:
     settings = production_settings()
 
