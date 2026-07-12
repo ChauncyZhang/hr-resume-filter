@@ -16,7 +16,7 @@ from server.app.identity.security import PasswordService
 from server.app.identity.service import AuthenticationFailed, Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
 from server.app.recruiting.models import CandidateEvent
-from server.app.recruiting.service import (IdempotencyConflict, ResourceVersionConflict, TicketInvalid, consume_download_ticket_record, issue_download_ticket_record, persisted_idempotent, transition_application_record, transition_job_record)
+from server.app.recruiting.service import (IdempotencyConflict, ResourceVersionConflict, TicketInvalid, consume_download_ticket_record, issue_download_ticket_record, persisted_idempotent, transition_application_record, transition_job_record, patch_application_record, patch_candidate_record, patch_job_record)
 from server.app.main import create_app
 
 
@@ -90,15 +90,35 @@ def test_postgres_api_applies_recruiter_scope_inside_job_candidate_and_funnel_qu
         owned_candidate = client.post("/api/v1/candidates", json={"display_name": "Owned Candidate"}, headers=headers).json()["data"]
 
         with pg_store.engine.begin() as connection:
-            unauthorized_job, unauthorized_candidate = uuid4(), uuid4()
+            unauthorized_job, unauthorized_candidate, unauthorized_file, unauthorized_resume = uuid4(), uuid4(), uuid4(), uuid4()
             connection.execute(text("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:id,:org,'Hidden',:owner,'open',now(),now())"), {"id": unauthorized_job, "org": organization_id, "owner": outsider_id})
             connection.execute(text("insert into candidates(id,organization_id,display_name,owner_id) values (:id,:org,'Hidden Candidate',:owner)"), {"id": unauthorized_candidate, "org": organization_id, "owner": outsider_id})
+            connection.execute(text("insert into file_objects(id,organization_id,storage_key,original_filename,mime_type,size_bytes,sha256,uploaded_by) values (:id,:org,:key,'hidden.pdf','application/pdf',1,:sha,:owner)"), {"id": unauthorized_file, "org": organization_id, "key": str(unauthorized_file), "sha": "4" * 64, "owner": outsider_id})
+            connection.execute(text("insert into resumes(id,organization_id,candidate_id,file_object_id,version_number) values (:id,:org,:candidate,:file,1)"), {"id": unauthorized_resume, "org": organization_id, "candidate": unauthorized_candidate, "file": unauthorized_file})
 
         jobs = client.get("/api/v1/jobs").json()["data"]
         candidates = client.get("/api/v1/candidates?q=Candidate").json()["data"]
         assert [row["id"] for row in jobs] == [owned_job["id"]]
         assert [row["id"] for row in candidates] == [owned_candidate["id"]]
         assert client.get(f"/api/v1/jobs/{unauthorized_job}/funnel").status_code == 404
+
+        before = pg_store.engine.connect().execute(text("select count(*) from applications")).scalar_one()
+        attack = client.post(f"/api/v1/jobs/{owned_job['id']}/applications", json={"candidate_id": str(unauthorized_candidate), "resume_id": str(unauthorized_resume)}, headers={**headers, "Idempotency-Key": "takeover"})
+        assert attack.status_code == 404
+        with pg_store.engine.connect() as connection:
+            assert connection.execute(text("select count(*) from applications")).scalar_one() == before
+            assert connection.execute(text("select count(*) from idempotency_records where idempotency_key='takeover'")).scalar_one() == 0
+            assert connection.execute(text("select count(*) from candidate_events where candidate_id=:candidate"), {"candidate": unauthorized_candidate}).scalar_one() == 0
+
+        with pg_store.engine.begin() as connection:
+            owned_file, owned_resume = uuid4(), uuid4()
+            connection.execute(text("insert into file_objects(id,organization_id,storage_key,original_filename,mime_type,size_bytes,sha256,uploaded_by) values (:id,:org,:key,'owned.pdf','application/pdf',1,:sha,:owner)"), {"id": owned_file, "org": organization_id, "key": str(owned_file), "sha": "5" * 64, "owner": recruiter.id})
+            connection.execute(text("insert into resumes(id,organization_id,candidate_id,file_object_id,version_number) values (:id,:org,:candidate,:file,1)"), {"id": owned_resume, "org": organization_id, "candidate": owned_candidate["id"], "file": owned_file})
+            connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage,source) values (:id,:org,:candidate,:job,:resume,:owner,'new','visible')"), {"id": uuid4(), "org": organization_id, "candidate": owned_candidate["id"], "job": owned_job["id"], "resume": owned_resume, "owner": recruiter.id})
+            connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage,source) values (:id,:org,:candidate,:job,:resume,:owner,'rejected','hidden-source')"), {"id": uuid4(), "org": organization_id, "candidate": owned_candidate["id"], "job": unauthorized_job, "resume": owned_resume, "owner": outsider_id})
+        assert client.get("/api/v1/candidates?stage=rejected").json()["data"] == []
+        assert client.get("/api/v1/candidates?source=hidden-source").json()["data"] == []
+        assert client.get(f"/api/v1/candidates?job_id={unauthorized_job}").json()["data"] == []
 
 
 def test_five_concurrent_failures_reliably_lock_account(pg_store) -> None:
@@ -251,6 +271,31 @@ def test_concurrent_stale_application_and_job_writers_only_emit_one_success(pg_s
         assert connection.execute(text("select version from applications where id=:id"), {"id": ids["application"]}).scalar_one() == 2
         assert connection.execute(text("select count(*) from application_stage_events where application_id=:id"), {"id": ids["application"]}).scalar_one() == 1
         assert connection.execute(text("select count(*) from audit_logs where trace_id='race'" )).scalar_one() == 2
+
+
+def test_concurrent_patch_compare_and_swap_has_one_success_and_one_atomic_audit_timeline(pg_store) -> None:
+    organization_id, user_id, ids = seed_recruiting_graph(pg_store)
+
+    cases = [
+        ("job", ids["job"], lambda db: patch_job_record(db, organization_id, ids["job"], {"title": "Changed"}, expected_version=1, actor_user_id=user_id, trace_id="patch-job")),
+        ("candidate", ids["candidate"], lambda db: patch_candidate_record(db, organization_id, ids["candidate"], {"display_name": "Changed"}, expected_version=1, actor_user_id=user_id, trace_id="patch-candidate")),
+        ("application", ids["application"], lambda db: patch_application_record(db, organization_id, ids["application"], {"human_conclusion": "recommend"}, expected_version=1, actor_user_id=user_id, trace_id="patch-application")),
+    ]
+    for _, _, operation in cases:
+        barrier = Barrier(2, timeout=10)
+        def worker(_):
+            with pg_store.sync_session() as db:
+                barrier.wait()
+                try:
+                    operation(db); db.commit(); return "success"
+                except ResourceVersionConflict:
+                    db.rollback(); return "conflict"
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            assert sorted(executor.map(worker, range(2))) == ["conflict", "success"]
+
+    with pg_store.engine.connect() as connection:
+        assert connection.execute(text("select count(*) from audit_logs where trace_id like 'patch-%'" )).scalar_one() == 3
+        assert connection.execute(text("select count(*) from candidate_events where event_type in ('candidate.corrected','application.updated')" )).scalar_one() == 2
 
 
 def test_concurrent_first_use_idempotency_serializes_winner_replay_and_conflict(pg_store) -> None:

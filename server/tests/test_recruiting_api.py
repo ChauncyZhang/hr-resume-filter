@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 
 from server.app.core.settings import Settings
@@ -8,7 +9,9 @@ from server.app.identity.models import Organization, User, UserRole
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting.models import FileObject, Resume
-from server.app.recruiting.storage import StoredDownload
+from server.app.recruiting.models import DownloadTicket
+from server.app.identity.models import AuditLog
+from server.app.recruiting.storage import StorageReadFailed
 
 
 class Probe:
@@ -20,16 +23,13 @@ class Probe:
 class FakeStorage:
     preview: str = "private parsed preview"
 
-    def read_preview(self, storage_key: str) -> str:
+    def read_download(self, storage_key: str, max_bytes: int) -> bytes:
         assert storage_key == "private/resume"
-        return self.preview
-
-    def stream_download(self, storage_key: str, content_type: str, filename: str) -> StoredDownload:
-        assert storage_key == "private/resume"
-        return StoredDownload([b"private-file"], content_type, filename)
+        assert max_bytes == 10 * 1024 * 1024
+        return b"private-file"
 
 
-def make_app(tmp_path):
+def make_app(tmp_path, storage=None):
     app = create_app(
         settings=Settings(
             environment="test",
@@ -39,10 +39,16 @@ def make_app(tmp_path):
         database_probe=Probe(),
         storage_probe=Probe(),
         initialize_identity_schema=True,
-        resume_storage=FakeStorage(),
+        resume_storage=storage or FakeStorage(),
     )
     app.state.identity_store.create_schema()
     return app
+
+
+class FailingStorage:
+    def __init__(self, failure: str): self.failure = failure
+    def read_download(self, storage_key: str, max_bytes: int) -> bytes:
+        raise StorageReadFailed(self.failure)
 
 
 def seed_user(app, role: str, email: str):
@@ -108,6 +114,14 @@ def test_recruiting_openapi_registers_complete_task_3b_contract_without_secret_f
         "/api/v1/applications/{application_id}/transitions": {"post"},
     }
     assert {path: set(schema["paths"].get(path, {})) for path in expected} == expected
+    for path, methods in expected.items():
+        for method in methods:
+            if path == "/api/v1/download-tickets/consume":
+                assert schema["paths"][path][method]["responses"]["200"]["content"]["application/octet-stream"]["schema"]
+                continue
+            responses = schema["paths"][path][method]["responses"]
+            success = responses.get("200") or responses.get("201")
+            assert success["content"]["application/json"]["schema"]
     rendered = str(schema).casefold()
     for secret in ("ciphertext", "lookup_hash", "storage_key", "token_hash", "parsed_text"):
         assert secret not in rendered
@@ -129,6 +143,25 @@ def test_recruiting_routes_require_an_opaque_session(tmp_path) -> None:
     assert response.status_code == 401
     assert response.headers["content-type"].startswith("application/problem+json")
     assert response.json()["code"] == "authentication_required"
+
+
+def test_recruiting_validation_is_stable_problem_json_without_echoing_values(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        cases = [
+            client.get("/api/v1/jobs/not-a-uuid"),
+            client.get("/api/v1/jobs?limit=101"),
+            client.get("/api/v1/candidates?cursor=raw-secret-value"),
+            client.post("/api/v1/candidates", json={"display_name": ""}, headers=headers),
+            client.post("/api/v1/download-tickets/consume", json={"token": "raw-secret-value"}, headers=headers),
+        ]
+    for response in cases:
+        assert response.status_code == 422
+        assert response.headers["content-type"].startswith("application/problem+json")
+        assert response.json()["code"] == "validation_failed"
+        assert "raw-secret-value" not in response.text
 
 
 def test_admin_happy_path_preconditions_idempotency_and_private_download(tmp_path) -> None:
@@ -171,6 +204,16 @@ def test_admin_happy_path_preconditions_idempotency_and_private_download(tmp_pat
 
         preview = client.get(f"/api/v1/resumes/{resume_id}/preview")
         assert preview.status_code == 200 and preview.headers["cache-control"] == "no-store"
+        assert preview.json()["data"]["text"] == "must-not-leak"
+        with app.state.identity_store.sync_session() as db:
+            stored_resume = db.get(Resume, UUID(resume_id))
+            stored_resume.parsed_text = "x" * (1024 * 1024 + 1)
+            db.commit()
+        oversized = client.get(f"/api/v1/resumes/{resume_id}/preview")
+        assert oversized.status_code == 422 and oversized.json()["code"] == "preview_too_large"
+        with app.state.identity_store.sync_session() as db:
+            db.get(Resume, UUID(resume_id)).parsed_text = "must-not-leak"
+            db.commit()
         ticket = client.post(f"/api/v1/resumes/{resume_id}/download-tickets", headers=headers)
         raw = ticket.json()["data"]["token"]
         assert raw not in str(ticket.request.url)
@@ -180,6 +223,8 @@ def test_admin_happy_path_preconditions_idempotency_and_private_download(tmp_pat
         assert download.headers["content-disposition"].startswith("attachment;")
         assert download.headers["x-content-type-options"] == "nosniff"
         assert client.post("/api/v1/download-tickets/consume", json={"token": raw}, headers=headers).status_code == 404
+        with app.state.identity_store.sync_session() as db:
+            assert raw not in repr([row.metadata_json for row in db.query(AuditLog).all()])
 
 
 def test_system_admin_and_interviewer_have_no_recruiting_access_by_role_alone(tmp_path) -> None:
@@ -189,6 +234,43 @@ def test_system_admin_and_interviewer_have_no_recruiting_access_by_role_alone(tm
     with TestClient(app) as client:
         for email in ("system@example.test", "interviewer@example.test"):
             login(client, email)
-            assert client.get("/api/v1/jobs").json() == {"data": [], "meta": {"limit": 50, "next_cursor": None}}
+            jobs = client.get("/api/v1/jobs").json()
+            assert jobs["data"] == [] and jobs["meta"]["limit"] == 50
             denied = client.post("/api/v1/candidates", json={"display_name": "Forbidden"}, headers={"Origin": "https://hr.example.test", "X-CSRF-Token": client.get('/api/v1/me', headers={'Sec-Fetch-Site': 'same-origin'}).headers['X-CSRF-Token']})
             assert denied.status_code == 404 and denied.json()["code"] == "resource_not_found"
+
+
+def test_recruiting_mutations_preserve_central_csrf_boundary(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        cases = [
+            {},
+            {"Origin": "https://hr.example.test", "X-CSRF-Token": "wrong"},
+            {"Origin": "https://evil.test", "X-CSRF-Token": headers["X-CSRF-Token"]},
+        ]
+        for bad_headers in cases:
+            response = client.post("/api/v1/jobs", json={"title": "Forbidden"}, headers=bad_headers)
+            assert response.status_code == 403 and response.json()["code"] == "csrf_validation_failed"
+
+
+@pytest.mark.parametrize("failure", ["open", "mid-read"])
+def test_download_storage_failure_leaves_ticket_usable_and_has_no_success_audit(tmp_path, failure) -> None:
+    app = make_app(tmp_path, FailingStorage(failure))
+    admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        candidate = client.post("/api/v1/candidates", json={"display_name": "Candidate"}, headers=headers).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            user = db.get(User, admin_id)
+            file = FileObject(organization_id=user.organization_id, storage_key="private/resume", original_filename="resume.pdf", mime_type="application/pdf", size_bytes=12, sha256="6" * 64, uploaded_by=admin_id)
+            db.add(file); db.flush()
+            resume = Resume(organization_id=user.organization_id, candidate_id=UUID(candidate["id"]), file_object_id=file.id, version_number=1, parsed_text="preview")
+            db.add(resume); db.commit(); resume_id = str(resume.id)
+        ticket = client.post(f"/api/v1/resumes/{resume_id}/download-tickets", headers=headers).json()["data"]["token"]
+        response = client.post("/api/v1/download-tickets/consume", json={"token": ticket}, headers=headers)
+        assert response.status_code == 503 and response.json()["code"] == "attachment_unavailable"
+        with app.state.identity_store.sync_session() as db:
+            assert db.query(DownloadTicket).one().consumed_at is None
+            assert db.query(AuditLog).filter_by(event_type="resume.downloaded").count() == 0

@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -20,6 +21,7 @@ from server.app.recruiting.cursor import CursorCodec
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.service import SystemClock, SystemTokens
 from server.app.recruiting.storage import MinioResumeStorage
+from server.app.recruiting.http import derive_cursor_key
 
 
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -75,9 +77,8 @@ def create_app(
     app.state.recruiting_clock = clock or SystemClock()
     app.state.recruiting_tokens = SystemTokens()
     cursor_secret = settings.contact_lookup_secret.get_secret_value()
-    app.state.recruiting_cursor = CursorCodec(
-        cursor_secret.encode() if cursor_secret != "change-me" else b"test-only-cursor-signing-boundary"
-    )
+    cursor_source = cursor_secret.encode() if cursor_secret != "change-me" else b"test-only-cursor-signing-boundary"
+    app.state.recruiting_cursor = CursorCodec(derive_cursor_key(cursor_source))
     app.state.contact_cipher = ContactCipher(
         settings.contact_encryption_key.get_secret_value().encode(),
         settings.contact_lookup_secret.get_secret_value().encode(),
@@ -87,6 +88,10 @@ def create_app(
     app.state.resume_storage = resume_storage
     app.include_router(identity_router)
     app.include_router(recruiting_router)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_problem(request: Request, _: RequestValidationError):
+        return problem(request, 422, "validation_failed", "The request is invalid.")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

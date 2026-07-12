@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 
 class InvalidStateTransition(Exception): pass
@@ -137,6 +137,51 @@ def transition_job_record(db, job_id, target, *, expected_version, actor_user_id
     db.add(AuditLog(organization_id=job.organization_id, actor_user_id=actor_user_id, event_type="job.stage_changed", outcome="success", trace_id=trace_id, metadata_json={"from_stage": source, "to_stage": target}))
     db.flush()
     return job
+
+
+def patch_job_record(db, organization_id, job_id, changes, *, expected_version, actor_user_id, trace_id):
+    from server.app.identity.models import AuditLog, Job
+
+    row = db.scalar(update(Job).where(
+        Job.organization_id == organization_id, Job.id == job_id, Job.version == expected_version,
+    ).values(**changes, version=Job.version + 1, updated_at=datetime.now(timezone.utc)).returning(Job))
+    if row is None:
+        raise ResourceVersionConflict
+    db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.updated", outcome="success", trace_id=trace_id, metadata_json={"fields": sorted(changes)}))
+    db.flush()
+    return row
+
+
+def patch_candidate_record(db, organization_id, candidate_id, changes, *, expected_version, actor_user_id, trace_id):
+    from server.app.identity.models import AuditLog
+    from server.app.recruiting.models import Candidate, CandidateEvent
+
+    row = db.scalar(update(Candidate).where(
+        Candidate.organization_id == organization_id, Candidate.id == candidate_id, Candidate.version == expected_version,
+    ).values(**changes, version=Candidate.version + 1, updated_at=datetime.now(timezone.utc)).returning(Candidate))
+    if row is None:
+        raise ResourceVersionConflict
+    safe = {"fields": sorted(changes)}
+    db.add(CandidateEvent(organization_id=organization_id, candidate_id=candidate_id, actor_user_id=actor_user_id, event_type="candidate.corrected", payload=safe))
+    db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="candidate.corrected", outcome="success", trace_id=trace_id, metadata_json=safe))
+    db.flush()
+    return row
+
+
+def patch_application_record(db, organization_id, application_id, changes, *, expected_version, actor_user_id, trace_id):
+    from server.app.identity.models import AuditLog
+    from server.app.recruiting.models import Application, CandidateEvent
+
+    row = db.scalar(update(Application).where(
+        Application.organization_id == organization_id, Application.id == application_id, Application.version == expected_version,
+    ).values(**changes, version=Application.version + 1, updated_at=datetime.now(timezone.utc)).returning(Application))
+    if row is None:
+        raise ResourceVersionConflict
+    safe = {"application_id": str(application_id), "fields": sorted(changes)}
+    db.add(CandidateEvent(organization_id=organization_id, candidate_id=row.candidate_id, actor_user_id=actor_user_id, event_type="application.updated", payload=safe))
+    db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="application.updated", outcome="success", trace_id=trace_id, metadata_json=safe))
+    db.flush()
+    return row
 
 
 def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):

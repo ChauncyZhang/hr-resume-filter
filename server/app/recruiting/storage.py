@@ -1,17 +1,20 @@
-from dataclasses import dataclass
-from typing import Iterable, Protocol
+from typing import Protocol
 
 
-@dataclass(frozen=True)
-class StoredDownload:
-    chunks: Iterable[bytes]
-    content_type: str
-    filename: str
+MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
+MAX_PREVIEW_BYTES = 1024 * 1024
+
+
+class StorageReadFailed(Exception):
+    pass
+
+
+class StorageObjectTooLarge(Exception):
+    pass
 
 
 class PrivateResumeStorage(Protocol):
-    def read_preview(self, storage_key: str) -> str: ...
-    def stream_download(self, storage_key: str, content_type: str, filename: str) -> StoredDownload: ...
+    def read_download(self, storage_key: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes: ...
 
 
 class MinioResumeStorage:
@@ -19,22 +22,23 @@ class MinioResumeStorage:
         self.client = client
         self.bucket = bucket
 
-    def read_preview(self, storage_key: str) -> str:
-        response = self.client.get_object(self.bucket, storage_key)
+    def read_download(self, storage_key: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+        response = None
         try:
-            return response.read().decode("utf-8", errors="replace")
+            response = self.client.get_object(self.bucket, storage_key)
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in response.stream(64 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise StorageObjectTooLarge
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except StorageObjectTooLarge:
+            raise
+        except Exception as error:
+            raise StorageReadFailed from error
         finally:
-            response.close()
-            response.release_conn()
-
-    def stream_download(self, storage_key: str, content_type: str, filename: str) -> StoredDownload:
-        response = self.client.get_object(self.bucket, storage_key)
-
-        def chunks():
-            try:
-                yield from response.stream(64 * 1024)
-            finally:
+            if response is not None:
                 response.close()
                 response.release_conn()
-
-        return StoredDownload(chunks(), content_type, filename)
