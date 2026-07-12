@@ -804,3 +804,13 @@ PRD 确认
 4. 采用模块化单体、PostgreSQL、私有文件存储和后台任务。
 5. 首期必须完成职位、候选人、筛选、面试、反馈和人才库闭环。
 6. AI 只辅助人工判断，默认不执行自动淘汰或录用。
+7. UX-09 使用 FastAPI、PostgreSQL、MinIO 和 PostgreSQL 持久任务队列，不在 MVP 引入微服务、Redis 或 Kubernetes。
+8. 浏览器认证使用可撤销的服务端会话；权限按角色、职位、人才库和面试分配在服务端求值。
+9. 候选人与职位申请严格分离，职位阶段只属于申请；重新激活创建新申请并保留历史。
+10. 当前本地 `app/web_app.py` 不作为生产 ATS 后端部署。
+
+实施级契约：
+
+- [UX-09A 服务端 MVP 技术架构](2026-07-12-ux-09-server-mvp-architecture.md)
+- [UX-09B 数据模型与 REST API 契约](2026-07-12-ux-09-data-model-api.md)
+- [UX-09 服务端 MVP 实施计划](../plans/2026-07-12-ux-09-server-mvp.md)
