@@ -31,6 +31,18 @@ def test_production_rejects_placeholder_secrets(field: str, value: str) -> None:
         production_settings(**{field: value})
 
 
+@pytest.mark.parametrize(
+    "database_url",
+    [
+        "postgresql+asyncpg://app@postgres/app",
+        "postgresql+asyncpg://app:@postgres/app",
+    ],
+)
+def test_production_rejects_database_url_without_password(database_url: str) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(database_url=database_url)
+
+
 def test_production_rejects_wildcard_cors() -> None:
     with pytest.raises(ValidationError):
         production_settings(cors_origins=["*"])

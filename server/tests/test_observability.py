@@ -43,6 +43,24 @@ def test_redact_removes_sensitive_keys_recursively() -> None:
     }
 
 
+def test_redact_matches_sensitive_key_fragments() -> None:
+    value = {
+        "object_storage_secret_key": "one",
+        "access_token": "two",
+        "client_secret": "three",
+        "database_password": "four",
+        "safe": "visible",
+    }
+
+    assert redact(value) == {
+        "object_storage_secret_key": "[REDACTED]",
+        "access_token": "[REDACTED]",
+        "client_secret": "[REDACTED]",
+        "database_password": "[REDACTED]",
+        "safe": "visible",
+    }
+
+
 def test_json_formatter_redacts_structured_context() -> None:
     record = logging.LogRecord("test", logging.INFO, "", 0, "request", (), None)
     record.context = {"cookie": "session", "path": "/health/live"}
@@ -51,4 +69,3 @@ def test_json_formatter_redacts_structured_context() -> None:
 
     assert payload["context"]["cookie"] == "[REDACTED]"
     assert payload["context"]["path"] == "/health/live"
-

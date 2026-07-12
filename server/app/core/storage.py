@@ -18,4 +18,3 @@ class ObjectStorageProbe:
         exists = await asyncio.to_thread(self._client.bucket_exists, self._bucket)
         if not exists:
             raise RuntimeError("required private bucket is unavailable")
-

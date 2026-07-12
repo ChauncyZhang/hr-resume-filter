@@ -17,4 +17,3 @@ class DatabaseProbe:
     async def check(self) -> None:
         async with self._engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
-

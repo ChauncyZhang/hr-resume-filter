@@ -1,6 +1,7 @@
 import json
 import os
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -20,6 +21,7 @@ class Settings(BaseModel):
     object_storage_secure: bool = False
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost"])
     worker_check_interval_seconds: float = Field(default=30, ge=0)
+    readiness_timeout_seconds: float = Field(default=5, gt=0)
 
     @model_validator(mode="after")
     def validate_production_safety(self) -> "Settings":
@@ -30,6 +32,8 @@ class Settings(BaseModel):
             self.object_storage_secret_key.strip().lower(),
         )
         database_url = self.database_url.strip().lower()
+        if not urlsplit(self.database_url).password:
+            raise ValueError("production database password is required")
         if (
             any(value in PLACEHOLDERS for value in credentials)
             or any(
@@ -63,6 +67,7 @@ class Settings(BaseModel):
             "OBJECT_STORAGE_BUCKET": "object_storage_bucket",
             "OBJECT_STORAGE_SECURE": "object_storage_secure",
             "WORKER_CHECK_INTERVAL_SECONDS": "worker_check_interval_seconds",
+            "READINESS_TIMEOUT_SECONDS": "readiness_timeout_seconds",
         }
         for env_name, field_name in mapping.items():
             if env_name in os.environ:

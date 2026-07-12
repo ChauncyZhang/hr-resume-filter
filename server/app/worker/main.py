@@ -3,6 +3,7 @@ import logging
 import signal
 
 from server.app.core.probes import ReadinessProbe
+from server.app.core.logging import configure_logging
 from server.app.core.settings import Settings
 
 
@@ -16,10 +17,12 @@ class Worker:
         storage_probe: ReadinessProbe,
         *,
         interval_seconds: float,
+        readiness_timeout_seconds: float = 5,
     ) -> None:
         self._database_probe = database_probe
         self._storage_probe = storage_probe
         self._interval_seconds = interval_seconds
+        self._readiness_timeout_seconds = readiness_timeout_seconds
         self._shutdown = asyncio.Event()
 
     def request_shutdown(self) -> None:
@@ -28,8 +31,12 @@ class Worker:
     async def run(self) -> None:
         while not self._shutdown.is_set():
             try:
-                await self._database_probe.check()
-                await self._storage_probe.check()
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        self._database_probe.check(), self._storage_probe.check()
+                    ),
+                    timeout=self._readiness_timeout_seconds,
+                )
             except Exception as error:
                 logger.warning(
                     "worker_dependency_readiness_failed",
@@ -60,6 +67,7 @@ async def _run() -> None:
             settings.object_storage_bucket,
         ),
         interval_seconds=settings.worker_check_interval_seconds,
+        readiness_timeout_seconds=settings.readiness_timeout_seconds,
     )
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM):
@@ -68,6 +76,7 @@ async def _run() -> None:
 
 
 def main() -> None:
+    configure_logging()
     asyncio.run(_run())
 
 

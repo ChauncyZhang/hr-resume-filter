@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-SENSITIVE_KEYS = {
+SENSITIVE_KEY_FRAGMENTS = {
     "api_key",
     "authorization",
     "cookie",
@@ -18,7 +18,9 @@ SENSITIVE_KEYS = {
 def redact(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
-            key: "[REDACTED]" if str(key).lower() in SENSITIVE_KEYS else redact(item)
+            key: "[REDACTED]"
+            if any(fragment in str(key).lower() for fragment in SENSITIVE_KEY_FRAGMENTS)
+            else redact(item)
             for key, item in value.items()
         }
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
@@ -44,4 +46,3 @@ def configure_logging() -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(logging.INFO)
-

@@ -8,6 +8,7 @@ x-app-environment: &app-environment
   OBJECT_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
   OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-resumes}
   CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:8080"]}
+  READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS:-5}
 
 x-app-service: &app-service
   build:
@@ -99,14 +100,25 @@ services:
       PGDATABASE: ${POSTGRES_DB}
       PGUSER: ${POSTGRES_USER}
       PGPASSWORD: ${POSTGRES_PASSWORD}
-    command: ["sh", "-c", "while true; do pg_dump -Fc -f /backups/ux09-$$(date +%Y%m%d-%H%M%S).dump; sleep 86400; done"]
+    command:
+      - sh
+      - -c
+      - >-
+        set -eu; while true; do
+        timestamp=$$(date +%Y%m%d-%H%M%S);
+        temporary=/backups/.ux09-$$timestamp.dump.tmp;
+        pg_dump -Fc -f $$temporary;
+        test -s $$temporary;
+        mv $$temporary /backups/ux09-$$timestamp.dump;
+        sleep 86400;
+        done
     volumes:
       - backup-data:/backups
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h postgres -U $$PGUSER -d $$PGDATABASE"]
+      test: ["CMD-SHELL", "find /backups -maxdepth 1 -type f -name 'ux09-*.dump' -mmin -1500 -size +0c | grep -q ."]
       interval: 30s
       timeout: 5s
       retries: 3

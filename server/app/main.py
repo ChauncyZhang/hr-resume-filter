@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import secrets
@@ -85,8 +86,10 @@ def create_app(
     @app.get("/health/ready")
     async def ready(request: Request):  # type: ignore[no-untyped-def]
         try:
-            await database_probe.check()
-            await storage_probe.check()
+            await asyncio.wait_for(
+                asyncio.gather(database_probe.check(), storage_probe.check()),
+                timeout=settings.readiness_timeout_seconds,
+            )
         except Exception as error:
             logger.warning(
                 "dependency_readiness_failed",
