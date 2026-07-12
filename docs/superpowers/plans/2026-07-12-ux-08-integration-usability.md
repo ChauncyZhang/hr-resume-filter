@@ -32,7 +32,7 @@
 - Consumes: deterministic fixture definitions embedded in the generator.
 - Produces: 18 synthetic files plus manifest records with `id`, `filename`, `format`, `targetPosition`, `expectedParseStatus`, `expectedScoreRange`, `scenarioTags`, and `synthetic: true`.
 
-- [ ] **Step 1: Write fixture definitions and verification mode**
+- [x] **Step 1: Write fixture definitions and verification mode**
 
 Add a deterministic `FIXTURES` list and `verify_output(output_dir)` that asserts 18 unique IDs/files, allowed domains, required role distribution, duplicate/same-name scenarios, and no unmasked phone number pattern.
 
@@ -49,21 +49,21 @@ def verify_output(output_dir: Path) -> None:
     }
 ```
 
-- [ ] **Step 2: Run verification and confirm RED**
+- [x] **Step 2: Run verification and confirm RED**
 
 Run: bundled Python `scripts/generate_ux08_resumes.py --verify-only`.
 
 Expected: non-zero exit because the output pack does not exist.
 
-- [ ] **Step 3: Generate TXT, DOCX, text PDF, scan-like PDF, long, and corrupt fixtures**
+- [x] **Step 3: Generate TXT, DOCX, text PDF, scan-like PDF, long, and corrupt fixtures**
 
 Use `python-docx` for DOCX, ReportLab for text PDF, and Pillow + ReportLab for image-only PDF. The corrupt PDF is intentionally invalid and must be marked `expectedParseStatus: failed`.
 
-- [ ] **Step 4: Render and inspect representative files**
+- [x] **Step 4: Render and inspect representative files**
 
 Render at least one DOCX, one text PDF, one scan-like PDF, and the long fixture. Inspect every rendered page for readable Chinese text, clipping, overlap, and correct synthetic labels.
 
-- [ ] **Step 5: Run fixture verification**
+- [x] **Step 5: Run fixture verification**
 
 Run: bundled Python `scripts/generate_ux08_resumes.py --verify-only`.
 
@@ -79,7 +79,7 @@ Expected: `18 synthetic resumes verified`.
 - Consumes: `{ positions, candidates, interviews, pools, memberships }` and workflow commands.
 - Produces: `applyScreeningResults`, `transitionCandidate`, `saveInterview`, `submitInterviewFeedback`, `addTalentMemberships`, `reactivateTalentCandidate`, `recalculatePositionCounts`, and `validateWorkflowState`.
 
-- [ ] **Step 1: Write failing workflow tests**
+- [x] **Step 1: Write failing workflow tests**
 
 Cover these invariants:
 
@@ -92,15 +92,15 @@ test("reactivation creates a linked application and blocks an active duplicate",
 test("validator reports no dangling interview or membership references", () => {});
 ```
 
-- [ ] **Step 2: Run `npm test` and confirm RED**
+- [x] **Step 2: Run `npm test` and confirm RED**
 
 Expected: failure because `ux08Workflow.js` does not exist.
 
-- [ ] **Step 3: Implement minimal immutable helpers**
+- [x] **Step 3: Implement minimal immutable helpers**
 
 Each helper returns a new state object and never mutates input arrays. Candidate stages must remain one of `新简历 | 待复核 | 待沟通 | 待安排 | 面试中 | 待决策 | 已录用 | 已淘汰 | 已撤回`.
 
-- [ ] **Step 4: Run `npm test` and confirm GREEN**
+- [x] **Step 4: Run `npm test` and confirm GREEN**
 
 Expected: existing tests and all UX-08 workflow tests pass.
 
