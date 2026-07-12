@@ -1,4 +1,6 @@
 import io
+import uuid
+from datetime import datetime,timedelta,timezone
 from dataclasses import dataclass, field
 
 from fastapi.testclient import TestClient
@@ -9,6 +11,7 @@ from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
 from server.app.screening.storage import StorageWriteFailed
+from server.app.screening.models import ScreeningItem
 
 class Probe:
     async def check(self): pass
@@ -47,12 +50,13 @@ def test_screening_api_create_upload_read_replay_and_scope(tmp_path):
         assert item["filename"]=="Candidate.txt" and item["status"]=="queued" and "storage_key" not in item and "sha256" not in item
         replay=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("../ Candidate\n.txt",b"Python 5\xe5\xb9\xb4","text/plain")},headers=upload_headers); assert replay.status_code==201 and replay.json()==uploaded.json() and storage.writes==1
         conflict=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("other.txt",b"Different","text/plain")},headers=upload_headers); assert conflict.status_code==409 and conflict.json()["code"]=="idempotency_conflict"
+        assert storage.writes==1
         second=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(("x"*250)+".txt",b"second","text/plain")},headers={**headers,"Idempotency-Key":"item-2"}); assert second.status_code==201 and len(second.json()["data"]["filename"])<=200
         detail=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers); assert detail.status_code==200 and detail.json()["data"]["total_count"]==2
         listing=client.get(f"/api/v1/screening-runs/{run['id']}/items?status=queued&limit=1",headers=headers); assert listing.status_code==200 and listing.json()["meta"]["next_cursor"]
         page2=client.get(f"/api/v1/screening-runs/{run['id']}/items?status=queued&limit=1&cursor={listing.json()['meta']['next_cursor']}",headers=headers); assert page2.status_code==200 and page2.json()["data"][0]["id"]!=listing.json()["data"][0]["id"]
         client.post("/api/v1/auth/logout",headers=headers); denied=login(client,"system@example.test"); denied["Idempotency-Key"]="denied"; assert client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers=denied).status_code==404
-        client.post("/api/v1/auth/logout",headers=denied); manager=login(client,"manager@example.test"); assert client.get(f"/api/v1/screening-runs/{run['id']}",headers=manager).status_code==200; manager["Idempotency-Key"]="read-only"; assert client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("x.txt",b"x","text/plain")},headers=manager).status_code==404
+        client.post("/api/v1/auth/logout",headers=denied); manager=login(client,"manager@example.test"); assert client.get(f"/api/v1/screening-runs/{run['id']}",headers=manager).status_code==200; manager["Idempotency-Key"]="read-only"; unauthorized=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("x.pdf",b"not-a-pdf","application/pdf")},headers=manager); assert unauthorized.status_code==404 and storage.writes==2
 
 def test_screening_upload_rejects_empty_and_magic_mismatch_without_storage(tmp_path):
     app,storage,job_id=app_and_seed(tmp_path)
@@ -68,7 +72,7 @@ def test_screening_upload_exact_size_boundary_and_storage_failure(tmp_path):
         headers=login(client,"admin@example.test"); headers["Idempotency-Key"]="run"; run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers=headers).json()["data"]
         exact=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("x.txt",b"x"*1024,"text/plain")},headers={**headers,"Idempotency-Key":"exact"}); assert exact.status_code==201
         over=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("x.txt",b"x"*1025,"text/plain")},headers={**headers,"Idempotency-Key":"over"}); assert over.status_code==422 and over.json()["code"]=="file_too_large"
-        storage.fail=True; failed=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("y.txt",b"safe","text/plain")},headers={**headers,"Idempotency-Key":"storage"}); assert failed.status_code==503 and failed.json()["code"]=="storage_write_failed"
+        storage.fail=True; failed=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("y.txt",b"safe","text/plain")},headers={**headers,"Idempotency-Key":"storage"}); assert failed.status_code==503 and failed.json()["code"]=="storage_write_failed" and storage.deletes==1
 
 def test_database_failure_deletes_new_quarantine_object(tmp_path,monkeypatch):
     app,storage,job_id=app_and_seed(tmp_path)
@@ -76,4 +80,25 @@ def test_database_failure_deletes_new_quarantine_object(tmp_path,monkeypatch):
         headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
         monkeypatch.setattr("server.app.screening.api.ScreeningItem",lambda **_: (_ for _ in ()).throw(RuntimeError("db failed with resume text")))
         response=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("x.txt",b"private resume","text/plain")},headers={**headers,"Idempotency-Key":"db-fail"})
-        assert response.status_code==409 and storage.writes==1 and storage.deletes==1 and storage.objects=={}
+        assert response.status_code==503 and response.json()["code"]=="persistence_failed" and storage.writes==1 and storage.deletes==1 and storage.objects=={}
+
+def test_run_create_schema_rejects_bad_uuid_and_source(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); headers["Idempotency-Key"]="bad"
+        for body in ({"jd_version_id":"not-a-uuid"},{"source":"worker"}):
+            assert client.post(f"/api/v1/jobs/{job_id}/screening-runs",json=body,headers=headers).status_code==422
+
+def test_screening_item_cursor_is_created_at_id_keyset_with_between_page_insert(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        ids=[]
+        for key in ("first","second"):
+            ids.append(client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"{key}.txt",key.encode(),"text/plain")},headers={**headers,"Idempotency-Key":key}).json()["data"]["id"])
+        with app.state.identity_store.sync_session() as db:
+            first=db.get(ScreeningItem,uuid.UUID(ids[0])); second=db.get(ScreeningItem,uuid.UUID(ids[1])); first.id=uuid.UUID(int=2**128-2); second.id=uuid.UUID(int=1); first.created_at=datetime.now(timezone.utc)-timedelta(seconds=2); second.created_at=first.created_at+timedelta(seconds=1); db.commit(); ids=[str(first.id),str(second.id)]
+        page1=client.get(f"/api/v1/screening-runs/{run['id']}/items?limit=1",headers=headers); assert page1.json()["data"][0]["id"]==ids[0]
+        inserted=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("third.txt",b"third","text/plain")},headers={**headers,"Idempotency-Key":"third"}).json()["data"]["id"]
+        cursor=page1.json()["meta"]["next_cursor"]; page2=client.get(f"/api/v1/screening-runs/{run['id']}/items?limit=10&cursor={cursor}",headers=headers)
+        assert [row["id"] for row in page2.json()["data"]]==[ids[1],inserted]
