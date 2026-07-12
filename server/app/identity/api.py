@@ -60,7 +60,9 @@ def login(payload: LoginRequest, request: Request):
 
 @router.get("/me")
 def me(request: Request):
-    if request.headers.get("sec-fetch-site") == "cross-site":
+    if request.headers.get("sec-fetch-site") not in {"same-origin", "same-site"}:
+        return problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
+    if request.headers.get("origin") is not None and not allowed_origin(request):
         return problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
     token = session_token(request)
     if not token:

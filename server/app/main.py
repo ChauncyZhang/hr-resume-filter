@@ -87,14 +87,18 @@ def create_app(
             network = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
             if not allowed_origin(request):
                 event = "authentication.logout" if request.url.path == "/api/v1/auth/logout" else "csrf.denied"
-                service.audit_denial(event, token=session_token(request), trace_id=trace_id, network=network)
+                audited = service.audit_denial(event, token=session_token(request), trace_id=trace_id, network=network)
+                if not audited:
+                    logger.info("anonymous_csrf_denied", extra={"context": {"trace_id": trace_id}})
                 response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
             if response is None and request.url.path != "/api/v1/auth/login":
                 token = session_token(request)
                 csrf = request.headers.get("x-csrf-token")
                 if not token or not csrf or not service.validate_csrf(token, csrf):
                     event = "authentication.logout" if request.url.path == "/api/v1/auth/logout" else "csrf.denied"
-                    service.audit_denial(event, token=token, trace_id=trace_id, network=network)
+                    audited = service.audit_denial(event, token=token, trace_id=trace_id, network=network)
+                    if not audited:
+                        logger.info("anonymous_csrf_denied", extra={"context": {"trace_id": trace_id}})
                     response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
         if response is None:
             response = await call_next(request)

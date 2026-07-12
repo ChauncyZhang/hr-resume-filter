@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from datetime import datetime, timezone
 import os
 import subprocess
@@ -68,6 +69,31 @@ def test_concurrent_success_cannot_overwrite_failed_attempt(pg_store) -> None:
         user = db.get(User, user_id)
         assert user.failed_login_count in {0, 1}
         assert db.execute(text("select count(*) from audit_logs where event_type='authentication.login'")).scalar_one() == 2
+
+
+def test_independent_users_in_one_organization_do_not_share_login_lock(pg_store) -> None:
+    first_id, organization_id = seed_pg_user(pg_store)
+    with pg_store.sync_session() as db:
+        second = User(organization_id=organization_id, email="second@example.test", normalized_email="second@example.test", display_name="Second", password_hash=PasswordService().hash("correct"), status=UserStatus.ACTIVE)
+        db.add(second)
+        db.commit()
+        assert second.id != first_id
+
+    barrier = Barrier(2, timeout=5)
+
+    class BarrierPasswords:
+        def verify(self, encoded, password):
+            barrier.wait()
+            return False
+
+    def fail(email):
+        service = IdentityService(pg_store, Clock(), TokenSource())
+        service.passwords = BarrierPasswords()
+        with pytest.raises(AuthenticationFailed):
+            service.login("concurrent", email, "wrong", trace_id=str(uuid4()), network="proxy")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(fail, ["user@example.test", "second@example.test"]))
 
 
 def test_cross_organization_relationships_are_rejected(pg_store) -> None:

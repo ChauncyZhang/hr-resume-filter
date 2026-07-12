@@ -85,6 +85,13 @@ def login(client, **overrides):
     )
 
 
+def get_me(client, *, fetch_site="same-origin", origin=None):
+    headers = {"Sec-Fetch-Site": fetch_site} if fetch_site is not None else {}
+    if origin is not None:
+        headers["Origin"] = origin
+    return client.get("/api/v1/me", headers=headers)
+
+
 def test_passwords_use_argon2id_and_verify() -> None:
     service = PasswordService()
     encoded = service.hash("correct horse")
@@ -162,7 +169,7 @@ def test_me_rotates_csrf_refreshes_idle_but_not_absolute(identity_app) -> None:
         absolute = original.absolute_expires_at
         idle = original.idle_expires_at
     clock.advance(minutes=5)
-    response = client.get("/api/v1/me", headers={"Sec-Fetch-Site": "same-origin"})
+    response = get_me(client)
     assert response.status_code == 200
     assert response.headers["X-CSRF-Token"] != old_csrf
     assert response.json()["data"]["roles"] == ["recruiting_admin"]
@@ -178,19 +185,19 @@ def test_idle_absolute_disable_and_authorization_version_revoke(identity_app) ->
     user_id = seed_user(app)
     assert login(client).status_code == 200
     clock.advance(minutes=31)
-    assert client.get("/api/v1/me").status_code == 401
+    assert get_me(client).status_code == 401
     assert login(client).status_code == 200
     with app.state.identity_store.sync_session() as session:
         user = session.get(User, user_id)
         user.authorization_version += 1
         session.commit()
-    assert client.get("/api/v1/me").status_code == 401
+    assert get_me(client).status_code == 401
     assert login(client).status_code == 200
     with app.state.identity_store.sync_session() as session:
         user = session.get(User, user_id)
         user.status = UserStatus.DISABLED
         session.commit()
-    assert client.get("/api/v1/me").status_code == 401
+    assert get_me(client).status_code == 401
 
 
 def test_absolute_expiry_is_not_extended_by_activity(identity_app) -> None:
@@ -199,9 +206,9 @@ def test_absolute_expiry_is_not_extended_by_activity(identity_app) -> None:
     assert login(client).status_code == 200
     for _ in range(23):
         clock.advance(minutes=29)
-        assert client.get("/api/v1/me").status_code == 200
+        assert get_me(client).status_code == 200
     clock.advance(hours=1)
-    assert client.get("/api/v1/me").status_code == 401
+    assert get_me(client).status_code == 401
 
 
 def test_logout_requires_origin_and_matching_csrf_then_revokes(identity_app) -> None:
@@ -217,7 +224,7 @@ def test_logout_requires_origin_and_matching_csrf_then_revokes(identity_app) -> 
         headers={"Origin": "https://hr.example.test", "X-CSRF-Token": csrf},
     )
     assert response.status_code == 204
-    assert client.get("/api/v1/me").status_code == 401
+    assert get_me(client).status_code == 401
     with app.state.identity_store.sync_session() as session:
         events = session.query(app.state.identity_store.AuditModel).filter_by(event_type="authentication.logout").all()
         assert [event.outcome for event in events] == ["denied", "denied", "denied", "success"]
@@ -237,11 +244,37 @@ def test_me_rejects_cross_site_fetch_before_mutating_session(identity_app) -> No
     app, client, _ = identity_app
     seed_user(app)
     csrf = login(client).headers["X-CSRF-Token"]
-    response = client.get("/api/v1/me", headers={"Sec-Fetch-Site": "cross-site"})
+    response = get_me(client, fetch_site="cross-site")
     assert response.status_code == 403
     with app.state.identity_store.sync_session() as session:
         stored = session.query(app.state.identity_store.SessionModel).one()
         assert stored.csrf_token_hash == hash_token(csrf)
+
+
+@pytest.mark.parametrize("fetch_site", [None, "none", "unexpected"])
+def test_me_rejects_missing_or_unrecognized_fetch_metadata(identity_app, fetch_site) -> None:
+    app, client, _ = identity_app
+    seed_user(app)
+    csrf = login(client).headers["X-CSRF-Token"]
+    response = get_me(client, fetch_site=fetch_site)
+    assert response.status_code == 403
+    with app.state.identity_store.sync_session() as session:
+        assert session.query(app.state.identity_store.SessionModel).one().csrf_token_hash == hash_token(csrf)
+
+
+@pytest.mark.parametrize("fetch_site", ["same-origin", "same-site"])
+def test_me_allows_recognized_same_site_metadata(identity_app, fetch_site) -> None:
+    app, client, _ = identity_app
+    seed_user(app)
+    login(client)
+    assert get_me(client, fetch_site=fetch_site).status_code == 200
+
+
+def test_me_rejects_disallowed_origin_even_with_same_origin_metadata(identity_app) -> None:
+    app, client, _ = identity_app
+    seed_user(app)
+    login(client)
+    assert get_me(client, origin="https://evil.test").status_code == 403
 
 
 def test_csrf_middleware_protects_future_state_changing_routes(identity_app) -> None:
@@ -259,6 +292,27 @@ def test_csrf_middleware_protects_future_state_changing_routes(identity_app) -> 
     assert response.status_code == 403
     assert response.json()["code"] == "csrf_validation_failed"
     assert response.headers["X-Trace-ID"] == response.json()["trace_id"]
+
+
+def test_anonymous_csrf_failures_do_not_create_audit_rows(identity_app) -> None:
+    app, client, _ = identity_app
+    for _ in range(5):
+        assert client.post("/api/v1/unknown-write").status_code == 403
+        assert client.post("/api/v1/unknown-write", headers={"Origin": "https://hr.example.test", "X-CSRF-Token": "wrong"}).status_code == 403
+    with app.state.identity_store.sync_session() as session:
+        assert session.query(app.state.identity_store.AuditModel).count() == 0
+
+
+def test_authenticated_wrong_csrf_creates_redacted_audit(identity_app) -> None:
+    app, client, _ = identity_app
+    seed_user(app)
+    login(client)
+    response = client.post("/api/v1/unknown-write", headers={"Origin": "https://hr.example.test", "X-CSRF-Token": "wrong"})
+    assert response.status_code == 403
+    with app.state.identity_store.sync_session() as session:
+        audit = session.query(app.state.identity_store.AuditModel).filter_by(event_type="csrf.denied").one()
+        assert audit.actor_user_id is not None
+        assert audit.metadata_json.keys() == {"network_id"}
 
 
 def test_audit_events_do_not_contain_credentials_tokens_or_full_ip(identity_app) -> None:

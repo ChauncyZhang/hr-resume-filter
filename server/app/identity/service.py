@@ -66,7 +66,7 @@ class IdentityService:
                 .join(Organization)
                 .options(selectinload(User.roles), selectinload(User.organization))
                 .where(Organization.slug == organization_slug, User.normalized_email == email.strip().casefold())
-                .with_for_update()
+                .with_for_update(of=User)
             )
             password_valid = self.passwords.verify(
                 user.password_hash if user else self._dummy_password_hash, password
@@ -163,17 +163,40 @@ class IdentityService:
 
     def validate_csrf(self, token: str, csrf: str) -> bool:
         with self.store.sync_session() as db:
-            try:
-                record = self._load_session(db, token)
-            except InvalidSession:
+            record = db.scalar(
+                select(UserSession)
+                .options(selectinload(UserSession.user))
+                .where(UserSession.token_hash == hash_token(token))
+            )
+            if not self._valid_session_record(record):
                 return False
             return tokens_match(record.csrf_token_hash, csrf)
 
-    def audit_denial(self, event: str, *, token: str | None, trace_id: str, network: str | None) -> None:
+    def audit_denial(self, event: str, *, token: str | None, trace_id: str, network: str | None) -> bool:
+        if not token:
+            return False
         with self.store.sync_session() as db:
-            record = db.scalar(select(UserSession).where(UserSession.token_hash == hash_token(token))) if token else None
-            self._audit(db, event, "denied", organization_id=record.organization_id if record else None, user_id=record.user_id if record else None, trace_id=trace_id, network=network)
+            record = db.scalar(
+                select(UserSession)
+                .options(selectinload(UserSession.user))
+                .where(UserSession.token_hash == hash_token(token))
+            )
+            if not self._valid_session_record(record):
+                return False
+            self._audit(db, event, "denied", organization_id=record.organization_id, user_id=record.user_id, trace_id=trace_id, network=network)
             db.commit()
+            return True
+
+    def _valid_session_record(self, record: UserSession | None) -> bool:
+        if record is None or record.revoked_at is not None:
+            return False
+        now = self.clock.current_time()
+        return (
+            self._aware(record.idle_expires_at) > now
+            and self._aware(record.absolute_expires_at) > now
+            and record.user.status == UserStatus.ACTIVE
+            and record.authorization_version == record.user.authorization_version
+        )
 
     @staticmethod
     def permission_summary(roles) -> list[str]:
