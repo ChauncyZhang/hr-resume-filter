@@ -207,12 +207,13 @@ WHERE stage NOT IN ('hired', 'rejected', 'withdrawn');
 | `GET` | `/api/v1/candidates/{candidate_id}/resumes` | 简历版本列表 |
 | `GET` | `/api/v1/resumes/{resume_id}/preview` | 授权预览；记录审计 |
 | `POST` | `/api/v1/resumes/{resume_id}/download-tickets` | 生成短期一次性下载票据 |
+| `POST` | `/api/v1/download-tickets/consume` | 在 JSON 请求体中消费票据并流式返回附件，票据不得进入 URL 或日志 |
 | `GET` | `/api/v1/candidates/{candidate_id}/applications` | 历史申请 |
 | `POST` | `/api/v1/jobs/{job_id}/applications` | 为已有候选人创建申请 |
 | `POST` | `/api/v1/applications/{application_id}/transitions` | 阶段流转和原因 |
 | `PATCH` | `/api/v1/applications/{application_id}` | 负责人、人工结论等非状态字段 |
 
-候选人列表默认不返回完整联系方式、解析文本和反馈；详情字段根据权限裁剪，而不是仅在前端脱敏。PII 响应统一返回 `Cache-Control: no-store`。
+候选人列表默认不返回完整联系方式、解析文本和反馈；详情字段根据权限裁剪，而不是仅在前端脱敏。PII 响应统一返回 `Cache-Control: no-store`。被授权职位的用人经理可查看有大小限制的解析文本预览，但联系方式保持脱敏，且无权创建或消费原始简历下载票据。
 
 ### 5.5 面试和反馈
 
