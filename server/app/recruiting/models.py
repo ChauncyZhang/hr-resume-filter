@@ -65,7 +65,7 @@ class VersionRecord(Record):
 
 
 def version_constraints():
-    return (UniqueConstraint("organization_id", "job_id", "version_number"), ForeignKeyConstraint(["organization_id", "job_id"], ["jobs.organization_id", "jobs.id"]), ForeignKeyConstraint(["organization_id", "created_by"], ["users.organization_id", "users.id"]))
+    return (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "job_id", "id"), UniqueConstraint("organization_id", "job_id", "version_number"), ForeignKeyConstraint(["organization_id", "job_id"], ["jobs.organization_id", "jobs.id"]), ForeignKeyConstraint(["organization_id", "created_by"], ["users.organization_id", "users.id"]))
 
 
 class JobJdVersion(VersionRecord, Base):

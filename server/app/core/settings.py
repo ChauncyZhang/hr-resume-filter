@@ -44,6 +44,12 @@ class Settings(BaseModel):
     worker_poll_interval_seconds: float = Field(default=1, ge=0)
     worker_shutdown_timeout_seconds: float = Field(default=30, gt=0)
     worker_cancel_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    parser_max_source_bytes: int = Field(default=10 * 1024 * 1024, ge=1024, le=100 * 1024 * 1024)
+    parser_max_text_chars: int = Field(default=500_000, ge=1000, le=5_000_000)
+    parser_pdf_max_pages: int = Field(default=100, ge=1, le=1000)
+    parser_docx_max_entries: int = Field(default=1000, ge=10, le=10000)
+    parser_docx_max_uncompressed_bytes: int = Field(default=50 * 1024 * 1024, ge=1024, le=500 * 1024 * 1024)
+    parser_docx_max_compression_ratio: int = Field(default=100, ge=1, le=1000)
 
     @model_validator(mode="after")
     def validate_worker_timing(self) -> "Settings":
@@ -121,6 +127,12 @@ class Settings(BaseModel):
             "WORKER_POLL_INTERVAL_SECONDS": "worker_poll_interval_seconds",
             "WORKER_SHUTDOWN_TIMEOUT_SECONDS": "worker_shutdown_timeout_seconds",
             "WORKER_CANCEL_TIMEOUT_SECONDS": "worker_cancel_timeout_seconds",
+            "PARSER_MAX_SOURCE_BYTES": "parser_max_source_bytes",
+            "PARSER_MAX_TEXT_CHARS": "parser_max_text_chars",
+            "PARSER_PDF_MAX_PAGES": "parser_pdf_max_pages",
+            "PARSER_DOCX_MAX_ENTRIES": "parser_docx_max_entries",
+            "PARSER_DOCX_MAX_UNCOMPRESSED_BYTES": "parser_docx_max_uncompressed_bytes",
+            "PARSER_DOCX_MAX_COMPRESSION_RATIO": "parser_docx_max_compression_ratio",
         }
         for env_name, field_name in mapping.items():
             if env_name in os.environ:

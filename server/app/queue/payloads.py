@@ -22,6 +22,12 @@ class OpaqueIdField:
         try: return str(uuid.UUID(value))
         except ValueError: raise UnsafePayload("opaque ID must be a UUID string") from None
 
+@dataclass(frozen=True)
+class IdentifierField:
+    def validate(self, value: object) -> str:
+        if not isinstance(value, str) or not IDENTIFIER_PATTERN.fullmatch(value): raise UnsafePayload("invalid version identifier")
+        return value
+
 
 @dataclass(frozen=True)
 class EnumField:
@@ -98,3 +104,5 @@ class PayloadPolicyRegistry:
 
 
 DEFAULT_PAYLOAD_POLICIES = PayloadPolicyRegistry()
+DEFAULT_PAYLOAD_POLICIES.register_job("screening.parse_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"parser_version":IdentifierField()}))
+DEFAULT_PAYLOAD_POLICIES.register_job("screening.score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"jd_version_id":OpaqueIdField(),"rule_version_id":OpaqueIdField(),"rule_engine_version":IdentifierField()}))

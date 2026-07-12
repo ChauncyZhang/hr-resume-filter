@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from server.app.core.settings import Settings
 from server.app.identity.models import Base
 from server.app.queue import models as queue_models  # noqa: F401
+from server.app.screening import models as screening_models  # noqa: F401
 
 
 config = context.config
