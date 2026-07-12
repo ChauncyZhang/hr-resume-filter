@@ -1,6 +1,7 @@
 import os
 import subprocess
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, inspect, select, text
@@ -46,13 +47,45 @@ def test_run_item_transitions_counters_and_immutable_versions(screening_db) -> N
     with Session(screening_db) as session:
         with pytest.raises(DBAPIError): session.execute(text("UPDATE screening_runs SET processed_count=1,succeeded_count=0,failed_count=0 WHERE id=:id"), {"id":run_id})
 
+
+def test_run_identity_source_status_and_version_constraints(screening_db) -> None:
+    with Session(screening_db) as session:
+        ids=seed(session,"run-hardening"); run=make_run(session,ids); session.commit(); run_id=run.id
+        for statement, params in (
+            ("UPDATE screening_runs SET id=:new WHERE id=:id", {"new":uuid.uuid4(),"id":run_id}),
+            ("UPDATE screening_runs SET source='api' WHERE id=:id", {"id":run_id}),
+            ("UPDATE screening_runs SET created_at=created_at+interval '1 second' WHERE id=:id", {"id":run_id}),
+        ):
+            with pytest.raises(DBAPIError) as raised: session.execute(text(statement), params)
+            assert "screening snapshot is immutable" in str(raised.value); session.rollback()
+        for statement in ("UPDATE screening_runs SET source='unknown' WHERE id=:id", "UPDATE screening_runs SET status='llm_scoring' WHERE id=:id", "UPDATE screening_runs SET version=0 WHERE id=:id"):
+            if "llm_scoring" in statement:
+                session.execute(text(statement), {"id":run_id}); session.commit(); assert session.get(ScreeningRun,run_id).status=="llm_scoring"
+            else:
+                with pytest.raises(DBAPIError): session.execute(text(statement), {"id":run_id})
+                session.rollback()
+
 def test_results_are_append_only_except_human_override(screening_db) -> None:
     with Session(screening_db) as session:
         ids=seed(session,"results"); run=make_run(session,ids); item=ScreeningItem(organization_id=ids[0],run_id=run.id,file_object_id=ids[5],status="scored",attempts=1); session.add(item); session.flush()
         result=ScreeningResult(organization_id=ids[0],item_id=item.id,rule_engine_version="rule-v1",rule_score=85,recommendation="优先沟通",required_hits=["Python"],required_missing=[],bonus_hits=[],estimated_years=5,risks=[],questions=[]); session.add(result); session.commit()
-        result.human_override_recommendation="可沟通"; result.human_override_reason_code="manual_review"; session.commit()
+        result.human_override_recommendation="可沟通"; result.human_override_reason_code="manual_review"; result.human_override_by=ids[1]; result.human_override_at=datetime.now(timezone.utc); session.commit()
+        with pytest.raises(DBAPIError) as changed_id: session.execute(text("UPDATE screening_results SET id=:new WHERE id=:id"), {"new":uuid.uuid4(),"id":result.id})
+        assert "screening result facts are append-only" in str(changed_id.value); session.rollback()
         with pytest.raises(DBAPIError): session.execute(text("UPDATE screening_results SET rule_score=1 WHERE id=:id"), {"id":result.id}); session.rollback()
         with pytest.raises(DBAPIError): session.execute(text("DELETE FROM screening_results WHERE id=:id"), {"id":result.id})
+
+
+def test_result_recommendations_and_override_are_database_validated(screening_db) -> None:
+    with Session(screening_db) as session:
+        ids=seed(session,"result-checks"); run=make_run(session,ids); item=ScreeningItem(organization_id=ids[0],run_id=run.id,file_object_id=ids[5],status="scored",attempts=1); session.add(item); session.commit()
+        bad=ScreeningResult(organization_id=ids[0],item_id=item.id,rule_engine_version="rule-v1",rule_score=50,recommendation="任意值",required_hits=[],required_missing=[],bonus_hits=[],estimated_years=0,risks=[],questions=[]); session.add(bad)
+        with pytest.raises(IntegrityError): session.commit()
+        session.rollback(); item=session.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==ids[0])); good=ScreeningResult(organization_id=ids[0],item_id=item.id,rule_engine_version="rule-v1",rule_score=50,recommendation="需人工复核",required_hits=[],required_missing=["Python"],bonus_hits=[],estimated_years=0,risks=[],questions=[]); session.add(good); session.commit()
+        good.human_override_recommendation="可沟通"
+        with pytest.raises(IntegrityError): session.commit()
+        session.rollback(); good=session.get(ScreeningResult,good.id); good.human_override_recommendation="可沟通"; good.human_override_reason_code="manual_review"; good.human_override_by=ids[1]; good.human_override_at=datetime.now(timezone.utc); session.commit()
+        assert good.human_override_recommendation=="可沟通"
 
 def test_tenant_fks_uniqueness_and_duplicate_hints(screening_db) -> None:
     with Session(screening_db) as session:

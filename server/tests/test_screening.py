@@ -7,6 +7,8 @@ from server.app.screening.parsers import ParserError, ParserLimits, parse_docume
 from server.app.screening.rules import ENGINE_VERSION, RuleSnapshot, score_resume
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, UnsafePayload
 import uuid
+from types import SimpleNamespace
+from server.app.screening.service import InvalidScreeningTransition, transition_run
 
 
 def test_rule_engine_matches_legacy_and_returns_structured_ordered_facts() -> None:
@@ -121,3 +123,14 @@ def test_future_screening_queue_payloads_are_registered_and_opaque_only() -> Non
     assert DEFAULT_PAYLOAD_POLICIES.validate_job("screening.parse_item", {"organization_id":org_id,"screening_item_id":item_id,"parser_version":"parser-v1"})["screening_item_id"] == item_id
     assert DEFAULT_PAYLOAD_POLICIES.validate_job("screening.score_item", {"organization_id":org_id,"screening_item_id":item_id,"jd_version_id":jd_id,"rule_version_id":rule_id,"rule_engine_version":"rule-v1"})["rule_engine_version"] == "rule-v1"
     with pytest.raises(UnsafePayload): DEFAULT_PAYLOAD_POLICIES.validate_job("screening.parse_item", {"organization_id":org_id,"screening_item_id":item_id,"parser_version":"parser-v1","resume_text":"secret"})
+
+
+def test_run_transition_contract_supports_rule_only_and_future_llm_paths() -> None:
+    direct = SimpleNamespace(status="rule_scoring", version=1)
+    transition_run(direct, "completed"); assert direct.status == "completed" and direct.version == 2
+    llm = SimpleNamespace(status="rule_scoring", version=3)
+    transition_run(llm, "llm_scoring"); transition_run(llm, "partial")
+    assert llm.status == "partial" and llm.version == 5
+    for terminal in ("completed", "partial", "failed", "cancelled"):
+        run = SimpleNamespace(status="llm_scoring", version=1); transition_run(run, terminal); assert run.status == terminal
+    with pytest.raises(InvalidScreeningTransition): transition_run(SimpleNamespace(status="queued", version=1), "llm_scoring")

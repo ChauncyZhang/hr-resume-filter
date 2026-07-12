@@ -1,4 +1,4 @@
-RUN_TRANSITIONS={"queued":{"parsing","cancelled"},"parsing":{"rule_scoring","partial","failed","cancelled"},"rule_scoring":{"completed","partial","failed","cancelled"}}
+RUN_TRANSITIONS={"queued":{"parsing","cancelled"},"parsing":{"rule_scoring","partial","failed","cancelled"},"rule_scoring":{"llm_scoring","completed","partial","failed","cancelled"},"llm_scoring":{"completed","partial","failed","cancelled"}}
 ITEM_TRANSITIONS={"queued":{"parsing","cancelled"},"parsing":{"parsed","failed"},"parsed":{"scoring","failed"},"scoring":{"scored","failed"}}
 class InvalidScreeningTransition(ValueError): pass
 def _transition(record,target,allowed):
