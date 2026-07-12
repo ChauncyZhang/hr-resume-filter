@@ -12,7 +12,7 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
 from server.app.identity.api import problem, session_token
-from server.app.identity.models import AuditLog, Job, JobCollaborator
+from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.recruiting.cursor import CursorCodec, InvalidCursor
@@ -184,6 +184,15 @@ def _candidate_data(db, candidate: Candidate, principal: Principal) -> dict[str,
     return {"id": str(candidate.id), "display_name": candidate.display_name, "current_title": candidate.current_title, "location": candidate.location, "owner_id": str(candidate.owner_id) if candidate.owner_id else None, "version": candidate.version, "updated_at": candidate.updated_at.isoformat(), "contacts": [{"kind": item.kind, "value": item.masked_value} for item in contacts]}
 
 
+def _eligible_recruiter(db, organization_id: UUID, user_id: UUID) -> bool:
+    return db.scalar(select(exists().where(
+        User.organization_id == organization_id,
+        User.id == user_id,
+        User.status == UserStatus.ACTIVE,
+        exists().where(UserRole.user_id == User.id, UserRole.role == "recruiter"),
+    )))
+
+
 def _application_data(item: Application) -> dict[str, Any]:
     return {"id": str(item.id), "candidate_id": str(item.candidate_id), "job_id": str(item.job_id), "resume_id": str(item.resume_id), "owner_id": str(item.owner_id), "stage": item.stage, "source": item.source, "source_application_id": str(item.source_application_id) if item.source_application_id else None, "human_conclusion": item.human_conclusion, "version": item.version, "updated_at": item.updated_at.isoformat()}
 
@@ -352,7 +361,12 @@ def create_candidate(payload: CandidateCreate, request: Request):
     if isinstance(principal, JSONResponse): return principal
     if not AUTH.role_allows(principal, RecruitingAction.MANAGE_CANDIDATE): return _denied(request)
     with request.app.state.identity_store.sync_session() as db:
-        candidate = Candidate(organization_id=principal.organization_id, display_name=payload.display_name, current_title=payload.current_title, location=payload.location, owner_id=payload.owner_id or principal.user_id); db.add(candidate); db.flush()
+        owner_id = payload.owner_id
+        if owner_id is None and "recruiter" in principal.roles:
+            owner_id = principal.user_id
+        if owner_id is not None and not _eligible_recruiter(db, principal.organization_id, owner_id):
+            return _denied(request)
+        candidate = Candidate(organization_id=principal.organization_id, display_name=payload.display_name, current_title=payload.current_title, location=payload.location, owner_id=owner_id); db.add(candidate); db.flush()
         try:
             for contact in payload.contacts:
                 protected = request.app.state.contact_cipher.protect(contact.kind, contact.value)
@@ -387,6 +401,8 @@ def patch_candidate(candidate_id: UUID, payload: CandidatePatch, request: Reques
         candidate = _load_candidate(db, principal, candidate_id, RecruitingAction.MANAGE_CANDIDATE)
         if candidate is None: return _denied(request)
         changes = payload.model_dump(exclude_unset=True)
+        if changes.get("owner_id") is not None and not _eligible_recruiter(db, principal.organization_id, changes["owner_id"]):
+            return _denied(request)
         try:
             candidate = patch_candidate_record(db, principal.organization_id, candidate_id, changes, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
             db.commit(); return _resource(_candidate_data(db, candidate, principal))
@@ -423,7 +439,7 @@ def notes(candidate_id: UUID, request: Request):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_candidate(db, principal, candidate_id, RecruitingAction.COMMENT) is None: return _denied(request)
+        if _load_candidate(db, principal, candidate_id, RecruitingAction.READ) is None: return _denied(request)
         rows = db.scalars(select(CandidateNote).where(CandidateNote.organization_id == principal.organization_id, CandidateNote.candidate_id == candidate_id).order_by(CandidateNote.created_at)).all()
         return {"data": [{"id": str(row.id), "body": row.payload["body"], "author_id": str(row.actor_user_id), "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
 
@@ -433,7 +449,7 @@ def add_note(candidate_id: UUID, payload: NoteCreate, request: Request):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_candidate(db, principal, candidate_id) is None: return _denied(request)
+        if _load_candidate(db, principal, candidate_id, RecruitingAction.COMMENT) is None: return _denied(request)
         note = CandidateNote(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note", payload={"body": payload.body}); db.add(note); db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note_added", payload={})); db.flush()
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="candidate.note_added", outcome="success", trace_id=request.state.trace_id, metadata_json={"candidate_id": str(candidate_id), "note_id": str(note.id)})); db.commit()
         return _resource({"id": str(note.id), "body": payload.body, "author_id": str(principal.user_id)}, 201)

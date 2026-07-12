@@ -31,7 +31,7 @@ ROLE_ACTIONS = {
     },
     "hiring_manager": {
         RecruitingAction.READ, RecruitingAction.COMMENT,
-        RecruitingAction.RECOMMEND,
+        RecruitingAction.RECOMMEND, RecruitingAction.PREVIEW,
     },
 }
 
@@ -82,6 +82,7 @@ class RecruitingAuthorizationService:
             ),
         )
         unassigned_owner = and_(
+            "recruiter" in principal.roles,
             action in {RecruitingAction.READ, RecruitingAction.COMMENT, RecruitingAction.MANAGE_CANDIDATE},
             candidate.owner_id == principal.user_id,
             ~exists().where(

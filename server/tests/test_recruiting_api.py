@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.app.core.settings import Settings
-from server.app.identity.models import Organization, User, UserRole, Job, JobCollaborator
+from server.app.identity.models import Organization, User, UserRole, UserStatus, Job, JobCollaborator
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting.models import Candidate, FileObject, Resume
@@ -295,6 +295,8 @@ def test_multi_role_manager_grant_cannot_be_crossed_with_recruiter_actions(tmp_p
         headers = login(client, "mixed@example.test")
         assert client.get(f"/api/v1/jobs/{job_id}").status_code == 200
         assert client.get(f"/api/v1/candidates/{candidate_id}").status_code == 200
+        preview = client.get(f"/api/v1/resumes/{resume_id}/preview")
+        assert preview.status_code == 200 and preview.json()["data"]["text"] == "preview"
         assert client.post(f"/api/v1/candidates/{candidate_id}/notes", json={"body": "Manager comment"}, headers=headers).status_code == 201
         recommendation = client.patch(f"/api/v1/applications/{application_id}", json={"human_conclusion": "recommend"}, headers={**headers, "If-Match": '"1"'})
         assert recommendation.status_code == 200 and recommendation.json()["data"]["human_conclusion"] == "recommend"
@@ -304,10 +306,51 @@ def test_multi_role_manager_grant_cannot_be_crossed_with_recruiter_actions(tmp_p
             client.post(f"/api/v1/jobs/{job_id}/jd-versions", json={"content": {"text": "takeover"}}, headers=headers),
             client.post(f"/api/v1/jobs/{job_id}/applications", json={"candidate_id": candidate_id, "resume_id": resume_id}, headers={**headers, "Idempotency-Key": "mixed-create"}),
             client.post(f"/api/v1/resumes/{resume_id}/download-tickets", headers=headers),
-            client.get(f"/api/v1/resumes/{resume_id}/preview"),
             client.post(f"/api/v1/applications/{application_id}/transitions", json={"target": "review"}, headers={**headers, "If-Match": '"1"', "Idempotency-Key": "mixed-app-transition"}),
         ]
         assert all(response.status_code == 404 for response in denied)
+
+
+@pytest.mark.parametrize("role", ["hiring_manager", "system_admin", "interviewer"])
+def test_non_recruiter_owner_id_never_grants_unassigned_candidate_access(tmp_path, role) -> None:
+    app = make_app(tmp_path)
+    user_id = seed_user(app, role, f"{role}@example.test")
+    with app.state.identity_store.sync_session() as db:
+        user = db.get(User, user_id)
+        candidate = Candidate(organization_id=user.organization_id, display_name="Legacy owner collision", owner_id=user_id)
+        db.add(candidate); db.commit(); candidate_id = str(candidate.id)
+    with TestClient(app) as client:
+        login(client, f"{role}@example.test")
+        response = client.get(f"/api/v1/candidates/{candidate_id}")
+        assert response.status_code == 404 and response.json()["code"] == "resource_not_found"
+
+
+def test_candidate_owner_assignment_requires_active_same_org_recruiter_on_create_and_patch(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
+    eligible_id = seed_user(app, "recruiter", "eligible@example.test")
+    second_id = seed_user(app, "recruiter", "second@example.test")
+    disabled_id = seed_user(app, "recruiter", "disabled@example.test")
+    non_recruiter_id = seed_user(app, "hiring_manager", "manager@example.test")
+    with app.state.identity_store.sync_session() as db:
+        db.get(User, disabled_id).status = UserStatus.DISABLED
+        other_org = Organization(slug="other-owner-org", name="Other", status="active")
+        cross_org = User(organization=other_org, email="cross@example.test", normalized_email="cross@example.test", display_name="Cross", password_hash=PasswordService().hash("correct horse"))
+        cross_org.roles.append(UserRole(role="recruiter")); db.add(cross_org); db.commit(); cross_org_id = cross_org.id
+    invalid = [str(disabled_id), str(non_recruiter_id), str(cross_org_id), "00000000-0000-0000-0000-000000000099"]
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        for owner_id in invalid:
+            denied = client.post("/api/v1/candidates", json={"display_name": "Denied", "owner_id": owner_id}, headers=headers)
+            assert denied.status_code == 404 and denied.json()["code"] == "resource_not_found"
+        created = client.post("/api/v1/candidates", json={"display_name": "Allowed", "owner_id": str(eligible_id)}, headers=headers)
+        assert created.status_code == 201 and created.json()["data"]["owner_id"] == str(eligible_id)
+        candidate_id = created.json()["data"]["id"]
+        for owner_id in invalid:
+            denied = client.patch(f"/api/v1/candidates/{candidate_id}", json={"owner_id": owner_id}, headers={**headers, "If-Match": '"1"'})
+            assert denied.status_code == 404 and denied.json()["code"] == "resource_not_found"
+        changed = client.patch(f"/api/v1/candidates/{candidate_id}", json={"owner_id": str(second_id)}, headers={**headers, "If-Match": '"1"'})
+        assert changed.status_code == 200 and changed.json()["data"]["owner_id"] == str(second_id)
 
 
 @pytest.mark.parametrize("failure", ["open", "mid-read"])
