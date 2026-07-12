@@ -175,6 +175,18 @@ class IdentityService:
             db.commit()
             return data, csrf
 
+    def principal(self, token: str):
+        from server.app.identity.policy import Principal
+
+        with self.store.sync_session() as db:
+            record = self._resolve_session(db, token)
+            return Principal(
+                user_id=record.user_id,
+                organization_id=record.organization_id,
+                roles=frozenset(role.role for role in record.user.roles),
+                active=True,
+            )
+
     def logout(self, token: str, csrf: str, *, trace_id: str, network: str | None) -> None:
         with self.store.sync_session() as db:
             record = self._resolve_session(db, token, trace_id=trace_id, network=network)

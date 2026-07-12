@@ -6,15 +6,18 @@ import subprocess
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from server.app.identity.models import Organization, User, UserStatus
+from server.app.core.settings import Settings
+from server.app.identity.models import Organization, User, UserRole, UserStatus
 from server.app.identity.security import PasswordService
 from server.app.identity.service import AuthenticationFailed, Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
 from server.app.recruiting.models import CandidateEvent
 from server.app.recruiting.service import (IdempotencyConflict, ResourceVersionConflict, TicketInvalid, consume_download_ticket_record, issue_download_ticket_record, persisted_idempotent, transition_application_record, transition_job_record)
+from server.app.main import create_app
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
@@ -59,6 +62,43 @@ class FixedRecruitingClock:
 class FixedToken:
     def __init__(self, value): self.value = value
     def new_token(self): return self.value
+
+
+class Probe:
+    async def check(self):
+        pass
+
+
+def test_postgres_api_applies_recruiter_scope_inside_job_candidate_and_funnel_queries(pg_store) -> None:
+    with pg_store.sync_session() as db:
+        organization = Organization(slug="api-scope", name="API Scope", status="active")
+        recruiter = User(organization=organization, email="recruiter@example.test", normalized_email="recruiter@example.test", display_name="Recruiter", password_hash=PasswordService().hash("correct"), status=UserStatus.ACTIVE)
+        recruiter.roles.append(UserRole(role="recruiter"))
+        outsider = User(organization=organization, email="other@example.test", normalized_email="other@example.test", display_name="Other", password_hash=PasswordService().hash("correct"), status=UserStatus.ACTIVE)
+        outsider.roles.append(UserRole(role="recruiter"))
+        db.add_all([recruiter, outsider]); db.commit()
+        organization_id, outsider_id = organization.id, outsider.id
+
+    app = create_app(
+        settings=Settings(environment="test", database_url=os.environ["POSTGRES_SMOKE_URL"], cors_origins=["https://hr.example.test"]),
+        database_probe=Probe(), storage_probe=Probe(),
+    )
+    with TestClient(app) as client:
+        login = client.post("/api/v1/auth/login", json={"organization_slug": "api-scope", "email": "recruiter@example.test", "password": "correct"}, headers={"Origin": "https://hr.example.test"})
+        headers = {"Origin": "https://hr.example.test", "X-CSRF-Token": login.headers["X-CSRF-Token"]}
+        owned_job = client.post("/api/v1/jobs", json={"title": "Owned"}, headers=headers).json()["data"]
+        owned_candidate = client.post("/api/v1/candidates", json={"display_name": "Owned Candidate"}, headers=headers).json()["data"]
+
+        with pg_store.engine.begin() as connection:
+            unauthorized_job, unauthorized_candidate = uuid4(), uuid4()
+            connection.execute(text("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:id,:org,'Hidden',:owner,'open',now(),now())"), {"id": unauthorized_job, "org": organization_id, "owner": outsider_id})
+            connection.execute(text("insert into candidates(id,organization_id,display_name,owner_id) values (:id,:org,'Hidden Candidate',:owner)"), {"id": unauthorized_candidate, "org": organization_id, "owner": outsider_id})
+
+        jobs = client.get("/api/v1/jobs").json()["data"]
+        candidates = client.get("/api/v1/candidates?q=Candidate").json()["data"]
+        assert [row["id"] for row in jobs] == [owned_job["id"]]
+        assert [row["id"] for row in candidates] == [owned_candidate["id"]]
+        assert client.get(f"/api/v1/jobs/{unauthorized_job}/funnel").status_code == 404
 
 
 def test_five_concurrent_failures_reliably_lock_account(pg_store) -> None:

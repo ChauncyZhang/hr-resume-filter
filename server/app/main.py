@@ -15,6 +15,11 @@ from server.app.core.settings import Settings
 from server.app.identity.api import allowed_origin, problem, router as identity_router, session_token
 from server.app.identity.service import Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
+from server.app.recruiting.api import router as recruiting_router
+from server.app.recruiting.cursor import CursorCodec
+from server.app.recruiting.security import ContactCipher
+from server.app.recruiting.service import SystemClock, SystemTokens
+from server.app.recruiting.storage import MinioResumeStorage
 
 
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -33,6 +38,7 @@ def create_app(
     clock: Clock | None = None,
     token_source: TokenSource | None = None,
     initialize_identity_schema: bool = False,
+    resume_storage=None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
 
@@ -41,8 +47,7 @@ def create_app(
         from server.app.db.session import DatabaseProbe, create_engine
 
         database_probe = database_probe or DatabaseProbe(create_engine(settings.database_url))
-        storage_probe = storage_probe or ObjectStorageProbe(
-            create_storage_client(
+        storage_client = create_storage_client(
                 settings.object_storage_endpoint,
                 settings.object_storage_access_key,
                 settings.object_storage_secret_key,
@@ -50,9 +55,9 @@ def create_app(
                 connect_timeout_seconds=settings.object_storage_connect_timeout_seconds,
                 read_timeout_seconds=settings.object_storage_read_timeout_seconds,
                 total_timeout_seconds=settings.object_storage_total_timeout_seconds,
-            ),
-            settings.object_storage_bucket,
-        )
+            )
+        storage_probe = storage_probe or ObjectStorageProbe(storage_client, settings.object_storage_bucket)
+        resume_storage = resume_storage or MinioResumeStorage(storage_client, settings.object_storage_bucket)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -67,7 +72,21 @@ def create_app(
     app.state.identity_service = IdentityService(
         app.state.identity_store, clock or Clock(), token_source or TokenSource()
     )
+    app.state.recruiting_clock = clock or SystemClock()
+    app.state.recruiting_tokens = SystemTokens()
+    cursor_secret = settings.contact_lookup_secret.get_secret_value()
+    app.state.recruiting_cursor = CursorCodec(
+        cursor_secret.encode() if cursor_secret != "change-me" else b"test-only-cursor-signing-boundary"
+    )
+    app.state.contact_cipher = ContactCipher(
+        settings.contact_encryption_key.get_secret_value().encode(),
+        settings.contact_lookup_secret.get_secret_value().encode(),
+    ) if settings.contact_encryption_key.get_secret_value() != "change-me" else ContactCipher(
+        b"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", b"fedcba9876543210fedcba9876543210"
+    )
+    app.state.resume_storage = resume_storage
     app.include_router(identity_router)
+    app.include_router(recruiting_router)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
