@@ -10,13 +10,14 @@ from sqlalchemy import and_,func,or_,select
 from server.app.identity.models import AuditLog,Job
 from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load_job,_principal,_problem_for
 from server.app.recruiting.authorization import RecruitingAction
-from server.app.recruiting.models import FileObject,IdempotencyRecord,JobJdVersion,ScreeningRuleVersion
+from server.app.recruiting.models import Application,FileObject,IdempotencyRecord,JobJdVersion,ScreeningRuleVersion
 from server.app.recruiting.service import IdempotencyConflict,persisted_idempotent
 from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,ScreeningRun
 from server.app.screening.parsers import ParserError,ParserLimits,validate_upload_preflight
-from server.app.screening.schemas import ItemCollection,ItemResource,RunCreate,RunResource
+from server.app.screening.schemas import BulkAction,BulkResource,ItemCollection,ItemResource,RetryResource,RunCreate,RunResource
 from server.app.screening.storage import StorageWriteFailed
 from server.app.queue.repository import QueueRepository
+from server.app.screening.actions import ScreeningBulkConflict,ScreeningItemNotRetryable,ScreeningRetryActive,apply_bulk_action,retry_screening_item,RECOVERABLE_CODES
 
 router=APIRouter(prefix="/api/v1"); _SAFE_STATUS={"queued","parsing","parsed","scoring","scored","failed","cancelled"}
 class RunNotQueued(Exception): pass
@@ -29,11 +30,13 @@ def _problem(request,status,code):
     from server.app.identity.api import problem
     response=problem(request,status,code,"The request could not be completed."); response.headers["Cache-Control"]="no-store"; return response
 def _not_found(request): return _problem(request,404,"resource_not_found")
-def _run_data(run): return {"id":str(run.id),"job_id":str(run.job_id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"source":run.source,"status":run.status,"total_count":run.total_count,"processed_count":run.processed_count,"succeeded_count":run.succeeded_count,"failed_count":run.failed_count,"version":run.version,"created_at":run.created_at.isoformat()}
-def _item_data(item,file): return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat()}
+def _run_data(run,error_summary=None): return {"id":str(run.id),"job_id":str(run.job_id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"source":run.source,"status":run.status,"total_count":run.total_count,"processed_count":run.processed_count,"succeeded_count":run.succeeded_count,"failed_count":run.failed_count,"version":run.version,"created_at":run.created_at.isoformat(),"error_summary":error_summary or {}}
+def _item_data(item,file,application=None): return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"application_stage":application.stage if application else None,"application_version":application.version if application else None}
 def _load_run(db,principal,run_id,action=RecruitingAction.READ,lock=False):
     query=select(ScreeningRun).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningRun.organization_id==principal.organization_id,ScreeningRun.id==run_id,_job_scope(principal,action))
     return db.scalar(query.with_for_update() if lock else query)
+def _load_item_scoped(db,principal,item_id,action=RecruitingAction.READ):
+    return db.scalar(select(ScreeningItem).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.id==item_id,_job_scope(principal,action)))
 def _filename(value,extension):
     name=PurePath(unquote(value or "").replace("\\","/")).name; name=re.sub(r"[\x00-\x1f\x7f]","",name).strip().replace("..",".")
     if not name: name=f"resume{extension}"
@@ -129,7 +132,42 @@ def get_run(run_id:UUID,request:Request):
     principal=_principal(request)
     if isinstance(principal,JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        run=_load_run(db,principal,run_id); return _not_found(request) if run is None else _response(_run_data(run))
+        run=_load_run(db,principal,run_id)
+        if run is None: return _not_found(request)
+        error_rows=db.execute(select(ScreeningItem.safe_error_code,func.count()).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.safe_error_code.is_not(None)).group_by(ScreeningItem.safe_error_code).order_by(func.count().desc(),ScreeningItem.safe_error_code).limit(20))
+        return _response(_run_data(run,{code:count for code,count in error_rows}))
+
+@router.post("/screening-items/{item_id}/retry",response_model=RetryResource)
+def retry_item(item_id:UUID,request:Request,idempotency_key:str|None=Header(None)):
+    principal=_principal(request); key=_idempotency(request,idempotency_key)
+    if isinstance(principal,JSONResponse): return principal
+    if isinstance(key,JSONResponse): return key
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_item_scoped(db,principal,item_id,RecruitingAction.MANAGE_JOB) is None: return _not_found(request)
+        try:
+            def action():
+                item,run,_=retry_screening_item(db,principal.organization_id,item_id,request.state.trace_id); stored=db.get(FileObject,item.file_object_id); application=db.get(Application,item.application_id) if item.application_id else None; return 200,{"data":{"item":_item_data(item,stored,application),"run":_run_data(run)}}
+            status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.item.retry",key,{"item_id":str(item_id)},action); db.commit()
+        except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
+        except ScreeningItemNotRetryable: db.rollback(); return _problem(request,409,"screening_item_not_retryable")
+        except ScreeningRetryActive: db.rollback(); return _problem(request,409,"screening_retry_active")
+        except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
+    response=JSONResponse(body,status_code=status); response.headers["Cache-Control"]="no-store"; return response
+
+@router.post("/screening-runs/{run_id}/bulk-actions",response_model=BulkResource)
+def bulk_actions(run_id:UUID,payload:BulkAction,request:Request,idempotency_key:str|None=Header(None)):
+    principal=_principal(request); key=_idempotency(request,idempotency_key)
+    if isinstance(principal,JSONResponse): return principal
+    if isinstance(key,JSONResponse): return key
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_run(db,principal,run_id,RecruitingAction.MANAGE_JOB) is None: return _not_found(request)
+        try:
+            def action(): return 200,{"data":apply_bulk_action(db,principal.organization_id,run_id,payload,principal.user_id,request.state.trace_id)}
+            status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.run.bulk_action",key,{"run_id":str(run_id),**payload.model_dump()},action); db.commit()
+        except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
+        except ScreeningBulkConflict: db.rollback(); return _problem(request,409,"screening_bulk_conflict")
+        except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
+    response=JSONResponse(body,status_code=status); response.headers["Cache-Control"]="no-store"; return response
 
 @router.post("/screening-runs/{run_id}/start",response_model=RunResource)
 def start_run(run_id:UUID,request:Request,idempotency_key:str|None=Header(None)):
@@ -174,4 +212,5 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             except Exception: return _problem(request,422,"validation_failed")
         rows=db.execute(query.order_by(ScreeningItem.created_at,ScreeningItem.id).limit(limit+1)).all(); next_cursor=None
         if len(rows)>limit: next_cursor=request.app.state.recruiting_cursor.encode(str(principal.organization_id),f"screening-items:{run_id}",rows[limit-1][0].created_at.isoformat(),str(rows[limit-1][0].id)); rows=rows[:limit]
-        response=JSONResponse({"data":[_item_data(item,stored) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
+        applications={application.id:application for application in db.scalars(select(Application).where(Application.organization_id==principal.organization_id,Application.id.in_([item.application_id for item,_ in rows if item.application_id])))}
+        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.application_id)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
