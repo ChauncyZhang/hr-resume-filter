@@ -120,6 +120,23 @@ def test_postgres_api_applies_recruiter_scope_inside_job_candidate_and_funnel_qu
         assert client.get("/api/v1/candidates?source=hidden-source").json()["data"] == []
         assert client.get(f"/api/v1/candidates?job_id={unauthorized_job}").json()["data"] == []
 
+        other_org, other_user, other_ids = seed_recruiting_graph(pg_store, "api-cross-org")
+        raw_cross_org_ticket = "cross-org-ticket-value-long-enough"
+        with pg_store.sync_session() as db:
+            issue_download_ticket_record(db, other_org, other_user, other_ids["resume"], FixedRecruitingClock(), FixedToken(raw_cross_org_ticket))
+            db.commit()
+        cross_org_denials = [
+            client.get(f"/api/v1/jobs/{other_ids['job']}"),
+            client.get(f"/api/v1/jobs/{other_ids['job']}/funnel"),
+            client.get(f"/api/v1/candidates/{other_ids['candidate']}"),
+            client.get(f"/api/v1/candidates/{other_ids['candidate']}/applications"),
+            client.get(f"/api/v1/resumes/{other_ids['resume']}/preview"),
+            client.post(f"/api/v1/resumes/{other_ids['resume']}/download-tickets", headers=headers),
+            client.patch(f"/api/v1/applications/{other_ids['application']}", json={"human_conclusion": "takeover"}, headers={**headers, "If-Match": '"1"'}),
+            client.post("/api/v1/download-tickets/consume", json={"token": raw_cross_org_ticket}, headers=headers),
+        ]
+        assert all(response.status_code == 404 and response.json()["code"] == "resource_not_found" for response in cross_org_denials)
+
 
 def test_five_concurrent_failures_reliably_lock_account(pg_store) -> None:
     user_id, _ = seed_pg_user(pg_store)

@@ -31,7 +31,7 @@ ROLE_ACTIONS = {
     },
     "hiring_manager": {
         RecruitingAction.READ, RecruitingAction.COMMENT,
-        RecruitingAction.RECOMMEND, RecruitingAction.PREVIEW,
+        RecruitingAction.RECOMMEND,
     },
 }
 
@@ -46,23 +46,26 @@ class RecruitingAuthorizationService:
         return principal.active and "recruiting_admin" in principal.roles
 
     def job_predicate(self, principal: Principal, action: RecruitingAction, job=Job):
-        if not self.role_allows(principal, action):
+        if not principal.active:
             return False
-        if self.is_admin(principal):
+        if "recruiting_admin" in principal.roles:
             return True
-        allowed_roles = {
-            "recruiter": ("job_owner", "job_recruiter"),
-            "hiring_manager": ("job_manager",),
-        }
-        grant_roles = tuple(
-            grant for role in principal.roles for grant in allowed_roles.get(role, ())
-        )
-        return exists().where(
-            JobCollaborator.organization_id == job.organization_id,
-            JobCollaborator.job_id == job.id,
-            JobCollaborator.user_id == principal.user_id,
-            JobCollaborator.access_role.in_(grant_roles or ("__none__",)),
-        )
+        branches = []
+        if "recruiter" in principal.roles and action in ROLE_ACTIONS["recruiter"]:
+            branches.append(exists().where(
+                JobCollaborator.organization_id == job.organization_id,
+                JobCollaborator.job_id == job.id,
+                JobCollaborator.user_id == principal.user_id,
+                JobCollaborator.access_role.in_(("job_owner", "job_recruiter")),
+            ))
+        if "hiring_manager" in principal.roles and action in ROLE_ACTIONS["hiring_manager"]:
+            branches.append(exists().where(
+                JobCollaborator.organization_id == job.organization_id,
+                JobCollaborator.job_id == job.id,
+                JobCollaborator.user_id == principal.user_id,
+                JobCollaborator.access_role == "job_manager",
+            ))
+        return or_(*branches) if branches else False
 
     def candidate_predicate(self, principal: Principal, action: RecruitingAction, candidate=Candidate):
         if not self.role_allows(principal, action):
@@ -79,7 +82,7 @@ class RecruitingAuthorizationService:
             ),
         )
         unassigned_owner = and_(
-            action in {RecruitingAction.READ, RecruitingAction.MANAGE_CANDIDATE},
+            action in {RecruitingAction.READ, RecruitingAction.COMMENT, RecruitingAction.MANAGE_CANDIDATE},
             candidate.owner_id == principal.user_id,
             ~exists().where(
                 Application.organization_id == candidate.organization_id,

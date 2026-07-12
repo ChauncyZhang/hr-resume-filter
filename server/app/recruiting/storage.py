@@ -1,4 +1,5 @@
-from typing import Protocol
+from tempfile import SpooledTemporaryFile
+from typing import BinaryIO, Protocol
 
 
 MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
@@ -14,7 +15,7 @@ class StorageObjectTooLarge(Exception):
 
 
 class PrivateResumeStorage(Protocol):
-    def read_download(self, storage_key: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes: ...
+    def open_download(self, storage_key: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> BinaryIO: ...
 
 
 class MinioResumeStorage:
@@ -22,21 +23,24 @@ class MinioResumeStorage:
         self.client = client
         self.bucket = bucket
 
-    def read_download(self, storage_key: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> bytes:
+    def open_download(self, storage_key: str, max_bytes: int = MAX_DOWNLOAD_BYTES) -> BinaryIO:
         response = None
+        spool = SpooledTemporaryFile(max_size=min(max_bytes, 1024 * 1024), mode="w+b")
         try:
             response = self.client.get_object(self.bucket, storage_key)
-            chunks: list[bytes] = []
             total = 0
             for chunk in response.stream(64 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
                     raise StorageObjectTooLarge
-                chunks.append(chunk)
-            return b"".join(chunks)
+                spool.write(chunk)
+            spool.seek(0)
+            return spool
         except StorageObjectTooLarge:
+            spool.close()
             raise
         except Exception as error:
+            spool.close()
             raise StorageReadFailed from error
         finally:
             if response is not None:

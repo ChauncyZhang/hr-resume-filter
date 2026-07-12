@@ -1,10 +1,12 @@
 from uuid import UUID
+from io import BytesIO
 
 import pytest
 
 from server.app.identity.policy import Principal
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.http import content_disposition, derive_cursor_key
+from server.app.recruiting.storage import MinioResumeStorage, StorageObjectTooLarge, StorageReadFailed
 
 
 def principal(role: str) -> Principal:
@@ -33,7 +35,7 @@ def principal(role: str) -> Principal:
         ("hiring_manager", RecruitingAction.MANAGE_JOB, False),
         ("hiring_manager", RecruitingAction.CREATE_VERSION, False),
         ("hiring_manager", RecruitingAction.TRANSITION, False),
-        ("hiring_manager", RecruitingAction.PREVIEW, True),
+        ("hiring_manager", RecruitingAction.PREVIEW, False),
         ("hiring_manager", RecruitingAction.ISSUE_TICKET, False),
         ("hiring_manager", RecruitingAction.DOWNLOAD, False),
     ] + [
@@ -73,3 +75,60 @@ def test_cursor_key_uses_domain_separated_hkdf():
     assert len(key) == 32
     assert key != source
     assert key == derive_cursor_key(source)
+
+
+class StorageResponse:
+    def __init__(self, chunks, failure_at=None):
+        self.chunks = chunks
+        self.failure_at = failure_at
+        self.closed = False
+        self.released = False
+
+    def stream(self, _):
+        for index, chunk in enumerate(self.chunks):
+            if index == self.failure_at:
+                raise OSError("upstream failed")
+            yield chunk
+
+    def close(self): self.closed = True
+    def release_conn(self): self.released = True
+
+
+class StorageClient:
+    def __init__(self, response=None, error=None):
+        self.response = response
+        self.error = error
+        self.calls = []
+
+    def get_object(self, bucket, key):
+        self.calls.append((bucket, key))
+        if self.error: raise self.error
+        return self.response
+
+
+def test_minio_storage_spools_successful_multi_chunk_and_closes_upstream():
+    upstream = StorageResponse([b"one", b"two", b"three"])
+    client = StorageClient(upstream)
+    spool = MinioResumeStorage(client, "private").open_download("objects/id", max_bytes=20)
+    assert spool.read() == b"onetwothree"
+    assert client.calls == [("private", "objects/id")]
+    assert upstream.closed and upstream.released
+    spool.close()
+
+
+def test_minio_storage_open_failure_is_redacted():
+    with pytest.raises(StorageReadFailed):
+        MinioResumeStorage(StorageClient(error=OSError("secret endpoint")), "private").open_download("objects/id")
+
+
+@pytest.mark.parametrize(
+    ("upstream", "error"),
+    [
+        (StorageResponse([b"one", b"two"], failure_at=1), StorageReadFailed),
+        (StorageResponse([b"12345", b"67890"]), StorageObjectTooLarge),
+    ],
+)
+def test_minio_storage_mid_read_and_oversize_close_every_resource(upstream, error):
+    with pytest.raises(error):
+        MinioResumeStorage(StorageClient(upstream), "private").open_download("objects/id", max_bytes=8)
+    assert upstream.closed and upstream.released

@@ -1,15 +1,16 @@
 from dataclasses import dataclass
+from tempfile import SpooledTemporaryFile
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from server.app.core.settings import Settings
-from server.app.identity.models import Organization, User, UserRole
+from server.app.identity.models import Organization, User, UserRole, Job, JobCollaborator
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
-from server.app.recruiting.models import FileObject, Resume
-from server.app.recruiting.models import DownloadTicket
+from server.app.recruiting.models import Candidate, FileObject, Resume
+from server.app.recruiting.models import Application, DownloadTicket
 from server.app.identity.models import AuditLog
 from server.app.recruiting.storage import StorageReadFailed
 
@@ -22,11 +23,15 @@ class Probe:
 @dataclass
 class FakeStorage:
     preview: str = "private parsed preview"
+    last_spool: object | None = None
 
-    def read_download(self, storage_key: str, max_bytes: int) -> bytes:
+    def open_download(self, storage_key: str, max_bytes: int):
         assert storage_key == "private/resume"
         assert max_bytes == 10 * 1024 * 1024
-        return b"private-file"
+        spool = SpooledTemporaryFile(max_size=1024, mode="w+b")
+        spool.write(b"private-file"); spool.seek(0)
+        self.last_spool = spool
+        return spool
 
 
 def make_app(tmp_path, storage=None):
@@ -47,7 +52,7 @@ def make_app(tmp_path, storage=None):
 
 class FailingStorage:
     def __init__(self, failure: str): self.failure = failure
-    def read_download(self, storage_key: str, max_bytes: int) -> bytes:
+    def open_download(self, storage_key: str, max_bytes: int):
         raise StorageReadFailed(self.failure)
 
 
@@ -222,6 +227,7 @@ def test_admin_happy_path_preconditions_idempotency_and_private_download(tmp_pat
         assert download.headers["cache-control"] == "no-store"
         assert download.headers["content-disposition"].startswith("attachment;")
         assert download.headers["x-content-type-options"] == "nosniff"
+        assert app.state.resume_storage.last_spool.closed
         assert client.post("/api/v1/download-tickets/consume", json={"token": raw}, headers=headers).status_code == 404
         with app.state.identity_store.sync_session() as db:
             assert raw not in repr([row.metadata_json for row in db.query(AuditLog).all()])
@@ -253,6 +259,55 @@ def test_recruiting_mutations_preserve_central_csrf_boundary(tmp_path) -> None:
         for bad_headers in cases:
             response = client.post("/api/v1/jobs", json={"title": "Forbidden"}, headers=bad_headers)
             assert response.status_code == 403 and response.json()["code"] == "csrf_validation_failed"
+
+
+def test_owning_recruiter_reads_unassigned_timeline_and_comments_via_comment_action(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiter", "owner@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "owner@example.test")
+        candidate = client.post("/api/v1/candidates", json={"display_name": "Unassigned"}, headers=headers).json()["data"]
+        timeline = client.get(f"/api/v1/candidates/{candidate['id']}/timeline")
+        assert timeline.status_code == 200
+        assert [event["event_type"] for event in timeline.json()["data"]] == ["candidate.created"]
+        note = client.post(f"/api/v1/candidates/{candidate['id']}/notes", json={"body": "Allowed comment"}, headers=headers)
+        assert note.status_code == 201
+
+
+def test_multi_role_manager_grant_cannot_be_crossed_with_recruiter_actions(tmp_path) -> None:
+    app = make_app(tmp_path)
+    user_id = seed_user(app, "recruiter", "mixed@example.test")
+    with app.state.identity_store.sync_session() as db:
+        user = db.get(User, user_id)
+        user.roles.append(UserRole(role="hiring_manager"))
+        job = Job(organization_id=user.organization_id, title="Managed", owner_id=user_id)
+        candidate = Candidate(organization_id=user.organization_id, display_name="Attached", owner_id=None)
+        file = FileObject(organization_id=user.organization_id, storage_key="private/resume", original_filename="resume.pdf", mime_type="application/pdf", size_bytes=12, sha256="7" * 64, uploaded_by=user_id)
+        db.add_all([job, candidate, file]); db.flush()
+        resume = Resume(organization_id=user.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1, parsed_text="preview")
+        db.add(resume); db.flush()
+        application = Application(organization_id=user.organization_id, candidate_id=candidate.id, job_id=job.id, resume_id=resume.id, owner_id=user_id)
+        db.add_all([application, JobCollaborator(organization_id=user.organization_id, job_id=job.id, user_id=user_id, access_role="job_manager")]); db.commit()
+        ids = str(job.id), str(candidate.id), str(resume.id), str(application.id)
+    job_id, candidate_id, resume_id, application_id = ids
+
+    with TestClient(app) as client:
+        headers = login(client, "mixed@example.test")
+        assert client.get(f"/api/v1/jobs/{job_id}").status_code == 200
+        assert client.get(f"/api/v1/candidates/{candidate_id}").status_code == 200
+        assert client.post(f"/api/v1/candidates/{candidate_id}/notes", json={"body": "Manager comment"}, headers=headers).status_code == 201
+        recommendation = client.patch(f"/api/v1/applications/{application_id}", json={"human_conclusion": "recommend"}, headers={**headers, "If-Match": '"1"'})
+        assert recommendation.status_code == 200 and recommendation.json()["data"]["human_conclusion"] == "recommend"
+        denied = [
+            client.patch(f"/api/v1/jobs/{job_id}", json={"title": "Takeover"}, headers={**headers, "If-Match": '"1"'}),
+            client.post(f"/api/v1/jobs/{job_id}/transitions", json={"target": "open"}, headers={**headers, "If-Match": '"1"', "Idempotency-Key": "mixed-transition"}),
+            client.post(f"/api/v1/jobs/{job_id}/jd-versions", json={"content": {"text": "takeover"}}, headers=headers),
+            client.post(f"/api/v1/jobs/{job_id}/applications", json={"candidate_id": candidate_id, "resume_id": resume_id}, headers={**headers, "Idempotency-Key": "mixed-create"}),
+            client.post(f"/api/v1/resumes/{resume_id}/download-tickets", headers=headers),
+            client.get(f"/api/v1/resumes/{resume_id}/preview"),
+            client.post(f"/api/v1/applications/{application_id}/transitions", json={"target": "review"}, headers={**headers, "If-Match": '"1"', "Idempotency-Key": "mixed-app-transition"}),
+        ]
+        assert all(response.status_code == 404 for response in denied)
 
 
 @pytest.mark.parametrize("failure", ["open", "mid-read"])

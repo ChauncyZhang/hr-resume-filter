@@ -6,7 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
@@ -231,8 +231,8 @@ def create_job(payload: JobCreate, request: Request):
         return _resource(_job_data(job), 201)
 
 
-def _load_job(db, principal: Principal, job_id: UUID):
-    return db.scalar(select(Job).where(Job.organization_id == principal.organization_id, Job.id == job_id, _job_scope(principal)))
+def _load_job(db, principal: Principal, job_id: UUID, action: RecruitingAction = RecruitingAction.READ):
+    return db.scalar(select(Job).where(Job.organization_id == principal.organization_id, Job.id == job_id, _job_scope(principal, action)))
 
 
 @router.get("/jobs/{job_id}", response_model=JobResource)
@@ -250,8 +250,8 @@ def patch_job(job_id: UUID, payload: JobPatch, request: Request, if_match: str |
     if isinstance(principal, JSONResponse): return principal
     if isinstance(expected, JSONResponse): return expected
     with request.app.state.identity_store.sync_session() as db:
-        job = _load_job(db, principal, job_id)
-        if job is None or not AUTH.role_allows(principal, RecruitingAction.MANAGE_JOB): return _denied(request)
+        job = _load_job(db, principal, job_id, RecruitingAction.MANAGE_JOB)
+        if job is None: return _denied(request)
         try:
             job = patch_job_record(db, principal.organization_id, job_id, payload.model_dump(exclude_unset=True), expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
             db.commit(); return _resource(_job_data(job))
@@ -265,7 +265,7 @@ def transition_job(job_id: UUID, payload: Transition, request: Request, if_match
     for value in (principal, expected, key):
         if isinstance(value, JSONResponse): return value
     with request.app.state.identity_store.sync_session() as db:
-        if _load_job(db, principal, job_id) is None or not AUTH.role_allows(principal, RecruitingAction.TRANSITION): return _denied(request)
+        if _load_job(db, principal, job_id, RecruitingAction.TRANSITION) is None: return _denied(request)
         try:
             status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "job.transition", key, {"job_id": job_id, **payload.model_dump()}, lambda: (200, {"data": _job_data(transition_job_record(db, job_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id))}))
             db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
@@ -277,9 +277,9 @@ def _versions(job_id: UUID, request: Request, model, payload: VersionCreate | No
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_job(db, principal, job_id) is None: return _denied(request)
+        action = RecruitingAction.CREATE_VERSION if payload is not None else RecruitingAction.READ
+        if _load_job(db, principal, job_id, action) is None: return _denied(request)
         if payload is not None:
-            if not AUTH.role_allows(principal, RecruitingAction.CREATE_VERSION): return _denied(request)
             number = (db.scalar(select(func.max(model.version_number)).where(model.organization_id == principal.organization_id, model.job_id == job_id)) or 0) + 1
             row = model(organization_id=principal.organization_id, job_id=job_id, version_number=number, content=payload.content, created_by=principal.user_id); db.add(row); db.flush()
             db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="job.version_created", outcome="success", trace_id=request.state.trace_id, metadata_json={"job_id": str(job_id), "version_number": number, "version_type": model.__tablename__}))
@@ -399,7 +399,7 @@ def timeline(candidate_id: UUID, request: Request):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_candidate(db, principal, candidate_id, RecruitingAction.COMMENT) is None: return _denied(request)
+        if _load_candidate(db, principal, candidate_id, RecruitingAction.READ) is None: return _denied(request)
         global_events = db.scalars(select(CandidateEvent).where(
             CandidateEvent.organization_id == principal.organization_id,
             CandidateEvent.candidate_id == candidate_id,
@@ -423,7 +423,7 @@ def notes(candidate_id: UUID, request: Request):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_candidate(db, principal, candidate_id) is None: return _denied(request)
+        if _load_candidate(db, principal, candidate_id, RecruitingAction.COMMENT) is None: return _denied(request)
         rows = db.scalars(select(CandidateNote).where(CandidateNote.organization_id == principal.organization_id, CandidateNote.candidate_id == candidate_id).order_by(CandidateNote.created_at)).all()
         return {"data": [{"id": str(row.id), "body": row.payload["body"], "author_id": str(row.actor_user_id), "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
 
@@ -449,8 +449,8 @@ def resumes(candidate_id: UUID, request: Request):
         return {"data": [{"id": str(row.id), "candidate_id": str(row.candidate_id), "version_number": row.version_number, "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
 
 
-def _load_resume(db, principal: Principal, resume_id: UUID):
-    return db.scalar(select(Resume).join(Candidate, and_(Candidate.organization_id == Resume.organization_id, Candidate.id == Resume.candidate_id)).where(Resume.organization_id == principal.organization_id, Resume.id == resume_id, _candidate_scope(principal)))
+def _load_resume(db, principal: Principal, resume_id: UUID, action: RecruitingAction):
+    return db.scalar(select(Resume).join(Candidate, and_(Candidate.organization_id == Resume.organization_id, Candidate.id == Resume.candidate_id)).where(Resume.organization_id == principal.organization_id, Resume.id == resume_id, _candidate_scope(principal, action)))
 
 
 @router.get("/resumes/{resume_id}/preview", response_model=PreviewResource)
@@ -458,7 +458,7 @@ def preview(resume_id: UUID, request: Request):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        resume = _load_resume(db, principal, resume_id)
+        resume = _load_resume(db, principal, resume_id, RecruitingAction.PREVIEW)
         if resume is None: return _denied(request)
         content = resume.parsed_text or ""
         if len(content.encode("utf-8")) > MAX_PREVIEW_BYTES:
@@ -473,7 +473,7 @@ def issue_ticket(resume_id: UUID, request: Request):
     if isinstance(principal, JSONResponse): return principal
     if not AUTH.role_allows(principal, RecruitingAction.ISSUE_TICKET): return _denied(request)
     with request.app.state.identity_store.sync_session() as db:
-        resume = _load_resume(db, principal, resume_id)
+        resume = _load_resume(db, principal, resume_id, RecruitingAction.ISSUE_TICKET)
         if resume is None: return _denied(request)
         raw = issue_download_ticket_record(db, principal.organization_id, principal.user_id, resume.id, request.app.state.recruiting_clock, request.app.state.recruiting_tokens)
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="resume.download_ticket_issued", outcome="success", trace_id=request.state.trace_id, metadata_json={"resume_id": str(resume.id)})); db.commit()
@@ -487,20 +487,29 @@ def consume_ticket(payload: TicketConsume, request: Request):
     with request.app.state.identity_store.sync_session() as db:
         ticket = db.scalar(select(DownloadTicket).where(DownloadTicket.token_hash == hashlib.sha256(payload.token.encode()).hexdigest()))
         if ticket is None: return _denied(request)
-        resume = _load_resume(db, principal, ticket.resume_id)
+        resume = _load_resume(db, principal, ticket.resume_id, RecruitingAction.DOWNLOAD)
         if resume is None or not AUTH.role_allows(principal, RecruitingAction.DOWNLOAD): return _denied(request)
         file = resume.__table__.metadata.tables["file_objects"]
         row = db.execute(select(file.c.storage_key, file.c.mime_type, file.c.original_filename).where(file.c.organization_id == principal.organization_id, file.c.id == resume.file_object_id)).one()
+        spool = None
         try:
-            body = request.app.state.resume_storage.read_download(row.storage_key, MAX_DOWNLOAD_BYTES)
+            spool = request.app.state.resume_storage.open_download(row.storage_key, MAX_DOWNLOAD_BYTES)
             disposition = content_disposition(row.original_filename)
         except (StorageReadFailed, StorageObjectTooLarge, ValueError):
+            if spool is not None: spool.close()
             db.rollback()
             return problem(request, 503, "attachment_unavailable", "The attachment is temporarily unavailable.")
         try: consume_download_ticket_record(db, payload.token, principal.organization_id, principal.user_id, resume.id, request.app.state.recruiting_clock)
-        except TicketInvalid as error: db.rollback(); return _problem_for(request, error)
+        except TicketInvalid as error:
+            spool.close(); db.rollback(); return _problem_for(request, error)
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="resume.downloaded", outcome="success", trace_id=request.state.trace_id, metadata_json={"resume_id": str(resume.id)})); db.commit()
-        response = Response(body, media_type=row.mime_type); response.headers["Cache-Control"] = "no-store"; response.headers["Content-Disposition"] = disposition; response.headers["X-Content-Type-Options"] = "nosniff"; return response
+        def stream_spool():
+            try:
+                while chunk := spool.read(64 * 1024):
+                    yield chunk
+            finally:
+                spool.close()
+        response = StreamingResponse(stream_spool(), media_type=row.mime_type); response.headers["Cache-Control"] = "no-store"; response.headers["Content-Disposition"] = disposition; response.headers["X-Content-Type-Options"] = "nosniff"; return response
 
 
 @router.get("/candidates/{candidate_id}/applications", response_model=ApplicationCollection)
@@ -519,7 +528,7 @@ def create_application(job_id: UUID, payload: ApplicationCreate, request: Reques
     if isinstance(principal, JSONResponse): return principal
     if isinstance(key, JSONResponse): return key
     with request.app.state.identity_store.sync_session() as db:
-        if _load_job(db, principal, job_id) is None or not AUTH.role_allows(principal, RecruitingAction.TRANSITION): return _denied(request)
+        if _load_job(db, principal, job_id, RecruitingAction.TRANSITION) is None: return _denied(request)
         candidate = _load_candidate(db, principal, payload.candidate_id, RecruitingAction.MANAGE_CANDIDATE)
         resume = db.scalar(select(Resume).where(
             Resume.organization_id == principal.organization_id,
@@ -536,8 +545,8 @@ def create_application(job_id: UUID, payload: ApplicationCreate, request: Reques
         except Exception as error: db.rollback(); return _problem_for(request, error)
 
 
-def _load_application(db, principal: Principal, application_id: UUID):
-    return db.scalar(select(Application).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.id == application_id, _job_scope(principal)))
+def _load_application(db, principal: Principal, application_id: UUID, action: RecruitingAction = RecruitingAction.READ):
+    return db.scalar(select(Application).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.id == application_id, _job_scope(principal, action)))
 
 
 @router.patch("/applications/{application_id}", response_model=ApplicationResource)
@@ -546,9 +555,9 @@ def patch_application(application_id: UUID, payload: ApplicationPatch, request: 
     if isinstance(principal, JSONResponse): return principal
     if isinstance(expected, JSONResponse): return expected
     with request.app.state.identity_store.sync_session() as db:
-        item = _load_application(db, principal, application_id)
         action = RecruitingAction.RECOMMEND if set(payload.model_dump(exclude_unset=True)) == {"human_conclusion"} else RecruitingAction.MANAGE_CANDIDATE
-        if item is None or not AUTH.role_allows(principal, action): return _denied(request)
+        item = _load_application(db, principal, application_id, action)
+        if item is None: return _denied(request)
         try:
             item = patch_application_record(db, principal.organization_id, application_id, payload.model_dump(exclude_unset=True), expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
             db.commit(); return _resource(_application_data(item))
@@ -562,7 +571,7 @@ def transition_application(application_id: UUID, payload: Transition, request: R
     for value in (principal, expected, key):
         if isinstance(value, JSONResponse): return value
     with request.app.state.identity_store.sync_session() as db:
-        if _load_application(db, principal, application_id) is None or not AUTH.role_allows(principal, RecruitingAction.TRANSITION): return _denied(request)
+        if _load_application(db, principal, application_id, RecruitingAction.TRANSITION) is None: return _denied(request)
         try:
             status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.transition", key, {"application_id": application_id, **payload.model_dump()}, lambda: (200, {"data": _application_data(transition_application_record(db, application_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id, reason_code=payload.reason_code, reason_text=payload.reason_text))})); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
         except Exception as error: db.rollback(); return _problem_for(request, error)
