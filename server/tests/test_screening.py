@@ -3,7 +3,6 @@ import zipfile
 
 import pytest
 
-from app.resume_filter import score_resume as legacy_score
 from server.app.screening.parsers import ParserError, ParserLimits, parse_document
 from server.app.screening.rules import ENGINE_VERSION, RuleSnapshot, score_resume
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, UnsafePayload
@@ -13,30 +12,38 @@ import uuid
 def test_rule_engine_matches_legacy_and_returns_structured_ordered_facts() -> None:
     jd = "必须条件：Python, FastAPI, 本科, python\n加分项：Docker, PostgreSQL"
     resume = "5年 Python / FastAPI 后端经验，本科，熟悉 Docker。"
-    legacy = legacy_score(resume, jd, "candidate.txt")
     result = score_resume(resume, RuleSnapshot(jd_text=jd))
     assert ENGINE_VERSION == "rule-v1"
-    assert result.score == legacy.score
-    assert result.recommendation == legacy.recommendation
+    assert result.score == 92
+    assert result.recommendation == "优先沟通"
     assert result.required_hits == ["Python", "FastAPI", "本科"]
     assert result.required_missing == []
     assert result.bonus_hits == ["Docker"]
     assert result.estimated_years == 5
 
 
-@pytest.mark.parametrize(("jd", "resume"), [
-    ("必须条件：Python, FastAPI, 本科", "3年 Java 专科"),
-    ("required: Python, LLM\nbonus:", "Python 2 years"),
-    ("Python backend distributed systems", "Python backend 4 years"),
-    ("硬性要求：中文沟通, 数据分析", "中文沟通，2年数据分析"),
+@pytest.mark.parametrize(("jd", "resume", "expected"), [
+    ("必须条件：Python, FastAPI, 本科", "3年 Java 专科", (6, "需人工复核", [], ["Python", "FastAPI", "本科"], [], 3)),
+    ("required: Python, LLM\nbonus:", "Python 2 years", (38, "需人工复核", ["Python"], ["LLM"], [], 0)),
+    ("Python backend distributed systems", "Python backend 4 years", (38, "需人工复核", ["Python", "backend"], ["distributed", "systems"], [], 0)),
+    ("硬性要求：中文沟通, 数据分析", "中文沟通，2年数据分析", (79, "可沟通", ["中文沟通", "数据分析"], [], [], 2)),
 ])
-def test_rule_engine_golden_parity_and_missing_cap(jd: str, resume: str) -> None:
-    legacy = legacy_score(resume, jd, "x.txt")
+def test_rule_engine_golden_parity_and_missing_cap(jd: str, resume: str, expected: tuple) -> None:
     result = score_resume(resume, RuleSnapshot(jd_text=jd))
-    assert result.score == legacy.score
-    assert result.recommendation == legacy.recommendation
+    assert (result.score, result.recommendation, result.required_hits, result.required_missing, result.bonus_hits, result.estimated_years) == expected
     if result.required_missing:
         assert result.score <= 59 and result.recommendation == "需人工复核"
+
+
+@pytest.mark.parametrize(("jd", "resume", "score", "recommendation"), [
+    ("required: Python", "Python", 75, "可沟通"),
+    ("required: Python\nbonus: Docker", "Python Docker", 90, "优先沟通"),
+    ("required: Python", "Python 5年经验", 85, "优先沟通"),
+])
+def test_rule_weights_are_exactly_75_15_10(jd: str, resume: str, score: int, recommendation: str) -> None:
+    result = score_resume(resume, RuleSnapshot(jd_text=jd))
+    assert result.score == score
+    assert result.recommendation == recommendation
 
 
 def docx_bytes(text: str) -> bytes:
