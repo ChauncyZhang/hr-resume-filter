@@ -3,7 +3,7 @@ import os
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from server.app.identity.models import Organization, User, UserRole, UserStatus
+from server.app.identity.models import AuditLog, Organization, User, UserRole, UserStatus
 from server.app.identity.security import PasswordService
 from server.app.identity.store import IdentityStore
 
@@ -19,16 +19,20 @@ def bootstrap_system_admin(store: IdentityStore, organization_slug: str, organiz
         user = db.scalar(select(User).options(selectinload(User.roles)).where(User.organization_id == organization.id, User.normalized_email == normalized))
         encoded = PasswordService().hash(password)
         if user:
+            event_type = "bootstrap.admin_rotated"
             user.password_hash = encoded
             user.display_name = display_name
             user.status = UserStatus.ACTIVE
             user.authorization_version += 1
         else:
+            event_type = "bootstrap.admin_created"
             user = User(organization_id=organization.id, email=email, normalized_email=normalized, display_name=display_name, password_hash=encoded, status=UserStatus.ACTIVE)
             user.roles.append(UserRole(role="system_admin"))
             db.add(user)
         if "system_admin" not in {role.role for role in user.roles}:
             user.roles.append(UserRole(role="system_admin"))
+        db.flush()
+        db.add(AuditLog(organization_id=organization.id, actor_user_id=user.id, event_type=event_type, outcome="success", metadata_json={}))
         db.commit()
         return user.id
 

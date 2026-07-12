@@ -5,7 +5,8 @@ from pydantic import BaseModel, Field, field_validator
 from server.app.identity.service import AuthenticationFailed, CsrfFailed, IdentityService, InvalidSession
 
 
-COOKIE_NAME = "__Host-hr_session"
+PRODUCTION_COOKIE_NAME = "__Host-hr_session"
+DEVELOPMENT_COOKIE_NAME = "hr_session"
 router = APIRouter(prefix="/api/v1")
 
 
@@ -34,24 +35,34 @@ def allowed_origin(request: Request) -> bool:
     return request.headers.get("origin") in request.app.state.settings.cors_origins
 
 
+def cookie_name(request: Request) -> str:
+    return PRODUCTION_COOKIE_NAME if request.app.state.settings.environment == "production" else DEVELOPMENT_COOKIE_NAME
+
+
+def session_token(request: Request) -> str | None:
+    return request.cookies.get(cookie_name(request))
+
+
 @router.post("/auth/login")
 def login(payload: LoginRequest, request: Request):
     if not allowed_origin(request):
         return problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
     service: IdentityService = request.app.state.identity_service
     try:
-        session_token, csrf = service.login(payload.organization_slug, payload.email, payload.password, trace_id=request.state.trace_id, network=request.headers.get("x-forwarded-for") or request.client.host if request.client else None)
+        session_token, csrf = service.login(payload.organization_slug, payload.email, payload.password, trace_id=request.state.trace_id, network=request.headers.get("x-real-ip") or request.client.host if request.client else None)
     except AuthenticationFailed:
         return problem(request, 401, "authentication_failed", "Invalid credentials or account unavailable.")
     response = JSONResponse({"data": {"authenticated": True}})
-    response.set_cookie(COOKIE_NAME, session_token, httponly=True, secure=request.app.state.settings.environment == "production", samesite="lax", path="/")
+    response.set_cookie(cookie_name(request), session_token, httponly=True, secure=request.app.state.settings.environment == "production", samesite="lax", path="/")
     response.headers["X-CSRF-Token"] = csrf
     return response
 
 
 @router.get("/me")
 def me(request: Request):
-    token = request.cookies.get(COOKIE_NAME)
+    if request.headers.get("sec-fetch-site") == "cross-site":
+        return problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
+    token = session_token(request)
     if not token:
         return problem(request, 401, "authentication_required", "Authentication is required.")
     try:
@@ -66,16 +77,16 @@ def me(request: Request):
 
 @router.post("/auth/logout", status_code=204)
 def logout(request: Request):
-    token = request.cookies.get(COOKIE_NAME)
+    token = session_token(request)
     csrf = request.headers.get("x-csrf-token")
     if not token or not csrf or not allowed_origin(request):
         return problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
     try:
-        request.app.state.identity_service.logout(token, csrf, trace_id=request.state.trace_id, network=request.headers.get("x-forwarded-for") or request.client.host if request.client else None)
+        request.app.state.identity_service.logout(token, csrf, trace_id=request.state.trace_id, network=request.headers.get("x-real-ip") or request.client.host if request.client else None)
     except CsrfFailed:
         return problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
     except InvalidSession:
         return problem(request, 401, "authentication_required", "Authentication is required.")
     response = Response(status_code=204)
-    response.delete_cookie(COOKIE_NAME, path="/", secure=request.app.state.settings.environment == "production", httponly=True, samesite="lax")
+    response.delete_cookie(cookie_name(request), path="/", secure=request.app.state.settings.environment == "production", httponly=True, samesite="lax")
     return response

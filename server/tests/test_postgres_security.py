@@ -1,0 +1,103 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import os
+import subprocess
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError, OperationalError
+
+from server.app.identity.models import Organization, User, UserStatus
+from server.app.identity.security import PasswordService
+from server.app.identity.service import AuthenticationFailed, Clock, IdentityService, TokenSource
+from server.app.identity.store import IdentityStore
+
+
+pytestmark = pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
+
+
+@pytest.fixture
+def pg_store():
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    env = {**os.environ, "DATABASE_URL": url}
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "head"], check=True, env=env)
+    store = IdentityStore(url)
+    yield store
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "downgrade", "base"], check=True, env=env)
+
+
+def seed_pg_user(store):
+    with store.sync_session() as db:
+        organization = Organization(slug="concurrent", name="Concurrent", status="active")
+        user = User(organization=organization, email="user@example.test", normalized_email="user@example.test", display_name="User", password_hash=PasswordService().hash("correct"), status=UserStatus.ACTIVE)
+        db.add(user)
+        db.commit()
+        return user.id, organization.id
+
+
+def test_five_concurrent_failures_reliably_lock_account(pg_store) -> None:
+    user_id, _ = seed_pg_user(pg_store)
+
+    def fail_login(_):
+        service = IdentityService(pg_store, Clock(), TokenSource())
+        with pytest.raises(AuthenticationFailed):
+            service.login("concurrent", "user@example.test", "wrong", trace_id=str(uuid4()), network="proxy")
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        list(executor.map(fail_login, range(5)))
+    with pg_store.sync_session() as db:
+        user = db.get(User, user_id)
+        assert user.failed_login_count == 5
+        assert user.locked_until > datetime.now(timezone.utc)
+
+
+def test_concurrent_success_cannot_overwrite_failed_attempt(pg_store) -> None:
+    user_id, _ = seed_pg_user(pg_store)
+
+    def login(password):
+        service = IdentityService(pg_store, Clock(), TokenSource())
+        try:
+            service.login("concurrent", "user@example.test", password, trace_id=str(uuid4()), network="proxy")
+        except AuthenticationFailed:
+            pass
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(login, ["correct", "wrong"]))
+    with pg_store.sync_session() as db:
+        user = db.get(User, user_id)
+        assert user.failed_login_count in {0, 1}
+        assert db.execute(text("select count(*) from audit_logs where event_type='authentication.login'")).scalar_one() == 2
+
+
+def test_cross_organization_relationships_are_rejected(pg_store) -> None:
+    with pg_store.engine.begin() as connection:
+        org1, org2, dep1, user1, user2, job1 = [uuid4() for _ in range(6)]
+        now = datetime.now(timezone.utc)
+        connection.execute(text("insert into organizations(id,slug,name,status,created_at,updated_at) values (:id,'o1','O1','active',:n,:n),(:id2,'o2','O2','active',:n,:n)"), {"id": org1, "id2": org2, "n": now})
+        connection.execute(text("insert into departments(id,organization_id,name,created_at,updated_at) values (:id,:org,'D',:n,:n)"), {"id": dep1, "org": org1, "n": now})
+        password = PasswordService().hash("x")
+        connection.execute(text("insert into users(id,organization_id,email,normalized_email,display_name,password_hash,status,authorization_version,failed_login_count,created_at,updated_at) values (:u1,:o1,'a@x','a@x','A',:p,'ACTIVE',1,0,:n,:n),(:u2,:o2,'b@x','b@x','B',:p,'ACTIVE',1,0,:n,:n)"), {"u1": user1, "u2": user2, "o1": org1, "o2": org2, "p": password, "n": now})
+        connection.execute(text("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:j,:o1,'J',:u1,'draft',:n,:n)"), {"j": job1, "o1": org1, "u1": user1, "n": now})
+    invalid = [
+        ("insert into users(id,organization_id,department_id,email,normalized_email,display_name,password_hash,status,authorization_version,failed_login_count,created_at,updated_at) values (:id,:o2,:d,'c@x','c@x','C','x','ACTIVE',1,0,now(),now())", {"id": uuid4(), "o2": org2, "d": dep1}),
+        ("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:id,:o2,'bad',:u1,'draft',now(),now())", {"id": uuid4(), "o2": org2, "u1": user1}),
+        ("insert into job_collaborators(id,organization_id,job_id,user_id,access_role,created_at,updated_at) values (:id,:o2,:j,:u2,'job_recruiter',now(),now())", {"id": uuid4(), "o2": org2, "j": job1, "u2": user2}),
+        ("insert into job_collaborators(id,organization_id,job_id,user_id,access_role,created_at,updated_at) values (:id,:o1,:j,:u2,'job_recruiter',now(),now())", {"id": uuid4(), "o1": org1, "j": job1, "u2": user2}),
+        ("insert into departments(id,organization_id,parent_id,name,created_at,updated_at) values (:id,:o2,:d,'bad',now(),now())", {"id": uuid4(), "o2": org2, "d": dep1}),
+    ]
+    for statement, params in invalid:
+        with pytest.raises(IntegrityError):
+            with pg_store.engine.begin() as connection:
+                connection.execute(text(statement), params)
+
+
+def test_audit_logs_reject_update_and_delete(pg_store) -> None:
+    _, organization_id = seed_pg_user(pg_store)
+    with pg_store.engine.begin() as connection:
+        audit_id = uuid4()
+        connection.execute(text("insert into audit_logs(id,organization_id,event_type,outcome,metadata_json,created_at) values (:id,:org,'test','success','{}',now())"), {"id": audit_id, "org": organization_id})
+    for statement in ("update audit_logs set outcome='changed' where id=:id", "delete from audit_logs where id=:id"):
+        with pytest.raises(OperationalError):
+            with pg_store.engine.begin() as connection:
+                connection.execute(text(statement), {"id": audit_id})

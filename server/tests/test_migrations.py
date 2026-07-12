@@ -18,4 +18,3 @@ def test_migration_upgrades_and_downgrades_empty_baseline() -> None:
     assert TABLES <= set(inspect(engine).get_table_names())
     subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "downgrade", "base"], check=True, env=env)
     assert not (TABLES & set(inspect(engine).get_table_names()))
-

@@ -100,15 +100,15 @@ def test_login_persists_only_hashes_and_sets_host_cookie(identity_app) -> None:
     assert response.status_code == 200
     csrf = response.headers["X-CSRF-Token"]
     cookie = response.headers["set-cookie"]
-    assert "__Host-hr_session=" in cookie
+    assert "hr_session=" in cookie and "__Host-hr_session=" not in cookie
     assert "HttpOnly" in cookie and "Path=/" in cookie and "SameSite=lax" in cookie
     assert "Secure" not in cookie
     assert "password" not in response.text.casefold()
     with app.state.identity_store.sync_session() as session:
         stored = session.query(app.state.identity_store.SessionModel).one()
-        assert stored.token_hash == hash_token(client.cookies["__Host-hr_session"])
+        assert stored.token_hash == hash_token(client.cookies["hr_session"])
         assert stored.csrf_token_hash == hash_token(csrf)
-        assert client.cookies["__Host-hr_session"] not in repr(stored)
+        assert client.cookies["hr_session"] not in repr(stored)
         assert csrf not in repr(stored)
 
 
@@ -162,7 +162,7 @@ def test_me_rotates_csrf_refreshes_idle_but_not_absolute(identity_app) -> None:
         absolute = original.absolute_expires_at
         idle = original.idle_expires_at
     clock.advance(minutes=5)
-    response = client.get("/api/v1/me")
+    response = client.get("/api/v1/me", headers={"Sec-Fetch-Site": "same-origin"})
     assert response.status_code == 200
     assert response.headers["X-CSRF-Token"] != old_csrf
     assert response.json()["data"]["roles"] == ["recruiting_admin"]
@@ -218,6 +218,9 @@ def test_logout_requires_origin_and_matching_csrf_then_revokes(identity_app) -> 
     )
     assert response.status_code == 204
     assert client.get("/api/v1/me").status_code == 401
+    with app.state.identity_store.sync_session() as session:
+        events = session.query(app.state.identity_store.AuditModel).filter_by(event_type="authentication.logout").all()
+        assert [event.outcome for event in events] == ["denied", "denied", "denied", "success"]
 
 
 def test_production_cookie_is_secure(identity_app) -> None:
@@ -226,7 +229,36 @@ def test_production_cookie_is_secure(identity_app) -> None:
     app.state.settings.environment = "production"
     with TestClient(app, base_url="https://hr.example.test") as client:
         response = login(client)
+    assert "__Host-hr_session=" in response.headers["set-cookie"]
     assert "Secure" in response.headers["set-cookie"]
+
+
+def test_me_rejects_cross_site_fetch_before_mutating_session(identity_app) -> None:
+    app, client, _ = identity_app
+    seed_user(app)
+    csrf = login(client).headers["X-CSRF-Token"]
+    response = client.get("/api/v1/me", headers={"Sec-Fetch-Site": "cross-site"})
+    assert response.status_code == 403
+    with app.state.identity_store.sync_session() as session:
+        stored = session.query(app.state.identity_store.SessionModel).one()
+        assert stored.csrf_token_hash == hash_token(csrf)
+
+
+def test_csrf_middleware_protects_future_state_changing_routes(identity_app) -> None:
+    app, client, _ = identity_app
+    from fastapi import APIRouter
+
+    extra = APIRouter(prefix="/api/v1")
+
+    @extra.post("/future-write")
+    def future_write():
+        return {"written": True}
+
+    app.include_router(extra)
+    response = client.post("/api/v1/future-write", headers={"Origin": "https://hr.example.test"})
+    assert response.status_code == 403
+    assert response.json()["code"] == "csrf_validation_failed"
+    assert response.headers["X-Trace-ID"] == response.json()["trace_id"]
 
 
 def test_audit_events_do_not_contain_credentials_tokens_or_full_ip(identity_app) -> None:
@@ -238,7 +270,7 @@ def test_audit_events_do_not_contain_credentials_tokens_or_full_ip(identity_app)
         headers={"Origin": "https://hr.example.test", "X-Forwarded-For": "203.0.113.9, 10.0.0.1"},
     )
     csrf = response.headers["X-CSRF-Token"]
-    token = client.cookies["__Host-hr_session"]
+    token = client.cookies["hr_session"]
     with app.state.identity_store.sync_session() as session:
         audit = session.query(app.state.identity_store.AuditModel).one()
         rendered = repr(audit.metadata_json)

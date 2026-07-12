@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
-from server.app.identity.api import router as identity_router
+from server.app.identity.api import allowed_origin, problem, router as identity_router, session_token
 from server.app.identity.service import Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
 
@@ -81,7 +81,23 @@ def create_app(
         supplied = request.headers.get("x-trace-id", "")
         trace_id = supplied if TRACE_ID_PATTERN.fullmatch(supplied) else _new_trace_id()
         request.state.trace_id = trace_id
-        response = await call_next(request)
+        response = None
+        if request.url.path.startswith("/api/v1") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            service: IdentityService = request.app.state.identity_service
+            network = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
+            if not allowed_origin(request):
+                event = "authentication.logout" if request.url.path == "/api/v1/auth/logout" else "csrf.denied"
+                service.audit_denial(event, token=session_token(request), trace_id=trace_id, network=network)
+                response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
+            if response is None and request.url.path != "/api/v1/auth/login":
+                token = session_token(request)
+                csrf = request.headers.get("x-csrf-token")
+                if not token or not csrf or not service.validate_csrf(token, csrf):
+                    event = "authentication.logout" if request.url.path == "/api/v1/auth/logout" else "csrf.denied"
+                    service.audit_denial(event, token=token, trace_id=trace_id, network=network)
+                    response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
+        if response is None:
+            response = await call_next(request)
         response.headers["X-Trace-ID"] = trace_id
         logger.info(
             "request_complete",

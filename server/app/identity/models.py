@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import CheckConstraint, JSON, DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, Uuid
+from sqlalchemy import CheckConstraint, JSON, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Integer, String, UniqueConstraint, Uuid
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -41,17 +41,29 @@ class Department(Timestamped, Base):
         UniqueConstraint(
             "organization_id", "parent_id", "name", postgresql_nulls_not_distinct=True
         ),
+        UniqueConstraint("organization_id", "id"),
+        ForeignKeyConstraint(
+            ["organization_id", "parent_id"],
+            ["departments.organization_id", "departments.id"],
+        ),
     )
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
-    parent_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("departments.id"))
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(200))
 
 
 class User(Timestamped, Base):
     __tablename__ = "users"
-    __table_args__ = (UniqueConstraint("organization_id", "normalized_email"),)
+    __table_args__ = (
+        UniqueConstraint("organization_id", "normalized_email"),
+        UniqueConstraint("organization_id", "id"),
+        ForeignKeyConstraint(
+            ["organization_id", "department_id"],
+            ["departments.organization_id", "departments.id"],
+        ),
+    )
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
-    department_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("departments.id"))
+    department_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     email: Mapped[str] = mapped_column(String(320))
     normalized_email: Mapped[str] = mapped_column(String(320))
     display_name: Mapped[str] = mapped_column(String(200))
@@ -81,7 +93,7 @@ class UserRole(Timestamped, Base):
 class UserSession(Timestamped, Base):
     __tablename__ = "user_sessions"
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
-    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     csrf_token_hash: Mapped[str] = mapped_column(String(64))
     idle_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -90,14 +102,28 @@ class UserSession(Timestamped, Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revocation_reason: Mapped[str | None] = mapped_column(String(64))
     user: Mapped[User] = relationship()
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "user_id"],
+            ["users.organization_id", "users.id"],
+            ondelete="CASCADE",
+        ),
+    )
 
 
 class Job(Timestamped, Base):
     __tablename__ = "jobs"
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String(200))
-    owner_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    owner_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     status: Mapped[str] = mapped_column(String(32), default="draft")
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id"),
+        ForeignKeyConstraint(
+            ["organization_id", "owner_id"],
+            ["users.organization_id", "users.id"],
+        ),
+    )
 
 
 class JobCollaborator(Timestamped, Base):
@@ -105,10 +131,20 @@ class JobCollaborator(Timestamped, Base):
     __table_args__ = (
         CheckConstraint("access_role IN ('job_owner','job_recruiter','job_manager')"),
         UniqueConstraint("job_id", "user_id", "access_role"),
+        ForeignKeyConstraint(
+            ["organization_id", "job_id"],
+            ["jobs.organization_id", "jobs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "user_id"],
+            ["users.organization_id", "users.id"],
+            ondelete="CASCADE",
+        ),
     )
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
-    job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id", ondelete="CASCADE"))
-    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    job_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     access_role: Mapped[str] = mapped_column(String(32))
 
 
