@@ -44,6 +44,9 @@ Outbox delivery is at-least-once. Every allowlisted topic handler receives the d
 `outbox_events.id` UUID as its mandatory idempotency key. External side effects must use
 that key for deduplication because a crash after the side effect and before publication
 can replay the same event. The system does not claim externally exactly-once delivery.
+When shutdown arrives while a database claim is in flight, the worker does not start the
+returned item. It intentionally leaves the lease untouched; database-time lease expiry
+and stale-claim recovery make the same durable ID available to another worker.
 Production TLS must terminate upstream or use externally managed certificates mounted into
 Nginx with a production-specific server block. Never expose API, PostgreSQL, or MinIO ports.
 

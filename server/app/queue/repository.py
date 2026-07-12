@@ -80,11 +80,17 @@ class QueueRepository:
         validated = self.policies.validate_topic(topic, payload)
         now = self.database_now(); event = OutboxEvent(organization_id=organization_id, topic=topic, aggregate_type=aggregate_type, aggregate_id=aggregate_id, payload=validated, status="queued", available_at=now, max_attempts=max_attempts, created_at=now, updated_at=now); self.session.add(event); self.session.flush(); return event
     def claim_outbox(self, organization_id, worker_id, *, lease_seconds):
-        now = self.database_now(); event = self.session.scalar(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, ((OutboxEvent.status == "queued") & (OutboxEvent.available_at <= now)) | ((OutboxEvent.status == "running") & (OutboxEvent.lease_expires_at < now)), OutboxEvent.attempts < OutboxEvent.max_attempts).order_by(OutboxEvent.available_at, OutboxEvent.created_at).limit(1).with_for_update(skip_locked=True))
+        now = self.database_now(); self._reap_expired_outbox(organization_id, now)
+        event = self.session.scalar(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, ((OutboxEvent.status == "queued") & (OutboxEvent.available_at <= now)) | ((OutboxEvent.status == "running") & (OutboxEvent.lease_expires_at < now)), OutboxEvent.attempts < OutboxEvent.max_attempts).order_by(OutboxEvent.available_at, OutboxEvent.created_at).limit(1).with_for_update(skip_locked=True))
         if event:
             if event.status == "running": event.safe_error_code = "lease_expired"
             event.status = "running"; event.lease_owner = worker_id; event.lease_expires_at = now + timedelta(seconds=lease_seconds); event.heartbeat_at = now; event.attempts += 1; event.updated_at = now; self.session.flush()
         return event
+    def _reap_expired_outbox(self, organization_id, now):
+        expired = self.session.scalars(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, OutboxEvent.status == "running", OutboxEvent.lease_expires_at < now, OutboxEvent.attempts >= OutboxEvent.max_attempts).with_for_update(skip_locked=True)).all()
+        for event in expired:
+            event.status = "failed"; event.failed_at = now; event.safe_error_code = "delivery_abandoned"; event.lease_owner = None; event.lease_expires_at = None; event.heartbeat_at = None; event.updated_at = now
+        self.session.flush()
     def publish_outbox(self, organization_id, event_id, worker_id):
         event, now = self._owned_outbox(organization_id, event_id, worker_id); event.status = "published"; event.published_at = now; event.lease_owner = None; event.lease_expires_at = None; event.heartbeat_at = None; event.safe_error_code = None; event.updated_at = now
     def fail_outbox(self, organization_id, event_id, worker_id, *, safe_code, retryable):

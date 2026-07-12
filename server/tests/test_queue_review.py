@@ -2,6 +2,7 @@ import asyncio
 import uuid
 
 import pytest
+import logging
 from pydantic import ValidationError
 
 from server.app.core.settings import Settings
@@ -190,3 +191,58 @@ def test_stubborn_handler_invokes_hard_stop_after_two_bounded_deadlines() -> Non
         task = asyncio.create_task(worker.run()); await asyncio.sleep(.01); worker.request_shutdown(); await asyncio.wait_for(task, .2)
     asyncio.run(exercise())
     assert hard_stops == [True]
+
+
+def test_stubborn_handler_on_lease_loss_hard_stops_and_never_claims_again() -> None:
+    gateway = LifecycleGateway(); gateway.events.clear(); gateway.heartbeat_error = RuntimeError("lease lost")
+    release = asyncio.Event(); hard_stops: list[bool] = []
+    async def stubborn(_: Item) -> None:
+        while True:
+            try: await release.wait(); return
+            except asyncio.CancelledError: continue
+    def hard_stop() -> None: hard_stops.append(True); release.set()
+    worker = make_worker(gateway, handlers={"test.work": stubborn}, hard_stop=hard_stop)
+    async def exercise() -> None:
+        task = asyncio.create_task(worker.run()); await asyncio.wait_for(task, .2)
+    asyncio.run(exercise())
+    assert hard_stops == [True]
+    assert gateway.claim_order.count("job") == 1
+    assert gateway.successes == 0
+
+
+@pytest.mark.parametrize("kind", ["job", "outbox"])
+def test_shutdown_during_blocking_claim_does_not_start_handler(kind: str) -> None:
+    started = asyncio.Event(); release = asyncio.Event(); handled: list[str] = []
+    class BlockingGateway(LifecycleGateway):
+        async def claim_job(self, **_: object):
+            self.claim_order.append("job")
+            if kind != "job": return None
+            started.set(); await release.wait(); return Item("job")
+        async def claim_outbox(self, **_: object):
+            self.claim_order.append("outbox")
+            if kind != "outbox": return None
+            started.set(); await release.wait(); return Item("outbox")
+    gateway = BlockingGateway()
+    async def job_handler(_: Item) -> None: handled.append("job")
+    async def outbox_handler(_: Item, __: uuid.UUID) -> None: handled.append("outbox")
+    worker = make_worker(gateway, handlers={"test.work": job_handler}, outbox_handlers={"test.event": outbox_handler}, shutdown_timeout_seconds=.1)
+    async def exercise() -> None:
+        task = asyncio.create_task(worker.run()); await started.wait(); worker.request_shutdown(); release.set(); await asyncio.wait_for(task, 1)
+    asyncio.run(exercise())
+    assert handled == []
+    assert gateway.successes == 0 and gateway.published == 0
+
+
+def test_structured_lifecycle_logs_include_safe_type_and_never_payload(caplog: pytest.LogCaptureFixture) -> None:
+    gateway = LifecycleGateway(); gateway.events.clear()
+    item = gateway.jobs[0]; item.payload = {"resume_text": "must-not-log"}
+    worker = make_worker(gateway)
+    async def exercise() -> None:
+        task = asyncio.create_task(worker.run())
+        while gateway.successes < 1: await asyncio.sleep(0)
+        worker.request_shutdown(); await task
+    with caplog.at_level(logging.INFO): asyncio.run(exercise())
+    records = [record for record in caplog.records if record.getMessage() == "worker_item_succeeded"]
+    assert len(records) == 1
+    assert records[0].context == {"item_id": str(item.id), "item_type": "test.work", "kind": "job", "attempt": 1, "trace_id": "trace-1", "safe_error_code": "succeeded"}
+    assert "must-not-log" not in caplog.text and "payload" not in caplog.text

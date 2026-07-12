@@ -8,6 +8,7 @@ from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
 from server.app.queue.service import PermanentJobError, RetryableJobError, normalize_safe_code
+from server.app.queue.payloads import IDENTIFIER_PATTERN, TYPE_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class Worker:
             except Exception:
                 logger.error("worker_claim_failed", extra={"context": {"safe_error_code": "queue_unavailable", "kind": kind}}); continue
             if item is not None:
+                if self._shutdown.is_set():
+                    logger.info("worker_claim_abandoned", extra={"context": self._context(item, kind, "shutdown_requested")}); return
                 await self._process(item, kind); return
 
     async def _process(self, item: object, kind: str) -> None:
@@ -89,7 +92,11 @@ class Worker:
         if heartbeat in done and heartbeat.exception() is not None:
             if not handling.done(): handling.cancel()
             try: await asyncio.wait_for(asyncio.shield(handling), self._cancel_timeout_seconds)
-            except (TimeoutError, asyncio.CancelledError): pass
+            except TimeoutError:
+                self._shutdown.set(); self._hard_stop()
+                try: await asyncio.wait_for(asyncio.shield(handling), self._cancel_timeout_seconds)
+                except (TimeoutError, asyncio.CancelledError): pass
+            except asyncio.CancelledError: pass
             self._active_handler = None
             logger.error("worker_lease_lost", extra={"context": self._context(item, kind, "lease_lost")}); return
         heartbeat.cancel(); await asyncio.gather(heartbeat, return_exceptions=True)
@@ -102,6 +109,7 @@ class Worker:
             try:
                 if kind == "job": await self._queue.succeed(item, self._worker_id)
                 else: await self._queue.publish_outbox(item, self._worker_id)
+                logger.info("worker_item_succeeded", extra={"context": self._context(item, kind, "succeeded")})
             except Exception: logger.error("worker_completion_rejected", extra={"context": self._context(item, kind, "lease_lost")})
         finally: self._active_handler = None
 
@@ -116,11 +124,16 @@ class Worker:
         try:
             method = self._queue.fail if kind == "job" else self._queue.fail_outbox
             await method(item, self._worker_id, safe_code=code, retryable=retryable)
+            logger.error("worker_item_failed", extra={"context": self._context(item, kind, code)})
         except Exception: logger.error("worker_failure_record_rejected", extra={"context": self._context(item, kind, "lease_lost")})
 
     @staticmethod
     def _context(item: object, kind: str, code: str) -> dict[str, object]:
-        return {"item_id": str(item.id), "kind": kind, "attempt": item.attempts, "trace_id": getattr(item, "trace_id", None), "safe_error_code": normalize_safe_code(code)}
+        label = getattr(item, "type", None) if kind == "job" else getattr(item, "topic", None)
+        safe_label = label if isinstance(label, str) and TYPE_PATTERN.fullmatch(label) else "internal.type"
+        trace = getattr(item, "trace_id", None)
+        safe_trace = trace if isinstance(trace, str) and IDENTIFIER_PATTERN.fullmatch(trace) else None
+        return {"item_id": str(item.id), "item_type": safe_label, "kind": kind, "attempt": item.attempts, "trace_id": safe_trace, "safe_error_code": normalize_safe_code(code)}
 
 
 async def _run() -> None:

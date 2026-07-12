@@ -1,3 +1,4 @@
+import asyncio
 import os
 import subprocess
 import threading
@@ -12,6 +13,8 @@ from server.app.queue.models import BackgroundJob, JobAttempt, OutboxEvent
 from server.app.queue.repository import LeaseRejected, QueueRepository
 from server.app.queue.payloads import OpaqueIdField, PayloadPolicyRegistry, PayloadSchema
 from server.app.queue.payloads import UnsafePayload
+from server.app.queue.runtime import DatabaseQueueGateway
+from server.app.worker.main import Worker
 
 
 pytestmark = pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
@@ -40,6 +43,7 @@ def policies() -> PayloadPolicyRegistry:
     for job_type in ("test.export", "test.work", "test.cancel"):
         registry.register_job(job_type, PayloadSchema({}))
     registry.register_topic("audit.created", PayloadSchema({"candidate_id": OpaqueIdField()}))
+    registry.register_job("test.unknown", PayloadSchema({}))
     return registry
 
 
@@ -218,3 +222,30 @@ def test_policy_rejection_tenant_isolation_and_index_metadata(queue_db) -> None:
     assert outbox_indexes["ix_outbox_events_stale_lease"] == ["organization_id", "lease_expires_at"]
     assert {item["name"] for item in inspector.get_check_constraints("background_jobs")} >= {"ck_background_jobs_status", "ck_background_jobs_attempts"}
     assert {item["name"] for item in inspector.get_check_constraints("outbox_events")} >= {"ck_outbox_events_status", "ck_outbox_events_attempts"}
+
+
+def test_expired_outbox_at_max_attempts_is_reaped_to_failed(queue_db) -> None:
+    with Session(queue_db) as session:
+        org = organization(session, "outbox-abandoned"); repo = repository(session)
+        event = repo.append_outbox(org, "audit.created", "candidate", uuid.uuid4(), {"candidate_id": str(uuid.uuid4())}, max_attempts=1); session.commit()
+        claimed = repo.claim_outbox(org, "crashed", lease_seconds=30); assert claimed.id == event.id
+        session.execute(text("UPDATE outbox_events SET lease_expires_at=now()-interval '1 second' WHERE id=:id"), {"id": event.id}); session.commit()
+        assert repo.claim_outbox(org, "next", lease_seconds=30) is None
+        session.refresh(event)
+        assert event.status == "failed" and event.failed_at is not None
+        assert event.safe_error_code == "delivery_abandoned" and event.lease_owner is None and event.lease_expires_at is None
+
+
+def test_persisted_unknown_job_type_is_dead_lettered_without_execution(queue_db) -> None:
+    with Session(queue_db) as session:
+        org = organization(session, "unknown-job"); repo = repository(session)
+        job = repo.enqueue(org, "test.unknown", {}); session.commit(); job_id = job.id
+    gateway = DatabaseQueueGateway(os.environ["POSTGRES_SMOKE_URL"], policies())
+    class Probe:
+        async def check(self) -> None: pass
+    worker = Worker(Probe(), Probe(), interval_seconds=0, queue=gateway, handlers={}, outbox_handlers={}, worker_id="unknown-worker", lease_seconds=30, heartbeat_seconds=10)
+    asyncio.run(worker._poll_once())
+    with Session(queue_db) as session:
+        stored = session.get(BackgroundJob, job_id)
+        assert stored.status == "dead_letter" and stored.last_error_code == "unknown_job_type"
+        assert session.scalar(select(JobAttempt).where(JobAttempt.job_id == job_id)).safe_error_code == "unknown_job_type"
