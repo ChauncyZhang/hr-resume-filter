@@ -20,6 +20,11 @@ x-app-environment: &app-environment
   WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-1}
   WORKER_SHUTDOWN_TIMEOUT_SECONDS: ${WORKER_SHUTDOWN_TIMEOUT_SECONDS:-30}
   WORKER_CANCEL_TIMEOUT_SECONDS: ${WORKER_CANCEL_TIMEOUT_SECONDS:-5}
+  CLAMAV_HOST: clamav
+  CLAMAV_PORT: 3310
+  CLAMAV_CONNECT_TIMEOUT_SECONDS: ${CLAMAV_CONNECT_TIMEOUT_SECONDS:-2}
+  CLAMAV_READ_TIMEOUT_SECONDS: ${CLAMAV_READ_TIMEOUT_SECONDS:-10}
+  CLAMAV_TOTAL_TIMEOUT_SECONDS: ${CLAMAV_TOTAL_TIMEOUT_SECONDS:-15}
 
 x-app-service: &app-service
   build:
@@ -31,6 +36,8 @@ x-app-service: &app-service
     postgres:
       condition: service_healthy
     minio:
+      condition: service_healthy
+    clamav:
       condition: service_healthy
   restart: unless-stopped
   networks: [private]
@@ -102,6 +109,16 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+    networks: [private]
+
+  clamav:
+    image: clamav/clamav:1.4.3
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
     restart: unless-stopped
     networks: [private]
 

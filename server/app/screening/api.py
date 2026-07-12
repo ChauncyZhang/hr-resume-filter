@@ -1,5 +1,5 @@
 import hashlib,json,re,uuid
-from datetime import datetime
+from datetime import datetime,timezone
 from urllib.parse import unquote
 from pathlib import PurePath
 from tempfile import SpooledTemporaryFile
@@ -16,10 +16,13 @@ from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,Scr
 from server.app.screening.parsers import ParserError,ParserLimits,validate_upload_preflight
 from server.app.screening.schemas import ItemCollection,ItemResource,RunCreate,RunResource
 from server.app.screening.storage import StorageWriteFailed
+from server.app.queue.repository import QueueRepository
 
 router=APIRouter(prefix="/api/v1"); _SAFE_STATUS={"queued","parsing","parsed","scoring","scored","failed","cancelled"}
 class RunNotQueued(Exception): pass
 class ScreeningItemLimit(Exception): pass
+class ScreeningRunEmpty(Exception): pass
+class ScreeningRunAlreadyStarted(Exception): pass
 def _response(data,status=200):
     response=JSONResponse({"data":data},status_code=status); response.headers["Cache-Control"]="no-store"; return response
 def _problem(request,status,code):
@@ -127,6 +130,33 @@ def get_run(run_id:UUID,request:Request):
     if isinstance(principal,JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
         run=_load_run(db,principal,run_id); return _not_found(request) if run is None else _response(_run_data(run))
+
+@router.post("/screening-runs/{run_id}/start",response_model=RunResource)
+def start_run(run_id:UUID,request:Request,idempotency_key:str|None=Header(None)):
+    principal=_principal(request); key=_idempotency(request,idempotency_key)
+    if isinstance(principal,JSONResponse): return principal
+    if isinstance(key,JSONResponse): return key
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_run(db,principal,run_id,RecruitingAction.MANAGE_JOB) is None: return _not_found(request)
+        try:
+            def action():
+                run=_load_run(db,principal,run_id,RecruitingAction.MANAGE_JOB,lock=True)
+                if run is None: raise LookupError
+                if run.status!="queued": raise ScreeningRunAlreadyStarted
+                items=list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.status=="queued").order_by(ScreeningItem.created_at,ScreeningItem.id)))
+                if not items: raise ScreeningRunEmpty
+                run.status="parsing"; run.started_at=datetime.now(timezone.utc); run.version+=1
+                queue=QueueRepository(db)
+                for item in items:
+                    queue.enqueue(principal.organization_id,"screening.parse_item",{"organization_id":str(principal.organization_id),"screening_item_id":str(item.id),"parser_version":"parser-v1"},dedupe_key=f"parse:{item.id}",trace_id=request.state.trace_id,max_attempts=3)
+                db.flush(); return 200,{"data":_run_data(run)}
+            status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.run.start",key,{"run_id":str(run_id)},action); db.commit()
+        except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
+        except ScreeningRunEmpty: db.rollback(); return _problem(request,409,"screening_run_empty")
+        except ScreeningRunAlreadyStarted: db.rollback(); return _problem(request,409,"screening_run_already_started")
+        except LookupError: db.rollback(); return _not_found(request)
+        except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
+    response=JSONResponse(body,status_code=status); response.headers["Cache-Control"]="no-store"; return response
 
 @router.get("/screening-runs/{run_id}/items",response_model=ItemCollection)
 def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=None,limit:int=Query(50,ge=1,le=100)):

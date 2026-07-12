@@ -12,6 +12,17 @@ from server.app.queue.payloads import IDENTIFIER_PATTERN, TYPE_PATTERN
 
 logger = logging.getLogger(__name__)
 
+def build_screening_handlers(settings,storage_client,bucket):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from server.app.screening.pipeline import ScreeningPipeline
+    from server.app.screening.scanner import ClamAvScanner
+    from server.app.screening.storage import PipelineStorage
+    sessions=sessionmaker(create_engine(settings.database_url.replace("+asyncpg","+psycopg")),expire_on_commit=False)
+    scanner=ClamAvScanner(settings.clamav_host,settings.clamav_port,connect_timeout=settings.clamav_connect_timeout_seconds,read_timeout=settings.clamav_read_timeout_seconds,total_timeout=settings.clamav_total_timeout_seconds)
+    pipeline=ScreeningPipeline(sessions,PipelineStorage(storage_client,bucket),scanner,settings)
+    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item}
+
 
 class Worker:
     def __init__(self, database_probe: ReadinessProbe, storage_probe: ReadinessProbe, *, interval_seconds: float,
@@ -140,8 +151,9 @@ async def _run() -> None:
     from server.app.core.storage import ObjectStorageProbe, create_storage_client
     from server.app.db.session import DatabaseProbe, create_engine
     from server.app.queue.runtime import DatabaseQueueGateway
-    settings = Settings.from_environment(); gateway = DatabaseQueueGateway(settings.database_url)
-    worker = Worker(DatabaseProbe(create_engine(settings.database_url)), ObjectStorageProbe(create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds), settings.object_storage_bucket), interval_seconds=settings.worker_poll_interval_seconds, readiness_timeout_seconds=settings.readiness_timeout_seconds, worker_id=settings.worker_id, lease_seconds=settings.worker_lease_seconds, shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds, cancel_timeout_seconds=settings.worker_cancel_timeout_seconds, heartbeat_seconds=settings.worker_heartbeat_seconds, queue=gateway, handlers={}, outbox_handlers={})
+    settings = Settings.from_environment(); gateway = DatabaseQueueGateway(settings.database_url); storage_client=create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds)
+    handlers=build_screening_handlers(settings,storage_client,settings.object_storage_bucket)
+    worker = Worker(DatabaseProbe(create_engine(settings.database_url)), ObjectStorageProbe(storage_client, settings.object_storage_bucket), interval_seconds=settings.worker_poll_interval_seconds, readiness_timeout_seconds=settings.readiness_timeout_seconds, worker_id=settings.worker_id, lease_seconds=settings.worker_lease_seconds, shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds, cancel_timeout_seconds=settings.worker_cancel_timeout_seconds, heartbeat_seconds=settings.worker_heartbeat_seconds, queue=gateway, handlers=handlers, outbox_handlers={})
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(event, worker.request_shutdown)
     await worker.run()

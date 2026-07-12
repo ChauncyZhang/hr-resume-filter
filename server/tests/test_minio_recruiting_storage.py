@@ -7,7 +7,7 @@ from minio import Minio
 from minio.error import S3Error
 
 from server.app.recruiting.storage import MinioResumeStorage
-from server.app.screening.storage import QuarantineStorage
+from server.app.screening.storage import PipelineStorage,QuarantineStorage
 
 
 @pytest.mark.skipif(not os.getenv("MINIO_SMOKE_ENDPOINT"), reason="MinIO smoke endpoint not configured")
@@ -47,3 +47,14 @@ def test_live_minio_quarantine_streaming_write_delete() -> None:
         with pytest.raises(S3Error) as missing: client.stat_object(bucket,key)
         assert missing.value.code in {"NoSuchKey","NoSuchObject"}
     finally: client.remove_bucket(bucket)
+
+@pytest.mark.skipif(not os.getenv("MINIO_SMOKE_ENDPOINT"), reason="MinIO smoke endpoint not configured")
+def test_live_minio_private_pipeline_open_copy_delete() -> None:
+    client=Minio(os.environ["MINIO_SMOKE_ENDPOINT"],access_key=os.environ["MINIO_SMOKE_ACCESS_KEY"],secret_key=os.environ["MINIO_SMOKE_SECRET_KEY"],secure=False); bucket=f"ux09-p-{uuid4().hex}"; client.make_bucket(bucket); source=f"quarantine/{uuid4()}/{uuid4()}/{uuid4()}"; target=f"clean/{uuid4()}/{uuid4()}"; client.put_object(bucket,source,io.BytesIO(b"private"),7); storage=PipelineStorage(client,bucket)
+    try:
+        stream=__import__("asyncio").run(storage.open(source,1024)); assert stream.read()==b"private"; stream.close(); __import__("asyncio").run(storage.copy(source,target,1024)); assert __import__("asyncio").run(storage.delete(source)) is True; assert client.stat_object(bucket,target).size==7
+    finally:
+        for key in (source,target):
+            try: client.remove_object(bucket,key)
+            except S3Error: pass
+        client.remove_bucket(bucket)

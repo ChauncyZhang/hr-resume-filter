@@ -12,6 +12,8 @@ from server.app.main import create_app
 from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
 from server.app.screening.storage import StorageWriteFailed
 from server.app.screening.models import ScreeningItem
+from server.app.queue.models import BackgroundJob
+from sqlalchemy import select
 
 class Probe:
     async def check(self): pass
@@ -102,3 +104,18 @@ def test_screening_item_cursor_is_created_at_id_keyset_with_between_page_insert(
         inserted=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("third.txt",b"third","text/plain")},headers={**headers,"Idempotency-Key":"third"}).json()["data"]["id"]
         cursor=page1.json()["meta"]["next_cursor"]; page2=client.get(f"/api/v1/screening-runs/{run['id']}/items?limit=10&cursor={cursor}",headers=headers)
         assert [row["id"] for row in page2.json()["data"]]==[ids[1],inserted]
+
+def test_start_run_is_authorized_idempotent_and_enqueues_each_item_atomically(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        empty=client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**headers,"Idempotency-Key":"empty"}); assert empty.status_code==409 and empty.json()["code"]=="screening_run_empty"
+        for key in ("one","two"): assert client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"{key}.txt",key.encode(),"text/plain")},headers={**headers,"Idempotency-Key":key}).status_code==201
+        started=client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**headers,"Idempotency-Key":"start"}); assert started.status_code==200 and started.json()["data"]["status"]=="parsing"
+        replay=client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**headers,"Idempotency-Key":"start"}); assert replay.status_code==200 and replay.json()==started.json()
+        conflict=client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**headers,"Idempotency-Key":"different"}); assert conflict.status_code==409 and conflict.json()["code"]=="screening_run_already_started"
+        with app.state.identity_store.sync_session() as db:
+            jobs=list(db.scalars(select(BackgroundJob).where(BackgroundJob.type=="screening.parse_item"))); assert len(jobs)==2 and len({job.dedupe_key for job in jobs})==2
+            assert all(set(job.payload)=={"organization_id","screening_item_id","parser_version"} for job in jobs)
+        client.post("/api/v1/auth/logout",headers=headers); manager=login(client,"manager@example.test")
+        assert client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**manager,"Idempotency-Key":"manager"}).status_code==404

@@ -2,13 +2,14 @@ import os,subprocess,threading
 from concurrent.futures import ThreadPoolExecutor
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import select,text
+from sqlalchemy import func,select,text
 from sqlalchemy.exc import IntegrityError
 from server.app.core.settings import Settings
 from server.app.identity.models import Job,JobCollaborator,Organization,User,UserRole
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting.models import FileObject,JobJdVersion,ScreeningRuleVersion
+from server.app.queue.models import BackgroundJob
 from server.app.screening.models import CandidateDuplicateHint,ScreeningRun
 from server.tests.test_screening_api import FakeQuarantineStorage,Probe,login
 pytestmark=pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"),reason="PostgreSQL smoke URL not configured")
@@ -51,3 +52,8 @@ def test_postgres_screening_api_concurrency_versions_limit_and_duplicates():
             db.scalar(select(FileObject)).detected_type="exe"
             with pytest.raises(IntegrityError): db.commit()
             db.rollback()
+        def start(key): return client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**headers,"Idempotency-Key":key})
+        with ThreadPoolExecutor(max_workers=2) as pool: starts=list(pool.map(start,("start-a","start-b")))
+        assert sorted(response.status_code for response in starts)==[200,409]
+        with app.state.identity_store.sync_session() as db:
+            assert db.scalar(select(func.count(BackgroundJob.id)).where(BackgroundJob.type=="screening.parse_item"))==db.get(ScreeningRun,run["id"]).total_count

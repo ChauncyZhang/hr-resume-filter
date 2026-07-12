@@ -12,7 +12,9 @@ class LeaseRejected(RuntimeError): pass
 
 class QueueRepository:
     def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES) -> None: self.session, self.jitter, self.policies = session, jitter, policies
-    def database_now(self) -> datetime: return self.session.scalar(select(text("CURRENT_TIMESTAMP")))
+    def database_now(self) -> datetime:
+        value=self.session.scalar(select(text("CURRENT_TIMESTAMP")))
+        return datetime.fromisoformat(value) if isinstance(value,str) else value
 
     def enqueue(self, organization_id: uuid.UUID, job_type: str, payload: Mapping[str, object], *, priority: int = 0, max_attempts: int = 3, run_after: datetime | None = None, dedupe_key: str | None = None, trace_id: str | None = None) -> BackgroundJob:
         job_type = self.policies.validate_type(job_type); dedupe_key = self.policies.validate_identifier(dedupe_key, field="dedupe_key"); trace_id = self.policies.validate_identifier(trace_id, field="trace_id")
