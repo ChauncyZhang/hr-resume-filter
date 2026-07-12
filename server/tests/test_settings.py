@@ -12,6 +12,8 @@ def production_settings(**overrides: object) -> Settings:
         "object_storage_access_key": "real-access-key",
         "object_storage_secret_key": "real-secret-key",
         "object_storage_bucket": "resumes",
+        "contact_encryption_key": "32-bytes-or-more-encryption-material",
+        "contact_lookup_secret": "independent-lookup-secret-material",
         "cors_origins": ["https://hr.example.com"],
     }
     values.update(overrides)
@@ -80,3 +82,20 @@ def test_production_accepts_explicit_origins_and_non_placeholder_secrets() -> No
 
     assert settings.environment == "production"
     assert settings.cors_origins == ["https://hr.example.com"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("contact_encryption_key", "change-me"), ("contact_lookup_secret", "placeholder")],
+)
+def test_production_rejects_placeholder_contact_secrets(field: str, value: str) -> None:
+    with pytest.raises(ValidationError):
+        production_settings(**{field: value})
+
+
+def test_production_accepts_deployment_supplied_contact_secrets() -> None:
+    settings = production_settings(
+        contact_encryption_key="32-bytes-or-more-encryption-material",
+        contact_lookup_secret="independent-lookup-secret-material",
+    )
+    assert settings.contact_encryption_key.startswith("32-bytes")

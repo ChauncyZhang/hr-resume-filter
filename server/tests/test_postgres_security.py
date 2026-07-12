@@ -127,3 +127,34 @@ def test_audit_logs_reject_update_and_delete(pg_store) -> None:
         with pytest.raises(OperationalError):
             with pg_store.engine.begin() as connection:
                 connection.execute(text(statement), {"id": audit_id})
+
+
+def test_active_application_partial_index_and_recruiting_tenant_constraints(pg_store) -> None:
+    user_id, organization_id = seed_pg_user(pg_store)
+    with pg_store.engine.begin() as connection:
+        candidate, job, file_id, resume = [uuid4() for _ in range(4)]
+        connection.execute(text("insert into candidates(id,organization_id,display_name,owner_id) values (:id,:org,'Masked Candidate',:user)"), {"id": candidate, "org": organization_id, "user": user_id})
+        connection.execute(text("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:id,:org,'Role',:user,'open',now(),now())"), {"id": job, "org": organization_id, "user": user_id})
+        connection.execute(text("insert into file_objects(id,organization_id,storage_key,original_filename,mime_type,size_bytes,sha256,uploaded_by) values (:id,:org,'private/key','resume.pdf','application/pdf',1,:sha,:user)"), {"id": file_id, "org": organization_id, "sha": "0" * 64, "user": user_id})
+        connection.execute(text("insert into resumes(id,organization_id,candidate_id,file_object_id,version_number) values (:id,:org,:candidate,:file,1)"), {"id": resume, "org": organization_id, "candidate": candidate, "file": file_id})
+        values = {"id": uuid4(), "org": organization_id, "candidate": candidate, "job": job, "resume": resume, "user": user_id}
+        connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage) values (:id,:org,:candidate,:job,:resume,:user,'new')"), values)
+    with pytest.raises(IntegrityError):
+        with pg_store.engine.begin() as connection:
+            connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage) values (:id,:org,:candidate,:job,:resume,:user,'review')"), {**values, "id": uuid4()})
+    with pg_store.engine.begin() as connection:
+        connection.execute(text("update applications set stage='rejected' where id=:id"), values)
+        connection.execute(text("insert into applications(id,organization_id,candidate_id,job_id,resume_id,owner_id,stage,source_application_id) values (:new,:org,:candidate,:job,:resume,:user,'new',:id)"), {**values, "new": uuid4()})
+
+
+def test_recruiting_immutable_rows_reject_update_and_delete(pg_store) -> None:
+    user_id, organization_id = seed_pg_user(pg_store)
+    with pg_store.engine.begin() as connection:
+        job_id = uuid4()
+        version_id = uuid4()
+        connection.execute(text("insert into jobs(id,organization_id,title,owner_id,status,created_at,updated_at) values (:id,:org,'Role',:user,'draft',now(),now())"), {"id": job_id, "org": organization_id, "user": user_id})
+        connection.execute(text("insert into job_jd_versions(id,organization_id,job_id,version_number,content,created_by) values (:id,:org,:job,1,'{}',:user)"), {"id": version_id, "org": organization_id, "job": job_id, "user": user_id})
+    for statement in ("update job_jd_versions set version_number=2 where id=:id", "delete from job_jd_versions where id=:id"):
+        with pytest.raises(OperationalError):
+            with pg_store.engine.begin() as connection:
+                connection.execute(text(statement), {"id": version_id})

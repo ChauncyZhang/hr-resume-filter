@@ -54,3 +54,8 @@ Set `APP_ENVIRONMENT=production`, a non-placeholder PostgreSQL password, distinc
 access and secret keys, and explicit HTTPS CORS origins. Startup rejects placeholders and
 wildcard CORS. Buckets are private and must be provisioned separately; the application never
 enables anonymous/public access. Rotate secrets through the deployment environment, not Git.
+
+Candidate contacts require separate `CONTACT_ENCRYPTION_KEY` and `CONTACT_LOOKUP_SECRET`
+values. Rotation is an offline maintenance boundary: stop writes, decrypt and re-encrypt all
+contacts, recompute lookup hashes, reconcile row counts and duplicate constraints, then deploy
+both new values atomically. Online dual-key rotation is outside Phase 2.

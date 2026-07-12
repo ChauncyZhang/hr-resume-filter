@@ -27,6 +27,8 @@ class Settings(BaseModel):
     object_storage_access_key: str = "change-me"
     object_storage_secret_key: str = "change-me"
     object_storage_bucket: str = "resumes"
+    contact_encryption_key: str = "change-me"
+    contact_lookup_secret: str = "change-me"
     object_storage_secure: bool = False
     object_storage_connect_timeout_seconds: float = Field(default=1, gt=0)
     object_storage_read_timeout_seconds: float = Field(default=3, gt=0)
@@ -42,6 +44,8 @@ class Settings(BaseModel):
         credentials = (
             self.object_storage_access_key.strip().lower(),
             self.object_storage_secret_key.strip().lower(),
+            self.contact_encryption_key.strip().lower(),
+            self.contact_lookup_secret.strip().lower(),
         )
         database_url = urlsplit(self.database_url)
         if not database_url.scheme or not database_url.hostname:
@@ -72,6 +76,8 @@ class Settings(BaseModel):
             "OBJECT_STORAGE_ACCESS_KEY": "object_storage_access_key",
             "OBJECT_STORAGE_SECRET_KEY": "object_storage_secret_key",
             "OBJECT_STORAGE_BUCKET": "object_storage_bucket",
+            "CONTACT_ENCRYPTION_KEY": "contact_encryption_key",
+            "CONTACT_LOOKUP_SECRET": "contact_lookup_secret",
             "OBJECT_STORAGE_SECURE": "object_storage_secure",
             "OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS": "object_storage_connect_timeout_seconds",
             "OBJECT_STORAGE_READ_TIMEOUT_SECONDS": "object_storage_read_timeout_seconds",

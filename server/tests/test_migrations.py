@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import create_engine, inspect
 
 
-TABLES = {"organizations", "departments", "users", "user_roles", "user_sessions", "jobs", "job_collaborators", "audit_logs"}
+TABLES = {"organizations", "departments", "users", "user_roles", "user_sessions", "jobs", "job_collaborators", "audit_logs", "candidates", "candidate_contacts", "file_objects", "resumes", "job_jd_versions", "screening_rule_versions", "applications", "application_stage_events", "candidate_notes", "candidate_events", "download_tickets", "idempotency_records"}
 
 
 @pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")

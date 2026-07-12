@@ -115,12 +115,25 @@ class Job(Timestamped, Base):
     __tablename__ = "jobs"
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     title: Mapped[str] = mapped_column(String(200))
+    department_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    headcount: Mapped[int] = mapped_column(Integer, default=1)
+    priority: Mapped[str] = mapped_column(String(16), default="normal")
+    hiring_owner_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     owner_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     status: Mapped[str] = mapped_column(String(32), default="draft")
+    version: Mapped[int] = mapped_column(Integer, default=1)
     __table_args__ = (
         UniqueConstraint("organization_id", "id"),
         ForeignKeyConstraint(
             ["organization_id", "owner_id"],
+            ["users.organization_id", "users.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "department_id"],
+            ["departments.organization_id", "departments.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "hiring_owner_id"],
             ["users.organization_id", "users.id"],
         ),
     )
