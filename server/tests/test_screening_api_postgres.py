@@ -1,0 +1,32 @@
+import os,subprocess
+from concurrent.futures import ThreadPoolExecutor
+from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import select,text
+from server.app.core.settings import Settings
+from server.app.identity.models import Job,JobCollaborator,Organization,User,UserRole
+from server.app.identity.security import PasswordService
+from server.app.main import create_app
+from server.app.recruiting.models import JobJdVersion,ScreeningRuleVersion
+from server.app.screening.models import CandidateDuplicateHint,ScreeningRun
+from server.tests.test_screening_api import FakeQuarantineStorage,Probe,login
+pytestmark=pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"),reason="PostgreSQL smoke URL not configured")
+
+def test_postgres_screening_api_concurrency_versions_limit_and_duplicates():
+    url=os.environ["POSTGRES_SMOKE_URL"]; subprocess.run(["python","-m","alembic","-c","server/alembic.ini","upgrade","head"],check=True,env={**os.environ,"DATABASE_URL":url}); storage=FakeQuarantineStorage(); app=create_app(settings=Settings(environment="test",database_url=url,cors_origins=["https://hr.example.test"]),database_probe=Probe(),storage_probe=Probe(),quarantine_storage=storage)
+    with app.state.identity_store.sync_session() as db:
+        db.execute(text("TRUNCATE organizations CASCADE")); org=Organization(slug="acme",name="PG",status="active"); user=User(organization=org,email="admin@pg.test",normalized_email="admin@pg.test",display_name="Admin",password_hash=PasswordService().hash("correct")); user.roles.append(UserRole(role="recruiting_admin")); db.add(user); db.flush(); jobs=[]
+        for title in ("One","Two"):
+            job=Job(organization_id=org.id,title=title,owner_id=user.id,status="draft"); db.add(job); db.flush(); jd=JobJdVersion(organization_id=org.id,job_id=job.id,version_number=1,content={},created_by=user.id); rule=ScreeningRuleVersion(organization_id=org.id,job_id=job.id,version_number=1,content={},created_by=user.id); db.add_all([jd,rule]); db.flush(); jobs.append((job.id,jd.id,rule.id))
+        db.commit()
+    with TestClient(app) as client:
+        headers=login(client,"admin@pg.test"); headers["Idempotency-Key"]="mismatch"; mismatch=client.post(f"/api/v1/jobs/{jobs[0][0]}/screening-runs",json={"jd_version_id":str(jobs[1][1]),"rule_version_id":str(jobs[1][2])},headers=headers); assert mismatch.status_code==422
+        run=client.post(f"/api/v1/jobs/{jobs[0][0]}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        def upload(index): return client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"{index}.txt",b"same-content","text/plain")},headers={**headers,"Idempotency-Key":f"item-{index}"})
+        with ThreadPoolExecutor(max_workers=2) as pool: responses=list(pool.map(upload,(1,2)))
+        assert [r.status_code for r in responses]==[201,201]
+        with app.state.identity_store.sync_session() as db:
+            stored=db.get(ScreeningRun,run["id"]); assert stored.total_count==2; assert db.scalar(select(CandidateDuplicateHint)) is not None; organization_id=stored.organization_id
+            stored.total_count=100; db.commit()
+        limited=upload(101); assert limited.status_code==409 and limited.json()["code"]=="screening_item_limit"
+        assert all(key.startswith(f"quarantine/{organization_id}/{run['id']}/") and "same" not in key for key in storage.objects)

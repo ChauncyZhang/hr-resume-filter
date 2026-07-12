@@ -41,6 +41,7 @@ def create_app(
     token_source: TokenSource | None = None,
     initialize_identity_schema: bool = False,
     resume_storage=None,
+    quarantine_storage=None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
 
@@ -60,6 +61,9 @@ def create_app(
             )
         storage_probe = storage_probe or ObjectStorageProbe(storage_client, settings.object_storage_bucket)
         resume_storage = resume_storage or MinioResumeStorage(storage_client, settings.object_storage_bucket)
+        if quarantine_storage is None:
+            from server.app.screening.storage import QuarantineStorage
+            quarantine_storage = QuarantineStorage(storage_client, settings.object_storage_bucket)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -86,8 +90,11 @@ def create_app(
         b"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", b"fedcba9876543210fedcba9876543210"
     )
     app.state.resume_storage = resume_storage
+    app.state.quarantine_storage = quarantine_storage
     app.include_router(identity_router)
     app.include_router(recruiting_router)
+    from server.app.screening.api import router as screening_router
+    app.include_router(screening_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):

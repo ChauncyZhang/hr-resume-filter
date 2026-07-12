@@ -34,6 +34,38 @@ def parse_document(stream: BinaryIO, *, extension: str, mime_type: str, limits: 
     if data.startswith((b"%PDF-", b"PK\x03\x04")): raise ParserError("file_magic_mismatch")
     return _txt(data, limits)
 
+def validate_upload_preflight(stream: BinaryIO, *, extension: str, mime_type: str, limits: ParserLimits = ParserLimits()) -> str:
+    extension=extension.lower()
+    if extension not in _MIMES: raise ParserError("file_type_not_allowed")
+    if mime_type!=_MIMES[extension]: raise ParserError("file_type_mismatch")
+    stream.seek(0); data=stream.read(limits.max_source_bytes+1); stream.seek(0)
+    if not data: raise ParserError("empty_file")
+    if len(data)>limits.max_source_bytes: raise ParserError("file_too_large")
+    if extension==".pdf" and not data.startswith(b"%PDF-"): raise ParserError("file_magic_mismatch")
+    if extension==".docx":
+        if not data.startswith(b"PK\x03\x04"): raise ParserError("file_magic_mismatch")
+        _docx_preflight(data,limits)
+    if extension==".txt":
+        if data.startswith((b"%PDF-",b"PK\x03\x04")): raise ParserError("file_magic_mismatch")
+        if b"\x00" in data: raise ParserError("binary_text_rejected")
+    return extension[1:]
+
+def _docx_preflight(data,limits):
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            infos=archive.infolist()
+            if len(infos)>limits.docx_max_entries: raise ParserError("docx_entry_limit")
+            total=0
+            for info in infos:
+                parts=info.filename.replace("\\","/").split("/")
+                if ".." in parts or info.filename.startswith(("/","\\")): raise ParserError("docx_path_traversal")
+                if info.filename.lower().endswith(("vbaproject.bin",".docm",".dotm")): raise ParserError("docx_macro_rejected")
+                total+=info.file_size
+                if total>limits.docx_max_uncompressed_bytes: raise ParserError("docx_size_limit")
+                if info.file_size and info.file_size/max(1,info.compress_size)>limits.docx_max_compression_ratio: raise ParserError("docx_compression_ratio")
+    except ParserError: raise
+    except zipfile.BadZipFile: raise ParserError("docx_malformed") from None
+
 def _bounded(text: str, limits: ParserLimits) -> str:
     if len(text) > limits.max_text_chars: raise ParserError("text_limit_exceeded")
     return text
@@ -51,17 +83,7 @@ def _pdf(data: bytes, limits: ParserLimits) -> ParsedDocument:
 
 def _docx(data: bytes, limits: ParserLimits) -> ParsedDocument:
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            infos = archive.infolist()
-            if len(infos) > limits.docx_max_entries: raise ParserError("docx_entry_limit")
-            total = 0
-            for info in infos:
-                parts = info.filename.replace("\\", "/").split("/")
-                if ".." in parts or info.filename.startswith(("/", "\\")): raise ParserError("docx_path_traversal")
-                if info.filename.lower().endswith(("vbaproject.bin", ".docm", ".dotm")): raise ParserError("docx_macro_rejected")
-                total += info.file_size
-                if total > limits.docx_max_uncompressed_bytes: raise ParserError("docx_size_limit")
-                if info.file_size and info.file_size / max(1, info.compress_size) > limits.docx_max_compression_ratio: raise ParserError("docx_compression_ratio")
+        _docx_preflight(data,limits)
         from docx import Document
         document = Document(io.BytesIO(data)); text = _bounded("\n".join(paragraph.text for paragraph in document.paragraphs), limits)
     except ParserError: raise

@@ -45,7 +45,10 @@ class FileObject(Record, Base):
     size_bytes: Mapped[int] = mapped_column(BigInteger)
     sha256: Mapped[str] = mapped_column(String(64))
     uploaded_by: Mapped[uuid.UUID] = mapped_column(Uuid)
-    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "storage_key"), ForeignKeyConstraint(["organization_id", "uploaded_by"], ["users.organization_id", "users.id"]))
+    storage_state: Mapped[str] = mapped_column(String(20), default="clean")
+    detected_type: Mapped[str | None] = mapped_column(String(20))
+    scan_status: Mapped[str] = mapped_column(String(20), default="clean")
+    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "storage_key"), ForeignKeyConstraint(["organization_id", "uploaded_by"], ["users.organization_id", "users.id"]), CheckConstraint("storage_state in ('quarantine','clean','rejected','deleted')",name="ck_file_objects_storage_state"), CheckConstraint("scan_status in ('pending','clean','rejected','failed')",name="ck_file_objects_scan_status"), Index("ix_file_objects_tenant_sha","organization_id","sha256"))
 
 
 class Resume(Record, Base):
