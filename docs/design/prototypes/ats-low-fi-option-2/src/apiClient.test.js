@@ -127,6 +127,16 @@ test("网络失败被标记为服务不可用错误且不透传底层消息", as
   });
 });
 
+test("fetch AbortError 原样向调用方抛出", async () => {
+  const expected = new DOMException("request cancelled", "AbortError");
+  const client = createApiClient({ fetchImpl: async () => { throw expected; } });
+
+  await assert.rejects(client.getMe(), (error) => {
+    assert.equal(error, expected);
+    return true;
+  });
+});
+
 test("request 将 AbortSignal 原样传给 fetch", async () => {
   const controller = new AbortController();
   let receivedSignal;

@@ -23,6 +23,12 @@ function safeStrings(value) {
   return Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
 }
 
+function isFile(value) {
+  return Object.prototype.toString.call(value) === "[object File]"
+    && typeof value?.name === "string"
+    && typeof value?.arrayBuffer === "function";
+}
+
 function normalizeRunStatus(status) {
   if (status === "completed") return "complete";
   if (["partial", "failed", "cancelled"].includes(status)) return status;
@@ -81,7 +87,7 @@ export function normalizeScreeningTask(run, items) {
     status: normalizeRunStatus(safeRun.status),
     completed: safeCount(safeRun.processed_count),
     total: safeCount(safeRun.total_count),
-    files: Array.isArray(items) ? items.map(normalizeFile) : [],
+    files: Array.isArray(items) ? items.filter((item) => isRecord(item) && safeString(item.id)).map(normalizeFile) : [],
   };
 }
 
@@ -121,10 +127,15 @@ export function createScreeningController({
   createIdempotencyKey = defaultIdempotencyKey,
   wait = defaultWait,
 } = {}) {
+  const pollGenerations = new Map();
+
   async function listJobs({ signal } = {}) {
     const response = await client.request("/api/v1/jobs?limit=100", withSignal(signal));
     return Array.isArray(response?.data)
-      ? response.data.filter(isRecord).map((job) => ({ id: safeString(job.id), title: safeString(job.title) }))
+      ? response.data
+        .filter(isRecord)
+        .map((job) => ({ id: safeString(job.id), title: safeString(job.title) }))
+        .filter((job) => job.id && job.title)
       : [];
   }
 
@@ -140,7 +151,7 @@ export function createScreeningController({
 
   async function uploadFiles(runId, files, { signal } = {}) {
     const uploads = Array.from(files, (file) => {
-      if (!(file instanceof File)) throw new TypeError("screening uploads require File objects");
+      if (!isFile(file)) throw new TypeError("screening uploads require File objects");
       const body = new FormData();
       body.append("file", file);
       return client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/items`, {
@@ -181,13 +192,17 @@ export function createScreeningController({
   }
 
   async function pollRun(runId, { signal, intervalMs = 1000, onSnapshot } = {}) {
+    const generation = (pollGenerations.get(runId) ?? 0) + 1;
+    pollGenerations.set(runId, generation);
+    const isCurrent = () => pollGenerations.get(runId) === generation;
+
     try {
-      while (!signal?.aborted) {
+      while (!signal?.aborted && isCurrent()) {
         const [run, items] = await Promise.all([
           getRun(runId, { signal }),
           getItems(runId, { signal }),
         ]);
-        if (signal?.aborted) return null;
+        if (signal?.aborted || !isCurrent()) return null;
         const snapshot = normalizeScreeningTask(run, items);
         onSnapshot?.(snapshot);
         if (TERMINAL_RUN_STATUSES.has(snapshot.status)) return snapshot;

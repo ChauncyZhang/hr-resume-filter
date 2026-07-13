@@ -52,7 +52,8 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     let response;
     try {
       response = await fetchImpl(path, { method, headers, body, credentials: "include", signal: options.signal });
-    } catch {
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
       throw new ApiError({ kind: "unavailable", code: "service_unavailable" });
     }
 

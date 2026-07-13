@@ -41,6 +41,14 @@ function item(overrides = {}) {
   };
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 test("lists job options from GET /jobs with only id and title", async () => {
   const client = createClient([{ data: [{ id: "job-1", title: "AI 工程师", status: "open" }] }]);
   const controller = createScreeningController({ client });
@@ -48,6 +56,18 @@ test("lists job options from GET /jobs with only id and title", async () => {
   assert.deepEqual(await controller.listJobs(), [{ id: "job-1", title: "AI 工程师" }]);
   assert.equal(client.calls[0].path, "/api/v1/jobs?limit=100");
   assert.deepEqual(client.calls[0].options, {});
+});
+
+test("drops malformed job and item records without creating blank UI rows", async () => {
+  const client = createClient([{ data: [null, { id: 7, title: "bad" }, { id: "", title: "blank" }, { id: "job-1", title: "AI 工程师" }] }]);
+  const controller = createScreeningController({ client });
+
+  assert.deepEqual(await controller.listJobs(), [{ id: "job-1", title: "AI 工程师" }]);
+
+  const task = normalizeScreeningTask(run(), [null, { id: 7, filename: "bad.pdf" }, item({ id: "item-2", llm_status: "unknown", status: "scored", rule_result: { score: 80 } })]);
+  assert.equal(task.files.length, 1);
+  assert.equal(task.files[0].id, "item-2");
+  assert.equal(task.files[0].status, "running");
 });
 
 test("creates, uploads, and starts with exact contracts and a new key per command", async () => {
@@ -77,6 +97,31 @@ test("creates, uploads, and starts with exact contracts and a new key per comman
   assert.deepEqual(client.calls.slice(1).map(({ options }) => options.idempotencyKey), ["key-2", "key-3", "key-4"]);
   assert.equal(client.calls[3].path, "/api/v1/screening-runs/run-1/start");
   assert.equal(new Set(client.calls.map(({ options }) => options.idempotencyKey)).size, 4);
+});
+
+test("accepts and preserves a cross-realm-like File object", async () => {
+  const client = createClient([{ data: { id: "item-1" } }]);
+  const controller = createScreeningController({ client, createIdempotencyKey: () => "upload-key" });
+  const file = new File(["resume"], "resume.pdf", { type: "application/pdf" });
+  const OriginalFormData = globalThis.FormData;
+  let appended;
+  Object.defineProperty(file, "name", { value: file.name });
+  Object.setPrototypeOf(file, Object.create(Blob.prototype, {
+    [Symbol.toStringTag]: { value: "File" },
+  }));
+  globalThis.FormData = class RecordingFormData {
+    append(name, value) { appended = { name, value }; }
+  };
+
+  try {
+    assert.equal(file instanceof File, false);
+    await controller.uploadFiles("run-1", [file]);
+  } finally {
+    globalThis.FormData = OriginalFormData;
+  }
+
+  assert.equal(appended.name, "file");
+  assert.equal(appended.value, file);
 });
 
 test("normalizes run states and server counts without timer-derived progress", () => {
@@ -216,6 +261,51 @@ test("polling aborts quietly without a stale partial-pair emission", async () =>
 
   assert.equal(result, null);
   assert.deepEqual(snapshots, []);
+});
+
+test("a newer poll for the same run suppresses all later emissions from the older poll and stops it", async () => {
+  const responses = Array.from({ length: 4 }, deferred);
+  let requestIndex = 0;
+  const client = { request: () => responses[requestIndex++].promise };
+  const controller = createScreeningController({ client });
+  const olderSnapshots = [];
+  const newerSnapshots = [];
+
+  const olderPoll = controller.pollRun("run-1", { onSnapshot: (snapshot) => olderSnapshots.push(snapshot) });
+  await Promise.resolve();
+  const newerPoll = controller.pollRun("run-1", { onSnapshot: (snapshot) => newerSnapshots.push(snapshot) });
+
+  responses[2].resolve({ data: run({ status: "completed", processed_count: 1, total_count: 1 }) });
+  responses[3].resolve({ data: [item({ status: "scored", rule_result: { score: 90 } })] });
+  assert.equal((await newerPoll).status, "complete");
+
+  responses[0].resolve({ data: run({ status: "completed", processed_count: 1, total_count: 1 }) });
+  responses[1].resolve({ data: [item({ status: "scored", rule_result: { score: 80 } })] });
+
+  assert.equal(await olderPoll, null);
+  assert.deepEqual(olderSnapshots, []);
+  assert.equal(newerSnapshots.length, 1);
+  assert.equal(requestIndex, 4);
+});
+
+test("polls for different runs remain independent", async () => {
+  const snapshots = { first: [], second: [] };
+  const client = { async request(path) {
+    if (path.endsWith("?limit=100")) return { data: [item()] };
+    const runId = path.split("/").at(-1);
+    return { data: run({ id: runId, status: "completed" }) };
+  } };
+  const controller = createScreeningController({ client });
+
+  const [first, second] = await Promise.all([
+    controller.pollRun("run-1", { onSnapshot: (snapshot) => snapshots.first.push(snapshot) }),
+    controller.pollRun("run-2", { onSnapshot: (snapshot) => snapshots.second.push(snapshot) }),
+  ]);
+
+  assert.equal(first.id, "run-1");
+  assert.equal(second.id, "run-2");
+  assert.deepEqual(snapshots.first.map(({ id }) => id), ["run-1"]);
+  assert.deepEqual(snapshots.second.map(({ id }) => id), ["run-2"]);
 });
 
 test("polling forwards non-abort API errors", async () => {
