@@ -12,7 +12,8 @@ from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load
 from server.app.recruiting.authorization import RecruitingAction
 from server.app.recruiting.models import Application,FileObject,IdempotencyRecord,JobJdVersion,ScreeningRuleVersion
 from server.app.recruiting.service import IdempotencyConflict,persisted_idempotent
-from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,ScreeningRun
+from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,ScreeningResult,ScreeningRun
+from server.app.llm.models import LlmScreeningEvaluation
 from server.app.screening.parsers import ParserError,ParserLimits,validate_upload_preflight
 from server.app.screening.schemas import BulkAction,BulkResource,ItemCollection,ItemResource,RetryResource,RunCreate,RunResource
 from server.app.screening.storage import StorageWriteFailed
@@ -31,7 +32,9 @@ def _problem(request,status,code):
     response=problem(request,status,code,"The request could not be completed."); response.headers["Cache-Control"]="no-store"; return response
 def _not_found(request): return _problem(request,404,"resource_not_found")
 def _run_data(run,error_summary=None): return {"id":str(run.id),"job_id":str(run.job_id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"source":run.source,"status":run.status,"total_count":run.total_count,"processed_count":run.processed_count,"succeeded_count":run.succeeded_count,"failed_count":run.failed_count,"version":run.version,"created_at":run.created_at.isoformat(),"error_summary":error_summary or {}}
-def _item_data(item,file,application=None): return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"application_stage":application.stage if application else None,"application_version":application.version if application else None}
+def _item_data(item,file,application=None,evaluation=None):
+    llm_evaluation=None if evaluation is None else {"score":evaluation.score,"recommendation":evaluation.recommendation,"summary":evaluation.summary,"strengths":evaluation.strengths,"gaps":evaluation.gaps,"risks":evaluation.risks,"questions":evaluation.interview_questions}
+    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"llm_status":item.llm_status,"llm_error_code":item.llm_safe_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
 def _load_run(db,principal,run_id,action=RecruitingAction.READ,lock=False):
     query=select(ScreeningRun).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningRun.organization_id==principal.organization_id,ScreeningRun.id==run_id,_job_scope(principal,action))
     return db.scalar(query.with_for_update() if lock else query)
@@ -134,8 +137,12 @@ def get_run(run_id:UUID,request:Request):
     with request.app.state.identity_store.sync_session() as db:
         run=_load_run(db,principal,run_id)
         if run is None: return _not_found(request)
-        error_rows=db.execute(select(ScreeningItem.safe_error_code,func.count()).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.safe_error_code.is_not(None)).group_by(ScreeningItem.safe_error_code).order_by(func.count().desc(),ScreeningItem.safe_error_code).limit(20))
-        return _response(_run_data(run,{code:count for code,count in error_rows}))
+        errors={}
+        for field in (ScreeningItem.safe_error_code,ScreeningItem.llm_safe_error_code):
+            rows=db.execute(select(field,func.count()).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,field.is_not(None)).group_by(field).order_by(func.count().desc(),field).limit(20))
+            for code,count in rows: errors[code]=errors.get(code,0)+count
+        summary=dict(sorted(errors.items(),key=lambda item:(-item[1],item[0]))[:20])
+        return _response(_run_data(run,summary))
 
 @router.post("/screening-items/{item_id}/retry",response_model=RetryResource)
 def retry_item(item_id:UUID,request:Request,idempotency_key:str|None=Header(None)):
@@ -213,4 +220,8 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
         rows=db.execute(query.order_by(ScreeningItem.created_at,ScreeningItem.id).limit(limit+1)).all(); next_cursor=None
         if len(rows)>limit: next_cursor=request.app.state.recruiting_cursor.encode(str(principal.organization_id),f"screening-items:{run_id}",rows[limit-1][0].created_at.isoformat(),str(rows[limit-1][0].id)); rows=rows[:limit]
         applications={application.id:application for application in db.scalars(select(Application).where(Application.organization_id==principal.organization_id,Application.id.in_([item.application_id for item,_ in rows if item.application_id])))}
-        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.application_id)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
+        item_ids=[item.id for item,_ in rows]; evaluations={}
+        if item_ids:
+            evaluation_rows=db.execute(select(ScreeningResult.item_id,LlmScreeningEvaluation).join(LlmScreeningEvaluation,and_(LlmScreeningEvaluation.organization_id==ScreeningResult.organization_id,LlmScreeningEvaluation.screening_result_id==ScreeningResult.id)).where(ScreeningResult.organization_id==principal.organization_id,ScreeningResult.item_id.in_(item_ids)).order_by(LlmScreeningEvaluation.created_at.desc())).all()
+            for item_id,evaluation in evaluation_rows: evaluations.setdefault(item_id,evaluation)
+        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.application_id),evaluations.get(item.id)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response

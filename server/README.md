@@ -83,5 +83,16 @@ Production provider URLs must use HTTPS on port 443. Connection tests resolve an
 provider addresses, pin one public address for the TLS request, reject redirects, and send only a
 constant health-check prompt. No JD or resume content is sent by the settings connection test.
 
+When LLM evaluation is enabled, an empty job allowlist applies to every job in the tenant; a
+non-empty list limits evaluation to those job IDs. Deterministic rule results remain authoritative
+fallback facts. LLM failure never changes an application stage and leaves the run partially
+completed with a safe error code. Successful bounded LLM facts are stored separately and exposed
+without prompts, provider bodies, input hashes, or API keys.
+
+Before evaluation, the worker removes recognized email/phone values, labeled name/address fields,
+and the known candidate display name, then applies strict input limits. This deterministic
+redaction is not a general DLP guarantee. Deploy only an approved provider that satisfies the
+organization's privacy and data-processing requirements.
+
 Candidate notes are append-only MVP facts, matching JD, rule, resume, stage-event, and
 candidate-event history. Corrections create a new note/event instead of editing prior text.

@@ -5,6 +5,7 @@ from server.app.queue.repository import QueueRepository
 from server.app.recruiting.models import Application,FileObject,Resume
 from server.app.recruiting.service import transition_application_record
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
+from server.app.screening.progress import aggregate_run
 from server.app.screening.rules import ENGINE_VERSION
 
 RECOVERABLE_CODES={"scanner_unavailable","storage_unavailable","scanner_error","scoring_failed","parser_timeout","queue_unavailable"}
@@ -12,15 +13,6 @@ class ScreeningActionConflict(Exception): pass
 class ScreeningItemNotRetryable(ScreeningActionConflict): pass
 class ScreeningRetryActive(ScreeningActionConflict): pass
 class ScreeningBulkConflict(ScreeningActionConflict): pass
-
-def _aggregate_run_from_items(db,run):
-    statuses=list(db.scalars(select(ScreeningItem.status).where(ScreeningItem.organization_id==run.organization_id,ScreeningItem.run_id==run.id)))
-    succeeded=sum(status=="scored" for status in statuses); failed=sum(status in {"failed","cancelled"} for status in statuses)
-    run.succeeded_count=succeeded; run.failed_count=failed; run.processed_count=succeeded+failed
-    if run.processed_count==run.total_count:
-        run.status="completed" if failed==0 else "failed" if succeeded==0 else "partial"
-    elif any(status in {"parsed","scoring","scored"} for status in statuses): run.status="rule_scoring"
-    else: run.status="parsing"
 
 def retry_screening_item(db,organization_id,item_id,trace_id):
     item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
@@ -37,7 +29,7 @@ def retry_screening_item(db,organization_id,item_id,trace_id):
     if not parsed and stored_file.scan_status=="rejected": raise ScreeningItemNotRetryable
     run.finished_at=None; run.version+=1
     item.status="parsed" if parsed else "queued"; item.safe_error_code=None; item.finished_at=None
-    db.flush(); _aggregate_run_from_items(db,run)
+    db.flush(); aggregate_run(db,run)
     queue=QueueRepository(db)
     if parsed:
         job=queue.enqueue(organization_id,"screening.score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"rule_engine_version":ENGINE_VERSION},dedupe_key=f"score:{item.id}",trace_id=trace_id,max_attempts=3)

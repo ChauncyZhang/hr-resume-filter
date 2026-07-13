@@ -9,7 +9,7 @@ from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, PayloadPolicyReg
 from server.app.queue.service import normalize_safe_code, retry_delay
 
 class LeaseRejected(RuntimeError): pass
-SCREENING_TERMINAL_TYPES={"screening.parse_item","screening.score_item"}
+SCREENING_TERMINAL_TYPES={"screening.parse_item","screening.score_item","screening.llm_score_item"}
 
 class QueueRepository:
     def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES, terminal_callbacks: Mapping[str,Callable] | None = None) -> None:

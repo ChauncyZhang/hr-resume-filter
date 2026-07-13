@@ -6,7 +6,9 @@ from sqlalchemy import func,select
 
 from server.app.recruiting.models import Application,Candidate,FileObject,Resume
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
-from server.app.screening.pipeline import ScreeningPipeline
+from server.app.llm.models import LlmProviderConfig,PromptVersion
+from server.app.queue.models import BackgroundJob
+from server.app.screening.pipeline import ScreeningPipeline,_PROMPT_CONTENT,_ensure_screening_prompt
 from server.app.screening.scanner import ScanResult
 from server.app.queue.service import PermanentJobError,RetryableJobError
 import pytest
@@ -53,6 +55,30 @@ def test_clean_parse_then_score_is_replay_safe_and_never_auto_advances(tmp_path)
         assert db.scalar(select(func.count(Candidate.id)))==1 and db.scalar(select(func.count(Resume.id)))==1 and db.scalar(select(func.count(Application.id)))==1 and db.scalar(select(func.count(ScreeningResult.id)))==1
         application=db.scalar(select(Application)); result=db.scalar(select(ScreeningResult)); completed=db.get(ScreeningRun,uuid.UUID(run["id"]))
         assert application.stage=="new" and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1 and db.scalar(select(ScreeningItem.finished_at)).isoformat()
+
+def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_path):
+    app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); db.add(LlmProviderConfig(organization_id=stored.organization_id,provider_id="approved",model="model",encrypted_api_key=b"encrypted",enabled=True,allowed_job_ids=[],version=3,created_by=aggregate.created_by,updated_by=aggregate.created_by)); db.commit()
+        score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3,trace_id="llm-score")
+    asyncio.run(pipeline.score_item(score_job)); asyncio.run(pipeline.score_item(score_job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); jobs=list(db.scalars(select(BackgroundJob).where(BackgroundJob.type=="screening.llm_score_item"))); prompt=db.scalar(select(PromptVersion))
+        assert stored.status=="scored" and stored.llm_status=="queued" and stored.finished_at is None
+        assert aggregate.status=="llm_scoring" and aggregate.processed_count==0
+        assert len(jobs)==1 and jobs[0].payload=={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"screening_result_id":str(db.scalar(select(ScreeningResult.id))),"config_id":str(db.scalar(select(LlmProviderConfig.id))),"config_version":3,"prompt_version_id":str(prompt.id)}
+        assert "resume" not in str(jobs[0].payload).lower() and "jd" not in jobs[0].payload
+        assert db.scalar(select(Application)).stage=="new"
+
+def test_screening_prompt_versions_can_upgrade_without_identity_conflict(tmp_path):
+    app,_,_=app_and_seed(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        user=db.scalar(select(__import__("server.app.identity.models",fromlist=["User"]).User)); organization_id=user.organization_id
+        first=_ensure_screening_prompt(db,organization_id,user.id,content=_PROMPT_CONTENT,version_number=1)
+        second=_ensure_screening_prompt(db,organization_id,user.id,content={**_PROMPT_CONTENT,"system":"upgraded"},version_number=2)
+        db.commit()
+        assert first.id!=second.id and first.version_number==1 and second.version_number==2
+        assert db.scalar(select(func.count(PromptVersion.id)))==2
 
 def test_infected_is_terminal_without_parse_or_identity(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); scanner.result=ScanResult.INFECTED

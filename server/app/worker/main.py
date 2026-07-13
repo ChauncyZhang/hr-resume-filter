@@ -18,10 +18,18 @@ def build_screening_handlers(settings,storage_client,bucket):
     from server.app.screening.pipeline import ScreeningPipeline
     from server.app.screening.scanner import ClamAvScanner
     from server.app.screening.storage import PipelineStorage
+    from server.app.screening.llm_pipeline import LlmScreeningPipeline
+    from server.app.llm.gateway import OpenAiCompatibleGateway
+    from server.app.llm.policy import ProviderAllowlist
+    from server.app.llm.security import ApiKeyCipher
     sessions=sessionmaker(create_engine(settings.database_url.replace("+asyncpg","+psycopg")),expire_on_commit=False)
     scanner=ClamAvScanner(settings.clamav_host,settings.clamav_port,connect_timeout=settings.clamav_connect_timeout_seconds,read_timeout=settings.clamav_read_timeout_seconds,total_timeout=settings.clamav_total_timeout_seconds)
     pipeline=ScreeningPipeline(sessions,PipelineStorage(storage_client,bucket),scanner,settings)
-    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item}
+    llm_key=settings.llm_config_encryption_key.get_secret_value()
+    if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
+    allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
+    llm_pipeline=LlmScreeningPipeline(sessions,OpenAiCompatibleGateway(allowlist),ApiKeyCipher(llm_key.encode()))
+    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item}
 
 
 class Worker:

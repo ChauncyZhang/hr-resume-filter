@@ -1,4 +1,4 @@
-import uuid
+import hashlib,json,uuid
 from datetime import datetime,timezone
 from pathlib import PurePath
 from sqlalchemy import and_,func,select
@@ -6,14 +6,28 @@ from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError,RetryableJobError
 from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
+from server.app.screening.progress import aggregate_run
 from server.app.screening.parsers import ParserLimits
 from server.app.screening.isolated_parser import IsolatedParser,IsolatedParserError
 from server.app.screening.rules import ENGINE_VERSION,RuleSnapshot,RuleSnapshotError,score_resume
 from server.app.screening.scanner import ScanResult
 from server.app.screening.storage import StorageWriteFailed
+from server.app.llm.models import LlmProviderConfig,PromptVersion
+from server.app.llm.screening import SCREENING_SYSTEM_PROMPT
 
 _RETRYABLE={"scanner_unavailable","scanner_error","storage_unavailable"}
 def _uuid(item_id,name): return uuid.uuid5(uuid.UUID(str(item_id)),name)
+_PROMPT_CONTENT={"system":SCREENING_SYSTEM_PROMPT,"schema_version":"screening-evaluation-v1"}
+_PROMPT_VERSION=1
+def _ensure_screening_prompt(db,organization_id,created_by,*,content=None,version_number=_PROMPT_VERSION):
+    prompt_content=dict(content or _PROMPT_CONTENT); prompt_hash=hashlib.sha256(json.dumps(prompt_content,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    prompt_id=uuid.uuid5(uuid.UUID(str(organization_id)),f"screening-evaluation:{version_number}")
+    prompt=db.scalar(select(PromptVersion).where(PromptVersion.organization_id==organization_id,PromptVersion.name=="screening-evaluation",PromptVersion.version_number==version_number))
+    if prompt is None:
+        prompt=PromptVersion(id=prompt_id,organization_id=organization_id,name="screening-evaluation",version_number=version_number,content=prompt_content,content_hash=prompt_hash,created_by=created_by); db.add(prompt); db.flush()
+    elif prompt.content_hash!=prompt_hash:
+        raise PermanentJobError("llm_prompt_version_conflict")
+    return prompt
 
 class ScreeningPipeline:
     def __init__(self,sessions,storage,scanner,settings,parser=None): self.sessions,self.storage,self.scanner,self.settings=sessions,storage,scanner,settings; self.parser=parser or IsolatedParser(settings.parser_hard_timeout_seconds)
@@ -101,8 +115,18 @@ class ScreeningPipeline:
         with self.sessions() as db:
             item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update())
             existing=db.scalar(select(ScreeningResult).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id,ScreeningResult.rule_engine_version==result.engine_version))
-            if not existing: db.add(ScreeningResult(organization_id=organization_id,item_id=item.id,application_id=item.application_id,resume_id=item.resume_id,rule_engine_version=result.engine_version,rule_score=result.score,recommendation=result.recommendation,required_hits=result.required_hits,required_missing=result.required_missing,bonus_hits=result.bonus_hits,estimated_years=result.estimated_years,risks=result.risks,questions=result.questions))
-            item.status="scored"; item.safe_error_code=None; item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,run); db.commit()
+            if not existing:
+                existing=ScreeningResult(organization_id=organization_id,item_id=item.id,application_id=item.application_id,resume_id=item.resume_id,rule_engine_version=result.engine_version,rule_score=result.score,recommendation=result.recommendation,required_hits=result.required_hits,required_missing=result.required_missing,bonus_hits=result.bonus_hits,estimated_years=result.estimated_years,risks=result.risks,questions=result.questions); db.add(existing); db.flush()
+            config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==organization_id))
+            allowed=config and (not config.allowed_job_ids or str(run.job_id) in config.allowed_job_ids)
+            item.status="scored"; item.safe_error_code=None
+            if config and config.enabled and config.encrypted_api_key is not None and allowed:
+                prompt=_ensure_screening_prompt(db,organization_id,config.updated_by)
+                QueueRepository(db).enqueue(organization_id,"screening.llm_score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"screening_result_id":str(existing.id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key=f"llm:{item.id}:{config.version}:{prompt.id}",trace_id=getattr(job,"trace_id",None),max_attempts=3)
+                item.llm_status="queued"; item.llm_safe_error_code=None; item.llm_finished_at=None; item.finished_at=None
+            else:
+                item.llm_status="skipped"; item.llm_safe_error_code=None; item.llm_finished_at=item.llm_finished_at or datetime.now(timezone.utc); item.finished_at=item.finished_at or datetime.now(timezone.utc)
+            self._aggregate(db,run); db.commit()
     async def _retry_or_finish(self,job,organization_id,item_id,code,stage):
         final=getattr(job,"attempts",1)>=getattr(job,"max_attempts",3)
         with self.sessions() as db:
@@ -120,8 +144,4 @@ class ScreeningPipeline:
             self._aggregate(db,db.get(ScreeningRun,item.run_id)); db.commit()
     @staticmethod
     def _aggregate(db,run):
-        statuses=list(db.scalars(select(ScreeningItem.status).where(ScreeningItem.organization_id==run.organization_id,ScreeningItem.run_id==run.id)))
-        succeeded=sum(value=="scored" for value in statuses); failed=sum(value in {"failed","cancelled"} for value in statuses); run.succeeded_count=succeeded; run.failed_count=failed; run.processed_count=succeeded+failed
-        if run.processed_count==run.total_count: run.status="completed" if failed==0 else "failed" if succeeded==0 else "partial"
-        elif any(value in {"parsed","scoring","scored"} for value in statuses): run.status="rule_scoring"
-        else: run.status="parsing"
+        aggregate_run(db,run)

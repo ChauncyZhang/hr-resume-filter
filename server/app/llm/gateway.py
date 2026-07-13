@@ -1,7 +1,9 @@
 import asyncio,http.client,json,socket,ssl,time
 from dataclasses import dataclass
 from typing import Protocol
+from pydantic import BaseModel,ConfigDict,Field,ValidationError
 from server.app.llm.policy import ProviderAllowlist,ProviderPolicyError,ProviderSpec
+from server.app.llm.screening import SCREENING_SYSTEM_PROMPT,ScreeningEvaluation,ScreeningRequest,ScreeningResult
 
 FIXED_PROBE_SYSTEM="Return the requested health-check JSON only."
 FIXED_PROBE_USER='Return {"status":"ok"}. This is a configuration test with no recruiting data.'
@@ -12,6 +14,12 @@ class GatewayError(RuntimeError):
 class TransportResponse: status_code:int; body:bytes
 class GatewayTransport(Protocol):
     def post(self,spec:ProviderSpec,address:str,path:str,headers:dict[str,str],body:bytes,max_response_bytes:int)->TransportResponse: ...
+
+class _Usage(BaseModel):
+    model_config=ConfigDict(extra="forbid",strict=True)
+    prompt_tokens:int=Field(default=0,ge=0,le=10_000_000)
+    completion_tokens:int=Field(default=0,ge=0,le=10_000_000)
+    total_tokens:int=Field(default=0,ge=0,le=10_000_000)
 
 class PinnedHttpsTransport:
     def __init__(self,*,connect_timeout:float=3,read_timeout:float=10): self.connect_timeout=connect_timeout; self.read_timeout=read_timeout
@@ -47,6 +55,7 @@ class OpenAiCompatibleGateway:
         except Exception: raise GatewayError("provider_unavailable") from None
         if len(response.body)>self.max_response_bytes: raise GatewayError("provider_response_too_large")
         if response.status_code in {401,403}: raise GatewayError("provider_auth_failed")
+        if response.status_code in {400,422}: raise GatewayError("provider_request_rejected")
         if response.status_code==404: raise GatewayError("provider_model_not_found")
         if response.status_code==429: raise GatewayError("provider_quota_or_rate_limited")
         if 300<=response.status_code<400: raise GatewayError("provider_redirect_rejected")
@@ -56,3 +65,35 @@ class OpenAiCompatibleGateway:
             if not isinstance(content,str) or len(content)>1000 or json.loads(content)!={"status":"ok"}: raise ValueError
         except (ValueError,KeyError,IndexError,TypeError,json.JSONDecodeError): raise GatewayError("provider_response_invalid") from None
         return max(0,int((time.monotonic()-started)*1000))
+
+    async def evaluate(self,provider_id:str,model:str,api_key:str,request:ScreeningRequest)->ScreeningEvaluation:
+        if not isinstance(request,ScreeningRequest): raise GatewayError("screening_request_invalid")
+        started=time.monotonic()
+        try:
+            spec=self.allowlist.require(provider_id,model); address=self.allowlist.resolve_public(spec)[0]
+            payload=json.dumps({"model":model,"messages":[{"role":"system","content":SCREENING_SYSTEM_PROMPT},{"role":"user","content":request.provider_content()}],"temperature":0,"max_tokens":800,"response_format":{"type":"json_object"}},separators=(",",":"),ensure_ascii=False).encode()
+            path=(spec.base_path or "")+"/chat/completions"; headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","Accept":"application/json"}
+            async def send():
+                async with self._semaphore:
+                    return await asyncio.to_thread(self.transport.post,spec,address,path,headers,payload,self.max_response_bytes)
+            response=await asyncio.wait_for(send(),self.total_timeout)
+        except GatewayError: raise
+        except ProviderPolicyError as error: raise GatewayError(str(error)) from None
+        except (TimeoutError,OSError,ssl.SSLError): raise GatewayError("provider_unavailable") from None
+        except Exception: raise GatewayError("provider_unavailable") from None
+        if len(response.body)>self.max_response_bytes: raise GatewayError("provider_response_too_large")
+        if response.status_code in {401,403}: raise GatewayError("provider_auth_failed")
+        if response.status_code in {400,422}: raise GatewayError("provider_request_rejected")
+        if response.status_code==404: raise GatewayError("provider_model_not_found")
+        if response.status_code==429: raise GatewayError("provider_quota_or_rate_limited")
+        if 300<=response.status_code<400: raise GatewayError("provider_redirect_rejected")
+        if response.status_code<200 or response.status_code>=300: raise GatewayError("provider_unavailable")
+        try:
+            document=json.loads(response.body)
+            content=document["choices"][0]["message"]["content"]
+            if not isinstance(content,str): raise ValueError
+            result=ScreeningResult.model_validate_json(content)
+            usage=_Usage.model_validate(document.get("usage",{})).model_dump()
+        except (ValueError,KeyError,IndexError,TypeError,json.JSONDecodeError,ValidationError):
+            raise GatewayError("provider_response_invalid") from None
+        return ScreeningEvaluation(result,max(0,int((time.monotonic()-started)*1000)),usage)

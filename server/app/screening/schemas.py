@@ -4,7 +4,8 @@ from pydantic import BaseModel,ConfigDict,Field,model_validator
 class ApiModel(BaseModel): model_config=ConfigDict(extra="forbid")
 class RunCreate(ApiModel): jd_version_id:UUID|None=None; rule_version_id:UUID|None=None; source:Literal["upload","manual"]="upload"
 class RunOut(ApiModel): id:str; job_id:str; jd_version_id:str; rule_version_id:str; source:str; status:str; total_count:int; processed_count:int; succeeded_count:int; failed_count:int; version:int; created_at:str; error_summary:dict[str,int]=Field(default_factory=dict)
-class ItemOut(ApiModel): id:str; run_id:str; filename:str; mime_type:str; size_bytes:int; status:str; parser_version:str|None; parse_quality:str|None; error_code:str|None; attempts:int; created_at:str; retryable:bool=False; application_stage:str|None=None; application_version:int|None=None
+class LlmEvaluationOut(ApiModel): score:int; recommendation:str; summary:str; strengths:list[str]; gaps:list[str]; risks:list[str]; questions:list[str]
+class ItemOut(ApiModel): id:str; run_id:str; filename:str; mime_type:str; size_bytes:int; status:str; parser_version:str|None; parse_quality:str|None; error_code:str|None; attempts:int; created_at:str; retryable:bool=False; application_stage:str|None=None; application_version:int|None=None; llm_status:str; llm_error_code:str|None; llm_attempts:int; llm_evaluation:LlmEvaluationOut|None=None
 class Meta(ApiModel): limit:int; next_cursor:str|None=None
 class RunResource(ApiModel): data:RunOut
 class ItemResource(ApiModel): data:ItemOut

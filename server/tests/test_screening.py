@@ -127,10 +127,13 @@ def test_parser_bounds_source_bytes_and_extracted_text_without_leaking_content()
 
 
 def test_future_screening_queue_payloads_are_registered_and_opaque_only() -> None:
-    item_id=str(uuid.uuid4()); org_id=str(uuid.uuid4()); jd_id=str(uuid.uuid4()); rule_id=str(uuid.uuid4())
+    item_id=str(uuid.uuid4()); org_id=str(uuid.uuid4()); jd_id=str(uuid.uuid4()); rule_id=str(uuid.uuid4()); result_id=str(uuid.uuid4()); config_id=str(uuid.uuid4()); prompt_id=str(uuid.uuid4())
     assert DEFAULT_PAYLOAD_POLICIES.validate_job("screening.parse_item", {"organization_id":org_id,"screening_item_id":item_id,"parser_version":"parser-v1"})["screening_item_id"] == item_id
     assert DEFAULT_PAYLOAD_POLICIES.validate_job("screening.score_item", {"organization_id":org_id,"screening_item_id":item_id,"jd_version_id":jd_id,"rule_version_id":rule_id,"rule_engine_version":"rule-v1"})["rule_engine_version"] == "rule-v1"
+    llm_payload={"organization_id":org_id,"screening_item_id":item_id,"screening_result_id":result_id,"config_id":config_id,"config_version":1,"prompt_version_id":prompt_id}
+    assert DEFAULT_PAYLOAD_POLICIES.validate_job("screening.llm_score_item",llm_payload)==llm_payload
     with pytest.raises(UnsafePayload): DEFAULT_PAYLOAD_POLICIES.validate_job("screening.parse_item", {"organization_id":org_id,"screening_item_id":item_id,"parser_version":"parser-v1","resume_text":"secret"})
+    with pytest.raises(UnsafePayload): DEFAULT_PAYLOAD_POLICIES.validate_job("screening.llm_score_item",{**llm_payload,"resume_text":"secret"})
 
 
 def test_run_transition_contract_supports_rule_only_and_future_llm_paths() -> None:
