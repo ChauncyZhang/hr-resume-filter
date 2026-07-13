@@ -119,6 +119,90 @@ test("a failed save clears the replacement key and keeps a safe error", async ()
   assert.equal(controller.getState().error.includes("secret backend detail"), false);
 });
 
+test("a failed save clears the held replacement key after dispose", async () => {
+  let rejectSave;
+  const client = createClient((path, options) => {
+    if (options.method === "PUT") {
+      return new Promise((resolve, reject) => { rejectSave = reject; });
+    }
+    return { data: systemConfig };
+  });
+  const controller = createLlmSettingsController({ client, createIdempotencyKey: () => "save-key" });
+  await controller.load();
+  controller.startKeyReplacement();
+  controller.setReplacementKey("sk-dispose-after-submit");
+
+  const saving = controller.save();
+  controller.dispose();
+  rejectSave(new ApiError({ status: 503, code: "persistence_failed", detail: "private failure" }));
+  await saving;
+
+  assert.equal(client.calls[1].options.body.api_key, "sk-dispose-after-submit");
+  assert.equal(controller.getState().replacementKey, "");
+  assert.equal(controller.getState().replacingKey, false);
+});
+
+test("a superseded failed save clears its submitted key without overwriting newer request state", async () => {
+  let rejectSave;
+  let resolveReload;
+  const client = createClient((path, options, count) => {
+    if (options.method === "PUT") {
+      return new Promise((resolve, reject) => { rejectSave = reject; });
+    }
+    if (count === 1) return { data: systemConfig };
+    return new Promise((resolve) => { resolveReload = resolve; });
+  });
+  const controller = createLlmSettingsController({ client, createIdempotencyKey: () => "save-key" });
+  await controller.load();
+  controller.startKeyReplacement();
+  controller.setReplacementKey("sk-superseded-submit");
+
+  const saving = controller.save();
+  const reloading = controller.load();
+  rejectSave(new ApiError({ status: 503, code: "persistence_failed", detail: "stale failure" }));
+  await saving;
+  const stateAfterFailure = controller.getState();
+  resolveReload({ data: { ...systemConfig, model: "model-b", version: 8 } });
+  await reloading;
+
+  assert.equal(stateAfterFailure.status, "loading");
+  assert.equal(stateAfterFailure.error, "");
+  assert.equal(stateAfterFailure.replacementKey, "");
+  assert.equal(stateAfterFailure.replacingKey, false);
+  assert.equal(controller.getState().draft.model, "model-b");
+});
+
+test("a superseded failed save preserves a newer replacement key", async () => {
+  let rejectSave;
+  let resolveReload;
+  const client = createClient((path, options, count) => {
+    if (options.method === "PUT") {
+      return new Promise((resolve, reject) => { rejectSave = reject; });
+    }
+    if (count === 1) return { data: systemConfig };
+    return new Promise((resolve) => { resolveReload = resolve; });
+  });
+  const controller = createLlmSettingsController({ client, createIdempotencyKey: () => "save-key" });
+  await controller.load();
+  controller.startKeyReplacement();
+  controller.setReplacementKey("sk-original-submit");
+
+  const saving = controller.save();
+  const reloading = controller.load();
+  controller.startKeyReplacement();
+  controller.setReplacementKey("sk-newer-unsubmitted");
+  rejectSave(new ApiError({ status: 503, code: "persistence_failed", detail: "stale failure" }));
+  await saving;
+  const stateAfterFailure = controller.getState();
+  resolveReload({ data: { ...systemConfig, version: 8 } });
+  await reloading;
+
+  assert.equal(stateAfterFailure.status, "loading");
+  assert.equal(stateAfterFailure.error, "");
+  assert.equal(stateAfterFailure.replacementKey, "sk-newer-unsubmitted");
+  assert.equal(stateAfterFailure.replacingKey, true);
+});
+
 test("cancel replacement clears the key and restores the clean state when it was the only change", async () => {
   const client = createClient(() => ({ data: systemConfig }));
   const controller = createLlmSettingsController({ client });

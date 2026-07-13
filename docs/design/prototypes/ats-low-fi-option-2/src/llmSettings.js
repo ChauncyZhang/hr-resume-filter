@@ -68,6 +68,7 @@ export function createLlmSettingsController({
 } = {}) {
   let disposed = false;
   let requestSequence = 0;
+  let replacementKeyRevision = 0;
   const listeners = new Set();
   let state = {
     status: "idle",
@@ -86,9 +87,19 @@ export function createLlmSettingsController({
     listeners.forEach((listener) => listener(state));
   }
 
+  function publishReplacementState(patch) {
+    replacementKeyRevision += 1;
+    publish(patch);
+  }
+
+  function clearSubmittedReplacementKey(submittedRevision) {
+    if (submittedRevision === null || submittedRevision !== replacementKeyRevision) return;
+    publishReplacementState({ replacingKey: false, replacementKey: "" });
+  }
+
   function installConfig(rawConfig, extra = {}) {
     const config = sanitizeConfig(rawConfig);
-    publish({
+    publishReplacementState({
       status: "ready",
       config,
       draft: draftFromConfig(config),
@@ -121,12 +132,12 @@ export function createLlmSettingsController({
   }
 
   function startKeyReplacement() {
-    publish({ replacingKey: true, replacementKey: "", error: "", message: "" });
+    publishReplacementState({ replacingKey: true, replacementKey: "", error: "", message: "" });
   }
 
   function setReplacementKey(replacementKey) {
     if (!state.replacingKey) return;
-    publish({
+    publishReplacementState({
       replacementKey,
       dirty: draftChanged(state.draft, state.config) || replacementKey.length > 0,
       error: "",
@@ -135,7 +146,7 @@ export function createLlmSettingsController({
   }
 
   function cancelKeyReplacement() {
-    publish({
+    publishReplacementState({
       replacingKey: false,
       replacementKey: "",
       dirty: draftChanged(state.draft, state.config),
@@ -152,6 +163,7 @@ export function createLlmSettingsController({
   async function save() {
     if (!state.config || state.status === "saving" || state.status === "testing") return false;
     const requestId = ++requestSequence;
+    const submittedReplacementRevision = state.replacingKey ? replacementKeyRevision : null;
     const body = {
       provider_id: state.draft.provider_id,
       model: state.draft.model,
@@ -167,20 +179,28 @@ export function createLlmSettingsController({
         ifMatch: `"${state.config.version}"`,
         idempotencyKey: createIdempotencyKey(),
       });
-      if (disposed || requestId !== requestSequence) return false;
+      if (disposed) return false;
+      if (requestId !== requestSequence) {
+        clearSubmittedReplacementKey(submittedReplacementRevision);
+        return false;
+      }
       installConfig(response?.data, { message: "LLM 设置已保存。" });
       return true;
     } catch (error) {
-      if (disposed || requestId !== requestSequence) return false;
+      if (disposed) return false;
+      if (requestId !== requestSequence) {
+        clearSubmittedReplacementKey(submittedReplacementRevision);
+        return false;
+      }
       if (error?.code === "resource_version_conflict") {
-        publish({ replacingKey: false, replacementKey: "", dirty: false });
+        publishReplacementState({ replacingKey: false, replacementKey: "", dirty: false });
         await load();
         if (!disposed && state.status === "ready") {
           publish({ message: "配置已被其他管理员更新。已加载最新设置，请检查后重试。" });
         }
         return false;
       }
-      publish({
+      publishReplacementState({
         status: "error",
         replacingKey: false,
         replacementKey: "",
@@ -235,6 +255,10 @@ export function createLlmSettingsController({
     dispose() {
       disposed = true;
       requestSequence += 1;
+      replacementKeyRevision += 1;
+      if (state.replacingKey || state.replacementKey) {
+        state = { ...state, replacingKey: false, replacementKey: "" };
+      }
       listeners.clear();
     },
   };
