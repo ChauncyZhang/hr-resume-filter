@@ -20,7 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { mergeCandidateRecords } from "./candidateController.js";
-import { getJobDefinitionErrors } from "./jobWorkspaceState.js";
+import { commitJobMutation, getJobDefinitionErrors, retryJobRefresh } from "./jobWorkspaceState.js";
 
 // Legacy workflow scenarios still import this fixture. The authenticated job
 // workspace never uses it as list or detail data.
@@ -207,7 +207,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   );
 }
 
-function JobDetail({ state, lifecycleState, onBack, onEdit, onImport, onOpenCandidate, onReload, onLoadCandidates, onTransition }) {
+function JobDetail({ state, lifecycleState, refreshState, onBack, onEdit, onImport, onOpenCandidate, onReload, onRetryRefresh, onLoadCandidates, onTransition }) {
   const [tab, setTab] = useState("候选人");
   const [query, setQuery] = useState(state.candidates?.filters.q || "");
   const firstQueryRender = useRef(true);
@@ -230,10 +230,12 @@ function JobDetail({ state, lifecycleState, onBack, onEdit, onImport, onOpenCand
   if (!job || !candidates) return null;
 
   const lifecycleActions = LIFECYCLE_ACTIONS[job.status] || [];
+  const writesDisabled = lifecycleState.status === "loading" || refreshState.retrying || Boolean(refreshState.error);
   return (
     <div className="job-page job-detail-page">
       <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回职位列表</button>
-      <section className="job-detail-hero"><div className="job-detail-title"><span className="job-icon"><BriefcaseBusiness size={22} /></span><div><div><h2>{job.name}</h2><StatusTag>{job.status}</StatusTag></div><p>{job.department || "未分配部门"} · {job.location || "地点未填写"} · 负责人 {job.owner || "未分配"}</p></div></div><div className="job-detail-actions"><button className="button secondary" type="button" onClick={onEdit} disabled={lifecycleState.status === "loading"}><Pencil size={16} />编辑职位</button>{lifecycleActions.map(([target, label, Icon]) => <button className="button secondary" type="button" key={target} onClick={() => onTransition(target)} disabled={lifecycleState.status === "loading"}><Icon size={16} />{label}</button>)}{job.status === "招聘中" && <button className="button primary" type="button" onClick={onImport}><Import size={16} />导入简历</button>}</div></section>
+      <section className="job-detail-hero"><div className="job-detail-title"><span className="job-icon"><BriefcaseBusiness size={22} /></span><div><div><h2>{job.name}</h2><StatusTag>{job.status}</StatusTag></div><p>{job.department || "未分配部门"} · {job.location || "地点未填写"} · 负责人 {job.owner || "未分配"}</p></div></div><div className="job-detail-actions"><button className="button secondary" type="button" onClick={onEdit} disabled={writesDisabled}><Pencil size={16} />编辑职位</button>{lifecycleActions.map(([target, label, Icon]) => <button className="button secondary" type="button" key={target} onClick={() => onTransition(target)} disabled={writesDisabled}><Icon size={16} />{label}</button>)}{job.status === "招聘中" && <button className="button primary" type="button" onClick={onImport} disabled={writesDisabled}><Import size={16} />导入简历</button>}</div></section>
+      {refreshState.error && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{refreshState.error}</span><button type="button" onClick={onRetryRefresh} disabled={refreshState.retrying}>{refreshState.retrying ? "正在读取…" : "重试读取"}</button></div>}
       {lifecycleState.error && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{lifecycleState.error}</span>{lifecycleState.conflict && <button type="button" onClick={onReload}>刷新职位</button>}</div>}
       <div className="job-metrics">{[["候选人总数", job.candidates, Users], ["待复核", job.review, FileText], ["面试中", job.interview, CalendarDays], ["待决策", job.decision, Clock3]].map(([label, value, Icon]) => <div key={label}><span><Icon size={18} /></span><div><strong>{value}</strong><small>{label}</small></div></div>)}</div>
       <section className="job-detail-panel">
@@ -255,8 +257,10 @@ function JobDetail({ state, lifecycleState, onBack, onEdit, onImport, onOpenCand
 export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate }) {
   const [detailState, setDetailState] = useState({ status: "idle", job: null, candidates: null });
   const [lifecycleState, setLifecycleState] = useState({ status: "idle", error: "", conflict: false });
+  const [refreshState, setRefreshState] = useState({ error: "", retrying: false, kind: "updated" });
   const detailRequestRef = useRef(null);
   const candidateRequestRef = useRef(null);
+  const skipNextDetailLoadRef = useRef(false);
   const detailSequenceRef = useRef(0);
   const candidateSequenceRef = useRef(0);
 
@@ -268,13 +272,14 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     detailRequestRef.current = controller;
     setDetailState({ status: "loading", job: null, candidates: null });
     setLifecycleState({ status: "idle", error: "", conflict: false });
+    setRefreshState({ error: "", retrying: false, kind: "updated" });
     try {
       const [definition, candidatePage] = await Promise.all([
         jobController.loadDefinition(summary.id, { signal: controller.signal }),
         candidateController.listCandidates({ jobId: summary.id, limit: 20 }, { signal: controller.signal }),
       ]);
       if (detailRequestRef.current !== controller || requestId !== detailSequenceRef.current) return;
-      const job = jobController.mergeDefinition(summary, definition);
+      const job = jobController.mergeDefinition(summary, definition, listState);
       setSelectedJob(job);
       setDetailState({ status: "ready", job, candidates: { status: "ready", records: candidatePage.records, nextCursor: candidatePage.nextCursor, filters: { q: "", stage: "全部阶段" }, error: "" } });
     } catch (error) {
@@ -283,10 +288,15 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     } finally {
       if (detailRequestRef.current === controller) detailRequestRef.current = null;
     }
-  }, [candidateController, jobController, setSelectedJob]);
+  }, [candidateController, jobController, listState.departments, listState.owners, setSelectedJob]);
 
   useEffect(() => {
-    if (mode === "detail" && selectedJob?.id) void loadDetail(selectedJob);
+    if (mode !== "detail" || !selectedJob?.id) return;
+    if (skipNextDetailLoadRef.current) {
+      skipNextDetailLoadRef.current = false;
+      return;
+    }
+    void loadDetail(selectedJob);
   }, [loadDetail, mode, selectedJob?.id]);
 
   useEffect(() => () => {
@@ -316,13 +326,18 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
 
   async function saveDefinition(values, publish) {
     const existing = selectedJob?.formMode === "edit" ? selectedJob : null;
-    const saved = await jobController.saveDefinition(values, { job: existing, publish });
-    const complete = await onRefreshJobMutation(saved.id);
-    if (!complete) return;
+    const result = await commitJobMutation(async () => {
+      const saved = await jobController.saveDefinition(values, { job: existing, publish });
+      return existing ? jobController.mergeDefinition(saved, existing, listState) : saved;
+    }, onRefreshJobMutation);
+    const complete = result.record;
+    const refreshError = result.refreshError ? "已保存，但最新数据加载失败，请重试读取。" : "";
     setSelectedJob(complete);
-    onNotify(publish ? (existing ? "职位修改已保存" : "职位已发布") : "职位已保存为草稿");
-    if (publish) {
+    setRefreshState({ error: refreshError, retrying: false, kind: "saved" });
+    onNotify(refreshError || (publish ? (existing ? "职位修改已保存" : "职位已发布") : "职位已保存为草稿"));
+    if (publish || refreshError) {
       setDetailState({ status: "ready", job: complete, candidates: detailState.candidates || { status: "ready", records: [], nextCursor: null, filters: { q: "", stage: "全部阶段" }, error: "" } });
+      skipNextDetailLoadRef.current = true;
       setMode("detail");
     } else {
       setMode("list");
@@ -333,20 +348,37 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     if (lifecycleState.status === "loading" || !detailState.job) return;
     setLifecycleState({ status: "loading", error: "", conflict: false });
     try {
-      const summary = await jobController.transition(detailState.job, target);
-      const next = await onRefreshJobMutation(summary.id);
-      if (!next) return;
+      const result = await commitJobMutation(async () => {
+        const summary = await jobController.transition(detailState.job, target);
+        return jobController.mergeDefinition(summary, detailState.job, listState);
+      }, onRefreshJobMutation);
+      const next = result.record;
+      const refreshError = result.refreshError ? "已更新，但最新数据加载失败，请重试读取。" : "";
       setDetailState((current) => ({ ...current, job: next }));
       setSelectedJob(next);
+      setRefreshState({ error: refreshError, retrying: false, kind: "updated" });
       setLifecycleState({ status: "ready", error: "", conflict: false });
-      onNotify(`职位状态已更新为${next.status}`);
+      onNotify(refreshError || `职位状态已更新为${next.status}`);
     } catch (error) {
       const conflict = error?.status === 409;
       setLifecycleState({ status: "error", conflict, error: conflict ? "职位已被其他人更新，请刷新后重试。" : "职位状态更新失败，请重试。" });
     }
   }
 
+  async function retryMutationRefresh() {
+    if (refreshState.retrying || !detailState.job) return;
+    setRefreshState((current) => ({ ...current, retrying: true }));
+    const result = await retryJobRefresh(detailState.job, onRefreshJobMutation);
+    setDetailState((current) => ({ ...current, job: result.record }));
+    setSelectedJob(result.record);
+    setRefreshState((current) => ({
+      ...current,
+      retrying: false,
+      error: result.refreshError ? (current.kind === "saved" ? "已保存，但最新数据加载失败，请重试读取。" : "已更新，但最新数据加载失败，请重试读取。") : "",
+    }));
+  }
+
   if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={listState.departments} owners={listState.owners} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} />;
-  if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onLoadCandidates={loadCandidates} onTransition={transition} />;
+  if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} refreshState={refreshState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onRetryRefresh={retryMutationRefresh} onLoadCandidates={loadCandidates} onTransition={transition} />;
   return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
 }

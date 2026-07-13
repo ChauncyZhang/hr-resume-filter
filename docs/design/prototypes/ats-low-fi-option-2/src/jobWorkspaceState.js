@@ -86,3 +86,18 @@ export function getJobDefinitionErrors(values) {
   if (!values?.process?.trim()) errors.process = "请输入招聘流程模板";
   return errors;
 }
+
+export async function retryJobRefresh(record, refresh) {
+  try {
+    const refreshed = await refresh(record);
+    if (!refreshed) throw new Error("refresh unavailable");
+    return { record: refreshed, refreshError: "" };
+  } catch {
+    return { record, refreshError: "最新数据加载失败，请重试读取。" };
+  }
+}
+
+export async function commitJobMutation(mutate, refresh) {
+  const record = await mutate();
+  return retryJobRefresh(record, refresh);
+}

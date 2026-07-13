@@ -6,9 +6,11 @@ const stateModule = await import("./jobWorkspaceState.js").catch(() => ({}));
 
 const {
   appendJobPage,
+  commitJobMutation,
   createInitialJobWorkspaceState,
   failJobRequest,
   getJobDefinitionErrors,
+  retryJobRefresh,
   startJobRequest,
   succeedJobMutationRefresh,
   succeedJobRequest,
@@ -108,4 +110,55 @@ test("exit dialog closes before draft save so a failed save error remains visibl
 
   assert.match(source, /onSave=\{\(\) => \{\s*setConfirmExit\(false\);\s*void submit\(false\);\s*\}\}/);
   assert.match(source, /ref=\{submitErrorRef\}[^>]*tabIndex="-1"/);
+});
+
+test("create success remains committed when refresh fails and retry performs reads only", async () => {
+  let mutationCalls = 0;
+  let readCalls = 0;
+  const created = { id: "job-created", version: 1, status: "草稿", name: "平台工程师" };
+
+  const committed = await commitJobMutation(
+    async () => { mutationCalls += 1; return created; },
+    async () => { readCalls += 1; throw new Error("read failed"); },
+  );
+  const retried = await retryJobRefresh(committed.record, async () => {
+    readCalls += 1;
+    return { ...created, department: "技术部", funnel: { new: 0 } };
+  });
+
+  assert.equal(mutationCalls, 1);
+  assert.equal(readCalls, 2);
+  assert.equal(committed.record, created);
+  assert.match(committed.refreshError, /最新数据加载失败/);
+  assert.deepEqual(retried, { record: { ...created, department: "技术部", funnel: { new: 0 } }, refreshError: "" });
+});
+
+test("transition success keeps returned status and retry never repeats the transition", async () => {
+  let transitionCalls = 0;
+  let readCalls = 0;
+  const transitioned = { id: "job-1", version: 9, status: "已关闭" };
+
+  const committed = await commitJobMutation(
+    async () => { transitionCalls += 1; return transitioned; },
+    async () => { readCalls += 1; throw new Error("definition unavailable"); },
+  );
+  await retryJobRefresh(committed.record, async (record) => {
+    readCalls += 1;
+    return { ...record, name: "平台工程师", funnel: { review: 2 } };
+  });
+
+  assert.equal(transitionCalls, 1);
+  assert.equal(readCalls, 2);
+  assert.equal(committed.record.status, "已关闭");
+  assert.equal(committed.record.version, 9);
+  assert.ok(committed.refreshError);
+});
+
+test("job workspace routes writes through commit helper and refresh retry through read helper", async () => {
+  const source = await readFile(new URL("./JobViews.jsx", import.meta.url), "utf8");
+
+  assert.match(source, /commitJobMutation\(/);
+  assert.match(source, /retryJobRefresh\(/);
+  assert.match(source, /已保存，但最新数据加载失败/);
+  assert.match(source, /已更新，但最新数据加载失败/);
 });

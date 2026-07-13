@@ -444,6 +444,39 @@ test("mergeDefinition keeps list metadata and complete definition fields", () =>
   });
 });
 
+test("mergeDefinition fills names from refreshed facets when a closed job is excluded from the open list", () => {
+  const controller = createJobController({ client: { request: async () => { throw new Error("unused"); } } });
+  const definition = {
+    id: JOB_ID,
+    version: 9,
+    status: "已关闭",
+    name: "平台工程师",
+    departmentId: DEPARTMENT_ID,
+    department: "",
+    ownerId: HIRING_OWNER_ID,
+    owner: "",
+    funnel: { new: 1, review: 2, decision: 1 },
+    candidates: 4,
+    review: 2,
+    jd: "完整 JD",
+    process: "标准流程",
+    mustHave: [],
+    niceToHave: [],
+  };
+  const refreshedMetadata = {
+    departments: [{ id: DEPARTMENT_ID, name: "技术部" }],
+    owners: [{ id: HIRING_OWNER_ID, name: "招聘经理" }],
+  };
+
+  const merged = controller.mergeDefinition(null, definition, refreshedMetadata);
+
+  assert.equal(merged.department, "技术部");
+  assert.equal(merged.owner, "招聘经理");
+  assert.equal(merged.status, "已关闭");
+  assert.deepEqual(merged.funnel, { new: 1, review: 2, decision: 1 });
+  assert.equal(merged.candidates, 4);
+});
+
 test("transition maps pause, resume, close, and archive targets with mutation headers", async () => {
   const { client, calls } = queuedClient([
     { data: apiJob({ status: "paused", version: 8 }) },

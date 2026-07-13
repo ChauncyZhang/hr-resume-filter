@@ -156,8 +156,17 @@ function formUuid(values, field, job) {
   return safeUuid(source) || null;
 }
 
-function mergeDefinition(listRecord, definition) {
-  return listRecord ? { ...definition, ...listRecord } : definition;
+function facetName(facets, id) {
+  return safeArray(facets).find((item) => item?.id === id)?.name || "";
+}
+
+function mergeDefinition(listRecord, definition, metadata = {}) {
+  const merged = listRecord ? { ...definition, ...listRecord } : { ...definition };
+  return {
+    ...merged,
+    department: merged.department || facetName(metadata.departments, merged.departmentId),
+    owner: merged.owner || facetName(metadata.owners, merged.ownerId),
+  };
 }
 
 function definitionCommand(values, job, publish) {

@@ -283,33 +283,40 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     return null;
   }, [jobController]);
 
-  const refreshJobAfterMutation = useCallback(async (jobId) => {
+  const refreshJobAfterMutation = useCallback(async (mutationRecord) => {
+    jobListRequestRef.current?.controller.abort();
     jobMutationRefreshRef.current?.controller.abort();
     const controller = new AbortController();
-    const requestId = ++jobMutationRefreshSequenceRef.current;
-    jobMutationRefreshRef.current = { controller, requestId };
+    const listRequestId = ++jobListRequestSequenceRef.current;
+    const mutationRequestId = ++jobMutationRefreshSequenceRef.current;
+    jobListRequestRef.current = { controller, requestId: listRequestId };
+    jobMutationRefreshRef.current = { controller, requestId: mutationRequestId };
     const filters = jobState.filters;
+    setJobState((current) => startJobRequest(current, listRequestId, filters));
     try {
       const [page, definition] = await Promise.all([
-        loadJobs(filters, { mutation: true }),
-        jobController.loadDefinition(jobId, { signal: controller.signal }),
+        jobController.listJobs({ ...filters, limit: 50 }, { signal: controller.signal }),
+        jobController.loadDefinition(mutationRecord.id, { signal: controller.signal }),
       ]);
-      if (jobMutationRefreshRef.current?.controller !== controller) return null;
-      const listRecord = page?.records.find((record) => record.id === jobId) || null;
-      const complete = jobController.mergeDefinition(listRecord, definition);
+      if (jobMutationRefreshRef.current?.controller !== controller || jobListRequestRef.current?.controller !== controller) return null;
+      const listRecord = page.records.find((record) => record.id === mutationRecord.id) || null;
+      const complete = jobController.mergeDefinition(listRecord, definition, page);
+      setJobState((current) => succeedJobMutationRefresh(current, listRequestId, page));
       setSelectedJob(complete);
-      if (page && !filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
+      if (!filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
         setPositionRecords(page.records);
         setJobs(page.records.map((record) => record.name));
       }
       return complete;
     } catch (error) {
       if (error?.name === "AbortError" || jobMutationRefreshRef.current?.controller !== controller) return null;
+      setJobState((current) => failJobRequest(current, listRequestId, new Error("职位已更新，但最新数据加载失败，请重试读取。")));
       throw error;
     } finally {
+      if (jobListRequestRef.current?.controller === controller) jobListRequestRef.current = null;
       if (jobMutationRefreshRef.current?.controller === controller) jobMutationRefreshRef.current = null;
     }
-  }, [jobController, jobState.filters, loadJobs]);
+  }, [jobController, jobState.filters]);
 
   useEffect(() => {
     const filters = createInitialJobWorkspaceState().filters;
