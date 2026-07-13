@@ -1,30 +1,30 @@
 import { apiClient } from "./apiClient.js";
 
-const API_TO_UI_STATUS = {
-  draft: "草稿",
-  open: "招聘中",
-  paused: "已暂停",
-  closed: "已关闭",
-  archived: "已归档",
-};
+const API_TO_UI_STATUS = new Map([
+  ["draft", "草稿"],
+  ["open", "招聘中"],
+  ["paused", "已暂停"],
+  ["closed", "已关闭"],
+  ["archived", "已归档"],
+]);
 
-const UI_TO_API_STATUS = Object.fromEntries(Object.entries(API_TO_UI_STATUS).map(([api, ui]) => [ui, api]));
+const UI_TO_API_STATUS = new Map([...API_TO_UI_STATUS].map(([api, ui]) => [ui, api]));
 
-const API_TO_UI_PRIORITY = {
-  high: "高",
-  normal: "中",
-  low: "低",
-};
+const API_TO_UI_PRIORITY = new Map([
+  ["high", "高"],
+  ["normal", "中"],
+  ["low", "低"],
+]);
 
-const UI_TO_API_PRIORITY = Object.fromEntries(Object.entries(API_TO_UI_PRIORITY).map(([api, ui]) => [ui, api]));
+const UI_TO_API_PRIORITY = new Map([...API_TO_UI_PRIORITY].map(([api, ui]) => [ui, api]));
 
-const JOB_TRANSITIONS = {
-  draft: new Set(["open"]),
-  open: new Set(["paused", "closed"]),
-  paused: new Set(["open", "closed"]),
-  closed: new Set(["archived"]),
-  archived: new Set(),
-};
+const JOB_TRANSITIONS = new Map([
+  ["draft", new Set(["open"])],
+  ["open", new Set(["paused", "closed"])],
+  ["paused", new Set(["open", "closed"])],
+  ["closed", new Set(["archived"])],
+  ["archived", new Set()],
+]);
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -53,6 +53,14 @@ function codedError(code, message) {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+function requireJobId(value) {
+  const candidate = safeString(value).trim();
+  if (!candidate) throw codedError("JOB_ID_REQUIRED", "job id required");
+  const id = safeUuid(candidate);
+  if (!id) throw codedError("JOB_ID_INVALID", "job id invalid");
+  return id;
 }
 
 function requestOptions(signal, options = {}) {
@@ -86,23 +94,25 @@ function normalizeStages(value) {
 function normalizeJob(item, funnelOverride) {
   const stages = normalizeStages(funnelOverride?.stages ?? item?.funnel?.stages);
   const total = safeCount(funnelOverride?.total ?? item?.funnel?.total);
-  const hiringOwnerId = safeString(item?.hiring_owner_id);
-  const hiringOwnerName = safeString(item?.hiring_owner_name);
+  const id = safeUuid(item?.id);
+  const hiringOwnerId = safeUuid(item?.hiring_owner_id);
+  const hiringOwnerName = safeString(item?.hiring_owner_name).trim();
+  const useHiringOwner = Boolean(hiringOwnerId && hiringOwnerName);
   const title = safeString(item?.title);
 
   return {
-    id: safeString(item?.id),
-    serverBacked: true,
+    id,
+    serverBacked: Boolean(id),
     version: safeVersion(item?.version),
     title,
     name: title,
-    departmentId: safeString(item?.department_id),
+    departmentId: safeUuid(item?.department_id),
     department: safeString(item?.department_name),
-    ownerId: hiringOwnerId || safeString(item?.owner_id),
-    owner: hiringOwnerName || safeString(item?.owner_name),
+    ownerId: useHiringOwner ? hiringOwnerId : safeUuid(item?.owner_id),
+    owner: useHiringOwner ? hiringOwnerName : safeString(item?.owner_name).trim(),
     headcount: safeCount(item?.headcount),
-    status: API_TO_UI_STATUS[item?.status] || "",
-    priority: API_TO_UI_PRIORITY[item?.priority] || "",
+    status: API_TO_UI_STATUS.get(item?.status) || "",
+    priority: API_TO_UI_PRIORITY.get(item?.priority) || "",
     updated: displayDateTime(item?.updated_at),
     updatedAt: safeString(item?.updated_at),
     funnel: stages,
@@ -133,7 +143,7 @@ function normalizeDefinition(resource, funnel) {
 }
 
 function normalizeStatusCounts(value) {
-  return Object.fromEntries(Object.entries(API_TO_UI_STATUS).map(([api, ui]) => [ui, safeCount(value?.[api])]));
+  return Object.fromEntries([...API_TO_UI_STATUS].map(([api, ui]) => [ui, safeCount(value?.[api])]));
 }
 
 function normalizeRules(value) {
@@ -144,7 +154,9 @@ function normalizeRules(value) {
 function definitionCommand(values, job, publish) {
   const departmentId = safeUuid(values?.departmentId || job?.departmentId);
   const ownerId = safeUuid(values?.ownerId || job?.ownerId);
-  const priority = UI_TO_API_PRIORITY[values?.priority] || (API_TO_UI_PRIORITY[values?.priority] ? values.priority : "normal");
+  const priorityValue = safeString(values?.priority).trim();
+  const priority = UI_TO_API_PRIORITY.get(priorityValue) || (API_TO_UI_PRIORITY.has(priorityValue) ? priorityValue : "");
+  if (!priority) throw codedError("JOB_PRIORITY_UNSUPPORTED", "job priority unsupported");
   return {
     title: safeString(values?.name).trim(),
     department_id: departmentId || null,
@@ -166,7 +178,7 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     const params = new URLSearchParams();
     const query = safeString(filters.q).trim();
     const statusValue = safeString(filters.status).trim();
-    const status = UI_TO_API_STATUS[statusValue] || (API_TO_UI_STATUS[statusValue] ? statusValue : "");
+    const status = UI_TO_API_STATUS.get(statusValue) || (API_TO_UI_STATUS.has(statusValue) ? statusValue : "");
     const departmentId = safeUuid(filters.departmentId);
     const ownerId = safeUuid(filters.ownerId);
     const cursor = safeString(filters.cursor).trim();
@@ -189,7 +201,7 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
   }
 
   async function loadDefinition(jobId, { signal } = {}) {
-    const id = safeString(jobId).trim();
+    const id = requireJobId(jobId);
     const options = requestOptions(signal);
     const [definition, funnel] = await Promise.all([
       client.request(`/api/v1/job-definitions/${id}`, options),
@@ -200,9 +212,8 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
 
   async function saveDefinition(values, { job = null, publish = false, signal } = {}) {
     const existing = job !== null && job !== undefined;
-    const id = safeString(job?.id).trim();
+    const id = existing ? requireJobId(job?.id) : "";
     const version = safeVersion(job?.version);
-    if (existing && !id) throw codedError("JOB_ID_REQUIRED", "job id required");
     if (existing && version === null) throw codedError("JOB_VERSION_REQUIRED", "job version required");
     const options = requestOptions(signal, {
       method: existing ? "PUT" : "POST",
@@ -215,14 +226,13 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
   }
 
   async function transition(job, targetUiStatus, { signal } = {}) {
-    const id = safeString(job?.id).trim();
+    const id = requireJobId(job?.id);
     const version = safeVersion(job?.version);
-    if (!id) throw codedError("JOB_ID_REQUIRED", "job id required");
     if (version === null) throw codedError("JOB_VERSION_REQUIRED", "job version required");
     const sourceValue = safeString(job?.status).trim();
-    const source = UI_TO_API_STATUS[sourceValue] || (API_TO_UI_STATUS[sourceValue] ? sourceValue : "");
-    const target = UI_TO_API_STATUS[safeString(targetUiStatus).trim()] || "";
-    if (!source || !target || !JOB_TRANSITIONS[source]?.has(target)) {
+    const source = UI_TO_API_STATUS.get(sourceValue) || (API_TO_UI_STATUS.has(sourceValue) ? sourceValue : "");
+    const target = UI_TO_API_STATUS.get(safeString(targetUiStatus).trim()) || "";
+    if (!source || !target || !JOB_TRANSITIONS.get(source)?.has(target)) {
       throw codedError("JOB_TRANSITION_UNSUPPORTED", "job transition unsupported");
     }
     const result = await client.request(`/api/v1/jobs/${id}/transitions`, requestOptions(signal, {

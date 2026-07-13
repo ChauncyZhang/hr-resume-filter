@@ -187,6 +187,83 @@ test("listJobs omits invalid filters and safely defaults malformed optional valu
   });
 });
 
+test("status and priority mappings ignore prototype-chain keys", async () => {
+  const { client, calls } = queuedClient([{
+    data: [apiJob({ status: "__proto__", priority: "constructor" })],
+    meta: {},
+  }]);
+  const controller = createJobController({ client });
+
+  const result = await controller.listJobs({ status: "__proto__" });
+
+  assert.equal(calls[0].path, "/api/v1/jobs");
+  assert.equal(result.records[0].status, "");
+  assert.equal(result.records[0].priority, "");
+  assert.equal(typeof result.records[0].status, "string");
+  assert.equal(typeof result.records[0].priority, "string");
+  await assert.rejects(
+    () => controller.saveDefinition({ name: "职位", priority: "constructor" }, { publish: false }),
+    { code: "JOB_PRIORITY_UNSUPPORTED" },
+  );
+  assert.equal(calls.length, 1);
+});
+
+test("normalizeJob only trusts valid UUID job identities", async () => {
+  const { client } = queuedClient([{
+    data: [apiJob({ id: "constructor" })],
+    meta: {},
+  }]);
+
+  const result = await createJobController({ client }).listJobs();
+
+  assert.equal(result.records[0].id, "");
+  assert.equal(result.records[0].serverBacked, false);
+});
+
+test("loadDefinition rejects an invalid UUID before starting either request", async () => {
+  const { client, calls } = queuedClient([]);
+
+  await assert.rejects(
+    () => createJobController({ client }).loadDefinition("../jobs/other"),
+    { code: "JOB_ID_INVALID" },
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("existing definition writes and transitions reject invalid UUIDs before network I/O", async () => {
+  const { client, calls } = queuedClient([]);
+  const controller = createJobController({ client });
+
+  await assert.rejects(
+    () => controller.saveDefinition({ name: "职位", priority: "中" }, { job: { id: "__proto__", version: 1 } }),
+    { code: "JOB_ID_INVALID" },
+  );
+  await assert.rejects(
+    () => controller.transition({ id: "constructor", version: 1, status: "招聘中" }, "已暂停"),
+    { code: "JOB_ID_INVALID" },
+  );
+  assert.equal(calls.length, 0);
+});
+
+test("effective owner selects hiring owner only when its UUID and name are both valid", async () => {
+  const { client } = queuedClient([{
+    data: [
+      apiJob({ hiring_owner_name: "   " }),
+      apiJob({ hiring_owner_id: "not-a-uuid", hiring_owner_name: "招聘经理" }),
+      apiJob(),
+    ],
+    meta: {},
+  }]);
+
+  const result = await createJobController({ client }).listJobs();
+
+  assert.deepEqual(result.records.map(({ ownerId, owner }) => ({ ownerId, owner })), [
+    { ownerId: OWNER_ID, owner: "招聘负责人" },
+    { ownerId: OWNER_ID, owner: "招聘负责人" },
+    { ownerId: HIRING_OWNER_ID, owner: "招聘经理" },
+  ]);
+});
+
 test("loadDefinition starts definition and funnel requests concurrently and propagates the signal", async () => {
   const signal = new AbortController().signal;
   const calls = [];
