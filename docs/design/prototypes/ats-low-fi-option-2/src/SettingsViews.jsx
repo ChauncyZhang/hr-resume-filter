@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Bot, CheckCircle2, ChevronDown, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
 import { getRoleCapabilities, isPermissionExpansion } from "./ux07Domain.js";
-import { canEditAiSettings } from "./roleCapabilities.js";
+import { canEditAiSettings, canEditAuditSettings, canEditOrganizationSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
 
 const settingsSections = [
   ["组织与权限", Users],
@@ -39,7 +39,7 @@ function PermissionNotice({ children }) {
 }
 
 function OrganizationSettings({ role, onNotify }) {
-  const editable = getRoleCapabilities(role).settingsEdit;
+  const editable = canEditOrganizationSettings(role);
   const [users, setUsers] = useState(seedUsers);
   const [query, setQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState("全部角色");
@@ -82,14 +82,14 @@ function AiSettings({ role, onNotify, initialForm, onFormChange }) {
 }
 
 function AuditSettings({ role, onNotify }) {
-  const editable = role === "招聘管理员";
+  const editable = canEditAuditSettings(role);
   const capabilities = getRoleCapabilities(role);
   const [action, setAction] = useState("全部操作");
   const [selected, setSelected] = useState(null);
   const [retention, setRetention] = useState(730);
   const [draftRetention, setDraftRetention] = useState(730);
   const [risk, setRisk] = useState(false);
-  if (!capabilities.auditView) return <section className="settings-denied"><LockKeyhole size={31} /><h3>无审计与治理权限</h3><p>面试官不能查看系统访问记录或候选人保留策略。</p></section>;
+  if (!capabilities.auditView && role !== "系统管理员") return <section className="settings-denied"><LockKeyhole size={31} /><h3>无审计与治理权限</h3><p>面试官不能查看系统访问记录或候选人保留策略。</p></section>;
   const rows = auditRows.filter((item) => action === "全部操作" || item.action === action);
   function saveRetention() { if (draftRetention < retention) { setRisk(true); return; } setRetention(draftRetention); onNotify("数据保留策略已保存"); }
   return <div className="settings-section"><div className="settings-section-heading"><div><h2>审计与数据治理</h2><p>查询关键操作并管理候选人数据保留周期。</p></div></div>{!editable && <PermissionNotice>HR 仅可查看授权对象的审计记录，不能修改保留策略。</PermissionNotice>}<div className="audit-toolbar"><label><select value={action} onChange={(event) => setAction(event.target.value)}><option>全部操作</option><option>登录</option><option>下载简历</option><option>状态变化</option><option>配置变更</option></select><ChevronDown size={14} /></label><span>近 30 天 · {rows.length} 条示例记录</span></div><div className="settings-table audit-table"><div className="settings-table-head"><span>时间</span><span>操作者</span><span>操作</span><span>对象</span><span>结果</span><span /></div>{rows.map((row) => <button type="button" className="settings-table-row" key={row.id} onClick={() => setSelected(row)}><span>{row.time}</span><span>{row.actor}</span><span>{row.action}</span><span>{row.object}</span><span className={row.result === "成功" ? "status-ok" : "status-danger"}>{row.result}</span><span>详情</span></button>)}</div><section className="retention-policy"><header><Database size={21} /><div><h3>数据保留策略</h3><p>缩短周期可能触发不可逆的数据清理。</p></div></header><div><label>候选人档案保留<select disabled={!editable} value={draftRetention} onChange={(event) => setDraftRetention(Number(event.target.value))}><option value="365">365 天</option><option value="540">540 天</option><option value="730">730 天</option><option value="1095">1095 天</option></select></label><label>审计日志保留<input disabled value="1095 天" /></label><label>备份保留<input disabled value="90 天" /></label>{editable && <button className="button primary" type="button" onClick={saveRetention}>保存保留策略</button>}</div></section>{selected && <aside className="settings-drawer" aria-label="审计详情"><header><div><h2>审计详情</h2><p>{selected.id} · {selected.result}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setSelected(null)}><X size={20} /></button></header><div className="settings-drawer-body"><dl><div><dt>时间</dt><dd>{selected.time}</dd></div><div><dt>操作者</dt><dd>{selected.actor}</dd></div><div><dt>操作</dt><dd>{selected.action}</dd></div><div><dt>对象</dt><dd>{selected.object}</dd></div><div><dt>来源 IP</dt><dd>{selected.ip}</dd></div><div><dt>Trace ID</dt><dd>{selected.trace}</dd></div><div><dt>变更摘要</dt><dd>{selected.change}</dd></div></dl></div><footer><button className="button primary" type="button" onClick={() => setSelected(null)}>完成</button></footer></aside>}{risk && <DangerDialog title="确认缩短候选人保留期限" description={`保留周期将从 ${retention} 天缩短为 ${draftRetention} 天。`} impact="预计 18 位候选人将在下一次清理任务中进入删除队列；删除后只能从仍在保留期内的备份恢复。" confirmText="确认缩短期限" onCancel={() => setRisk(false)} onConfirm={() => { setRetention(draftRetention); setRisk(false); onNotify("保留策略已缩短并记录审计"); }} />}</div>;
@@ -100,9 +100,12 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify }) {
   const [aiDirty, setAiDirty] = useState(false);
   const [aiFormDraft, setAiFormDraft] = useState(defaultAiForm);
   const [pendingSection, setPendingSection] = useState(null);
-  const content = section === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} /> : section === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} /> : section === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} initialForm={aiFormDraft} onFormChange={setAiFormDraft} /> : <AuditSettings role={currentRole} onNotify={onNotify} />;
+  const allowedSettingsSections = getAllowedSettingsSections(currentRole);
+  const visibleSettingsSections = settingsSections.filter(([label]) => allowedSettingsSections.includes(label));
+  const activeSection = allowedSettingsSections.includes(section) ? section : allowedSettingsSections[0];
+  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} initialForm={aiFormDraft} onFormChange={setAiFormDraft} /> : activeSection === "审计与数据治理" ? <AuditSettings role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
   function openSection(nextSection) {
-    if (section === "AI 设置" && aiDirty && nextSection !== section) {
+    if (activeSection === "AI 设置" && aiDirty && nextSection !== activeSection) {
       setPendingSection(nextSection);
       return;
     }
@@ -115,5 +118,5 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify }) {
     setSection(pendingSection);
     setPendingSection(null);
   }
-  return <div className="settings-page"><div className="settings-heading"><div><h2>设置</h2><p>管理招聘组织、流程、AI 和数据治理。</p></div><RoleSwitch value={currentRole} onChange={onRoleChange} /></div><div className="settings-layout"><nav className="settings-subnav" aria-label="设置导航">{settingsSections.map(([label, Icon]) => <button type="button" key={label} className={section === label ? "active" : ""} onClick={() => openSection(label)}><Icon size={17} />{label}</button>)}</nav><main className="settings-content" onChangeCapture={() => { if (section === "AI 设置" && currentRole === "招聘管理员") setAiDirty(true); }} onClickCapture={(event) => { if (event.target.closest("button")?.textContent === "保存设置") setAiDirty(false); }}>{content}</main></div>{pendingSection && <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label="AI 设置尚未保存"><header><div><h3>AI 设置尚未保存</h3><p>离开后可以放弃本次修改，或将配置保存为本地草稿。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingSection(null)}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>草稿只保存在当前浏览器，不会启用 Provider，也不会写入生产配置。</span></div><footer><button className="button secondary" type="button" onClick={() => setPendingSection(null)}>继续编辑</button><button className="button secondary" type="button" onClick={() => leaveAiSettings(false)}>放弃修改</button><button className="button primary" type="button" onClick={() => leaveAiSettings(true)}>保存草稿并离开</button></footer></section></div>}</div>;
+  return <div className="settings-page"><div className="settings-heading"><div><h2>设置</h2><p>管理招聘组织、流程、AI 和数据治理。</p></div><RoleSwitch value={currentRole} onChange={onRoleChange} /></div><div className="settings-layout"><nav className="settings-subnav" aria-label="设置导航">{visibleSettingsSections.map(([label, Icon]) => <button type="button" key={label} className={activeSection === label ? "active" : ""} onClick={() => openSection(label)}><Icon size={17} />{label}</button>)}</nav><main className="settings-content" onChangeCapture={() => { if (activeSection === "AI 设置" && canEditAiSettings(currentRole)) setAiDirty(true); }} onClickCapture={(event) => { if (event.target.closest("button")?.textContent === "保存设置") setAiDirty(false); }}>{content}</main></div>{pendingSection && <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label="AI 设置尚未保存"><header><div><h3>AI 设置尚未保存</h3><p>离开后可以放弃本次修改，或将配置保存为本地草稿。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingSection(null)}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>草稿只保存在当前浏览器，不会启用 Provider，也不会写入生产配置。</span></div><footer><button className="button secondary" type="button" onClick={() => setPendingSection(null)}>继续编辑</button><button className="button secondary" type="button" onClick={() => leaveAiSettings(false)}>放弃修改</button><button className="button primary" type="button" onClick={() => leaveAiSettings(true)}>保存草稿并离开</button></footer></section></div>}</div>;
 }
