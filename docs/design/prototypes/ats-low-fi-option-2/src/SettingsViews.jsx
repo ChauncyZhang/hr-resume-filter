@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Bot, CheckCircle2, ChevronDown, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
 import { getRoleCapabilities, isPermissionExpansion } from "./ux07Domain.js";
+import { canEditAiSettings } from "./roleCapabilities.js";
 
 const settingsSections = [
   ["组织与权限", Users],
@@ -25,7 +26,7 @@ const auditRows = [
 ];
 
 function RoleSwitch({ value, onChange }) {
-  if (value !== "招聘管理员") return null;
+  if (!onChange || value !== "招聘管理员") return null;
   return <div className="role-switch" aria-label="当前角色">{["招聘管理员", "HR", "面试官"].map((role) => <button type="button" key={role} className={value === role ? "active" : ""} onClick={() => onChange(role)}>{role}</button>)}</div>;
 }
 
@@ -68,7 +69,7 @@ function TemplateSettings({ role, onNotify }) {
 }
 
 function AiSettings({ role, onNotify, initialForm, onFormChange }) {
-  const editable = role === "招聘管理员";
+  const editable = canEditAiSettings(role);
   const [form, setForm] = useState(initialForm ?? defaultAiForm);
   const [keyMode, setKeyMode] = useState(false);
   const [testState, setTestState] = useState("idle");

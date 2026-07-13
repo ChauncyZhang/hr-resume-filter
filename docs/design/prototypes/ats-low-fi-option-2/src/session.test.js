@@ -17,6 +17,7 @@ test("会话从 bootstrapping 开始，/me 的 401 转为 anonymous", async () =
     user: null,
     role: null,
     submitting: false,
+    loggingOut: false,
     error: null,
   });
 });
@@ -59,7 +60,7 @@ test("登录失败区分通用认证失败与服务不可用", async () => {
   assert.equal(unavailable.getSnapshot().error, "unavailable");
 });
 
-test("退出请求失败时仍清除用户与内存 CSRF", async () => {
+test("退出请求失败时保留认证身份和 CSRF 并显示安全错误", async () => {
   let cleared = false;
   const controller = createSessionController({
     getMe: async () => user,
@@ -70,19 +71,39 @@ test("退出请求失败时仍清除用户与内存 CSRF", async () => {
 
   await assert.rejects(controller.logout());
 
+  assert.equal(cleared, false);
+  assert.equal(controller.getSnapshot().status, "authenticated");
+  assert.equal(controller.getSnapshot().user, user);
+  assert.equal(controller.getSnapshot().loggingOut, false);
+  assert.equal(controller.getSnapshot().error, "logout_failed");
+  assert.equal(getSessionMessage(controller.getSnapshot().error), "退出失败，请稍后重试。");
+});
+
+test("成功退出后才清除认证身份和内存 CSRF", async () => {
+  let cleared = false;
+  const controller = createSessionController({
+    getMe: async () => user,
+    logout: async () => {},
+    clearCsrf: () => { cleared = true; },
+  });
+  await controller.bootstrap();
+
+  await controller.logout();
+
   assert.equal(cleared, true);
   assert.equal(controller.getSnapshot().status, "anonymous");
   assert.equal(controller.getSnapshot().user, null);
 });
 
 test("服务端角色仅映射到现有三个原型角色", () => {
-  assert.equal(mapServerRoles(["system_admin"]), "招聘管理员");
+  assert.equal(mapServerRoles(["system_admin"]), "系统管理员");
   assert.equal(mapServerRoles(["recruiting_admin"]), "招聘管理员");
   assert.equal(mapServerRoles(["recruiter"]), "HR 招聘专员");
   assert.equal(mapServerRoles(["hiring_manager"]), "面试官");
   assert.equal(mapServerRoles(["interviewer"]), "面试官");
   assert.equal(mapServerRoles(["unknown_role"]), null);
   assert.equal(mapServerRoles(["interviewer", "recruiting_admin"]), "招聘管理员");
+  assert.equal(mapServerRoles(["system_admin", "recruiting_admin"]), "系统管理员");
 });
 
 test("登录界面只显示安全的通用状态文案", () => {

@@ -29,12 +29,11 @@ import { initialInterviewRecords, InterviewsWorkspace } from "./InterviewViews.j
 import { initialTalentMemberships, initialTalentPools, TalentPoolWorkspace } from "./TalentPoolViews.jsx";
 import { ReportWorkspace } from "./ReportViews.jsx";
 import { SettingsWorkspace } from "./SettingsViews.jsx";
-import { Ux08ScenarioPanel } from "./Ux08ScenarioPanel.jsx";
 import { syntheticResumeFilesFor } from "./syntheticResumeFixtures.js";
-import { canPerformAction, getAllowedNavItems } from "./roleCapabilities.js";
+import { canPerformAction, getAllowedNavItems, getDefaultNavItem } from "./roleCapabilities.js";
 import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts, saveInterview, submitInterviewFeedback, validateWorkflowState } from "./ux08Workflow.js";
 import { LoginView, SessionLoadingView } from "./LoginView.jsx";
-import { getSessionIdentity, sessionController } from "./session.js";
+import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 
 const navItems = [
   ["工作台", Home],
@@ -106,9 +105,9 @@ const jobData = {
   产品经理: { count: 6 },
 };
 
-function IconButton({ label, children, className = "", onClick }) {
+function IconButton({ label, children, className = "", onClick, disabled = false }) {
   return (
-    <button className={`icon-button ${className}`} type="button" title={label} aria-label={label} onClick={onClick}>
+    <button className={`icon-button ${className}`} type="button" title={label} aria-label={label} onClick={onClick} disabled={disabled}>
       {children}
     </button>
   );
@@ -161,7 +160,8 @@ export function App({ controller = sessionController }) {
 }
 
 function AuthenticatedApp({ session, onLogout }) {
-  const [activeNav, setActiveNav] = useState("工作台");
+  const currentRole = session.role || "未知角色";
+  const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
   const [activeJob, setActiveJob] = useState("AI 工程师");
   const [menuOpen, setMenuOpen] = useState(false);
   const [view, setView] = useState("board");
@@ -177,7 +177,6 @@ function AuthenticatedApp({ session, onLogout }) {
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
   const [candidatePreset, setCandidatePreset] = useState(null);
-  const [currentRole, setCurrentRole] = useState(session.role || "未知角色");
   const [currentScenario, setCurrentScenario] = useState("default");
   const [interviewMode, setInterviewMode] = useState("list");
   const [interviewRecords, setInterviewRecords] = useState(initialInterviewRecords);
@@ -225,6 +224,7 @@ function AuthenticatedApp({ session, onLogout }) {
   }, [candidateRecords]);
   const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
   const roleIdentity = getSessionIdentity(session.user, currentRole);
+  const sessionMessage = getSessionMessage(session.error);
   const myPendingFeedbackInterviews = pendingFeedbackInterviews.filter((item) => item.interviewers.includes(roleIdentity.name));
   const screeningSummary = useMemo(() => {
     if (!recentTask?.files?.length) return null;
@@ -300,7 +300,6 @@ function AuthenticatedApp({ session, onLogout }) {
     setInterviewRecords(baseInterviews);
     setTalentPools(basePools);
     setTalentMemberships(baseMemberships);
-    setCurrentRole("招聘管理员");
     setActiveNav("工作台");
     setActiveJob("AI 工程师");
     setScreeningTask(null);
@@ -329,7 +328,6 @@ function AuthenticatedApp({ session, onLogout }) {
       setRecentTask(task);
     }
     if (scenario === "pending-feedback") {
-      setCurrentRole("面试官");
       setActiveNav("面试");
       setSelectedInterview(baseInterviews.find((interview) => interview.id === "INT-002"));
       setInterviewMode("feedback");
@@ -348,7 +346,6 @@ function AuthenticatedApp({ session, onLogout }) {
       setActiveNav("候选人");
     }
     if (scenario === "restricted") {
-      setCurrentRole("面试官");
       setActiveNav("报表");
     }
     setCurrentScenario(scenario);
@@ -507,7 +504,7 @@ function AuthenticatedApp({ session, onLogout }) {
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && canPerformAction(currentRole, "新建职位") && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
-            <IconButton label="退出登录" className="logout-action" onClick={() => { void onLogout().catch(() => {}); }}><LogOut size={18} /></IconButton>
+            <IconButton label={session.loggingOut ? "正在退出" : "退出登录"} className="logout-action" disabled={session.loggingOut} onClick={() => { void onLogout().catch(() => {}); }}><LogOut size={18} /></IconButton>
           </div>
         </header>
 
@@ -636,11 +633,11 @@ function AuthenticatedApp({ session, onLogout }) {
         )}
 
         {!screeningTask && activeNav === "报表" && (
-          <ReportWorkspace candidates={candidateRecords} positions={positionRecords} screeningSummary={screeningSummary} currentRole={currentRole} onRoleChange={setCurrentRole} onDrillDown={drillDownReport} onNotify={notify} />
+          <ReportWorkspace candidates={candidateRecords} positions={positionRecords} screeningSummary={screeningSummary} currentRole={currentRole} onDrillDown={drillDownReport} onNotify={notify} />
         )}
 
         {!screeningTask && activeNav === "设置" && (
-          <SettingsWorkspace currentRole={currentRole} onRoleChange={setCurrentRole} onNotify={notify} />
+          <SettingsWorkspace currentRole={currentRole} onNotify={notify} />
         )}
 
         {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && activeNav !== "人才库" && activeNav !== "报表" && activeNav !== "设置" && (
@@ -659,9 +656,9 @@ function AuthenticatedApp({ session, onLogout }) {
         </Modal>
       )}
 
-      {import.meta.env.DEV && <Ux08ScenarioPanel currentScenario={currentScenario} validation={workflowValidation} onSelect={resetScenario} />}
       {menuOpen && <button className="mobile-scrim" type="button" aria-label="关闭菜单" onClick={() => setMenuOpen(false)} />}
       {toast && <div className="toast" role="status"><Check size={16} />{toast}</div>}
+      {sessionMessage && <div className="toast error" role="alert"><CircleAlert size={16} />{sessionMessage}</div>}
     </div>
   );
 }

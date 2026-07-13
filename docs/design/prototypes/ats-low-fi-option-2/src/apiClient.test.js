@@ -54,6 +54,45 @@ test("GET /me 轮换 CSRF，后续请求支持幂等键与 If-Match", async () =
   assert.equal(headers.get("If-Match"), '"7"');
 });
 
+test("成功的 /me 缺少响应头时保留已有 CSRF", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ data: { display_name: "林岚" } }, { headers: { "X-CSRF-Token": "existing-csrf" } }),
+    jsonResponse({ data: { display_name: "林岚" } }),
+    jsonResponse({ data: { ok: true } }),
+  ];
+  const client = createApiClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  } });
+
+  await client.getMe();
+  await client.getMe();
+  await client.request("/api/v1/jobs", { method: "POST", body: {} });
+
+  assert.equal(calls[2].options.headers.get("X-CSRF-Token"), "existing-csrf");
+});
+
+test("登录尝试仍会在请求前清除已有 CSRF", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ data: { display_name: "林岚" } }, { headers: { "X-CSRF-Token": "old-csrf" } }),
+    jsonResponse({ data: { authenticated: true } }),
+    jsonResponse({ data: { ok: true } }),
+  ];
+  const client = createApiClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  } });
+
+  await client.getMe();
+  await client.login({ organization_slug: "acme", email: "hr@example.test", password: "secret" });
+  await client.request("/api/v1/jobs", { method: "POST", body: {} });
+
+  assert.equal(calls[1].options.headers.get("X-CSRF-Token"), null);
+  assert.equal(calls[2].options.headers.get("X-CSRF-Token"), null);
+});
+
 test("application/problem+json 被限制为安全的类型化错误字段", async () => {
   const client = createApiClient({ fetchImpl: async () => new Response(JSON.stringify({
     type: "about:blank",

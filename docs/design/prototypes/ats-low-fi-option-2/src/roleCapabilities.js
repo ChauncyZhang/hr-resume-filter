@@ -14,6 +14,12 @@ const RECRUITING_ACTIONS = [
 ];
 
 const ROLE_CAPABILITIES = {
+  系统管理员: {
+    identity: { name: "系统管理员", title: "系统管理员" },
+    navItems: ["设置"],
+    actions: [],
+    settingsAccess: "完整",
+  },
   招聘管理员: {
     identity: { name: "周明", title: "招聘管理员" },
     navItems: RECRUITING_NAV_ITEMS,
@@ -48,12 +54,20 @@ export function canAccessNav(role, navItem) {
   return getAllowedNavItems(role).includes(navItem);
 }
 
+export function getDefaultNavItem(role) {
+  return ROLE_CAPABILITIES[role]?.navItems[0] || null;
+}
+
 export function canPerformAction(role, action) {
   return ROLE_CAPABILITIES[role]?.actions.includes(action) || false;
 }
 
 export function getSettingsAccess(role) {
   return ROLE_CAPABILITIES[role]?.settingsAccess || "无";
+}
+
+export function canEditAiSettings(role) {
+  return role === "系统管理员";
 }
 
 export function getRoleIdentity(role) {

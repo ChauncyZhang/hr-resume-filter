@@ -57,7 +57,8 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     }
 
     if (refreshesCsrf && response.ok) {
-      csrfToken = response.headers.get("X-CSRF-Token") || null;
+      const responseCsrf = response.headers.get("X-CSRF-Token");
+      if (responseCsrf) csrfToken = responseCsrf;
     } else if (response.status === 401) {
       csrfToken = null;
     }

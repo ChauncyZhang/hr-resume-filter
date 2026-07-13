@@ -5,12 +5,14 @@ const INITIAL_STATE = Object.freeze({
   user: null,
   role: null,
   submitting: false,
+  loggingOut: false,
   error: null,
 });
 
 export function mapServerRoles(roles = []) {
   const values = new Set(Array.isArray(roles) ? roles : []);
-  if (values.has("system_admin") || values.has("recruiting_admin")) return "招聘管理员";
+  if (values.has("system_admin")) return "系统管理员";
+  if (values.has("recruiting_admin")) return "招聘管理员";
   if (values.has("recruiter")) return "HR 招聘专员";
   if (values.has("hiring_manager") || values.has("interviewer")) return "面试官";
   return null;
@@ -19,6 +21,7 @@ export function mapServerRoles(roles = []) {
 export function getSessionMessage(error) {
   if (error === "authentication") return "登录信息不正确或账号暂不可用，请核对后重试。";
   if (error === "unavailable") return "服务暂时无法连接，请稍后重试。";
+  if (error === "logout_failed") return "退出失败，请稍后重试。";
   return "";
 }
 
@@ -28,11 +31,11 @@ export function getSessionIdentity(user, role) {
 }
 
 function anonymousState(error = null, submitting = false) {
-  return { status: "anonymous", user: null, role: null, submitting, error };
+  return { status: "anonymous", user: null, role: null, submitting, loggingOut: false, error };
 }
 
-function authenticatedState(user) {
-  return { status: "authenticated", user, role: mapServerRoles(user?.roles), submitting: false, error: null };
+function authenticatedState(user, { loggingOut = false, error = null } = {}) {
+  return { status: "authenticated", user, role: mapServerRoles(user?.roles), submitting: false, loggingOut, error };
 }
 
 function errorKind(error) {
@@ -43,6 +46,7 @@ function errorKind(error) {
 export function createSessionController(client) {
   let state = INITIAL_STATE;
   let bootstrapPromise = null;
+  let logoutPromise = null;
   let bootstrapped = false;
   const listeners = new Set();
 
@@ -92,14 +96,24 @@ export function createSessionController(client) {
         throw error;
       }
     },
-    async logout() {
-      setState(anonymousState());
-      try {
-        await client.logout();
-      } finally {
-        client.clearCsrf?.();
-        setState(anonymousState());
-      }
+    logout() {
+      if (logoutPromise) return logoutPromise;
+      if (state.status !== "authenticated") return Promise.resolve();
+      const authenticatedUser = state.user;
+      setState(authenticatedState(authenticatedUser, { loggingOut: true }));
+      logoutPromise = (async () => {
+        try {
+          await client.logout();
+          client.clearCsrf?.();
+          setState(anonymousState());
+        } catch (error) {
+          setState(authenticatedState(authenticatedUser, { error: "logout_failed" }));
+          throw error;
+        } finally {
+          logoutPromise = null;
+        }
+      })();
+      return logoutPromise;
     },
   };
 }

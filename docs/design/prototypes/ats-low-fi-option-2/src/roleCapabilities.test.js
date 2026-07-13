@@ -2,16 +2,36 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   canAccessNav,
+  canEditAiSettings,
   canPerformAction,
   getAllowedNavItems,
+  getDefaultNavItem,
   getRoleIdentity,
   getSettingsAccess,
 } from "./roleCapabilities.js";
 
 const fullRecruitingNav = ["工作台", "职位", "候选人", "面试", "人才库", "报表", "设置"];
 
+test("系统管理员只能进入设置且没有招聘操作", () => {
+  assert.deepEqual(getAllowedNavItems("系统管理员"), ["设置"]);
+  assert.equal(getDefaultNavItem("系统管理员"), "设置");
+  assert.equal(getSettingsAccess("系统管理员"), "完整");
+  for (const action of ["导入简历", "新建职位", "候选人搜索", "查看报表"]) {
+    assert.equal(canPerformAction("系统管理员", action), false);
+  }
+  assert.equal(canAccessNav("系统管理员", "工作台"), false);
+});
+
+test("只有系统管理员可以编辑 AI 设置", () => {
+  assert.equal(canEditAiSettings("系统管理员"), true);
+  assert.equal(canEditAiSettings("招聘管理员"), false);
+  assert.equal(canEditAiSettings("HR 招聘专员"), false);
+  assert.equal(canEditAiSettings("面试官"), false);
+});
+
 test("招聘管理员拥有完整招聘导航和设置能力", () => {
   assert.deepEqual(getAllowedNavItems("招聘管理员"), fullRecruitingNav);
+  assert.equal(getDefaultNavItem("招聘管理员"), "工作台");
   assert.equal(getSettingsAccess("招聘管理员"), "完整");
   assert.equal(canPerformAction("招聘管理员", "导入简历"), true);
 });
