@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Bot, CheckCircle2, ChevronDown, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
 import { getRoleCapabilities, isPermissionExpansion } from "./ux07Domain.js";
 import { canEditAiSettings, canEditAuditSettings, canEditOrganizationSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
-import { createLlmSettingsController, getTestDisabledReason } from "./llmSettings.js";
+import { createLlmSettingsController, getTestDisabledReason, releaseLlmSettingsSubscription } from "./llmSettings.js";
 
 const settingsSections = [
   ["组织与权限", Users],
@@ -96,9 +96,7 @@ function AiSettings({ role, onNotify, onDirtyChange }) {
     const unsubscribe = controller.subscribe(setViewState);
     controller.load();
     return () => {
-      unsubscribe();
-      controller.cancelKeyReplacement();
-      controller.dispose();
+      releaseLlmSettingsSubscription(controller, unsubscribe);
       onDirtyChange?.(false);
     };
   }, [controller, onDirtyChange]);

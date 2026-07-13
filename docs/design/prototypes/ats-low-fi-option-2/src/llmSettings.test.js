@@ -5,6 +5,7 @@ import {
   createLlmSettingsController,
   getLlmSettingsErrorMessage,
   getTestDisabledReason,
+  releaseLlmSettingsSubscription,
 } from "./llmSettings.js";
 
 const systemConfig = {
@@ -211,4 +212,24 @@ test("dispose prevents updates and notifications after an in-flight request sett
 
   assert.equal(controller.getState(), stateBeforeDispose);
   assert.equal(notifications, 1);
+});
+
+test("React Strict Mode cleanup releases a subscription without permanently disposing the controller", async () => {
+  const client = createClient(() => ({ data: systemConfig }));
+  const controller = createLlmSettingsController({ client });
+  const unsubscribe = controller.subscribe(() => {});
+
+  await controller.load();
+  controller.startKeyReplacement();
+  controller.setReplacementKey("temporary-key");
+  releaseLlmSettingsSubscription(controller, unsubscribe);
+
+  const observed = [];
+  controller.subscribe((state) => observed.push(state.status));
+  await controller.load();
+
+  assert.equal(controller.getState().status, "ready");
+  assert.equal(controller.getState().replacementKey, "");
+  assert.ok(observed.includes("loading"));
+  assert.equal(client.calls.length, 2);
 });

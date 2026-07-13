@@ -56,6 +56,11 @@ export function getTestDisabledReason(state) {
   return "";
 }
 
+export function releaseLlmSettingsSubscription(controller, unsubscribe) {
+  unsubscribe();
+  controller.cancelKeyReplacement();
+}
+
 export function createLlmSettingsController({
   client = apiClient,
   createIdempotencyKey = createUniqueIdempotencyKey,
