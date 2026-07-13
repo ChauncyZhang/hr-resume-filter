@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const stateModule = await import("./jobWorkspaceState.js").catch(() => ({}));
@@ -7,9 +8,10 @@ const {
   appendJobPage,
   createInitialJobWorkspaceState,
   failJobRequest,
+  getJobDefinitionErrors,
   startJobRequest,
+  succeedJobMutationRefresh,
   succeedJobRequest,
-  upsertJobMutation,
 } = stateModule;
 
 const firstPage = {
@@ -70,18 +72,40 @@ test("request failure preserves the previous successful page and metadata", () =
   assert.deepEqual(failed.statusCounts, firstPage.statusCounts);
 });
 
-test("mutation upsert replaces an existing job and prepends a newly created job", () => {
+test("mutation refresh replaces records from the current filters instead of unconditionally upserting", () => {
   const ready = succeedJobRequest(
     startJobRequest(createInitialJobWorkspaceState(), 1, {}),
     1,
     firstPage,
   );
+  const refreshing = startJobRequest(ready, 2, { status: "招聘中" });
+  const filteredPage = {
+    ...firstPage,
+    records: [{ id: "job-2", name: "仍在招聘", version: 1 }],
+    statusCounts: { 草稿: 2, 招聘中: 1, 已暂停: 0, 已关闭: 0, 已归档: 0 },
+  };
 
-  const updated = upsertJobMutation(ready, { id: "job-1", name: "高级平台工程师", version: 2 });
-  const created = upsertJobMutation(updated, { id: "job-2", name: "数据工程师", version: 1 });
+  const refreshed = succeedJobMutationRefresh(refreshing, 2, filteredPage);
+  const stale = succeedJobMutationRefresh(refreshing, 1, filteredPage);
 
-  assert.deepEqual(created.records, [
-    { id: "job-2", name: "数据工程师", version: 1 },
-    { id: "job-1", name: "高级平台工程师", version: 2 },
-  ]);
+  assert.deepEqual(refreshed.records, filteredPage.records);
+  assert.equal(refreshed.records.some((record) => record.id === "job-1"), false);
+  assert.deepEqual(refreshed.statusCounts, filteredPage.statusCounts);
+  assert.equal(stale, refreshing);
+});
+
+test("draft and publish validation require name, description, and process template", () => {
+  assert.deepEqual(getJobDefinitionErrors({ name: "", jd: "", process: "" }), {
+    name: "请输入职位名称",
+    jd: "请输入公开职位描述",
+    process: "请输入招聘流程模板",
+  });
+  assert.deepEqual(getJobDefinitionErrors({ name: "平台工程师", jd: "建设平台", process: "标准流程" }), {});
+});
+
+test("exit dialog closes before draft save so a failed save error remains visible", async () => {
+  const source = await readFile(new URL("./JobViews.jsx", import.meta.url), "utf8");
+
+  assert.match(source, /onSave=\{\(\) => \{\s*setConfirmExit\(false\);\s*void submit\(false\);\s*\}\}/);
+  assert.match(source, /ref=\{submitErrorRef\}[^>]*tabIndex="-1"/);
 });

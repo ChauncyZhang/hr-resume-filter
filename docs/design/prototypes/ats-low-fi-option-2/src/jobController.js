@@ -151,18 +151,27 @@ function normalizeRules(value) {
   return rules.map((item) => safeString(item).trim()).filter(Boolean);
 }
 
+function formUuid(values, field, job) {
+  const source = Object.prototype.hasOwnProperty.call(values || {}, field) ? values[field] : job?.[field];
+  return safeUuid(source) || null;
+}
+
+function mergeDefinition(listRecord, definition) {
+  return listRecord ? { ...definition, ...listRecord } : definition;
+}
+
 function definitionCommand(values, job, publish) {
-  const departmentId = safeUuid(values?.departmentId || job?.departmentId);
-  const ownerId = safeUuid(values?.ownerId || job?.ownerId);
+  const departmentId = formUuid(values, "departmentId", job);
+  const ownerId = formUuid(values, "ownerId", job);
   const priorityValue = safeString(values?.priority).trim();
   const priority = UI_TO_API_PRIORITY.get(priorityValue) || (API_TO_UI_PRIORITY.has(priorityValue) ? priorityValue : "");
   if (!priority) throw codedError("JOB_PRIORITY_UNSUPPORTED", "job priority unsupported");
   return {
     title: safeString(values?.name).trim(),
-    department_id: departmentId || null,
+    department_id: departmentId,
     headcount: Number.isInteger(values?.headcount) ? values.headcount : 1,
     priority,
-    hiring_owner_id: ownerId || null,
+    hiring_owner_id: ownerId,
     description: safeString(values?.jd).trim(),
     location: safeString(values?.location).trim(),
     process_template: safeString(values?.process).trim(),
@@ -244,7 +253,7 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     return normalizeJob(result?.data);
   }
 
-  return { listJobs, loadDefinition, saveDefinition, transition };
+  return { listJobs, loadDefinition, saveDefinition, transition, mergeDefinition };
 }
 
 export const jobController = createJobController();

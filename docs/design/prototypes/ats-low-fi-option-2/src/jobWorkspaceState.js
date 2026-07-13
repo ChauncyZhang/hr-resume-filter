@@ -51,6 +51,10 @@ export function succeedJobRequest(state, requestId, page) {
   };
 }
 
+export function succeedJobMutationRefresh(state, requestId, page) {
+  return succeedJobRequest(state, requestId, page);
+}
+
 export function appendJobPage(state, requestId, page) {
   if (state.requestId !== requestId) return state;
   const existingIds = new Set(state.records.map((record) => record.id));
@@ -75,11 +79,10 @@ export function failJobRequest(state, requestId, error) {
   };
 }
 
-export function upsertJobMutation(state, record) {
-  const existingIndex = state.records.findIndex((item) => item.id === record.id);
-  if (existingIndex < 0) return { ...state, records: [record, ...state.records] };
-  return {
-    ...state,
-    records: state.records.map((item, index) => index === existingIndex ? record : item),
-  };
+export function getJobDefinitionErrors(values) {
+  const errors = {};
+  if (!values?.name?.trim()) errors.name = "请输入职位名称";
+  if (!values?.jd?.trim()) errors.jd = "请输入公开职位描述";
+  if (!values?.process?.trim()) errors.process = "请输入招聘流程模板";
+  return errors;
 }

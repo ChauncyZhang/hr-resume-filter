@@ -42,8 +42,8 @@ import {
   createInitialJobWorkspaceState,
   failJobRequest,
   startJobRequest,
+  succeedJobMutationRefresh,
   succeedJobRequest,
-  upsertJobMutation,
 } from "./jobWorkspaceState.js";
 import { getRecentScreeningTaskStorageKey, LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY, parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
 
@@ -192,6 +192,8 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [jobState, setJobState] = useState(createInitialJobWorkspaceState);
   const jobListRequestRef = useRef(null);
   const jobListRequestSequenceRef = useRef(0);
+  const jobMutationRefreshRef = useRef(null);
+  const jobMutationRefreshSequenceRef = useRef(0);
   const [positionRecords, setPositionRecords] = useState([]);
   const [candidateMode, setCandidateMode] = useState("list");
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
@@ -256,7 +258,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   }, [recentTask]);
   const workflowValidation = useMemo(() => validateWorkflowState({ positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships }), [candidateRecords, interviewRecords, positionRecords, talentMemberships, talentPools]);
 
-  const loadJobs = useCallback(async (filters, { append = false, cursor = null } = {}) => {
+  const loadJobs = useCallback(async (filters, { append = false, cursor = null, mutation = false } = {}) => {
     jobListRequestRef.current?.controller.abort();
     const controller = new AbortController();
     const requestId = ++jobListRequestSequenceRef.current;
@@ -265,19 +267,49 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     try {
       const page = await jobController.listJobs({ ...filters, cursor: cursor || undefined, limit: 50 }, { signal: controller.signal });
       if (jobListRequestRef.current?.controller !== controller) return;
-      setJobState((current) => append ? appendJobPage(current, requestId, page) : succeedJobRequest(current, requestId, page));
+      setJobState((current) => append ? appendJobPage(current, requestId, page) : mutation ? succeedJobMutationRefresh(current, requestId, page) : succeedJobRequest(current, requestId, page));
       if (!append && !filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
         setPositionRecords(page.records);
         setJobs(page.records.map((record) => record.name));
         if (page.records[0]) setActiveJob((current) => page.records.some((record) => record.name === current) ? current : page.records[0].name);
       }
+      return page;
     } catch (error) {
       if (error?.name === "AbortError" || jobListRequestRef.current?.controller !== controller) return;
       setJobState((current) => failJobRequest(current, requestId, new Error("职位加载失败，请重试。")));
     } finally {
       if (jobListRequestRef.current?.controller === controller) jobListRequestRef.current = null;
     }
+    return null;
   }, [jobController]);
+
+  const refreshJobAfterMutation = useCallback(async (jobId) => {
+    jobMutationRefreshRef.current?.controller.abort();
+    const controller = new AbortController();
+    const requestId = ++jobMutationRefreshSequenceRef.current;
+    jobMutationRefreshRef.current = { controller, requestId };
+    const filters = jobState.filters;
+    try {
+      const [page, definition] = await Promise.all([
+        loadJobs(filters, { mutation: true }),
+        jobController.loadDefinition(jobId, { signal: controller.signal }),
+      ]);
+      if (jobMutationRefreshRef.current?.controller !== controller) return null;
+      const listRecord = page?.records.find((record) => record.id === jobId) || null;
+      const complete = jobController.mergeDefinition(listRecord, definition);
+      setSelectedJob(complete);
+      if (page && !filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
+        setPositionRecords(page.records);
+        setJobs(page.records.map((record) => record.name));
+      }
+      return complete;
+    } catch (error) {
+      if (error?.name === "AbortError" || jobMutationRefreshRef.current?.controller !== controller) return null;
+      throw error;
+    } finally {
+      if (jobMutationRefreshRef.current?.controller === controller) jobMutationRefreshRef.current = null;
+    }
+  }, [jobController, jobState.filters, loadJobs]);
 
   useEffect(() => {
     const filters = createInitialJobWorkspaceState().filters;
@@ -285,6 +317,8 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     return () => {
       jobListRequestRef.current?.controller.abort();
       jobListRequestRef.current = null;
+      jobMutationRefreshRef.current?.controller.abort();
+      jobMutationRefreshRef.current = null;
     };
   }, [loadJobs]);
 
@@ -430,13 +464,6 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   function registerJob(record) {
     setJobs((current) => current.includes(record.name) ? current : [...current, record.name]);
     setActiveJob(record.name);
-  }
-
-  function applyJobMutation(record) {
-    setJobState((current) => upsertJobMutation(current, record));
-    setPositionRecords((current) => upsertJobMutation({ records: current }, record).records);
-    setSelectedJob(record);
-    registerJob(record);
   }
 
   async function loadServerCandidate(context) {
@@ -727,7 +754,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
             onLoadJobs={loadJobs}
             jobController={jobController}
             candidateController={candidateController}
-            onJobMutation={applyJobMutation}
+            onRefreshJobMutation={refreshJobAfterMutation}
             onNotify={notify}
             onImport={() => { setActiveJob(selectedJob?.name || activeJob); setImportOpen(true); }}
             onOpenCandidate={openCandidate}

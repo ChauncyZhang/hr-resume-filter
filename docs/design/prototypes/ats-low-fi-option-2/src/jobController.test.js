@@ -383,6 +383,67 @@ test("saveDefinition maps the complete UI form for draft, publish, and versioned
   assert.equal(updated.jd, "建设可靠的招聘平台。");
 });
 
+test("definition update submits explicit unassigned department and owner as null", async () => {
+  const { client, calls } = queuedClient([definitionResource()]);
+  const controller = createJobController({ client, idempotencyKey: () => "clear-assignment-key" });
+
+  await controller.saveDefinition({
+    name: "平台工程师",
+    departmentId: "",
+    ownerId: "",
+    headcount: 2,
+    priority: "中",
+    jd: "建设平台",
+    location: "上海",
+    process: "标准流程",
+    llmEnabled: false,
+    mustHave: [],
+    niceToHave: [],
+  }, { job: { id: JOB_ID, version: 7, departmentId: DEPARTMENT_ID, ownerId: HIRING_OWNER_ID } });
+
+  assert.equal(calls[0].options.body.department_id, null);
+  assert.equal(calls[0].options.body.hiring_owner_id, null);
+});
+
+test("mergeDefinition keeps list metadata and complete definition fields", () => {
+  const controller = createJobController({ client: { request: async () => { throw new Error("unused"); } } });
+  const definition = {
+    id: JOB_ID,
+    name: "平台工程师",
+    departmentId: "",
+    department: "",
+    ownerId: "",
+    owner: "",
+    funnel: { review: 4 },
+    candidates: 4,
+    jd: "完整 JD",
+    process: "标准流程",
+    mustHave: ["React"],
+    niceToHave: ["Vite"],
+  };
+  const listRecord = {
+    id: JOB_ID,
+    name: "平台工程师",
+    departmentId: DEPARTMENT_ID,
+    department: "技术部",
+    ownerId: HIRING_OWNER_ID,
+    owner: "招聘经理",
+    funnel: { new: 2, review: 3 },
+    candidates: 5,
+    review: 3,
+    version: 8,
+  };
+
+  assert.deepEqual(controller.mergeDefinition(listRecord, definition), {
+    ...definition,
+    ...listRecord,
+    jd: "完整 JD",
+    process: "标准流程",
+    mustHave: ["React"],
+    niceToHave: ["Vite"],
+  });
+});
+
 test("transition maps pause, resume, close, and archive targets with mutation headers", async () => {
   const { client, calls } = queuedClient([
     { data: apiJob({ status: "paused", version: 8 }) },

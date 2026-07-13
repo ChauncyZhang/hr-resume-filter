@@ -20,6 +20,7 @@ import {
   X,
 } from "lucide-react";
 import { mergeCandidateRecords } from "./candidateController.js";
+import { getJobDefinitionErrors } from "./jobWorkspaceState.js";
 
 // Legacy workflow scenarios still import this fixture. The authenticated job
 // workspace never uses it as list or detail data.
@@ -137,7 +138,12 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const submitErrorRef = useRef(null);
   const [confirmExit, setConfirmExit] = useState(false);
+
+  useEffect(() => {
+    if (submitError) submitErrorRef.current?.focus();
+  }, [submitError]);
 
   function change(field, value) {
     setValues((current) => ({ ...current, [field]: value }));
@@ -146,16 +152,14 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
     setErrors((current) => ({ ...current, [field]: "" }));
   }
 
-  function validate(publish) {
-    const next = {};
-    if (!values.name.trim()) next.name = "请输入职位名称";
-    if (publish && !values.jd.trim()) next.jd = "请输入公开职位描述";
+  function validate() {
+    const next = getJobDefinitionErrors(values);
     setErrors(next);
     return Object.keys(next).length === 0;
   }
 
   async function submit(publish) {
-    if (saving || !validate(publish)) return;
+    if (saving || !validate()) return;
     setSaving(true);
     setSubmitError("");
     try {
@@ -173,7 +177,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
     <div className="job-page job-form-page">
       <button className="back-link" type="button" onClick={() => dirty ? setConfirmExit(true) : onBack()} disabled={saving}><ArrowLeft size={17} />返回职位列表</button>
       <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div><button className="button secondary" type="button" onClick={() => submit(false)} disabled={saving}>{saving ? "正在保存…" : "保存草稿"}</button><button className="button primary" type="button" onClick={() => submit(true)} disabled={saving}>{saving ? "正在保存…" : initialJob ? "保存并发布" : "发布职位"}</button></div></div>
-      {submitError && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span></div>}
+      {submitError && <div ref={submitErrorRef} tabIndex="-1" className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span></div>}
       <fieldset className="job-form-fieldset" disabled={saving}>
         <div className="job-form-layout">
           <div className="job-form-sections">
@@ -191,14 +195,14 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
               <label>加分项<textarea rows="3" value={values.niceToHave} onChange={(event) => change("niceToHave", event.target.value)} placeholder="用顿号分隔" /></label>
             </div></section>
             <section className="form-section"><header><span>3</span><div><h3>招聘流程与 AI</h3><p>记录服务端流程模板，并确认是否允许模型辅助评估。</p></div></header><div className="job-fields">
-              <label>流程模板<input value={values.process} onChange={(event) => change("process", event.target.value)} placeholder="例如：技术岗位标准流程" /></label>
+              <label>流程模板<input value={values.process} onChange={(event) => change("process", event.target.value)} placeholder="例如：技术岗位标准流程" />{errors.process && <small className="field-error">{errors.process}</small>}</label>
               <label className="toggle-row"><span><Bot size={18} /><span><strong>启用 LLM 简历评估</strong><small>使用组织已配置的模型服务。</small></span></span><input aria-label="启用 LLM 简历评估" type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
             </div></section>
           </div>
           <aside className="form-summary"><h3>发布检查</h3><div className="completion-ring"><strong>{completion}/5</strong><span>关键项已完成</span></div>{[["职位名称", values.name], ["所属部门", values.departmentId], ["公开 JD", values.jd], ["筛选条件", values.mustHave], ["招聘流程", values.process]].map(([label, value]) => <div className={value ? "check-row done" : "check-row"} key={label}>{value ? <Check size={15} /> : <Clock3 size={15} />}<span>{label}</span></div>)}</aside>
         </div>
       </fieldset>
-      {confirmExit && <JobDialog onClose={() => setConfirmExit(false)} onDiscard={onBack} onSave={() => submit(false)} saving={saving} />}
+      {confirmExit && <JobDialog onClose={() => setConfirmExit(false)} onDiscard={onBack} onSave={() => { setConfirmExit(false); void submit(false); }} saving={saving} />}
     </div>
   );
 }
@@ -248,7 +252,7 @@ function JobDetail({ state, lifecycleState, onBack, onEdit, onImport, onOpenCand
   );
 }
 
-export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onJobMutation, onNotify, onImport, onOpenCandidate }) {
+export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate }) {
   const [detailState, setDetailState] = useState({ status: "idle", job: null, candidates: null });
   const [lifecycleState, setLifecycleState] = useState({ status: "idle", error: "", conflict: false });
   const detailRequestRef = useRef(null);
@@ -265,11 +269,12 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     setDetailState({ status: "loading", job: null, candidates: null });
     setLifecycleState({ status: "idle", error: "", conflict: false });
     try {
-      const [job, candidatePage] = await Promise.all([
+      const [definition, candidatePage] = await Promise.all([
         jobController.loadDefinition(summary.id, { signal: controller.signal }),
         candidateController.listCandidates({ jobId: summary.id, limit: 20 }, { signal: controller.signal }),
       ]);
       if (detailRequestRef.current !== controller || requestId !== detailSequenceRef.current) return;
+      const job = jobController.mergeDefinition(summary, definition);
       setSelectedJob(job);
       setDetailState({ status: "ready", job, candidates: { status: "ready", records: candidatePage.records, nextCursor: candidatePage.nextCursor, filters: { q: "", stage: "全部阶段" }, error: "" } });
     } catch (error) {
@@ -312,11 +317,12 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
   async function saveDefinition(values, publish) {
     const existing = selectedJob?.formMode === "edit" ? selectedJob : null;
     const saved = await jobController.saveDefinition(values, { job: existing, publish });
-    onJobMutation(saved);
-    setSelectedJob(saved);
+    const complete = await onRefreshJobMutation(saved.id);
+    if (!complete) return;
+    setSelectedJob(complete);
     onNotify(publish ? (existing ? "职位修改已保存" : "职位已发布") : "职位已保存为草稿");
     if (publish) {
-      setDetailState({ status: "ready", job: saved, candidates: detailState.candidates || { status: "ready", records: [], nextCursor: null, filters: { q: "", stage: "全部阶段" }, error: "" } });
+      setDetailState({ status: "ready", job: complete, candidates: detailState.candidates || { status: "ready", records: [], nextCursor: null, filters: { q: "", stage: "全部阶段" }, error: "" } });
       setMode("detail");
     } else {
       setMode("list");
@@ -328,10 +334,10 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     setLifecycleState({ status: "loading", error: "", conflict: false });
     try {
       const summary = await jobController.transition(detailState.job, target);
-      const next = { ...detailState.job, ...summary };
+      const next = await onRefreshJobMutation(summary.id);
+      if (!next) return;
       setDetailState((current) => ({ ...current, job: next }));
       setSelectedJob(next);
-      onJobMutation(next);
       setLifecycleState({ status: "ready", error: "", conflict: false });
       onNotify(`职位状态已更新为${next.status}`);
     } catch (error) {
