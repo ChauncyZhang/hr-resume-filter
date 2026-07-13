@@ -126,7 +126,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
     departmentId: initialJob?.departmentId || "",
     location: initialJob?.location || "",
     headcount: initialJob?.headcount || 1,
-    ownerId: initialJob?.ownerId || "",
+    ownerId: initialJob?.hiringOwnerId || initialJob?.ownerId || "",
     priority: initialJob?.priority || "中",
     jd: initialJob?.jd || "",
     mustHave: initialJob?.mustHave?.join("、") || "",

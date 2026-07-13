@@ -111,6 +111,8 @@ test("listJobs encodes supplied filters and fully normalizes records and facets"
       name: "平台工程师",
       departmentId: DEPARTMENT_ID,
       department: "技术部",
+      recruitingOwnerId: OWNER_ID,
+      hiringOwnerId: HIRING_OWNER_ID,
       ownerId: HIRING_OWNER_ID,
       owner: "招聘经理",
       headcount: 3,
@@ -172,6 +174,8 @@ test("listJobs omits invalid filters and safely defaults malformed optional valu
     name: "平台工程师",
     departmentId: "",
     department: "",
+    recruitingOwnerId: OWNER_ID,
+    hiringOwnerId: "",
     ownerId: OWNER_ID,
     owner: "招聘负责人",
     headcount: 0,
@@ -475,6 +479,54 @@ test("mergeDefinition fills names from refreshed facets when a closed job is exc
   assert.equal(merged.status, "已关闭");
   assert.deepEqual(merged.funnel, { new: 1, review: 2, decision: 1 });
   assert.equal(merged.candidates, 4);
+});
+
+test("definition keeps raw owner identities and filtered refresh restores the hiring owner for display and edit", async () => {
+  const rawDefinition = definitionResource({
+    job: {
+      hiring_owner_id: HIRING_OWNER_ID,
+      hiring_owner_name: "",
+      owner_id: OWNER_ID,
+      owner_name: "招聘负责人",
+      status: "closed",
+      version: 9,
+    },
+  });
+  const { client, calls } = queuedClient([
+    rawDefinition,
+    { data: { stages: { new: 1, review: 2 }, total: 3 } },
+    rawDefinition,
+  ]);
+  const controller = createJobController({ client, idempotencyKey: () => "edit-owner-key" });
+
+  const definition = await controller.loadDefinition(JOB_ID);
+  assert.equal(definition.recruitingOwnerId, OWNER_ID);
+  assert.equal(definition.hiringOwnerId, HIRING_OWNER_ID);
+  assert.deepEqual({ ownerId: definition.ownerId, owner: definition.owner }, { ownerId: OWNER_ID, owner: "招聘负责人" });
+
+  const merged = controller.mergeDefinition(null, definition, {
+    departments: [{ id: DEPARTMENT_ID, name: "技术部" }],
+    owners: [
+      { id: OWNER_ID, name: "招聘负责人" },
+      { id: HIRING_OWNER_ID, name: "招聘经理" },
+    ],
+  });
+  assert.deepEqual({ ownerId: merged.ownerId, owner: merged.owner }, { ownerId: HIRING_OWNER_ID, owner: "招聘经理" });
+
+  await controller.saveDefinition({
+    name: definition.name,
+    departmentId: definition.departmentId,
+    headcount: definition.headcount,
+    priority: definition.priority,
+    jd: definition.jd,
+    location: definition.location,
+    process: definition.process,
+    llmEnabled: definition.llmEnabled,
+    mustHave: definition.mustHave,
+    niceToHave: definition.niceToHave,
+  }, { job: definition });
+
+  assert.equal(calls.at(-1).options.body.hiring_owner_id, HIRING_OWNER_ID);
 });
 
 test("transition maps pause, resume, close, and archive targets with mutation headers", async () => {

@@ -95,9 +95,12 @@ function normalizeJob(item, funnelOverride) {
   const stages = normalizeStages(funnelOverride?.stages ?? item?.funnel?.stages);
   const total = safeCount(funnelOverride?.total ?? item?.funnel?.total);
   const id = safeUuid(item?.id);
+  const recruitingOwnerId = safeUuid(item?.owner_id);
+  const recruitingOwnerName = safeString(item?.owner_name).trim();
   const hiringOwnerId = safeUuid(item?.hiring_owner_id);
   const hiringOwnerName = safeString(item?.hiring_owner_name).trim();
   const useHiringOwner = Boolean(hiringOwnerId && hiringOwnerName);
+  const useRecruitingOwner = Boolean(recruitingOwnerId && recruitingOwnerName);
   const title = safeString(item?.title);
 
   return {
@@ -108,8 +111,10 @@ function normalizeJob(item, funnelOverride) {
     name: title,
     departmentId: safeUuid(item?.department_id),
     department: safeString(item?.department_name),
-    ownerId: useHiringOwner ? hiringOwnerId : safeUuid(item?.owner_id),
-    owner: useHiringOwner ? hiringOwnerName : safeString(item?.owner_name).trim(),
+    recruitingOwnerId,
+    hiringOwnerId,
+    ownerId: useHiringOwner ? hiringOwnerId : useRecruitingOwner ? recruitingOwnerId : "",
+    owner: useHiringOwner ? hiringOwnerName : useRecruitingOwner ? recruitingOwnerName : "",
     headcount: safeCount(item?.headcount),
     status: API_TO_UI_STATUS.get(item?.status) || "",
     priority: API_TO_UI_PRIORITY.get(item?.priority) || "",
@@ -162,16 +167,38 @@ function facetName(facets, id) {
 
 function mergeDefinition(listRecord, definition, metadata = {}) {
   const merged = listRecord ? { ...definition, ...listRecord } : { ...definition };
+  let ownerId = merged.ownerId;
+  let owner = merged.owner;
+  if (!listRecord) {
+    const hiringOwnerId = definition?.hiringOwnerId || "";
+    const recruitingOwnerId = definition?.recruitingOwnerId || (!hiringOwnerId ? definition?.ownerId : "");
+    const hiringOwnerName = facetName(metadata.owners, hiringOwnerId);
+    const recruitingOwnerName = facetName(metadata.owners, recruitingOwnerId)
+      || (definition?.ownerId === recruitingOwnerId ? definition?.owner : "");
+    if (hiringOwnerId && hiringOwnerName) {
+      ownerId = hiringOwnerId;
+      owner = hiringOwnerName;
+    } else if (recruitingOwnerId && recruitingOwnerName) {
+      ownerId = recruitingOwnerId;
+      owner = recruitingOwnerName;
+    } else {
+      ownerId = "";
+      owner = "";
+    }
+  }
   return {
     ...merged,
     department: merged.department || facetName(metadata.departments, merged.departmentId),
-    owner: merged.owner || facetName(metadata.owners, merged.ownerId),
+    ownerId,
+    owner,
   };
 }
 
 function definitionCommand(values, job, publish) {
   const departmentId = formUuid(values, "departmentId", job);
-  const ownerId = formUuid(values, "ownerId", job);
+  const ownerId = Object.prototype.hasOwnProperty.call(values || {}, "ownerId")
+    ? safeUuid(values.ownerId) || null
+    : safeUuid(job?.hiringOwnerId) || safeUuid(job?.ownerId) || null;
   const priorityValue = safeString(values?.priority).trim();
   const priority = UI_TO_API_PRIORITY.get(priorityValue) || (API_TO_UI_PRIORITY.has(priorityValue) ? priorityValue : "");
   if (!priority) throw codedError("JOB_PRIORITY_UNSUPPORTED", "job priority unsupported");
