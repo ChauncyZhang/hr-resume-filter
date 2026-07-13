@@ -36,6 +36,15 @@ import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 import { screeningController as defaultScreeningController } from "./screeningController.js";
 import { candidateController as defaultCandidateController } from "./candidateController.js";
+import { jobController as defaultJobController } from "./jobController.js";
+import {
+  appendJobPage,
+  createInitialJobWorkspaceState,
+  failJobRequest,
+  startJobRequest,
+  succeedJobRequest,
+  upsertJobMutation,
+} from "./jobWorkspaceState.js";
 import { getRecentScreeningTaskStorageKey, LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY, parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
 
 const navItems = [
@@ -148,7 +157,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -163,10 +172,10 @@ export function App({ controller = sessionController, screeningController = defa
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} />;
 }
 
-function AuthenticatedApp({ session, onLogout, screeningController, candidateController }) {
+function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController }) {
   const currentRole = session.role || "未知角色";
   const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
@@ -180,7 +189,10 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [jobs, setJobs] = useState(Object.keys(jobData));
   const [jobMode, setJobMode] = useState("list");
   const [selectedJob, setSelectedJob] = useState(null);
-  const [positionRecords, setPositionRecords] = useState(() => recalculatePositionCounts(initialPositionRecords, initialCandidateRecords));
+  const [jobState, setJobState] = useState(createInitialJobWorkspaceState);
+  const jobListRequestRef = useRef(null);
+  const jobListRequestSequenceRef = useRef(0);
+  const [positionRecords, setPositionRecords] = useState([]);
   const [candidateMode, setCandidateMode] = useState("list");
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
@@ -243,6 +255,38 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     };
   }, [recentTask]);
   const workflowValidation = useMemo(() => validateWorkflowState({ positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships }), [candidateRecords, interviewRecords, positionRecords, talentMemberships, talentPools]);
+
+  const loadJobs = useCallback(async (filters, { append = false, cursor = null } = {}) => {
+    jobListRequestRef.current?.controller.abort();
+    const controller = new AbortController();
+    const requestId = ++jobListRequestSequenceRef.current;
+    jobListRequestRef.current = { controller, requestId };
+    setJobState((current) => startJobRequest(current, requestId, filters));
+    try {
+      const page = await jobController.listJobs({ ...filters, cursor: cursor || undefined, limit: 50 }, { signal: controller.signal });
+      if (jobListRequestRef.current?.controller !== controller) return;
+      setJobState((current) => append ? appendJobPage(current, requestId, page) : succeedJobRequest(current, requestId, page));
+      if (!append && !filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
+        setPositionRecords(page.records);
+        setJobs(page.records.map((record) => record.name));
+        if (page.records[0]) setActiveJob((current) => page.records.some((record) => record.name === current) ? current : page.records[0].name);
+      }
+    } catch (error) {
+      if (error?.name === "AbortError" || jobListRequestRef.current?.controller !== controller) return;
+      setJobState((current) => failJobRequest(current, requestId, new Error("职位加载失败，请重试。")));
+    } finally {
+      if (jobListRequestRef.current?.controller === controller) jobListRequestRef.current = null;
+    }
+  }, [jobController]);
+
+  useEffect(() => {
+    const filters = createInitialJobWorkspaceState().filters;
+    void loadJobs(filters);
+    return () => {
+      jobListRequestRef.current?.controller.abort();
+      jobListRequestRef.current = null;
+    };
+  }, [loadJobs]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
@@ -386,6 +430,13 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   function registerJob(record) {
     setJobs((current) => current.includes(record.name) ? current : [...current, record.name]);
     setActiveJob(record.name);
+  }
+
+  function applyJobMutation(record) {
+    setJobState((current) => upsertJobMutation(current, record));
+    setPositionRecords((current) => upsertJobMutation({ records: current }, record).records);
+    setSelectedJob(record);
+    registerJob(record);
   }
 
   async function loadServerCandidate(context) {
@@ -672,12 +723,14 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
             setMode={setJobMode}
             selectedJob={selectedJob}
             setSelectedJob={setSelectedJob}
-            records={positionRecords}
-            setRecords={setPositionRecords}
+            listState={jobState}
+            onLoadJobs={loadJobs}
+            jobController={jobController}
+            candidateController={candidateController}
+            onJobMutation={applyJobMutation}
             onNotify={notify}
             onImport={() => { setActiveJob(selectedJob?.name || activeJob); setImportOpen(true); }}
             onOpenCandidate={openCandidate}
-            onCreateJob={registerJob}
           />
         )}
 

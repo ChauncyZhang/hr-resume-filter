@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Bot,
@@ -12,421 +12,335 @@ import {
   CirclePlay,
   Clock3,
   FileText,
-  Filter,
   Import,
   ListFilter,
-  MoreHorizontal,
   Pencil,
   Search,
-  Settings,
-  Sparkles,
   Users,
   X,
 } from "lucide-react";
+import { mergeCandidateRecords } from "./candidateController.js";
 
+// Legacy workflow scenarios still import this fixture. The authenticated job
+// workspace never uses it as list or detail data.
 export const initialPositionRecords = [
-  {
-    id: "JOB-AI-001",
-    name: "AI 工程师",
-    department: "技术部",
-    location: "北京",
-    owner: "张小北",
-    status: "招聘中",
-    priority: "高",
-    headcount: 3,
-    candidates: 48,
-    review: 8,
-    interview: 5,
-    decision: 3,
-    updated: "今天 11:05",
-    jd: "负责大模型应用、AI Agent、RAG 检索增强生成等 AI 应用的设计、开发和落地。",
-    mustHave: ["Python", "机器学习", "深度学习", "LLM"],
-    niceToHave: ["RAG", "Agent", "Docker", "Kubernetes"],
-    process: "技术岗位标准流程",
-  },
-  {
-    id: "JOB-JAVA-002",
-    name: "Java 后端工程师",
-    department: "技术部",
-    location: "上海",
-    owner: "陈雨",
-    status: "招聘中",
-    priority: "中",
-    headcount: 2,
-    candidates: 32,
-    review: 6,
-    interview: 4,
-    decision: 1,
-    updated: "今天 09:42",
-    jd: "负责核心业务服务的设计与开发，建设稳定、可观测的微服务体系。",
-    mustHave: ["Java", "Spring Boot", "MySQL", "Redis"],
-    niceToHave: ["Kafka", "Kubernetes", "高并发"],
-    process: "技术岗位标准流程",
-  },
-  {
-    id: "JOB-PM-003",
-    name: "产品经理",
-    department: "产品部",
-    location: "北京",
-    owner: "张小北",
-    status: "招聘中",
-    priority: "中",
-    headcount: 1,
-    candidates: 21,
-    review: 4,
-    interview: 2,
-    decision: 1,
-    updated: "昨天 18:20",
-    jd: "负责企业服务产品的需求分析、方案设计、项目推进和效果复盘。",
-    mustHave: ["B 端产品", "需求分析", "项目管理"],
-    niceToHave: ["招聘行业", "数据分析", "AI 产品"],
-    process: "产品岗位标准流程",
-  },
-  {
-    id: "JOB-FE-004",
-    name: "前端工程师",
-    department: "技术部",
-    location: "深圳",
-    owner: "刘思远",
-    status: "草稿",
-    priority: "低",
-    headcount: 2,
-    candidates: 0,
-    review: 0,
-    interview: 0,
-    decision: 0,
-    updated: "07-10 16:30",
-    jd: "负责招聘协同平台 Web 端开发与体验优化。",
-    mustHave: ["React", "TypeScript", "CSS"],
-    niceToHave: ["数据可视化", "设计系统"],
-    process: "技术岗位标准流程",
-  },
-  {
-    id: "JOB-OPS-005",
-    name: "招聘运营专员",
-    department: "人力资源部",
-    location: "北京",
-    owner: "王敏",
-    status: "已暂停",
-    priority: "低",
-    headcount: 1,
-    candidates: 15,
-    review: 2,
-    interview: 0,
-    decision: 0,
-    updated: "07-09 14:10",
-    jd: "负责招聘渠道运营、数据分析和候选人体验提升。",
-    mustHave: ["招聘运营", "数据分析"],
-    niceToHave: ["ATS 使用经验", "雇主品牌"],
-    process: "职能岗位标准流程",
-  },
+  { id: "JOB-AI-001", name: "AI 工程师", department: "技术部", location: "北京", owner: "张小北", status: "招聘中", priority: "高", headcount: 3, candidates: 48, review: 8, interview: 5, decision: 3, updated: "今天 11:05", jd: "负责大模型应用、AI Agent、RAG 检索增强生成等 AI 应用的设计、开发和落地。", mustHave: ["Python", "机器学习", "深度学习", "LLM"], niceToHave: ["RAG", "Agent", "Docker", "Kubernetes"], process: "技术岗位标准流程" },
+  { id: "JOB-JAVA-002", name: "Java 后端工程师", department: "技术部", location: "上海", owner: "陈雨", status: "招聘中", priority: "中", headcount: 2, candidates: 32, review: 6, interview: 4, decision: 1, updated: "今天 09:42", jd: "负责核心业务服务的设计与开发，建设稳定、可观测的微服务体系。", mustHave: ["Java", "Spring Boot", "MySQL", "Redis"], niceToHave: ["Kafka", "Kubernetes", "高并发"], process: "技术岗位标准流程" },
+  { id: "JOB-PM-003", name: "产品经理", department: "产品部", location: "北京", owner: "张小北", status: "招聘中", priority: "中", headcount: 1, candidates: 21, review: 4, interview: 2, decision: 1, updated: "昨天 18:20", jd: "负责企业服务产品的需求分析、方案设计、项目推进和效果复盘。", mustHave: ["B 端产品", "需求分析", "项目管理"], niceToHave: ["招聘行业", "数据分析", "AI 产品"], process: "产品岗位标准流程" },
+  { id: "JOB-FE-004", name: "前端工程师", department: "技术部", location: "深圳", owner: "刘思远", status: "草稿", priority: "低", headcount: 2, candidates: 0, review: 0, interview: 0, decision: 0, updated: "07-10 16:30", jd: "负责招聘协同平台 Web 端开发与体验优化。", mustHave: ["React", "TypeScript", "CSS"], niceToHave: ["数据可视化", "设计系统"], process: "技术岗位标准流程" },
+  { id: "JOB-OPS-005", name: "招聘运营专员", department: "人力资源部", location: "北京", owner: "王敏", status: "已暂停", priority: "低", headcount: 1, candidates: 15, review: 2, interview: 0, decision: 0, updated: "07-09 14:10", jd: "负责招聘渠道运营、数据分析和候选人体验提升。", mustHave: ["招聘运营", "数据分析"], niceToHave: ["ATS 使用经验", "雇主品牌"], process: "职能岗位标准流程" },
 ];
 
-const stageCounts = [
-  ["新简历", 22],
-  ["待复核", 8],
-  ["待沟通", 6],
-  ["待安排", 4],
-  ["面试中", 5],
-  ["待决策", 3],
+const JOB_STATUSES = ["全部", "招聘中", "草稿", "已暂停", "已关闭", "已归档"];
+const CANDIDATE_STAGES = ["全部阶段", "新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已淘汰"];
+const DEFAULT_CANDIDATE_FILTERS = Object.freeze({ q: "", stage: "全部阶段" });
+const FUNNEL_STAGES = [
+  ["新简历", "new"],
+  ["待复核", "review"],
+  ["待沟通", "contact"],
+  ["待安排", "interview_pending"],
+  ["面试中", "interviewing"],
+  ["待决策", "decision"],
 ];
-
-const candidateRows = [
-  ["候 A1", "AI 算法工程师 · 字节", "新简历", "81", "今天 10:28", "张小北"],
-  ["候 B2", "AI 研究员 · 阿里", "待复核", "78", "今天 09:45", "张小北"],
-  ["候 C1", "算法工程师 · 字节", "待沟通", "86", "昨天 16:30", "陈雨"],
-  ["候 D2", "AI 工程师 · 阿里", "待安排", "75", "昨天 14:12", "张小北"],
-  ["候 E1", "大模型应用工程师 · 腾讯", "面试中", "88", "07-10 18:05", "刘思远"],
-];
-
-const roleProfiles = {
-  "Java 后端工程师": ["Java 开发工程师 · 美团", "后端工程师 · 京东", "资深 Java 工程师 · 快手", "服务端工程师 · 小米", "Java 架构师 · 携程"],
-  产品经理: ["高级产品经理 · 京东", "B 端产品经理 · 用友", "平台产品经理 · 腾讯", "产品经理 · 美团", "AI 产品经理 · 百度"],
-  前端工程师: ["React 工程师 · 字节", "前端开发工程师 · 腾讯", "Web 工程师 · 美团", "资深前端工程师 · 阿里", "前端架构师 · 小米"],
-  招聘运营专员: ["招聘运营 · 小红书", "招聘专员 · 美团", "人才运营 · 字节", "招聘顾问 · 猎聘", "雇主品牌专员 · 百度"],
+const LIFECYCLE_ACTIONS = {
+  招聘中: [["已暂停", "暂停招聘", CirclePause], ["已关闭", "关闭职位", X]],
+  已暂停: [["招聘中", "恢复招聘", CirclePlay], ["已关闭", "关闭职位", X]],
+  已关闭: [["已归档", "归档职位", Check]],
 };
-
-function candidatesFor(job) {
-  if (job.name === "AI 工程师") return candidateRows;
-  const profiles = roleProfiles[job.name] || candidateRows.map(() => `${job.name}候选人 · 示例公司`);
-  return candidateRows.map((row, index) => [row[0], profiles[index], ...row.slice(2)]);
-}
 
 function StatusTag({ children }) {
   const className = children === "招聘中" ? "status-active" : children === "草稿" ? "status-draft" : "status-paused";
-  return <span className={`job-status ${className}`}>{children}</span>;
+  return <span className={`job-status ${className}`}>{children || "状态未知"}</span>;
 }
 
-function JobDialog({ onClose, onDiscard, onSave }) {
-  return (
-    <div className="job-confirm-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="job-confirm" role="dialog" aria-modal="true" aria-label="保存未完成的职位" onMouseDown={(event) => event.stopPropagation()}>
-        <header><CircleAlert size={21} /><h3>职位尚未保存</h3></header>
-        <p>你填写的内容还没有保存。可以先保存为草稿，或者放弃本次修改。</p>
-        <footer>
-          <button className="button secondary" type="button" onClick={onClose}>继续编辑</button>
-          <button className="button danger-text" type="button" onClick={onDiscard}>放弃修改</button>
-          <button className="button primary" type="button" onClick={onSave}>保存草稿</button>
-        </footer>
-      </section>
-    </div>
-  );
-}
+function JobList({ state, onLoad, onOpen }) {
+  const [query, setQuery] = useState(state.filters.q);
+  const firstQueryRender = useRef(true);
 
-function JobList({ records, onOpen }) {
-  const [query, setQuery] = useState("");
-  const [status, setStatus] = useState("全部");
-  const [department, setDepartment] = useState("全部部门");
-  const [owner, setOwner] = useState("全部负责人");
+  useEffect(() => {
+    if (firstQueryRender.current) {
+      firstQueryRender.current = false;
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      if (query !== state.filters.q) void onLoad({ ...state.filters, q: query });
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [onLoad, query, state.filters]);
 
-  const filtered = useMemo(() => records.filter((job) => {
-    const matchesQuery = !query || `${job.name}${job.id}${job.department}`.toLowerCase().includes(query.toLowerCase());
-    const matchesStatus = status === "全部" || job.status === status;
-    const matchesDepartment = department === "全部部门" || job.department === department;
-    const matchesOwner = owner === "全部负责人" || job.owner === owner;
-    return matchesQuery && matchesStatus && matchesDepartment && matchesOwner;
-  }), [department, owner, query, records, status]);
+  const total = Object.values(state.statusCounts).reduce((sum, count) => sum + count, 0);
+  const updateFilters = (changes) => void onLoad({ ...state.filters, ...changes });
+  const clearFilters = () => {
+    setQuery("");
+    void onLoad({ q: "", status: "全部", departmentId: "", ownerId: "" });
+  };
 
   return (
     <div className="job-page job-list-page">
-      <div className="job-page-heading">
-        <div><h2>职位管理</h2><p>统一维护招聘职位、负责人和候选人推进情况。</p></div>
-      </div>
-
+      <div className="job-page-heading"><div><h2>职位管理</h2><p>统一维护招聘职位、负责人和候选人推进情况。</p></div></div>
       <div className="job-status-tabs" role="tablist" aria-label="职位状态">
-        {["全部", "招聘中", "草稿", "已暂停"].map((item) => (
-          <button key={item} role="tab" aria-selected={status === item} type="button" className={status === item ? "active" : ""} onClick={() => setStatus(item)}>{item}<span>{item === "全部" ? records.length : records.filter((job) => job.status === item).length}</span></button>
-        ))}
+        {JOB_STATUSES.map((item) => <button key={item} role="tab" aria-selected={state.filters.status === item} type="button" className={state.filters.status === item ? "active" : ""} onClick={() => updateFilters({ status: item })}>{item}<span>{item === "全部" ? total : state.statusCounts[item] || 0}</span></button>)}
       </div>
 
       <section className="job-list-panel">
         <div className="job-filters">
-          <label className="search-control"><Search size={17} /><input aria-label="搜索职位" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索职位名称或编号" /></label>
-          <label className="select-control"><BriefcaseBusiness size={16} /><select aria-label="部门筛选" value={department} onChange={(event) => setDepartment(event.target.value)}><option>全部部门</option><option>技术部</option><option>产品部</option><option>人力资源部</option></select><ChevronDown size={14} /></label>
-          <label className="select-control"><Users size={16} /><select aria-label="负责人筛选" value={owner} onChange={(event) => setOwner(event.target.value)}><option>全部负责人</option><option>张小北</option><option>陈雨</option><option>刘思远</option><option>王敏</option></select><ChevronDown size={14} /></label>
-          <button className="button secondary compact" type="button" onClick={() => { setQuery(""); setStatus("全部"); setDepartment("全部部门"); setOwner("全部负责人"); }}><X size={15} />清空</button>
+          <label className="search-control"><Search size={17} /><input aria-label="搜索职位" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索职位名称" /></label>
+          <label className="select-control"><BriefcaseBusiness size={16} /><select aria-label="部门筛选" value={state.filters.departmentId} onChange={(event) => updateFilters({ departmentId: event.target.value })}><option value="">全部部门</option>{state.departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label>
+          <label className="select-control"><Users size={16} /><select aria-label="负责人筛选" value={state.filters.ownerId} onChange={(event) => updateFilters({ ownerId: event.target.value })}><option value="">全部负责人</option>{state.owners.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label>
+          <button className="button secondary compact" type="button" onClick={clearFilters}><X size={15} />清空</button>
         </div>
 
-        <div className="job-table" role="table" aria-label="职位列表">
-          <div className="job-table-head" role="row">
-            <span>职位</span><span>状态</span><span>负责人</span><span>招聘进度</span><span>候选人</span><span>更新时间</span><span>操作</span>
-          </div>
-          {filtered.map((job) => (
+        {state.status === "error" && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{state.error}</span><button type="button" onClick={() => onLoad(state.filters)}>重试</button></div>}
+        {state.status === "loading" && state.records.length > 0 && <div className="job-request-state" role="status">正在更新职位列表…</div>}
+
+        <div className="job-table" role="table" aria-label="职位列表" aria-busy={state.status === "loading"}>
+          <div className="job-table-head" role="row"><span>职位</span><span>状态</span><span>负责人</span><span>招聘进度</span><span>候选人</span><span>更新时间</span><span>操作</span></div>
+          {state.records.map((job) => (
             <button className="job-table-row" role="row" type="button" key={job.id} onClick={() => onOpen(job)}>
-              <span className="job-title-cell"><strong>{job.name}</strong><small>{job.id} · {job.department} · {job.location}</small></span>
+              <span className="job-title-cell"><strong>{job.name || "未命名职位"}</strong><small>{job.department || "未分配部门"}</small></span>
               <span><StatusTag>{job.status}</StatusTag></span>
-              <span className="owner-cell"><span>{job.owner.slice(0, 1)}</span>{job.owner}</span>
-              <span className="progress-cell"><strong>{job.headcount} 人</strong><small>优先级：{job.priority}</small></span>
+              <span className="owner-cell"><span>{(job.owner || "未").slice(0, 1)}</span>{job.owner || "未分配"}</span>
+              <span className="progress-cell"><strong>{job.headcount} 人</strong><small>优先级：{job.priority || "未设置"}</small></span>
               <span className="candidate-count"><strong>{job.candidates}</strong><small>待复核 {job.review}</small></span>
               <span className="updated-cell">{job.updated}</span>
-              <span className="row-actions"><span title="查看职位"><ChevronRight size={18} /></span><span title="更多操作"><MoreHorizontal size={18} /></span></span>
+              <span className="row-actions"><span title="查看职位"><ChevronRight size={18} /></span></span>
             </button>
           ))}
-          {filtered.length === 0 && <div className="job-empty"><ListFilter size={25} /><strong>没有符合条件的职位</strong><span>调整搜索词或清空筛选条件后重试。</span></div>}
+          {state.status === "loading" && state.records.length === 0 && <div className="job-empty" role="status"><strong>正在加载职位…</strong></div>}
+          {state.status === "ready" && state.records.length === 0 && <div className="job-empty"><ListFilter size={25} /><strong>没有符合条件的职位</strong><span>调整搜索词或清空筛选条件后重试。</span></div>}
         </div>
+        {state.nextCursor && <div className="job-load-more"><button className="button secondary" type="button" disabled={state.status === "loading"} onClick={() => onLoad(state.filters, { append: true, cursor: state.nextCursor })}>{state.status === "loading" ? "正在加载…" : "加载更多"}</button></div>}
       </section>
     </div>
   );
 }
 
-function JobForm({ initialJob, onBack, onSaveDraft, onPublish }) {
+function JobDialog({ onClose, onDiscard, onSave, saving }) {
+  return <div className="job-confirm-backdrop" role="presentation" onMouseDown={onClose}><section className="job-confirm" role="dialog" aria-modal="true" aria-label="保存未完成的职位" onMouseDown={(event) => event.stopPropagation()}><header><CircleAlert size={21} /><h3>职位尚未保存</h3></header><p>你填写的内容还没有保存。可以先保存为草稿，或者放弃本次修改。</p><footer><button className="button secondary" type="button" onClick={onClose} disabled={saving}>继续编辑</button><button className="button danger-text" type="button" onClick={onDiscard} disabled={saving}>放弃修改</button><button className="button primary" type="button" onClick={onSave} disabled={saving}>保存草稿</button></footer></section></div>;
+}
+
+function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   const [values, setValues] = useState({
     name: initialJob?.name || "",
-    department: initialJob?.department || "技术部",
-    location: initialJob?.location || "北京",
+    departmentId: initialJob?.departmentId || "",
+    location: initialJob?.location || "",
     headcount: initialJob?.headcount || 1,
-    owner: initialJob?.owner || "张小北",
+    ownerId: initialJob?.ownerId || "",
     priority: initialJob?.priority || "中",
     jd: initialJob?.jd || "",
     mustHave: initialJob?.mustHave?.join("、") || "",
     niceToHave: initialJob?.niceToHave?.join("、") || "",
-    process: initialJob?.process || "技术岗位标准流程",
-    llmEnabled: true,
+    process: initialJob?.process || "",
+    llmEnabled: initialJob?.llmEnabled === true,
   });
   const [errors, setErrors] = useState({});
   const [dirty, setDirty] = useState(false);
-  const [extractState, setExtractState] = useState("idle");
+  const [saving, setSaving] = useState(false);
+  const [submitError, setSubmitError] = useState("");
   const [confirmExit, setConfirmExit] = useState(false);
 
   function change(field, value) {
     setValues((current) => ({ ...current, [field]: value }));
     setDirty(true);
+    setSubmitError("");
     setErrors((current) => ({ ...current, [field]: "" }));
   }
 
-  function validate() {
+  function validate(publish) {
     const next = {};
     if (!values.name.trim()) next.name = "请输入职位名称";
-    if (!values.jd.trim()) next.jd = "请输入公开职位描述";
+    if (publish && !values.jd.trim()) next.jd = "请输入公开职位描述";
     setErrors(next);
     return Object.keys(next).length === 0;
   }
 
-  function leave() {
-    if (dirty) setConfirmExit(true);
-    else onBack();
-  }
-
-  function extract() {
-    if (!values.jd.trim()) {
-      setErrors((current) => ({ ...current, jd: "请先填写 JD，再提取筛选条件" }));
-      return;
+  async function submit(publish) {
+    if (saving || !validate(publish)) return;
+    setSaving(true);
+    setSubmitError("");
+    try {
+      await onSubmit(values, publish);
+      setDirty(false);
+    } catch (error) {
+      setSubmitError(error?.status === 409 ? "职位已被其他人更新。请保留当前内容，刷新职位后核对并重试。" : "职位保存失败，请检查网络后重试。当前表单内容已保留。");
+    } finally {
+      setSaving(false);
     }
-    setExtractState("loading");
-    window.setTimeout(() => {
-      setExtractState("done");
-      const dataRole = values.jd.includes("数据");
-      if (!values.mustHave) change("mustHave", dataRole ? "SQL、Python、数据建模、ETL" : "Python、机器学习、深度学习、LLM");
-      if (!values.niceToHave) change("niceToHave", dataRole ? "Flink、Spark、数据治理、云平台" : "RAG、Agent、Docker、Kubernetes");
-    }, 800);
   }
 
-  function submit(publish) {
-    if (publish && !validate()) return;
-    const record = {
-      ...initialJob,
-      id: initialJob?.id || `JOB-${Date.now().toString().slice(-5)}`,
-      ...values,
-      status: publish ? "招聘中" : "草稿",
-      candidates: initialJob?.candidates || 0,
-      review: initialJob?.review || 0,
-      interview: initialJob?.interview || 0,
-      decision: initialJob?.decision || 0,
-      updated: "刚刚",
-      mustHave: values.mustHave.split(/[、,，]/).map((item) => item.trim()).filter(Boolean),
-      niceToHave: values.niceToHave.split(/[、,，]/).map((item) => item.trim()).filter(Boolean),
-    };
-    setDirty(false);
-    if (publish) onPublish(record);
-    else onSaveDraft(record);
-  }
-
-  const completion = [values.name, values.department, values.jd, values.mustHave, values.process].filter(Boolean).length;
-
+  const completion = [values.name, values.departmentId, values.jd, values.mustHave, values.process].filter(Boolean).length;
   return (
     <div className="job-page job-form-page">
-      <button className="back-link" type="button" onClick={leave}><ArrowLeft size={17} />返回职位列表</button>
-      <div className="job-page-heading form-heading">
-        <div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，发布后即可导入并筛选简历。</p></div>
-        <div><button className="button secondary" type="button" onClick={() => submit(false)}>保存草稿</button><button className="button primary" type="button" onClick={() => submit(true)}>{initialJob ? "保存修改" : "发布职位"}</button></div>
-      </div>
-
-      <div className="job-form-layout">
-        <div className="job-form-sections">
-          <section className="form-section">
-            <header><span>1</span><div><h3>基本信息</h3><p>设置职位归属、招聘目标和负责人。</p></div></header>
-            <div className="job-fields two-columns">
-              <label>职位名称<input value={values.name} onChange={(event) => change("name", event.target.value)} placeholder="例如：AI 工程师" />{errors.name && <small className="field-error">{errors.name}</small>}</label>
-              <label>所属部门<select value={values.department} onChange={(event) => change("department", event.target.value)}><option>技术部</option><option>产品部</option><option>人力资源部</option></select></label>
-              <label>工作地点<select value={values.location} onChange={(event) => change("location", event.target.value)}><option>北京</option><option>上海</option><option>深圳</option><option>远程</option></select></label>
+      <button className="back-link" type="button" onClick={() => dirty ? setConfirmExit(true) : onBack()} disabled={saving}><ArrowLeft size={17} />返回职位列表</button>
+      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div><button className="button secondary" type="button" onClick={() => submit(false)} disabled={saving}>{saving ? "正在保存…" : "保存草稿"}</button><button className="button primary" type="button" onClick={() => submit(true)} disabled={saving}>{saving ? "正在保存…" : initialJob ? "保存并发布" : "发布职位"}</button></div></div>
+      {submitError && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span></div>}
+      <fieldset className="job-form-fieldset" disabled={saving}>
+        <div className="job-form-layout">
+          <div className="job-form-sections">
+            <section className="form-section"><header><span>1</span><div><h3>基本信息</h3><p>设置职位归属、招聘目标和负责人。</p></div></header><div className="job-fields two-columns">
+              <label>职位名称<input value={values.name} onChange={(event) => change("name", event.target.value)} placeholder="例如：平台工程师" />{errors.name && <small className="field-error">{errors.name}</small>}</label>
+              <label>所属部门<select value={values.departmentId} onChange={(event) => change("departmentId", event.target.value)}><option value="">未分配部门</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+              <label>工作地点<input value={values.location} onChange={(event) => change("location", event.target.value)} placeholder="例如：上海或远程" /></label>
               <label>招聘人数<input type="number" min="1" max="99" value={values.headcount} onChange={(event) => change("headcount", Number(event.target.value))} /></label>
-              <label>负责人<select value={values.owner} onChange={(event) => change("owner", event.target.value)}><option>张小北</option><option>陈雨</option><option>刘思远</option><option>王敏</option></select></label>
-              <label>优先级<div className="segmented-control">{["高", "中", "低"].map((item) => <button key={item} type="button" className={values.priority === item ? "active" : ""} onClick={() => change("priority", item)}>{item}</button>)}</div></label>
-            </div>
-          </section>
-
-          <section className="form-section">
-            <header><span>2</span><div><h3>职位描述与筛选标准</h3><p>JD 面向候选人展示，筛选标准仅供招聘团队使用。</p></div></header>
-            <div className="job-fields">
+              <label>负责人<select value={values.ownerId} onChange={(event) => change("ownerId", event.target.value)}><option value="">未分配负责人</option>{owners.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+              <label>优先级<span className="segmented-control" role="group" aria-label="职位优先级">{["高", "中", "低"].map((item) => <button key={item} type="button" aria-pressed={values.priority === item} className={values.priority === item ? "active" : ""} onClick={() => change("priority", item)}>{item}</button>)}</span></label>
+            </div></section>
+            <section className="form-section"><header><span>2</span><div><h3>职位描述与筛选标准</h3><p>JD 面向候选人展示，筛选标准仅供招聘团队使用。</p></div></header><div className="job-fields">
               <label>公开 JD<textarea rows="8" value={values.jd} onChange={(event) => change("jd", event.target.value)} placeholder="粘贴或输入完整职位描述" />{errors.jd && <small className="field-error">{errors.jd}</small>}</label>
-              <div className="extract-row"><button className="button secondary" type="button" onClick={extract} disabled={extractState === "loading"}><Sparkles size={16} />{extractState === "loading" ? "正在提取..." : "AI 提取筛选条件"}</button>{extractState === "done" && <span className="extract-success"><Check size={15} />已提取，可人工修改</span>}</div>
-              <label>必须条件<textarea rows="3" value={values.mustHave} onChange={(event) => change("mustHave", event.target.value)} placeholder="用顿号分隔，例如：Python、机器学习" /></label>
-              <label>加分项<textarea rows="3" value={values.niceToHave} onChange={(event) => change("niceToHave", event.target.value)} placeholder="用顿号分隔，例如：RAG、Agent" /></label>
-            </div>
-          </section>
-
-          <section className="form-section">
-            <header><span>3</span><div><h3>招聘流程与 AI</h3><p>选择候选人推进流程，并确认是否允许模型辅助评估。</p></div></header>
-            <div className="job-fields">
-              <label>流程模板<select value={values.process} onChange={(event) => change("process", event.target.value)}><option>技术岗位标准流程</option><option>产品岗位标准流程</option><option>职能岗位标准流程</option></select></label>
-              <label className="toggle-row"><span><Bot size={18} /><span><strong>启用 LLM 简历评估</strong><small>继承组织模型设置，仅向服务商发送 JD 与简历正文。</small></span></span><input type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
-            </div>
-          </section>
+              <label>必须条件<textarea rows="3" value={values.mustHave} onChange={(event) => change("mustHave", event.target.value)} placeholder="用顿号分隔" /></label>
+              <label>加分项<textarea rows="3" value={values.niceToHave} onChange={(event) => change("niceToHave", event.target.value)} placeholder="用顿号分隔" /></label>
+            </div></section>
+            <section className="form-section"><header><span>3</span><div><h3>招聘流程与 AI</h3><p>记录服务端流程模板，并确认是否允许模型辅助评估。</p></div></header><div className="job-fields">
+              <label>流程模板<input value={values.process} onChange={(event) => change("process", event.target.value)} placeholder="例如：技术岗位标准流程" /></label>
+              <label className="toggle-row"><span><Bot size={18} /><span><strong>启用 LLM 简历评估</strong><small>使用组织已配置的模型服务。</small></span></span><input aria-label="启用 LLM 简历评估" type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
+            </div></section>
+          </div>
+          <aside className="form-summary"><h3>发布检查</h3><div className="completion-ring"><strong>{completion}/5</strong><span>关键项已完成</span></div>{[["职位名称", values.name], ["所属部门", values.departmentId], ["公开 JD", values.jd], ["筛选条件", values.mustHave], ["招聘流程", values.process]].map(([label, value]) => <div className={value ? "check-row done" : "check-row"} key={label}>{value ? <Check size={15} /> : <Clock3 size={15} />}<span>{label}</span></div>)}</aside>
         </div>
-
-        <aside className="form-summary">
-          <h3>发布检查</h3>
-          <div className="completion-ring"><strong>{completion}/5</strong><span>关键项已完成</span></div>
-          {[['职位名称', values.name], ['所属部门', values.department], ['公开 JD', values.jd], ['筛选条件', values.mustHave], ['招聘流程', values.process]].map(([label, value]) => <div className={value ? "check-row done" : "check-row"} key={label}>{value ? <Check size={15} /> : <Clock3 size={15} />}<span>{label}</span></div>)}
-          <p>职位发布后仍可编辑，已进入流程的候选人不会被自动重置。</p>
-        </aside>
-      </div>
-
-      {confirmExit && <JobDialog onClose={() => setConfirmExit(false)} onDiscard={onBack} onSave={() => submit(false)} />}
+      </fieldset>
+      {confirmExit && <JobDialog onClose={() => setConfirmExit(false)} onDiscard={onBack} onSave={() => submit(false)} saving={saving} />}
     </div>
   );
 }
 
-function JobDetail({ job, onBack, onEdit, onImport, onNotify, onOpenCandidate, onStatusChange }) {
+function JobDetail({ state, lifecycleState, onBack, onEdit, onImport, onOpenCandidate, onReload, onLoadCandidates, onTransition }) {
   const [tab, setTab] = useState("候选人");
-  const paused = job.status === "已暂停";
-  const visibleStages = job.candidates > 0 ? stageCounts : stageCounts.map(([label]) => [label, 0]);
-  const visibleCandidates = candidatesFor(job);
+  const [query, setQuery] = useState(state.candidates?.filters.q || "");
+  const firstQueryRender = useRef(true);
+  const job = state.job;
+  const candidates = state.candidates;
+  const candidateFilters = candidates?.filters || DEFAULT_CANDIDATE_FILTERS;
 
+  useEffect(() => {
+    if (!candidates) return undefined;
+    if (firstQueryRender.current) { firstQueryRender.current = false; return undefined; }
+    const timer = window.setTimeout(() => {
+      if (query !== candidateFilters.q) void onLoadCandidates({ ...candidateFilters, q: query });
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [candidateFilters, candidates, onLoadCandidates, query]);
+
+  if (state.status === "loading") return <div className="job-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回职位列表</button><div className="job-detail-state" role="status">正在加载职位详情…</div></div>;
+  if (state.status === "not-found") return <div className="job-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回职位列表</button><div className="job-detail-state"><CircleAlert size={24} /><strong>无法查看该职位</strong><span>职位不存在，或你没有查看权限。</span><button className="button secondary" type="button" onClick={onReload}>重试</button></div></div>;
+  if (state.status === "error") return <div className="job-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回职位列表</button><div className="job-detail-state" role="alert"><CircleAlert size={24} /><strong>职位详情加载失败</strong><span>请检查网络连接后重试。</span><button className="button secondary" type="button" onClick={onReload}>重试</button></div></div>;
+  if (!job || !candidates) return null;
+
+  const lifecycleActions = LIFECYCLE_ACTIONS[job.status] || [];
   return (
     <div className="job-page job-detail-page">
       <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回职位列表</button>
-      <section className="job-detail-hero">
-        <div className="job-detail-title"><span className="job-icon"><BriefcaseBusiness size={22} /></span><div><div><h2>{job.name}</h2><StatusTag>{job.status}</StatusTag></div><p>{job.id} · {job.department} · {job.location} · 负责人 {job.owner}</p></div></div>
-        <div className="job-detail-actions">
-          <button className="button secondary" type="button" onClick={onEdit}><Pencil size={16} />编辑职位</button>
-          <button className="button secondary" type="button" onClick={() => { onStatusChange(paused ? "招聘中" : "已暂停"); onNotify(paused ? "职位已恢复招聘" : "职位已暂停招聘"); }}>{paused ? <CirclePlay size={16} /> : <CirclePause size={16} />}{paused ? "恢复招聘" : "暂停招聘"}</button>
-          <button className="button primary" type="button" onClick={onImport}><Import size={16} />导入简历</button>
-        </div>
-      </section>
-
-      <div className="job-metrics">
-        {[['候选人总数', job.candidates, Users], ['待复核', job.review, FileText], ['面试中', job.interview, CalendarDays], ['待决策', job.decision, Clock3]].map(([label, value, Icon]) => <div key={label}><span><Icon size={18} /></span><div><strong>{value}</strong><small>{label}</small></div></div>)}
-      </div>
-
+      <section className="job-detail-hero"><div className="job-detail-title"><span className="job-icon"><BriefcaseBusiness size={22} /></span><div><div><h2>{job.name}</h2><StatusTag>{job.status}</StatusTag></div><p>{job.department || "未分配部门"} · {job.location || "地点未填写"} · 负责人 {job.owner || "未分配"}</p></div></div><div className="job-detail-actions"><button className="button secondary" type="button" onClick={onEdit} disabled={lifecycleState.status === "loading"}><Pencil size={16} />编辑职位</button>{lifecycleActions.map(([target, label, Icon]) => <button className="button secondary" type="button" key={target} onClick={() => onTransition(target)} disabled={lifecycleState.status === "loading"}><Icon size={16} />{label}</button>)}{job.status === "招聘中" && <button className="button primary" type="button" onClick={onImport}><Import size={16} />导入简历</button>}</div></section>
+      {lifecycleState.error && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{lifecycleState.error}</span>{lifecycleState.conflict && <button type="button" onClick={onReload}>刷新职位</button>}</div>}
+      <div className="job-metrics">{[["候选人总数", job.candidates, Users], ["待复核", job.review, FileText], ["面试中", job.interview, CalendarDays], ["待决策", job.decision, Clock3]].map(([label, value, Icon]) => <div key={label}><span><Icon size={18} /></span><div><strong>{value}</strong><small>{label}</small></div></div>)}</div>
       <section className="job-detail-panel">
-        <div className="detail-tabs" role="tablist">
-          {["候选人", "职位信息", "协作动态", "职位设置"].map((item) => <button key={item} role="tab" aria-selected={tab === item} type="button" className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>)}
-        </div>
-
+        <div className="detail-tabs" role="tablist">{["候选人", "职位信息"].map((item) => <button key={item} role="tab" aria-selected={tab === item} type="button" className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
         {tab === "候选人" && <div className="detail-tab-content">
-          <div className="funnel-strip">{visibleStages.map(([label, count], index) => <button type="button" key={label} onClick={() => onNotify(`已筛选${label}阶段`)}><span>{label}</span><strong>{count}</strong>{index < visibleStages.length - 1 && <ChevronRight size={15} />}</button>)}</div>
-          <div className="candidate-toolbar"><label className="search-control"><Search size={16} /><input placeholder="搜索当前职位候选人" /></label><button className="button secondary compact" type="button" onClick={() => onNotify("已打开候选人筛选") }><Filter size={15} />筛选</button><button className="button secondary compact" type="button" onClick={() => onNotify("已进入批量操作模式") }><Check size={15} />批量操作</button></div>
-          <div className="detail-candidate-table">
-            <div className="detail-candidate-head"><span>候选人</span><span>当前阶段</span><span>匹配分</span><span>最近进展</span><span>负责人</span><span /></div>
-            {job.candidates > 0 ? visibleCandidates.map(([name, role, stage, score, updated, owner]) => <button type="button" key={name} onClick={() => onOpenCandidate({ name, role, company: role.split(" · ")[1] || "", age: updated })}><span className="candidate-identity"><span>{name.slice(-1)}</span><span><strong>{name}</strong><small>{role}</small></span></span><span><span className="stage-pill">{stage}</span></span><span className="score-cell">{score}</span><span>{updated}</span><span>{owner}</span><ChevronRight size={16} /></button>) : <div className="detail-empty"><Users size={24} /><strong>尚无候选人</strong><span>导入简历后，候选人会出现在对应招聘阶段。</span><button className="button primary" type="button" onClick={onImport}><Import size={15} />导入简历</button></div>}
-          </div>
+          <div className="funnel-strip">{FUNNEL_STAGES.map(([label, key], index) => <button type="button" key={key} aria-pressed={candidates.filters.stage === label} onClick={() => onLoadCandidates({ ...candidates.filters, stage: label })}><span>{label}</span><strong>{job.funnel?.[key] || 0}</strong>{index < FUNNEL_STAGES.length - 1 && <ChevronRight size={15} />}</button>)}</div>
+          <div className="candidate-toolbar"><label className="search-control"><Search size={16} /><input aria-label="搜索当前职位候选人" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前职位候选人" /></label><label className="select-control"><select aria-label="候选人阶段" value={candidates.filters.stage} onChange={(event) => onLoadCandidates({ ...candidates.filters, stage: event.target.value })}>{CANDIDATE_STAGES.map((stage) => <option key={stage}>{stage}</option>)}</select><ChevronDown size={14} /></label></div>
+          {candidates.status === "error" && <div className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{candidates.error}</span><button type="button" onClick={() => onLoadCandidates(candidates.filters)}>重试</button></div>}
+          {candidates.status === "loading" && candidates.records.length > 0 && <div className="job-request-state" role="status">正在更新候选人…</div>}
+          <div className="detail-candidate-table" aria-busy={candidates.status === "loading"}><div className="detail-candidate-head"><span>候选人</span><span>当前阶段</span><span>匹配分</span><span>最近进展</span><span>负责人</span><span /></div>{candidates.records.map((candidate) => <button type="button" key={candidate.applicationId || candidate.candidateId} onClick={() => onOpenCandidate(candidate)}><span className="candidate-identity"><span>{candidate.name.slice(-1)}</span><span><strong>{candidate.name}</strong><small>{candidate.role}</small></span></span><span><span className="stage-pill">{candidate.stage}</span></span><span className="score-cell">{candidate.score}</span><span>{candidate.lastActivity}</span><span>{candidate.owner}</span><ChevronRight size={16} /></button>)}{candidates.status === "loading" && candidates.records.length === 0 && <div className="detail-empty" role="status"><strong>正在加载候选人…</strong></div>}{candidates.status === "ready" && candidates.records.length === 0 && <div className="detail-empty"><Users size={24} /><strong>当前筛选下没有候选人</strong><span>可调整搜索或阶段筛选。</span></div>}</div>
+          {candidates.nextCursor && <div className="job-load-more"><button className="button secondary" type="button" disabled={candidates.status === "loading"} onClick={() => onLoadCandidates(candidates.filters, { append: true, cursor: candidates.nextCursor })}>{candidates.status === "loading" ? "正在加载…" : "加载更多候选人"}</button></div>}
         </div>}
-
-        {tab === "职位信息" && <div className="detail-tab-content job-info-grid">
-          <section><h3>公开职位描述</h3><p>{job.jd}</p></section>
-          <section><h3>必须条件</h3><div className="skill-tags">{job.mustHave.map((item) => <span key={item}>{item}</span>)}</div><h3>加分项</h3><div className="skill-tags muted">{job.niceToHave.map((item) => <span key={item}>{item}</span>)}</div></section>
-          <section><h3>招聘配置</h3><dl><div><dt>招聘人数</dt><dd>{job.headcount} 人</dd></div><div><dt>优先级</dt><dd>{job.priority}</dd></div><div><dt>流程模板</dt><dd>{job.process}</dd></div><div><dt>LLM 评估</dt><dd>已启用</dd></div></dl></section>
-        </div>}
-
-        {tab === "协作动态" && <div className="detail-tab-content activity-list">
-          {[['今天 11:05', '张小北', '将候 E4 推进到二面'], ['今天 10:28', '系统', '完成 5 份简历解析与 AI 初筛'], ['昨天 16:30', '陈雨', '添加候 C1 的沟通备注'], ['07-10 14:12', '张小北', '更新职位必须条件']].map(([time, actor, action]) => <div key={`${time}-${action}`}><span className="activity-dot" /><div><strong>{actor}</strong><p>{action}</p><small>{time}</small></div></div>)}
-        </div>}
-
-        {tab === "职位设置" && <div className="detail-tab-content settings-summary">
-          <section><div><Settings size={19} /><span><strong>职位可见范围</strong><small>招聘团队和技术部负责人可见</small></span></div><button type="button" onClick={onEdit}>编辑</button></section>
-          <section><div><Bot size={19} /><span><strong>AI 简历评估</strong><small>使用组织默认模型，规则评分失败时仍保留人工复核</small></span></div><span className="enabled-label">已启用</span></section>
-          <section><div><FileText size={19} /><span><strong>招聘流程</strong><small>{job.process}</small></span></div><button type="button" onClick={onEdit}>更换模板</button></section>
-        </div>}
+        {tab === "职位信息" && <div className="detail-tab-content job-info-grid"><section><h3>公开职位描述</h3><p>{job.jd || "未填写职位描述"}</p></section><section><h3>必须条件</h3><div className="skill-tags">{job.mustHave.length ? job.mustHave.map((item) => <span key={item}>{item}</span>) : <span>未设置</span>}</div><h3>加分项</h3><div className="skill-tags muted">{job.niceToHave.length ? job.niceToHave.map((item) => <span key={item}>{item}</span>) : <span>未设置</span>}</div></section><section><h3>招聘配置</h3><dl><div><dt>招聘人数</dt><dd>{job.headcount} 人</dd></div><div><dt>优先级</dt><dd>{job.priority || "未设置"}</dd></div><div><dt>流程模板</dt><dd>{job.process || "未设置"}</dd></div><div><dt>LLM 评估</dt><dd>{job.llmEnabled ? "已启用" : "未启用"}</dd></div></dl></section></div>}
       </section>
     </div>
   );
 }
 
-export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, records, setRecords, onNotify, onImport, onOpenCandidate, onCreateJob }) {
-  function upsert(record) {
-    setRecords((current) => current.some((item) => item.id === record.id) ? current.map((item) => item.id === record.id ? record : item) : [record, ...current]);
-    setSelectedJob(record);
-    onCreateJob(record);
+export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onJobMutation, onNotify, onImport, onOpenCandidate }) {
+  const [detailState, setDetailState] = useState({ status: "idle", job: null, candidates: null });
+  const [lifecycleState, setLifecycleState] = useState({ status: "idle", error: "", conflict: false });
+  const detailRequestRef = useRef(null);
+  const candidateRequestRef = useRef(null);
+  const detailSequenceRef = useRef(0);
+  const candidateSequenceRef = useRef(0);
+
+  const loadDetail = useCallback(async (summary) => {
+    detailRequestRef.current?.abort();
+    candidateRequestRef.current?.abort();
+    const controller = new AbortController();
+    const requestId = ++detailSequenceRef.current;
+    detailRequestRef.current = controller;
+    setDetailState({ status: "loading", job: null, candidates: null });
+    setLifecycleState({ status: "idle", error: "", conflict: false });
+    try {
+      const [job, candidatePage] = await Promise.all([
+        jobController.loadDefinition(summary.id, { signal: controller.signal }),
+        candidateController.listCandidates({ jobId: summary.id, limit: 20 }, { signal: controller.signal }),
+      ]);
+      if (detailRequestRef.current !== controller || requestId !== detailSequenceRef.current) return;
+      setSelectedJob(job);
+      setDetailState({ status: "ready", job, candidates: { status: "ready", records: candidatePage.records, nextCursor: candidatePage.nextCursor, filters: { q: "", stage: "全部阶段" }, error: "" } });
+    } catch (error) {
+      if (error?.name === "AbortError" || detailRequestRef.current !== controller) return;
+      setDetailState({ status: error?.status === 403 || error?.status === 404 ? "not-found" : "error", job: null, candidates: null });
+    } finally {
+      if (detailRequestRef.current === controller) detailRequestRef.current = null;
+    }
+  }, [candidateController, jobController, setSelectedJob]);
+
+  useEffect(() => {
+    if (mode === "detail" && selectedJob?.id) void loadDetail(selectedJob);
+  }, [loadDetail, mode, selectedJob?.id]);
+
+  useEffect(() => () => {
+    detailRequestRef.current?.abort();
+    candidateRequestRef.current?.abort();
+  }, []);
+
+  const loadCandidates = useCallback(async (filters, { append = false, cursor = null } = {}) => {
+    const jobId = detailState.job?.id;
+    if (!jobId) return;
+    candidateRequestRef.current?.abort();
+    const controller = new AbortController();
+    const requestId = ++candidateSequenceRef.current;
+    candidateRequestRef.current = controller;
+    setDetailState((current) => ({ ...current, candidates: { ...current.candidates, status: "loading", filters, error: "" } }));
+    try {
+      const page = await candidateController.listCandidates({ jobId, q: filters.q, stage: filters.stage, cursor: cursor || undefined, limit: 20 }, { signal: controller.signal });
+      if (candidateRequestRef.current !== controller || requestId !== candidateSequenceRef.current) return;
+      setDetailState((current) => ({ ...current, candidates: { ...current.candidates, status: "ready", records: append ? mergeCandidateRecords(current.candidates.records, page.records) : page.records, nextCursor: page.nextCursor, filters, error: "" } }));
+    } catch (error) {
+      if (error?.name === "AbortError" || candidateRequestRef.current !== controller) return;
+      setDetailState((current) => ({ ...current, candidates: { ...current.candidates, status: "error", error: "候选人加载失败，请重试。" } }));
+    } finally {
+      if (candidateRequestRef.current === controller) candidateRequestRef.current = null;
+    }
+  }, [candidateController, detailState.job?.id]);
+
+  async function saveDefinition(values, publish) {
+    const existing = selectedJob?.formMode === "edit" ? selectedJob : null;
+    const saved = await jobController.saveDefinition(values, { job: existing, publish });
+    onJobMutation(saved);
+    setSelectedJob(saved);
+    onNotify(publish ? (existing ? "职位修改已保存" : "职位已发布") : "职位已保存为草稿");
+    if (publish) {
+      setDetailState({ status: "ready", job: saved, candidates: detailState.candidates || { status: "ready", records: [], nextCursor: null, filters: { q: "", stage: "全部阶段" }, error: "" } });
+      setMode("detail");
+    } else {
+      setMode("list");
+    }
   }
 
-  if (mode === "form") {
-    return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} onBack={() => { setSelectedJob(null); setMode("list"); }} onSaveDraft={(record) => { upsert(record); onNotify("职位已保存为草稿"); setMode("list"); }} onPublish={(record) => { upsert(record); onNotify(selectedJob?.formMode === "edit" ? "职位修改已保存" : "职位已发布"); setMode("detail"); }} />;
+  async function transition(target) {
+    if (lifecycleState.status === "loading" || !detailState.job) return;
+    setLifecycleState({ status: "loading", error: "", conflict: false });
+    try {
+      const summary = await jobController.transition(detailState.job, target);
+      const next = { ...detailState.job, ...summary };
+      setDetailState((current) => ({ ...current, job: next }));
+      setSelectedJob(next);
+      onJobMutation(next);
+      setLifecycleState({ status: "ready", error: "", conflict: false });
+      onNotify(`职位状态已更新为${next.status}`);
+    } catch (error) {
+      const conflict = error?.status === 409;
+      setLifecycleState({ status: "error", conflict, error: conflict ? "职位已被其他人更新，请刷新后重试。" : "职位状态更新失败，请重试。" });
+    }
   }
 
-  if (mode === "detail" && selectedJob) {
-    return <JobDetail job={selectedJob} onBack={() => { setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onNotify={onNotify} onOpenCandidate={onOpenCandidate} onStatusChange={(status) => { const next = { ...selectedJob, status, formMode: undefined }; setSelectedJob(next); setRecords((current) => current.map((item) => item.id === next.id ? next : item)); }} />;
-  }
-
-  return <JobList records={records} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
+  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={listState.departments} owners={listState.owners} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} />;
+  if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onLoadCandidates={loadCandidates} onTransition={transition} />;
+  return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
 }
