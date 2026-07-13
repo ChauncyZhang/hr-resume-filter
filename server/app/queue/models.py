@@ -34,3 +34,10 @@ class OutboxEvent(Base):
     status: Mapped[str] = mapped_column(String(20), default="queued"); available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); attempts: Mapped[int] = mapped_column(Integer, default=0); max_attempts: Mapped[int] = mapped_column(Integer, default=5)
     lease_owner: Mapped[str | None] = mapped_column(String(200)); lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True)); safe_error_code: Mapped[str | None] = mapped_column(String(100)); created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True)); updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     __table_args__ = (ForeignKeyConstraint(["organization_id"], ["organizations.id"]), CheckConstraint("status in ('queued','running','published','failed')", name="ck_outbox_events_status"), CheckConstraint("attempts >= 0 AND max_attempts > 0 AND attempts <= max_attempts", name="ck_outbox_events_attempts"), Index("ix_outbox_events_claim", "organization_id", "available_at", "created_at", postgresql_where=text("status = 'queued'")), Index("ix_outbox_events_stale_lease", "organization_id", "lease_expires_at", postgresql_where=text("status = 'running'")))
+
+class QueueClaimCursor(Base):
+    __tablename__ = "queue_claim_cursors"
+    kind: Mapped[str] = mapped_column(String(20), primary_key=True)
+    last_organization_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (CheckConstraint("kind in ('job','outbox')", name="ck_queue_claim_cursors_kind"),)

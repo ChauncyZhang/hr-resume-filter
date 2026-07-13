@@ -10,6 +10,7 @@ from server.app.queue.service import normalize_safe_code, retry_delay
 
 class LeaseRejected(RuntimeError): pass
 SCREENING_TERMINAL_TYPES={"screening.parse_item","screening.score_item","screening.llm_score_item"}
+LEASE_REAP_BATCH_SIZE = 100
 
 class QueueRepository:
     def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES, terminal_callbacks: Mapping[str,Callable] | None = None) -> None:
@@ -34,8 +35,16 @@ class QueueRepository:
             return existing
         return job
 
-    def _abandon_expired(self, organization_id: uuid.UUID, now: datetime) -> None:
-        jobs = self.session.scalars(select(BackgroundJob).where(BackgroundJob.organization_id == organization_id, BackgroundJob.status == "running", BackgroundJob.lease_expires_at < now).with_for_update(skip_locked=True)).all()
+    def _abandon_expired(self, organization_id: uuid.UUID, now: datetime, *, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        jobs = self.session.scalars(
+            select(BackgroundJob)
+            .where(BackgroundJob.organization_id == organization_id, BackgroundJob.status == "running", BackgroundJob.lease_expires_at < now)
+            .order_by(BackgroundJob.lease_expires_at, BackgroundJob.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
         for job in jobs:
             attempt = self.session.scalar(select(JobAttempt).where(JobAttempt.job_id == job.id, JobAttempt.attempt_no == job.attempts, JobAttempt.finished_at.is_(None)).with_for_update())
             if attempt: self._finish_attempt(attempt, now, "abandoned", "lease_expired")
@@ -43,8 +52,14 @@ class QueueRepository:
             if job.status=="dead_letter": self._terminal(job,"lease_expired",now)
         self.session.flush()
 
-    def claim(self, organization_id: uuid.UUID, worker_id: str, *, lease_seconds: int) -> BackgroundJob | None:
-        now = self.database_now(); self._abandon_expired(organization_id, now)
+        return len(jobs)
+
+    def reap_expired_jobs(self, organization_id: uuid.UUID, *, limit: int = LEASE_REAP_BATCH_SIZE) -> int:
+        return self._abandon_expired(organization_id, self.database_now(), limit=limit)
+
+    def claim(self, organization_id: uuid.UUID, worker_id: str, *, lease_seconds: int, recover_expired: bool = True) -> BackgroundJob | None:
+        now = self.database_now()
+        if recover_expired: self._abandon_expired(organization_id, now, limit=LEASE_REAP_BATCH_SIZE)
         job = self.session.scalar(select(BackgroundJob).where(BackgroundJob.organization_id == organization_id, BackgroundJob.status == "queued", BackgroundJob.run_after <= now).order_by(BackgroundJob.priority.desc(), BackgroundJob.run_after, BackgroundJob.created_at).limit(1).with_for_update(skip_locked=True))
         if not job: return None
         job.status = "running"; job.attempts += 1; job.lease_owner = worker_id; job.lease_expires_at = now + timedelta(seconds=lease_seconds); job.heartbeat_at = now; job.updated_at = now
@@ -88,18 +103,31 @@ class QueueRepository:
         topic = self.policies.validate_type(topic); aggregate_type = self.policies.validate_identifier(aggregate_type, field="aggregate_type")
         validated = self.policies.validate_topic(topic, payload)
         now = self.database_now(); event = OutboxEvent(organization_id=organization_id, topic=topic, aggregate_type=aggregate_type, aggregate_id=aggregate_id, payload=validated, status="queued", available_at=now, max_attempts=max_attempts, created_at=now, updated_at=now); self.session.add(event); self.session.flush(); return event
-    def claim_outbox(self, organization_id, worker_id, *, lease_seconds):
-        now = self.database_now(); self._reap_expired_outbox(organization_id, now)
+    def reap_expired_outbox(self, organization_id, *, limit: int = LEASE_REAP_BATCH_SIZE) -> int:
+        return self._reap_expired_outbox(organization_id, self.database_now(), limit=limit)
+
+    def claim_outbox(self, organization_id, worker_id, *, lease_seconds, recover_expired: bool = True):
+        now = self.database_now()
+        if recover_expired: self._reap_expired_outbox(organization_id, now, limit=LEASE_REAP_BATCH_SIZE)
         event = self.session.scalar(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, ((OutboxEvent.status == "queued") & (OutboxEvent.available_at <= now)) | ((OutboxEvent.status == "running") & (OutboxEvent.lease_expires_at < now)), OutboxEvent.attempts < OutboxEvent.max_attempts).order_by(OutboxEvent.available_at, OutboxEvent.created_at).limit(1).with_for_update(skip_locked=True))
         if event:
             if event.status == "running": event.safe_error_code = "lease_expired"
             event.status = "running"; event.lease_owner = worker_id; event.lease_expires_at = now + timedelta(seconds=lease_seconds); event.heartbeat_at = now; event.attempts += 1; event.updated_at = now; self.session.flush()
         return event
-    def _reap_expired_outbox(self, organization_id, now):
-        expired = self.session.scalars(select(OutboxEvent).where(OutboxEvent.organization_id == organization_id, OutboxEvent.status == "running", OutboxEvent.lease_expires_at < now, OutboxEvent.attempts >= OutboxEvent.max_attempts).with_for_update(skip_locked=True)).all()
+    def _reap_expired_outbox(self, organization_id, now, *, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        expired = self.session.scalars(
+            select(OutboxEvent)
+            .where(OutboxEvent.organization_id == organization_id, OutboxEvent.status == "running", OutboxEvent.lease_expires_at < now, OutboxEvent.attempts >= OutboxEvent.max_attempts)
+            .order_by(OutboxEvent.lease_expires_at, OutboxEvent.created_at)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
         for event in expired:
             event.status = "failed"; event.failed_at = now; event.safe_error_code = "delivery_abandoned"; event.lease_owner = None; event.lease_expires_at = None; event.heartbeat_at = None; event.updated_at = now
         self.session.flush()
+        return len(expired)
     def publish_outbox(self, organization_id, event_id, worker_id):
         event, now = self._owned_outbox(organization_id, event_id, worker_id); event.status = "published"; event.published_at = now; event.lease_owner = None; event.lease_expires_at = None; event.heartbeat_at = None; event.safe_error_code = None; event.updated_at = now
     def fail_outbox(self, organization_id, event_id, worker_id, *, safe_code, retryable):

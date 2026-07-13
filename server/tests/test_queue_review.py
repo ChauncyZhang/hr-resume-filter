@@ -132,6 +132,22 @@ def test_worker_alternates_job_and_outbox_and_passes_stable_idempotency_key() ->
     assert keys == [expected_event_id]
 
 
+def test_worker_does_not_pause_while_claimed_work_remains() -> None:
+    gateway = LifecycleGateway()
+    gateway.events.clear()
+    gateway.jobs.append(Item("job"))
+    worker = make_worker(gateway, interval_seconds=60)
+    successes_when_paused: list[int] = []
+
+    async def stop_at_first_pause() -> None:
+        successes_when_paused.append(gateway.successes)
+        worker.request_shutdown()
+
+    worker._pause = stop_at_first_pause
+    asyncio.run(worker.run())
+    assert successes_when_paused == [2]
+
+
 def test_worker_contains_claim_and_completion_gateway_failures() -> None:
     class Failing(LifecycleGateway):
         async def claim_job(self, **_: object): self.claim_order.append("job"); raise RuntimeError("db down")

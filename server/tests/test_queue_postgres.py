@@ -28,6 +28,7 @@ def queue_db():
     engine = create_engine(async_url.replace("+asyncpg", "+psycopg"))
     with engine.begin() as connection:
         connection.execute(text("TRUNCATE outbox_events, job_attempts, background_jobs, organizations CASCADE"))
+        connection.execute(text("UPDATE queue_claim_cursors SET last_organization_id=NULL, updated_at=now()"))
     yield engine
     engine.dispose()
 
@@ -96,6 +97,79 @@ def test_claim_is_exclusive_and_ordered(queue_db) -> None:
     assert future_id not in claimed
 
 
+def test_gateway_rotates_tenants_for_jobs_and_outbox(queue_db) -> None:
+    with Session(queue_db) as session:
+        organizations = sorted((organization(session, "fair-a"), organization(session, "fair-b")))
+        first, second = organizations
+        repo = repository(session)
+        repo.enqueue(first, "test.work", {})
+        repo.enqueue(first, "test.work", {})
+        second_job = repo.enqueue(second, "test.work", {})
+        repo.append_outbox(first, "audit.created", "candidate", uuid.uuid4(), {"candidate_id": str(uuid.uuid4())})
+        repo.append_outbox(first, "audit.created", "candidate", uuid.uuid4(), {"candidate_id": str(uuid.uuid4())})
+        second_event = repo.append_outbox(second, "audit.created", "candidate", uuid.uuid4(), {"candidate_id": str(uuid.uuid4())})
+        session.commit()
+        second_job_id, second_event_id = second_job.id, second_event.id
+
+    async def claim_two_of_each():
+        jobs = [
+            await DatabaseQueueGateway(os.environ["POSTGRES_SMOKE_URL"], policies()).claim_job(worker_id="worker", lease_seconds=30)
+            for _ in range(2)
+        ]
+        events = [
+            await DatabaseQueueGateway(os.environ["POSTGRES_SMOKE_URL"], policies()).claim_outbox(worker_id="dispatcher", lease_seconds=30)
+            for _ in range(2)
+        ]
+        return jobs, events
+
+    jobs, events = asyncio.run(claim_two_of_each())
+    assert jobs[1].id == second_job_id
+    assert events[1].id == second_event_id
+
+
+def test_gateway_reap_budget_is_global_for_jobs_and_outbox(queue_db) -> None:
+    with Session(queue_db) as session:
+        organizations = (organization(session, "reap-a"), organization(session, "reap-b"))
+        repo = repository(session)
+        jobs = []
+        events = []
+        for org in organizations:
+            jobs.extend(repo.enqueue(org, "test.work", {}, max_attempts=1) for _ in range(101))
+            events.extend(
+                repo.append_outbox(org, "audit.created", "candidate", uuid.uuid4(), {"candidate_id": str(uuid.uuid4())}, max_attempts=1)
+                for _ in range(101)
+            )
+        now = repo.database_now()
+        expired_at = now - timedelta(seconds=1)
+        for job in jobs:
+            job.status = "running"
+            job.attempts = 1
+            job.lease_owner = "old-worker"
+            job.lease_expires_at = expired_at
+            job.heartbeat_at = expired_at
+            session.add(JobAttempt(organization_id=job.organization_id, job_id=job.id, attempt_no=1, started_at=expired_at, worker_id="old-worker"))
+        for event in events:
+            event.status = "running"
+            event.attempts = 1
+            event.lease_owner = "old-dispatcher"
+            event.lease_expires_at = expired_at
+            event.heartbeat_at = expired_at
+        session.commit()
+
+    gateway = DatabaseQueueGateway(os.environ["POSTGRES_SMOKE_URL"], policies())
+
+    async def reap_once():
+        return (
+            await gateway.claim_job(worker_id="new-worker", lease_seconds=30),
+            await gateway.claim_outbox(worker_id="new-dispatcher", lease_seconds=30),
+        )
+
+    assert asyncio.run(reap_once()) == (None, None)
+    with Session(queue_db) as session:
+        assert session.scalar(select(text("count(*)")).select_from(BackgroundJob).where(BackgroundJob.status == "dead_letter")) == 100
+        assert session.scalar(select(text("count(*)")).select_from(OutboxEvent).where(OutboxEvent.status == "failed")) == 100
+
+
 def test_owner_checks_reclaim_retry_cancel_and_tenant_isolation(queue_db) -> None:
     with Session(queue_db) as session:
         org = organization(session, "owner")
@@ -122,6 +196,31 @@ def test_owner_checks_reclaim_retry_cancel_and_tenant_isolation(queue_db) -> Non
         assert repo.cancel(org, cancelled.id)
         session.commit()
         assert repo.claim(org, "new", lease_seconds=30) is None
+
+
+def test_expired_job_reaping_is_bounded(queue_db) -> None:
+    with Session(queue_db) as session:
+        org = organization(session, "bounded-reaper")
+        repo = repository(session)
+        for _ in range(101):
+            repo.enqueue(org, "test.work", {}, max_attempts=2)
+        session.commit()
+
+        for _ in range(101):
+            assert repo.claim(org, "old-worker", lease_seconds=30) is not None
+        session.execute(text("UPDATE background_jobs SET lease_expires_at=now()-interval '1 second' WHERE organization_id=:org"), {"org": org})
+        session.commit()
+
+        assert repo.claim(org, "new-worker", lease_seconds=30) is not None
+        session.commit()
+        still_owned_by_old_worker = session.scalar(
+            select(text("count(*)")).select_from(BackgroundJob).where(
+                BackgroundJob.organization_id == org,
+                BackgroundJob.status == "running",
+                BackgroundJob.lease_owner == "old-worker",
+            )
+        )
+        assert still_owned_by_old_worker == 1
 
 
 def test_outbox_retries_and_publishes_once_and_attempt_history_is_immutable(queue_db) -> None:

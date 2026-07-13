@@ -68,8 +68,9 @@ class Worker:
                     processing.cancel(); await asyncio.gather(processing, return_exceptions=True)
                 return
             stopping.cancel(); await asyncio.gather(stopping, return_exceptions=True)
-            await asyncio.gather(processing, return_exceptions=True)
-            await self._pause()
+            outcome = (await asyncio.gather(processing, return_exceptions=True))[0]
+            if outcome is not True:
+                await self._pause()
 
     async def _ready(self) -> bool:
         try:
@@ -83,11 +84,11 @@ class Worker:
         try: await asyncio.wait_for(self._shutdown.wait(), self._interval_seconds)
         except TimeoutError: pass
 
-    async def _poll_once(self) -> None:
-        if self._queue is None or self._shutdown.is_set(): return
+    async def _poll_once(self) -> bool:
+        if self._queue is None or self._shutdown.is_set(): return False
         first = self._next_kind; second = "outbox" if first == "job" else "job"; self._next_kind = second
         for kind in (first, second):
-            if self._shutdown.is_set(): return
+            if self._shutdown.is_set(): return False
             try:
                 claim = self._queue.claim_job if kind == "job" else self._queue.claim_outbox
                 item = await claim(worker_id=self._worker_id, lease_seconds=self._lease_seconds)
@@ -95,8 +96,9 @@ class Worker:
                 logger.error("worker_claim_failed", extra={"context": {"safe_error_code": "queue_unavailable", "kind": kind}}); continue
             if item is not None:
                 if self._shutdown.is_set():
-                    logger.info("worker_claim_abandoned", extra={"context": self._context(item, kind, "shutdown_requested")}); return
-                await self._process(item, kind); return
+                    logger.info("worker_claim_abandoned", extra={"context": self._context(item, kind, "shutdown_requested")}); return False
+                await self._process(item, kind); return True
+        return False
 
     async def _process(self, item: object, kind: str) -> None:
         handler = self._handlers.get(item.type) if kind == "job" else self._outbox_handlers.get(item.topic)

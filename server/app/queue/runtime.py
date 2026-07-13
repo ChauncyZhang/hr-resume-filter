@@ -1,8 +1,11 @@
 import asyncio
+from bisect import bisect_right
+
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from server.app.identity.models import Organization
-from server.app.queue.repository import QueueRepository
+from server.app.queue.models import QueueClaimCursor
+from server.app.queue.repository import LEASE_REAP_BATCH_SIZE, QueueRepository
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, PayloadPolicyRegistry
 
 
@@ -22,12 +25,36 @@ class DatabaseQueueGateway:
 
     def _claim(self, kind: str, worker_id: str, lease_seconds: int):
         with self._sessions.begin() as session:
+            cursor = session.scalar(select(QueueClaimCursor).where(QueueClaimCursor.kind == kind).with_for_update())
+            if cursor is None:
+                raise RuntimeError("queue claim cursor is missing")
             organization_ids = session.scalars(select(Organization.id).order_by(Organization.id)).all()
-            for organization_id in organization_ids:
+            if not organization_ids:
+                return None
+            start = bisect_right(organization_ids, cursor.last_organization_id) % len(organization_ids) if cursor.last_organization_id else 0
+            ordered_ids = organization_ids[start:] + organization_ids[:start]
+            reap_budget = LEASE_REAP_BATCH_SIZE
+            last_scanned = None
+            for organization_id in ordered_ids:
                 repository = QueueRepository(session, policies=self._policies,terminal_callbacks=self._terminal_callbacks)
-                item = repository.claim(organization_id, worker_id, lease_seconds=lease_seconds) if kind == "job" else repository.claim_outbox(organization_id, worker_id, lease_seconds=lease_seconds)
+                if kind == "job":
+                    reaped = repository.reap_expired_jobs(organization_id, limit=reap_budget)
+                    item = repository.claim(organization_id, worker_id, lease_seconds=lease_seconds, recover_expired=False)
+                else:
+                    reaped = repository.reap_expired_outbox(organization_id, limit=reap_budget)
+                    item = repository.claim_outbox(organization_id, worker_id, lease_seconds=lease_seconds, recover_expired=False)
+                reap_budget -= reaped
+                last_scanned = organization_id
                 if item:
-                    session.expunge(item); return item
+                    cursor.last_organization_id = organization_id
+                    cursor.updated_at = repository.database_now()
+                    session.expunge(item)
+                    return item
+                if reap_budget == 0:
+                    break
+            if last_scanned is not None:
+                cursor.last_organization_id = last_scanned
+                cursor.updated_at = QueueRepository(session).database_now()
         return None
 
     async def succeed(self, job, worker_id: str) -> None:
