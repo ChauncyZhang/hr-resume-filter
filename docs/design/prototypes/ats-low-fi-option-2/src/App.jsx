@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import {
   BriefcaseBusiness,
   CalendarDays,
@@ -11,6 +11,7 @@ import {
   Home,
   Import,
   LayoutList,
+  LogOut,
   Menu,
   MoreHorizontal,
   Plus,
@@ -30,8 +31,10 @@ import { ReportWorkspace } from "./ReportViews.jsx";
 import { SettingsWorkspace } from "./SettingsViews.jsx";
 import { Ux08ScenarioPanel } from "./Ux08ScenarioPanel.jsx";
 import { syntheticResumeFilesFor } from "./syntheticResumeFixtures.js";
-import { canPerformAction, getAllowedNavItems, getRoleIdentity } from "./roleCapabilities.js";
+import { canPerformAction, getAllowedNavItems } from "./roleCapabilities.js";
 import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts, saveInterview, submitInterviewFeedback, validateWorkflowState } from "./ux08Workflow.js";
+import { LoginView, SessionLoadingView } from "./LoginView.jsx";
+import { getSessionIdentity, sessionController } from "./session.js";
 
 const navItems = [
   ["工作台", Home],
@@ -143,7 +146,21 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App() {
+export function App({ controller = sessionController }) {
+  const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
+
+  useEffect(() => {
+    void controller.bootstrap();
+  }, [controller]);
+
+  if (session.status === "bootstrapping") return <SessionLoadingView />;
+  if (session.status === "anonymous") {
+    return <LoginView error={session.error} submitting={session.submitting} onLogin={(credentials) => controller.login(credentials)} />;
+  }
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} />;
+}
+
+function AuthenticatedApp({ session, onLogout }) {
   const [activeNav, setActiveNav] = useState("工作台");
   const [activeJob, setActiveJob] = useState("AI 工程师");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -160,7 +177,7 @@ export function App() {
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
   const [candidatePreset, setCandidatePreset] = useState(null);
-  const [currentRole, setCurrentRole] = useState("招聘管理员");
+  const [currentRole, setCurrentRole] = useState(session.role || "未知角色");
   const [currentScenario, setCurrentScenario] = useState("default");
   const [interviewMode, setInterviewMode] = useState("list");
   const [interviewRecords, setInterviewRecords] = useState(initialInterviewRecords);
@@ -207,7 +224,7 @@ export function App() {
     return [...identityCounts.values()].filter((count) => count > 1).length;
   }, [candidateRecords]);
   const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
-  const roleIdentity = getRoleIdentity(currentRole) || { name: "未知用户", title: currentRole };
+  const roleIdentity = getSessionIdentity(session.user, currentRole);
   const myPendingFeedbackInterviews = pendingFeedbackInterviews.filter((item) => item.interviewers.includes(roleIdentity.name));
   const screeningSummary = useMemo(() => {
     if (!recentTask?.files?.length) return null;
@@ -490,6 +507,7 @@ export function App() {
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && canPerformAction(currentRole, "新建职位") && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
+            <IconButton label="退出登录" className="logout-action" onClick={() => { void onLogout().catch(() => {}); }}><LogOut size={18} /></IconButton>
           </div>
         </header>
 
