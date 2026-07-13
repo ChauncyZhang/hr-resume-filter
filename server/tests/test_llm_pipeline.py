@@ -8,14 +8,16 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from server.app.llm.gateway import GatewayError
-from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation
+from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.llm.screening import MAX_RESUME_CHARS,ScreeningEvaluation, ScreeningResult
 from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
+from server.app.identity.models import AuditLog
 from server.app.recruiting.models import Application, ApplicationStageEvent, JobJdVersion, Resume
 from server.app.screening.llm_pipeline import LlmScreeningPipeline
 from server.app.screening.terminal import finalize_llm_dead_letter
 from server.app.screening.models import ScreeningItem, ScreeningResult as RuleResult, ScreeningRun
+from server.app.screening.progress import aggregate_run
 from server.app.llm.security import ApiKeyCipher
 from server.tests.test_screening_pipeline import seeded_pipeline
 from server.tests.test_screening_api import login
@@ -95,6 +97,161 @@ def prepared(tmp_path, *, allowed_job_ids=None):
         trace_id="llm-trace",
     )
     return app, cipher, job
+
+
+def terminal_llm_failure(app, job, code="provider_unavailable"):
+    with app.state.identity_store.sync_session() as db:
+        queue_job = db.get(BackgroundJob, job.id)
+        queue_job.status = "dead_letter"
+        queue_job.attempts = queue_job.max_attempts
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        item.llm_status = "failed"
+        item.llm_safe_error_code = code
+        item.llm_started_at = item.created_at
+        item.llm_finished_at = item.created_at
+        item.finished_at = item.created_at
+        run = db.get(ScreeningRun, item.run_id)
+        aggregate_run(db, run)
+        db.commit()
+        return item.id, run.id, item.application_id
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [
+        ("provider_unavailable", True),
+        ("llm_provider_unavailable", True),
+        ("provider_quota_or_rate_limited", True),
+        ("llm_provider_quota_or_rate_limited", True),
+        ("provider_response_invalid", True),
+        ("llm_provider_response_invalid", True),
+        ("provider_auth_failed", False),
+        ("llm_provider_auth_failed", False),
+    ],
+)
+def test_screening_item_exposes_independent_llm_retryability(tmp_path, code, expected):
+    app, _cipher, job = prepared(tmp_path)
+    item_id, run_id, _application_id = terminal_llm_failure(app, job, code)
+
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        response = client.get(f"/api/v1/screening-runs/{run_id}/items", headers=headers)
+
+    assert response.status_code == 200
+    item = next(value for value in response.json()["data"] if value["id"] == str(item_id))
+    assert item["retryable"] is False
+    assert item["llm_retryable"] is expected
+
+
+def test_manual_llm_retry_requeues_current_dependencies_and_is_idempotent(tmp_path):
+    app, _cipher, old_job = prepared(tmp_path)
+    item_id, run_id, application_id = terminal_llm_failure(app, old_job, "llm_provider_unavailable")
+    with app.state.identity_store.sync_session() as db:
+        config = db.get(LlmProviderConfig, uuid.UUID(old_job.payload["config_id"]))
+        config.version += 1
+        result_id = db.scalar(select(RuleResult.id).where(RuleResult.item_id == item_id))
+        prompt_id = db.scalar(select(PromptVersion.id).where(PromptVersion.organization_id == config.organization_id))
+        rule_count = db.scalar(select(func.count(RuleResult.id)))
+        db.commit()
+        current_config_version = config.version
+
+    with TestClient(app) as client:
+        headers = {**login(client, "admin@example.test"), "Idempotency-Key": "llm-retry"}
+        response = client.post(f"/api/v1/screening-items/{item_id}/retry", headers=headers)
+        replay = client.post(f"/api/v1/screening-items/{item_id}/retry", headers=headers)
+        active = client.post(
+            f"/api/v1/screening-items/{item_id}/retry",
+            headers={**headers, "Idempotency-Key": "llm-retry-new-request"},
+        )
+
+    assert response.status_code == 200
+    assert replay.status_code == 200 and replay.json() == response.json()
+    assert active.status_code == 409 and active.json()["code"] == "screening_retry_active"
+    body = response.json()["data"]
+    assert body["item"]["status"] == "scored"
+    assert body["item"]["retryable"] is False
+    assert body["item"]["llm_status"] == "queued"
+    assert body["item"]["llm_retryable"] is False
+    assert body["run"]["status"] == "llm_scoring"
+    assert body["run"]["processed_count"] == 0
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, item_id)
+        jobs = list(db.scalars(select(BackgroundJob).where(BackgroundJob.type == "screening.llm_score_item").order_by(BackgroundJob.created_at)))
+        assert len(jobs) == 2
+        retry_job = next(value for value in jobs if value.id != old_job.id)
+        assert retry_job.status == "queued"
+        assert retry_job.dedupe_key != jobs[0].dedupe_key
+        assert retry_job.payload == {
+            "organization_id": str(item.organization_id),
+            "screening_item_id": str(item.id),
+            "screening_result_id": str(result_id),
+            "config_id": str(config.id),
+            "config_version": current_config_version,
+            "prompt_version_id": str(prompt_id),
+        }
+        assert item.llm_started_at is None and item.llm_finished_at is None and item.finished_at is None
+        assert db.get(Application, application_id).stage == "new"
+        assert db.scalar(select(func.count(RuleResult.id))) == rule_count
+        audit = db.scalar(select(AuditLog).where(AuditLog.event_type == "screening.item_retried"))
+        assert audit.outcome == "success"
+        assert audit.metadata_json == {"run_id": str(run_id), "item_id": str(item_id), "retry_stage": "llm"}
+        assert all(secret not in repr(audit.metadata_json) for secret in ("sk-private", "prompt", "resume"))
+
+
+@pytest.mark.parametrize("change", ["disabled", "missing_key", "job_not_allowed"])
+def test_manual_llm_retry_rejects_invalid_current_config(tmp_path, change):
+    app, _cipher, job = prepared(tmp_path)
+    item_id, run_id, _application_id = terminal_llm_failure(app, job)
+    with app.state.identity_store.sync_session() as db:
+        config = db.get(LlmProviderConfig, uuid.UUID(job.payload["config_id"]))
+        if change == "disabled":
+            config.enabled = False
+        elif change == "missing_key":
+            config.enabled = False
+            config.encrypted_api_key = None
+        else:
+            item = db.get(ScreeningItem, item_id)
+            run = db.get(ScreeningRun, item.run_id)
+            config.allowed_job_ids = [str(uuid.uuid4())]
+            assert str(run.job_id) not in config.allowed_job_ids
+        db.commit()
+
+    with TestClient(app) as client:
+        headers = {**login(client, "admin@example.test"), "Idempotency-Key": change}
+        listing = client.get(f"/api/v1/screening-runs/{run_id}/items", headers=headers)
+        response = client.post(f"/api/v1/screening-items/{item_id}/retry", headers=headers)
+
+    advertised = next(value for value in listing.json()["data"] if value["id"] == str(item_id))
+    assert advertised["llm_retryable"] is False
+    assert response.status_code == 409
+    assert response.json()["code"] == "screening_item_not_retryable"
+    with app.state.identity_store.sync_session() as db:
+        assert db.get(ScreeningItem, item_id).llm_status == "failed"
+        assert db.scalar(select(func.count(BackgroundJob.id)).where(BackgroundJob.type == "screening.llm_score_item")) == 1
+
+
+def test_manual_llm_retry_rejects_permanent_failure_and_active_job(tmp_path):
+    permanent_root = tmp_path / "permanent"
+    permanent_root.mkdir()
+    permanent_app, _cipher, permanent_job = prepared(permanent_root)
+    permanent_id, _run_id, _application_id = terminal_llm_failure(permanent_app, permanent_job, "provider_auth_failed")
+    active_root = tmp_path / "active"
+    active_root.mkdir()
+    active_app, _cipher, active_job = prepared(active_root)
+    active_id, _run_id, _application_id = terminal_llm_failure(active_app, active_job)
+    with active_app.state.identity_store.sync_session() as db:
+        db.get(BackgroundJob, active_job.id).status = "queued"
+        db.commit()
+
+    for app, item_id, key, code in (
+        (permanent_app, permanent_id, "permanent", "screening_item_not_retryable"),
+        (active_app, active_id, "active", "screening_retry_active"),
+    ):
+        with TestClient(app) as client:
+            headers = {**login(client, "admin@example.test"), "Idempotency-Key": key}
+            response = client.post(f"/api/v1/screening-items/{item_id}/retry", headers=headers)
+        assert response.status_code == 409 and response.json()["code"] == code
 
 
 def test_success_commits_running_before_provider_and_is_replay_safe(tmp_path):
@@ -177,7 +334,7 @@ def test_deleted_config_revokes_call_and_completes_with_rule_result(tmp_path):
         assert run.status=="completed" and db.scalar(select(func.count(LlmInvocation.id)))==0
 
 
-@pytest.mark.parametrize("safe_code", ["provider_unavailable", "provider_quota_or_rate_limited"])
+@pytest.mark.parametrize("safe_code", ["provider_unavailable", "provider_quota_or_rate_limited", "provider_response_invalid"])
 def test_transient_provider_failure_retries_then_exhausts_to_partial(tmp_path, safe_code):
     app, cipher, job = prepared(tmp_path)
     pipeline = LlmScreeningPipeline(app.state.identity_store.sync_session, Gateway(GatewayError(safe_code)), cipher)

@@ -1,10 +1,17 @@
 import { normalizeScreeningTask } from "./screeningController.js";
 
-const SAFE_METADATA_KEYS = ["position", "source", "note", "llmEnabled", "creator", "createdAt"];
+const SAFE_METADATA_KEYS = ["position", "source", "note", "creator", "createdAt"];
 const LEGAL_SOURCES = new Set(["BOSS 直聘", "猎聘", "智联招聘", "员工内推", "人才库重新激活", "其他合法来源", "本地上传"]);
+export const LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY = "ats_recent_screening_task";
+const RECENT_SCREENING_TASK_STORAGE_KEY_PREFIX = `${LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY}:user:`;
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function getRecentScreeningTaskStorageKey(authenticatedUser) {
+  if (typeof authenticatedUser?.id !== "string" || !authenticatedUser.id.trim()) return null;
+  return `${RECENT_SCREENING_TASK_STORAGE_KEY_PREFIX}${encodeURIComponent(authenticatedUser.id.trim())}`;
 }
 
 function codedError(code, message) {
@@ -28,7 +35,6 @@ function isValidMetadata(value) {
     && value.position.length > 0
     && LEGAL_SOURCES.has(value.source)
     && typeof value.note === "string"
-    && typeof value.llmEnabled === "boolean"
     && typeof value.creator === "string"
     && typeof value.createdAt === "string";
 }
@@ -43,7 +49,7 @@ export function serializeRecentScreeningTask(task) {
 export function parseRecentScreeningTask(raw) {
   try {
     const value = JSON.parse(raw);
-    const allowedKeys = new Set(["id", "jobId", "serverBacked", ...SAFE_METADATA_KEYS]);
+    const allowedKeys = new Set(["id", "jobId", "serverBacked", "llmEnabled", ...SAFE_METADATA_KEYS]);
     if (!isRecord(value) || Object.keys(value).some((key) => !allowedKeys.has(key))) return null;
     if (value.serverBacked !== true || typeof value.id !== "string" || !value.id || typeof value.jobId !== "string" || !value.jobId || !isValidMetadata(value)) return null;
     return { id: value.id, jobId: value.jobId, serverBacked: true, ...safeMetadata(value) };
@@ -59,13 +65,14 @@ export function mergeServerTaskMetadata(snapshot, metadata) {
 export function createScreeningWorkflow(controller) {
   let submitting = false;
 
-  async function submit({ jobId, files, metadata, signal, onProgress = () => {} }) {
+  async function submit({ jobId, files, metadata, signal, onProgress = () => {}, onRunCreated = () => {} }) {
     if (submitting) throw codedError("SUBMISSION_IN_PROGRESS", "screening submission already in progress");
     submitting = true;
     try {
       const run = await controller.createRun(jobId, { signal });
-      if (signal?.aborted) return null;
       if (!run?.id) throw codedError("INVALID_RUN", "screening run was not created");
+      onRunCreated({ id: run.id, jobId, serverBacked: true, ...safeMetadata(metadata) });
+      if (signal?.aborted) return null;
 
       const selectedFiles = Array.from(files ?? []);
       let succeeded = 0;
@@ -109,14 +116,29 @@ export function createScreeningWorkflow(controller) {
 export function pollServerTask({ task, controller, signal, onTaskChange, onError = () => {} }) {
   if (!task?.serverBacked) return { done: Promise.resolve(null), retry: async () => null };
   const metadata = safeMetadata(task);
-  const start = () => controller.pollRun(task.id, {
-    signal,
-    onSnapshot: (snapshot) => onTaskChange(mergeServerTaskMetadata(snapshot, metadata)),
-  }).catch((error) => {
+  let recoveryChecked = false;
+  const start = async () => {
+    if (!recoveryChecked && task.total === 0 && Array.isArray(task.files) && task.files.length === 0) {
+      recoveryChecked = true;
+      const run = await controller.getRun(task.id, { signal });
+      if (run?.status === "queued") {
+        const items = await controller.getItems(task.id, { signal });
+        const snapshot = mergeServerTaskMetadata(normalizeScreeningTask(run, items), metadata);
+        onTaskChange(snapshot);
+        if (run.total_count === 0) throw codedError("RECOVERED_RUN_EMPTY", "recovered run has no uploaded files");
+        await controller.startRun(task.id, { signal });
+      }
+    }
+    return controller.pollRun(task.id, {
+      signal,
+      onSnapshot: (snapshot) => onTaskChange(mergeServerTaskMetadata(snapshot, metadata)),
+    });
+  };
+  const startSafely = () => start().catch((error) => {
     if (!isAbort(error, signal)) onError(error);
     return null;
   });
-  let done = start();
+  let done = startSafely();
 
   return {
     done,
@@ -125,7 +147,7 @@ export function pollServerTask({ task, controller, signal, onTaskChange, onError
       try {
         await controller.retryItem(itemId, { signal });
         if (signal?.aborted) return null;
-        done = start();
+        done = startSafely();
         return true;
       } catch (error) {
         if (!isAbort(error, signal)) onError(error);

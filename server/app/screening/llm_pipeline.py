@@ -15,7 +15,7 @@ from server.app.screening.models import ScreeningItem, ScreeningResult, Screenin
 from server.app.screening.progress import aggregate_run
 
 
-_TRANSIENT_ERRORS = {"provider_unavailable", "provider_quota_or_rate_limited"}
+_TRANSIENT_ERRORS = {"provider_unavailable", "provider_quota_or_rate_limited", "provider_response_invalid"}
 _REQUEST_FIELDS = ["jd", "resume", "rule_facts"]
 
 

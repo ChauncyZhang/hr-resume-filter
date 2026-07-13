@@ -35,7 +35,7 @@ import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate,
 import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 import { screeningController as defaultScreeningController } from "./screeningController.js";
-import { parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
+import { getRecentScreeningTaskStorageKey, LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY, parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
 
 const navItems = [
   ["工作台", Home],
@@ -167,6 +167,7 @@ export function App({ controller = sessionController, screeningController = defa
 
 function AuthenticatedApp({ session, onLogout, screeningController }) {
   const currentRole = session.role || "未知角色";
+  const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
   const [activeJob, setActiveJob] = useState("AI 工程师");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -196,7 +197,7 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [recentTask, setRecentTask] = useState(() => {
-    return parseRecentScreeningTask(window.localStorage.getItem("ats_recent_screening_task"));
+    return recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null;
   });
 
   const stages = useMemo(() => stageMeta.map(([stage]) => candidateRecords.filter((candidate) => candidate.position === activeJob && candidate.stage === stage).map((candidate) => {
@@ -243,6 +244,11 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
     window.scrollTo({ top: 0, behavior: "auto" });
   }, [activeNav, jobMode, candidateMode, interviewMode, talentMode, Boolean(screeningTask)]);
 
+  useEffect(() => {
+    window.localStorage.removeItem(LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY);
+    setRecentTask(recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null);
+  }, [recentTaskStorageKey]);
+
   function notify(message) {
     setToast(message);
     window.setTimeout(() => setToast(""), 2200);
@@ -255,16 +261,21 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
     setActiveNav("候选人");
   }
 
+  const persistRecentServerTask = useCallback((task) => {
+    setRecentTask(task);
+    const serialized = serializeRecentScreeningTask(task);
+    if (recentTaskStorageKey && serialized) window.localStorage.setItem(recentTaskStorageKey, serialized);
+  }, [recentTaskStorageKey]);
+
   const handleTaskChange = useCallback((task) => {
     setScreeningTask(task);
-    setRecentTask(task);
     if (task?.serverBacked) {
-      const serialized = serializeRecentScreeningTask(task);
-      if (serialized) window.localStorage.setItem("ats_recent_screening_task", serialized);
+      persistRecentServerTask(task);
     } else {
-      window.localStorage.removeItem("ats_recent_screening_task");
+      setRecentTask(task);
+      if (recentTaskStorageKey) window.localStorage.removeItem(recentTaskStorageKey);
     }
-  }, []);
+  }, [persistRecentServerTask, recentTaskStorageKey]);
 
   const updateCandidateRecords = useCallback((update) => {
     setCandidateRecords((current) => {
@@ -322,7 +333,7 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
     setSelectedJob(null);
     setJobMode("list");
     setImportOpen(false);
-    window.localStorage.removeItem("ats_recent_screening_task");
+    if (recentTaskStorageKey) window.localStorage.removeItem(recentTaskStorageKey);
 
     if (scenario === "new-position") {
       setActiveNav("职位");
@@ -655,7 +666,7 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
         {screeningTask && <ScreeningTaskView task={screeningTask} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
       </main>
 
-      {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} onNotify={notify} actorName={roleIdentity.name} />}
+      {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onRunCreated={persistRecentServerTask} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} onNotify={notify} actorName={roleIdentity.name} />}
 
       {modal === "duplicates" && (
         <Modal title="处理重复候选人" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>暂不处理</button><button className="button primary" type="button" onClick={() => { setModal(null); notify("2 组候选人已合并"); }}>确认合并</button></>}>

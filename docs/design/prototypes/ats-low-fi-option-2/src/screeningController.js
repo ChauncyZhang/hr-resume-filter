@@ -41,8 +41,10 @@ function normalizeFile(item) {
   const hasFinalRuleResult = item?.status === "scored" && ruleResult !== null;
   let status = item?.status === "queued" ? "queued" : "running";
 
-  if (item?.status === "failed" || item?.status === "cancelled") {
+  if (item?.status === "failed") {
     status = "failed";
+  } else if (item?.status === "cancelled") {
+    status = "cancelled";
   } else if (hasFinalRuleResult && item?.llm_status === "failed") {
     status = "partial";
   } else if (hasFinalRuleResult && SUCCESSFUL_LLM_STATUSES.has(item?.llm_status)) {
@@ -64,6 +66,7 @@ function normalizeFile(item) {
   return {
     id: safeString(item?.id),
     name: safeString(item?.filename),
+    candidateId: safeString(item?.candidate_id) || null,
     candidate: safeString(item?.candidate_name),
     status,
     ruleScore: safeScore(ruleResult?.score),
@@ -75,6 +78,8 @@ function normalizeFile(item) {
     error,
     application_stage: safeString(item?.application_stage) || null,
     application_version: Number.isInteger(item?.application_version) ? item.application_version : null,
+    retryable: item?.retryable === true,
+    llmRetryable: item?.llm_retryable === true,
   };
 }
 
@@ -130,13 +135,19 @@ export function createScreeningController({
   const pollGenerations = new Map();
 
   async function listJobs({ signal } = {}) {
-    const response = await client.request("/api/v1/jobs?limit=100", withSignal(signal));
-    return Array.isArray(response?.data)
-      ? response.data
+    const jobs = [];
+    let cursor = "";
+    do {
+      const path = `/api/v1/jobs?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const response = await client.request(path, withSignal(signal));
+      if (Array.isArray(response?.data)) jobs.push(...response.data);
+      cursor = safeString(response?.meta?.next_cursor);
+    } while (cursor);
+
+    return jobs
         .filter(isRecord)
         .map((job) => ({ id: safeString(job.id), title: safeString(job.title) }))
-        .filter((job) => job.id && job.title)
-      : [];
+        .filter((job) => job.id && job.title);
   }
 
   async function createRun(jobId, { signal } = {}) {
@@ -191,6 +202,20 @@ export function createScreeningController({
     return resourceData(response);
   }
 
+  async function bulkAction(runId, items, { signal } = {}) {
+    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/bulk-actions`, {
+      method: "POST",
+      body: { command: "advance_to_review", items },
+      idempotencyKey: createIdempotencyKey(),
+      ...withSignal(signal),
+    });
+    const data = resourceData(response);
+    return {
+      applied: safeCount(data?.applied_count),
+      already_applied: safeCount(data?.already_applied_count),
+    };
+  }
+
   async function pollRun(runId, { signal, intervalMs = 1000, onSnapshot } = {}) {
     const generation = (pollGenerations.get(runId) ?? 0) + 1;
     pollGenerations.set(runId, generation);
@@ -198,10 +223,9 @@ export function createScreeningController({
 
     try {
       while (!signal?.aborted && isCurrent()) {
-        const [run, items] = await Promise.all([
-          getRun(runId, { signal }),
-          getItems(runId, { signal }),
-        ]);
+        const run = await getRun(runId, { signal });
+        if (signal?.aborted || !isCurrent()) return null;
+        const items = await getItems(runId, { signal });
         if (signal?.aborted || !isCurrent()) return null;
         const snapshot = normalizeScreeningTask(run, items);
         onSnapshot?.(snapshot);
@@ -215,7 +239,7 @@ export function createScreeningController({
     }
   }
 
-  return { listJobs, createRun, uploadFiles, startRun, getRun, getItems, retryItem, pollRun };
+  return { listJobs, createRun, uploadFiles, startRun, getRun, getItems, retryItem, bulkAction, pollRun };
 }
 
 export const screeningController = createScreeningController();

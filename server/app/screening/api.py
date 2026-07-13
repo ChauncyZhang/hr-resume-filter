@@ -13,12 +13,12 @@ from server.app.recruiting.authorization import RecruitingAction
 from server.app.recruiting.models import Application,Candidate,FileObject,IdempotencyRecord,JobJdVersion,ScreeningRuleVersion
 from server.app.recruiting.service import IdempotencyConflict,persisted_idempotent
 from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,ScreeningResult,ScreeningRun
-from server.app.llm.models import LlmScreeningEvaluation
+from server.app.llm.models import LlmProviderConfig,LlmScreeningEvaluation,PromptVersion
 from server.app.screening.parsers import ParserError,ParserLimits,validate_upload_preflight
 from server.app.screening.schemas import BulkAction,BulkResource,ItemCollection,ItemResource,RetryResource,RunCreate,RunResource
 from server.app.screening.storage import StorageWriteFailed
 from server.app.queue.repository import QueueRepository
-from server.app.screening.actions import ScreeningBulkConflict,ScreeningItemNotRetryable,ScreeningRetryActive,apply_bulk_action,retry_screening_item,RECOVERABLE_CODES
+from server.app.screening.actions import ScreeningBulkConflict,ScreeningItemNotRetryable,ScreeningRetryActive,apply_bulk_action,is_llm_retryable,retry_screening_item,RECOVERABLE_CODES
 
 router=APIRouter(prefix="/api/v1"); _SAFE_STATUS={"queued","parsing","parsed","scoring","scored","failed","cancelled"}
 class RunNotQueued(Exception): pass
@@ -32,10 +32,10 @@ def _problem(request,status,code):
     response=problem(request,status,code,"The request could not be completed."); response.headers["Cache-Control"]="no-store"; return response
 def _not_found(request): return _problem(request,404,"resource_not_found")
 def _run_data(run,error_summary=None): return {"id":str(run.id),"job_id":str(run.job_id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"source":run.source,"status":run.status,"total_count":run.total_count,"processed_count":run.processed_count,"succeeded_count":run.succeeded_count,"failed_count":run.failed_count,"version":run.version,"created_at":run.created_at.isoformat(),"error_summary":error_summary or {}}
-def _item_data(item,file,application=None,evaluation=None,candidate=None,rule_result=None):
+def _item_data(item,file,application=None,evaluation=None,candidate=None,rule_result=None,llm_retryable=False):
     llm_evaluation=None if evaluation is None else {"score":evaluation.score,"recommendation":evaluation.recommendation,"summary":evaluation.summary,"strengths":evaluation.strengths,"gaps":evaluation.gaps,"risks":evaluation.risks,"questions":evaluation.interview_questions}
     rule_data=None if rule_result is None or item.status!="scored" else {"score":rule_result.rule_score,"recommendation":rule_result.recommendation,"required_hits":rule_result.required_hits,"required_missing":rule_result.required_missing,"bonus_hits":rule_result.bonus_hits,"risks":rule_result.risks}
-    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"candidate_id":str(candidate.id) if candidate else None,"candidate_name":candidate.display_name if candidate else None,"rule_result":rule_data,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"llm_status":item.llm_status,"llm_error_code":item.llm_safe_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
+    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"llm_retryable":llm_retryable,"candidate_id":str(candidate.id) if candidate else None,"candidate_name":candidate.display_name if candidate else None,"rule_result":rule_data,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"llm_status":item.llm_status,"llm_error_code":item.llm_safe_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
 def _load_run(db,principal,run_id,action=RecruitingAction.READ,lock=False):
     query=select(ScreeningRun).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningRun.organization_id==principal.organization_id,ScreeningRun.id==run_id,_job_scope(principal,action))
     return db.scalar(query.with_for_update() if lock else query)
@@ -154,7 +154,7 @@ def retry_item(item_id:UUID,request:Request,idempotency_key:str|None=Header(None
         if _load_item_scoped(db,principal,item_id,RecruitingAction.MANAGE_JOB) is None: return _not_found(request)
         try:
             def action():
-                item,run,_=retry_screening_item(db,principal.organization_id,item_id,request.state.trace_id); stored=db.get(FileObject,item.file_object_id); application=db.get(Application,item.application_id) if item.application_id else None; return 200,{"data":{"item":_item_data(item,stored,application),"run":_run_data(run)}}
+                item,run,_=retry_screening_item(db,principal.organization_id,item_id,request.state.trace_id,principal.user_id); stored=db.get(FileObject,item.file_object_id); application=db.get(Application,item.application_id) if item.application_id else None; return 200,{"data":{"item":_item_data(item,stored,application),"run":_run_data(run)}}
             status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.item.retry",key,{"item_id":str(item_id)},action); db.commit()
         except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
         except ScreeningItemNotRetryable: db.rollback(); return _problem(request,409,"screening_item_not_retryable")
@@ -220,7 +220,7 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             except Exception: return _problem(request,422,"validation_failed")
         rows=db.execute(query.order_by(ScreeningItem.created_at,ScreeningItem.id).limit(limit+1)).all(); next_cursor=None
         if len(rows)>limit: next_cursor=request.app.state.recruiting_cursor.encode(str(principal.organization_id),f"screening-items:{run_id}",rows[limit-1][0].created_at.isoformat(),str(rows[limit-1][0].id)); rows=rows[:limit]
-        item_ids=[item.id for item,_ in rows]; applications={}; candidates={}; rule_results={}; evaluations={}
+        item_ids=[item.id for item,_ in rows]; applications={}; candidates={}; rule_results={}; evaluations={}; llm_config=None; llm_prompt=None
         if item_ids:
             enrichment_scope=(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.id.in_(item_ids))
             application_rows=db.execute(select(ScreeningItem.id,Application).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(*enrichment_scope)).all()
@@ -231,4 +231,6 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             for item_id,result in result_rows: rule_results.setdefault(item_id,result)
             evaluation_rows=db.execute(select(ScreeningResult.item_id,LlmScreeningEvaluation).join(ScreeningItem,and_(ScreeningItem.organization_id==ScreeningResult.organization_id,ScreeningItem.id==ScreeningResult.item_id)).join(LlmScreeningEvaluation,and_(LlmScreeningEvaluation.organization_id==ScreeningResult.organization_id,LlmScreeningEvaluation.screening_result_id==ScreeningResult.id)).where(*enrichment_scope).order_by(LlmScreeningEvaluation.created_at.desc(),LlmScreeningEvaluation.id.desc())).all()
             for item_id,evaluation in evaluation_rows: evaluations.setdefault(item_id,evaluation)
-        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.id),evaluations.get(item.id),candidates.get(item.id),rule_results.get(item.id)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
+            llm_config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==principal.organization_id))
+            llm_prompt=db.scalar(select(PromptVersion).where(PromptVersion.organization_id==principal.organization_id,PromptVersion.name=="screening-evaluation").order_by(PromptVersion.version_number.desc()).limit(1))
+        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.id),evaluations.get(item.id),candidates.get(item.id),rule_results.get(item.id),is_llm_retryable(item,run,rule_results.get(item.id),llm_config,llm_prompt)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response

@@ -58,6 +58,30 @@ test("lists job options from GET /jobs with only id and title", async () => {
   assert.deepEqual(client.calls[0].options, {});
 });
 
+test("lists every job page using the server cursor and the same abort signal", async () => {
+  const signal = new AbortController().signal;
+  const client = createClient([
+    {
+      data: [{ id: "job-1", title: "AI 工程师" }],
+      meta: { limit: 100, next_cursor: "opaque cursor/2" },
+    },
+    {
+      data: [{ id: "job-101", title: "数据平台主管" }],
+      meta: { limit: 100, next_cursor: null },
+    },
+  ]);
+  const controller = createScreeningController({ client });
+
+  assert.deepEqual(await controller.listJobs({ signal }), [
+    { id: "job-1", title: "AI 工程师" },
+    { id: "job-101", title: "数据平台主管" },
+  ]);
+  assert.deepEqual(client.calls, [
+    { path: "/api/v1/jobs?limit=100", options: { signal } },
+    { path: "/api/v1/jobs?limit=100&cursor=opaque%20cursor%2F2", options: { signal } },
+  ]);
+});
+
 test("drops malformed job and item records without creating blank UI rows", async () => {
   const client = createClient([{ data: [null, { id: 7, title: "bad" }, { id: "", title: "blank" }, { id: "job-1", title: "AI 工程师" }] }]);
   const controller = createScreeningController({ client });
@@ -144,12 +168,25 @@ test("normalizes run states and server counts without timer-derived progress", (
   }
 });
 
+test("keeps cancelled file items distinct from failures", () => {
+  const task = normalizeScreeningTask(run({ status: "cancelled", processed_count: 1, total_count: 1 }), [
+    item({ status: "cancelled", error_code: "cancelled" }),
+  ]);
+
+  assert.equal(task.status, "cancelled");
+  assert.equal(task.files[0].status, "cancelled");
+  assert.equal(task.files[0].error, "");
+});
+
 test("maps candidate, rule, LLM, risk, and application fields while retaining rule facts on LLM failure", () => {
   const task = normalizeScreeningTask(run({ status: "partial", processed_count: 1, total_count: 1 }), [item({
     status: "scored",
     llm_status: "failed",
     llm_error_code: "provider_rate_limited",
+    candidate_id: "candidate-1",
     candidate_name: "林启舟",
+    retryable: true,
+    llm_retryable: true,
     application_stage: "screening",
     application_version: 4,
     rule_result: {
@@ -165,6 +202,7 @@ test("maps candidate, rule, LLM, risk, and application fields while retaining ru
   assert.deepEqual(task.files[0], {
     id: "item-1",
     name: "resume.pdf",
+    candidateId: "candidate-1",
     candidate: "林启舟",
     status: "partial",
     ruleScore: 88,
@@ -176,6 +214,8 @@ test("maps candidate, rule, LLM, risk, and application fields while retaining ru
     error: "provider_rate_limited",
     application_stage: "screening",
     application_version: 4,
+    retryable: true,
+    llmRetryable: true,
   });
 });
 
@@ -211,7 +251,7 @@ test("malformed optional result fields normalize to safe null and empty display 
   assert.equal(normalized.files[0].application_version, null);
 });
 
-test("polling fetches paired snapshots immediately, waits between rounds, and stops terminally without overlap", async () => {
+test("polling fetches ordered snapshots immediately, waits between rounds, and stops terminally without overlap", async () => {
   const calls = [];
   const waits = [];
   let round = 0;
@@ -242,7 +282,37 @@ test("polling fetches paired snapshots immediately, waits between rounds, and st
   assert.deepEqual(waits, [25]);
   assert.deepEqual(snapshots.map(({ status }) => status), ["running", "complete"]);
   assert.equal(result.status, "complete");
-  assert.equal(maxActive, 2);
+  assert.equal(maxActive, 1);
+});
+
+test("polling reads terminal items after the terminal run and emits that final item state", async () => {
+  const terminalRun = deferred();
+  const events = [];
+  const client = { request(path) {
+    if (path.endsWith("?limit=100")) {
+      events.push("items-requested");
+      return Promise.resolve({ data: [item({ status: "scored", rule_result: { score: 92 } })] });
+    }
+    events.push("run-requested");
+    return terminalRun.promise.then((response) => {
+      events.push("run-resolved");
+      return response;
+    });
+  } };
+  const controller = createScreeningController({ client });
+  const snapshots = [];
+
+  const polling = controller.pollRun("run-1", { onSnapshot: (snapshot) => snapshots.push(snapshot) });
+  await Promise.resolve();
+  assert.deepEqual(events, ["run-requested"]);
+
+  terminalRun.resolve({ data: run({ status: "completed", processed_count: 1, total_count: 1 }) });
+  const result = await polling;
+
+  assert.deepEqual(events, ["run-requested", "run-resolved", "items-requested"]);
+  assert.equal(result.status, "complete");
+  assert.equal(result.files[0].status, "success");
+  assert.deepEqual(snapshots, [result]);
 });
 
 test("polling aborts quietly without a stale partial-pair emission", async () => {
@@ -264,7 +334,7 @@ test("polling aborts quietly without a stale partial-pair emission", async () =>
 });
 
 test("a newer poll for the same run suppresses all later emissions from the older poll and stops it", async () => {
-  const responses = Array.from({ length: 4 }, deferred);
+  const responses = Array.from({ length: 3 }, deferred);
   let requestIndex = 0;
   const client = { request: () => responses[requestIndex++].promise };
   const controller = createScreeningController({ client });
@@ -275,17 +345,17 @@ test("a newer poll for the same run suppresses all later emissions from the olde
   await Promise.resolve();
   const newerPoll = controller.pollRun("run-1", { onSnapshot: (snapshot) => newerSnapshots.push(snapshot) });
 
-  responses[2].resolve({ data: run({ status: "completed", processed_count: 1, total_count: 1 }) });
-  responses[3].resolve({ data: [item({ status: "scored", rule_result: { score: 90 } })] });
+  responses[1].resolve({ data: run({ status: "completed", processed_count: 1, total_count: 1 }) });
+  await Promise.resolve();
+  responses[2].resolve({ data: [item({ status: "scored", rule_result: { score: 90 } })] });
   assert.equal((await newerPoll).status, "complete");
 
   responses[0].resolve({ data: run({ status: "completed", processed_count: 1, total_count: 1 }) });
-  responses[1].resolve({ data: [item({ status: "scored", rule_result: { score: 80 } })] });
 
   assert.equal(await olderPoll, null);
   assert.deepEqual(olderSnapshots, []);
   assert.equal(newerSnapshots.length, 1);
-  assert.equal(requestIndex, 4);
+  assert.equal(requestIndex, 3);
 });
 
 test("polls for different runs remain independent", async () => {
@@ -325,4 +395,42 @@ test("retry uses its endpoint and a fresh idempotency key each time", async () =
 
   assert.deepEqual(client.calls.map(({ path }) => path), ["/api/v1/screening-items/item-1/retry", "/api/v1/screening-items/item-1/retry"]);
   assert.deepEqual(client.calls.map(({ options }) => options.idempotencyKey), ["retry-1", "retry-2"]);
+});
+
+test("bulk advance posts selected item versions with a fresh key and abort signal", async () => {
+  const signal = new AbortController().signal;
+  const client = createClient([
+    { data: { applied_count: 1, already_applied_count: 1 } },
+    { data: { applied_count: 0, already_applied_count: 2 } },
+  ]);
+  let key = 0;
+  const controller = createScreeningController({ client, createIdempotencyKey: () => `bulk-${++key}` });
+  const items = [
+    { item_id: "item/1", expected_application_version: 3 },
+    { item_id: "item-2", expected_application_version: 7 },
+  ];
+
+  assert.deepEqual(await controller.bulkAction("run/1", items, { signal }), { applied: 1, already_applied: 1 });
+  await controller.bulkAction("run/1", items, { signal });
+
+  assert.deepEqual(client.calls, [
+    {
+      path: "/api/v1/screening-runs/run%2F1/bulk-actions",
+      options: {
+        method: "POST",
+        body: { command: "advance_to_review", items },
+        idempotencyKey: "bulk-1",
+        signal,
+      },
+    },
+    {
+      path: "/api/v1/screening-runs/run%2F1/bulk-actions",
+      options: {
+        method: "POST",
+        body: { command: "advance_to_review", items },
+        idempotencyKey: "bulk-2",
+        signal,
+      },
+    },
+  ]);
 });
