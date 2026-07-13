@@ -98,6 +98,27 @@ test("save omits api_key when the saved key is retained", async () => {
   assert.equal("api_key" in client.calls[1].options.body, false);
 });
 
+test("a failed save clears the replacement key and keeps a safe error", async () => {
+  const client = createClient((path, options) => {
+    if (options.method === "PUT") {
+      throw new ApiError({ status: 503, code: "persistence_failed", detail: "secret backend detail" });
+    }
+    return { data: systemConfig };
+  });
+  const controller = createLlmSettingsController({ client, createIdempotencyKey: () => "save-key" });
+  await controller.load();
+  controller.startKeyReplacement();
+  controller.setReplacementKey("sk-clear-after-attempt");
+
+  await controller.save();
+
+  assert.equal(client.calls[1].options.body.api_key, "sk-clear-after-attempt");
+  assert.equal(controller.getState().replacementKey, "");
+  assert.equal(controller.getState().replacingKey, false);
+  assert.equal(controller.getState().error, getLlmSettingsErrorMessage({ code: "persistence_failed" }));
+  assert.equal(controller.getState().error.includes("secret backend detail"), false);
+});
+
 test("cancel replacement clears the key and restores the clean state when it was the only change", async () => {
   const client = createClient(() => ({ data: systemConfig }));
   const controller = createLlmSettingsController({ client });

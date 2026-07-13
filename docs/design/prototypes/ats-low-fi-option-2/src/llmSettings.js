@@ -180,7 +180,12 @@ export function createLlmSettingsController({
         }
         return false;
       }
-      publish({ status: "error", error: getLlmSettingsErrorMessage(error) });
+      publish({
+        status: "error",
+        replacingKey: false,
+        replacementKey: "",
+        error: getLlmSettingsErrorMessage(error),
+      });
       return false;
     }
   }
