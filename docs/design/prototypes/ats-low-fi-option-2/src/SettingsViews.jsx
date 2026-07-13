@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Bot, CheckCircle2, ChevronDown, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
 import { getRoleCapabilities, isPermissionExpansion } from "./ux07Domain.js";
 import { canEditAiSettings, canEditAuditSettings, canEditOrganizationSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
+import { createLlmSettingsController, getTestDisabledReason } from "./llmSettings.js";
 
 const settingsSections = [
   ["组织与权限", Users],
@@ -9,8 +10,6 @@ const settingsSections = [
   ["AI 设置", Bot],
   ["审计与数据治理", FileClock],
 ];
-const defaultAiForm = { enabled: true, provider: "OpenAI 兼容接口", model: "glm-5.2", baseUrl: "https://open.bigmodel.cn/api/paas/v4", scopes: ["AI 工程师"] };
-
 const seedUsers = [
   { id: "U-001", name: "张小北", email: "zhang***@company.com", department: "技术部", role: "招聘管理员", status: "启用", scopes: ["AI 工程师", "Java 后端工程师", "产品经理"] },
   { id: "U-002", name: "陈雨", email: "chen***@company.com", department: "技术部", role: "HR", status: "启用", scopes: ["Java 后端工程师"] },
@@ -68,17 +67,59 @@ function TemplateSettings({ role, onNotify }) {
   return <div className="settings-section"><div className="settings-section-heading"><div><h2>流程与评价模板</h2><p>管理招聘阶段、状态原因和结构化评价。</p></div></div>{!editable && <PermissionNotice>{role === "面试官" ? "你只能查看面试评价模板。" : "当前为只读模式，模板修改由招聘管理员完成。"}</PermissionNotice>}<div className="settings-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>{tab === "招聘流程" && <section className="template-editor"><header><div><input disabled={!editable} value={draftName} onChange={(event) => setDraftName(event.target.value)} /><span>适用职位：AI 工程师、Java 后端工程师</span></div>{editable && <button className="button primary" type="button" onClick={saveTemplate}>{saveFailed ? "重试保存" : "保存模板"}</button>}</header>{saveFailed && <div className="settings-error"><AlertTriangle size={18} /><span>保存失败，草稿已保留。网络恢复后可直接重试。</span></div>}<div className="stage-editor">{stages.map((stage, index) => <div key={`${stage}-${index}`}><span>{index + 1}</span><input disabled={!editable} value={stage} onChange={(event) => setStages(stages.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} /><small>{["新简历", "面试中"].includes(stage) ? "进行中申请正在使用，不可删除" : "可调整"}</small>{editable && <button type="button" disabled={["新简历", "面试中"].includes(stage)} onClick={() => setStages(stages.filter((_, itemIndex) => itemIndex !== index))}>删除</button>}</div>)}</div></section>}{tab === "淘汰原因" && <div className="reason-list">{[["岗位要求不匹配", "必填", "启用"], ["候选人主动放弃", "必填", "启用"], ["薪资预期不匹配", "可选", "启用"], ["暂不招聘", "可选", "停用"]].map((item) => <div key={item[0]}><strong>{item[0]}</strong><span>{item[1]}</span><span>{item[2]}</span>{editable && <button type="button">编辑</button>}</div>)}</div>}{tab === "面试评价模板" && <div className="evaluation-template"><header><div><strong>技术岗位结构化评价</strong><span>适用：技术一面、技术二面</span></div>{editable && <button className="button secondary" type="button">编辑模板</button>}</header>{["专业能力", "问题解决", "沟通协作", "岗位匹配"].map((item) => <div key={item}><span>{item}</span><small>必填 · 需提升 / 一般 / 良好 / 优秀</small></div>)}<footer>结论：强烈推荐、推荐、保留、不推荐</footer></div>}</div>;
 }
 
-function AiSettings({ role, onNotify, initialForm, onFormChange }) {
+function formatTestTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function ReadOnlyAiSettings({ config }) {
+  const rows = [
+    ["configured", "配置状态", (value) => value ? "已配置" : "未配置"],
+    ["enabled", "启用状态", (value) => value ? "已启用" : "未启用"],
+    ["provider_id", "Provider", (value) => value || "—"],
+    ["model", "模型", (value) => value || "—"],
+    ["version", "配置版本", (value) => String(value)],
+    ["last_test_status", "最近测试", (value) => value === "succeeded" ? "成功" : value === "failed" ? "失败" : "尚未测试"],
+    ["last_test_error_code", "测试错误码", (value) => value || "—"],
+    ["last_test_latency_ms", "测试耗时", (value) => Number.isFinite(value) ? `${value} ms` : "—"],
+    ["last_tested_at", "测试时间", formatTestTime],
+  ].filter(([key]) => Object.prototype.hasOwnProperty.call(config, key));
+  return <div className="llm-readonly"><PermissionNotice>招聘管理员仅可查看服务端授权返回的模型配置，修改由系统管理员完成。</PermissionNotice><dl>{rows.map(([key, label, format]) => <div key={key}><dt>{label}</dt><dd>{format(config[key])}</dd></div>)}</dl></div>;
+}
+
+function AiSettings({ role, onNotify, onDirtyChange }) {
   const editable = canEditAiSettings(role);
-  const [form, setForm] = useState(initialForm ?? defaultAiForm);
-  const [keyMode, setKeyMode] = useState(false);
-  const [testState, setTestState] = useState("idle");
-  const [risk, setRisk] = useState(false);
-  useEffect(() => { onFormChange?.(form); }, [form, onFormChange]);
+  const controller = useMemo(() => createLlmSettingsController(), [role]);
+  const [viewState, setViewState] = useState(() => controller.getState());
+  useEffect(() => {
+    const unsubscribe = controller.subscribe(setViewState);
+    controller.load();
+    return () => {
+      unsubscribe();
+      controller.cancelKeyReplacement();
+      controller.dispose();
+      onDirtyChange?.(false);
+    };
+  }, [controller, onDirtyChange]);
+  useEffect(() => { onDirtyChange?.(viewState.dirty); }, [viewState.dirty, onDirtyChange]);
   if (role === "面试官") return <section className="settings-denied"><LockKeyhole size={31} /><h3>无 AI 设置权限</h3><p>面试官不能查看 Provider、模型范围或密钥状态。</p></section>;
-  function toggleEnabled(checked) { if (checked && !form.enabled) { setRisk(true); return; } setForm({ ...form, enabled: checked }); }
-  function testConnection() { setTestState("testing"); window.setTimeout(() => setTestState(form.baseUrl.includes("invalid") ? "error" : "success"), 450); }
-  return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>控制候选人文本是否发送到外部模型服务。</p></div></div>{!editable && <PermissionNotice>HR 仅可查看启用状态和岗位范围，不能查看或替换密钥。</PermissionNotice>}<section className="ai-governance"><ShieldCheck size={20} /><div><strong>数据外发控制</strong><p>启用后仅向已配置 Provider 发送 JD 与简历文本，不发送审计日志或账号凭据。</p></div><label><input type="checkbox" disabled={!editable} checked={form.enabled} onChange={(event) => toggleEnabled(event.target.checked)} />启用</label></section><div className="settings-form"><label>Provider<select disabled={!editable} value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })}><option>OpenAI 兼容接口</option><option>Azure OpenAI</option><option>企业内部模型</option></select></label><label>模型<input disabled={!editable} value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} /></label><label>Base URL<input disabled={!editable} value={form.baseUrl} onChange={(event) => { setForm({ ...form, baseUrl: event.target.value }); setTestState("idle"); }} /></label><label>API Key<div className="masked-key"><KeyRound size={16} /><span>{editable ? "••••••••••••••••••••••••" : "已配置"}</span>{editable && <button type="button" onClick={() => setKeyMode(!keyMode)}>{keyMode ? "取消替换" : "替换"}</button>}</div>{keyMode && <input type="password" placeholder="输入新的 API Key，保存后不再回显" />}</label><fieldset><legend>允许使用的岗位</legend>{["AI 工程师", "Java 后端工程师", "产品经理"].map((scope) => <label key={scope}><input type="checkbox" disabled={!editable} checked={form.scopes.includes(scope)} onChange={(event) => setForm({ ...form, scopes: event.target.checked ? [...form.scopes, scope] : form.scopes.filter((item) => item !== scope) })} />{scope}</label>)}</fieldset></div><div className={`llm-test-result ${testState}`}><div>{testState === "success" ? <CheckCircle2 size={20} /> : testState === "error" ? <AlertTriangle size={20} /> : <Bot size={20} />}<span><strong>{testState === "testing" ? "正在测试连接" : testState === "success" ? "连接成功" : testState === "error" ? "连接失败" : "尚未测试当前配置"}</strong>{testState === "error" && <small>HTTP 404：Provider 路径不存在或模型不可用。请检查 Base URL 与模型名称。Trace ID：llm_test_72ad</small>}{testState === "success" && <small>模型响应正常，耗时 482ms，未发送真实候选人数据。</small>}</span></div>{editable && <button className="button secondary" type="button" disabled={testState === "testing"} onClick={testConnection}>{testState === "testing" ? <RefreshCw size={15} /> : null}测试连接</button>}</div>{editable && <div className="settings-sticky-actions"><span>配置修改会记录到审计日志。</span><button className="button primary" type="button" onClick={() => onNotify("AI 设置已保存")}>保存设置</button></div>}{risk && <DangerDialog title="确认启用外部 Provider" description="启用后，授权岗位的 JD 与简历文本将发送到外部模型服务。" impact="请确认该 Provider 符合公司隐私与数据处理要求。API Key 不会发送给除目标 Provider 以外的服务。" confirmText="确认启用" onCancel={() => setRisk(false)} onConfirm={() => { setForm({ ...form, enabled: true }); setRisk(false); onNotify("外部 Provider 已启用并记录审计"); }} />}</div>;
+  const { status, config, draft, replacingKey, replacementKey, dirty, error, message } = viewState;
+  if ((status === "idle" || status === "loading") && !config) return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>正在读取已保存的模型配置。</p></div></div><div className="llm-settings-loading" role="status"><RefreshCw size={18} />正在加载设置…</div></div>;
+  if (!config) return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>控制候选人文本是否发送到外部模型服务。</p></div></div><div className="llm-settings-load-error" role="alert"><AlertTriangle size={20} /><div><strong>设置加载失败</strong><p>{error}</p></div><button className="button secondary" type="button" onClick={() => controller.load()}>重试</button></div></div>;
+  if (!editable) return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>查看组织当前使用的模型配置。</p></div></div><ReadOnlyAiSettings config={config} /></div>;
+
+  const providers = Object.keys(config.available_providers || {});
+  const models = config.available_providers?.[draft.provider_id] || [];
+  const testDisabledReason = getTestDisabledReason(viewState);
+  const saveMissingKey = draft.enabled && config.key_configured !== true && !replacementKey;
+  const saveDisabled = status === "saving" || status === "testing" || !dirty || !draft.provider_id || !draft.model || saveMissingKey;
+  const scopeIds = Array.isArray(config.allowed_job_ids) ? config.allowed_job_ids : [];
+  const lastTestFailed = config.last_test_status === "failed";
+  const lastTestSucceeded = config.last_test_status === "succeeded";
+  async function save() { if (await controller.save()) onNotify("AI 设置已保存"); }
+  async function testConnection() { if (await controller.testConnection()) onNotify("LLM 连接测试成功"); }
+  return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>控制候选人文本是否发送到后端允许的模型服务。</p></div></div>{error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{error}</div>}{message && <div className="llm-settings-message" role="status">{message}</div>}<section className="ai-governance"><ShieldCheck size={20} /><div><strong>数据外发控制</strong><p>Provider 地址由后端部署白名单管理；前端仅选择已允许的 Provider 与模型。</p></div><label className="llm-enabled-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => controller.updateDraft({ enabled: event.target.checked })} />启用</label></section><div className="settings-form llm-settings-form"><label>Provider<select value={draft.provider_id} onChange={(event) => { const provider_id = event.target.value; controller.updateDraft({ provider_id, model: config.available_providers?.[provider_id]?.[0] || "" }); }}><option value="">请选择 Provider</option>{providers.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select></label><label>模型<select value={draft.model} disabled={!draft.provider_id || models.length === 0} onChange={(event) => controller.updateDraft({ model: event.target.value })}><option value="">请选择模型</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><div className="llm-key-field"><span className="llm-field-label">API Key</span><div className="masked-key"><KeyRound size={16} aria-hidden="true" /><span>{config.key_configured ? "已安全配置" : "尚未配置"}</span><button type="button" onClick={() => replacingKey ? controller.cancelKeyReplacement() : controller.startKeyReplacement()}>{replacingKey ? "取消替换" : config.key_configured ? "替换" : "添加"}</button></div>{replacingKey && <label className="llm-replacement-key">新的 API Key<input type="password" autoComplete="new-password" value={replacementKey} onChange={(event) => controller.setReplacementKey(event.target.value)} placeholder="保存后不会再次显示" /></label>}{saveMissingKey && <small className="llm-field-hint">启用模型前必须添加并保存 API Key。</small>}</div><div className="llm-scope-summary"><strong>允许使用的岗位</strong><p>{scopeIds.length === 0 ? "全部岗位（空列表表示不限制岗位）" : `已限制为 ${scopeIds.length} 个岗位`}</p>{scopeIds.length > 0 && <code>{scopeIds.join("、")}</code>}<small>岗位选择器尚未开放；保存时会原样保留当前岗位 ID。</small></div></div><section className={`llm-test-result ${lastTestSucceeded ? "success" : lastTestFailed ? "error" : "idle"}`} aria-live="polite"><div>{lastTestSucceeded ? <CheckCircle2 size={20} /> : lastTestFailed ? <AlertTriangle size={20} /> : <Bot size={20} />}<span><strong>{status === "testing" ? "正在测试已保存的配置" : lastTestSucceeded ? "最近一次连接成功" : lastTestFailed ? "最近一次连接失败" : "尚未测试已保存的配置"}</strong><small>{lastTestSucceeded ? `耗时 ${config.last_test_latency_ms ?? "—"} ms · ${formatTestTime(config.last_tested_at)}` : lastTestFailed ? `安全错误码：${config.last_test_error_code || "未知"} · ${formatTestTime(config.last_tested_at)}` : "测试只使用服务器中最后保存的 Provider、模型和 API Key。"}</small>{testDisabledReason && <small className="llm-test-explanation">{testDisabledReason}</small>}</span></div><button className="button secondary" type="button" disabled={Boolean(testDisabledReason)} onClick={testConnection}>{status === "testing" && <RefreshCw size={15} />}测试连接</button></section><div className="settings-sticky-actions"><span>{status === "saving" ? "正在保存…" : dirty ? "有尚未保存的修改" : "当前配置已保存"}</span>{dirty && <button className="button secondary" type="button" disabled={status === "saving" || status === "testing"} onClick={() => controller.discardDraft()}>取消修改</button>}<button className="button primary" type="button" disabled={saveDisabled} onClick={save}>{status === "saving" ? "保存中…" : "保存设置"}</button></div></div>;
 }
 
 function AuditSettings({ role, onNotify }) {
@@ -98,12 +139,11 @@ function AuditSettings({ role, onNotify }) {
 export function SettingsWorkspace({ currentRole, onRoleChange, onNotify }) {
   const [section, setSection] = useState("组织与权限");
   const [aiDirty, setAiDirty] = useState(false);
-  const [aiFormDraft, setAiFormDraft] = useState(defaultAiForm);
   const [pendingSection, setPendingSection] = useState(null);
   const allowedSettingsSections = getAllowedSettingsSections(currentRole);
   const visibleSettingsSections = settingsSections.filter(([label]) => allowedSettingsSections.includes(label));
   const activeSection = allowedSettingsSections.includes(section) ? section : allowedSettingsSections[0];
-  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} initialForm={aiFormDraft} onFormChange={setAiFormDraft} /> : activeSection === "审计与数据治理" ? <AuditSettings role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
+  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} onDirtyChange={setAiDirty} /> : activeSection === "审计与数据治理" ? <AuditSettings role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
   function openSection(nextSection) {
     if (activeSection === "AI 设置" && aiDirty && nextSection !== activeSection) {
       setPendingSection(nextSection);
@@ -111,12 +151,10 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify }) {
     }
     setSection(nextSection);
   }
-  function leaveAiSettings(saveDraft) {
-    if (saveDraft) onNotify("AI 设置草稿已保存在当前浏览器");
-    else setAiFormDraft(defaultAiForm);
+  function leaveAiSettings() {
     setAiDirty(false);
     setSection(pendingSection);
     setPendingSection(null);
   }
-  return <div className="settings-page"><div className="settings-heading"><div><h2>设置</h2><p>管理招聘组织、流程、AI 和数据治理。</p></div><RoleSwitch value={currentRole} onChange={onRoleChange} /></div><div className="settings-layout"><nav className="settings-subnav" aria-label="设置导航">{visibleSettingsSections.map(([label, Icon]) => <button type="button" key={label} className={activeSection === label ? "active" : ""} onClick={() => openSection(label)}><Icon size={17} />{label}</button>)}</nav><main className="settings-content" onChangeCapture={() => { if (activeSection === "AI 设置" && canEditAiSettings(currentRole)) setAiDirty(true); }} onClickCapture={(event) => { if (event.target.closest("button")?.textContent === "保存设置") setAiDirty(false); }}>{content}</main></div>{pendingSection && <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label="AI 设置尚未保存"><header><div><h3>AI 设置尚未保存</h3><p>离开后可以放弃本次修改，或将配置保存为本地草稿。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingSection(null)}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>草稿只保存在当前浏览器，不会启用 Provider，也不会写入生产配置。</span></div><footer><button className="button secondary" type="button" onClick={() => setPendingSection(null)}>继续编辑</button><button className="button secondary" type="button" onClick={() => leaveAiSettings(false)}>放弃修改</button><button className="button primary" type="button" onClick={() => leaveAiSettings(true)}>保存草稿并离开</button></footer></section></div>}</div>;
+  return <div className="settings-page"><div className="settings-heading"><div><h2>设置</h2><p>管理招聘组织、流程、AI 和数据治理。</p></div><RoleSwitch value={currentRole} onChange={onRoleChange} /></div><div className="settings-layout"><nav className="settings-subnav" aria-label="设置导航">{visibleSettingsSections.map(([label, Icon]) => <button type="button" key={label} className={activeSection === label ? "active" : ""} onClick={() => openSection(label)}><Icon size={17} />{label}</button>)}</nav><main className="settings-content">{content}</main></div>{pendingSection && <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label="AI 设置尚未保存"><header><div><h3>AI 设置尚未保存</h3><p>离开将放弃尚未保存的配置修改。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingSection(null)}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>未保存的 Provider、模型和 API Key 替换内容都会被清除。</span></div><footer><button className="button secondary" type="button" onClick={() => setPendingSection(null)}>继续编辑</button><button className="button danger" type="button" onClick={leaveAiSettings}>放弃修改并离开</button></footer></section></div>}</div>;
 }
