@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   BriefcaseBusiness,
   CalendarDays,
@@ -35,6 +35,7 @@ import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate,
 import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 import { screeningController as defaultScreeningController } from "./screeningController.js";
+import { candidateController as defaultCandidateController } from "./candidateController.js";
 import { getRecentScreeningTaskStorageKey, LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY, parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
 
 const navItems = [
@@ -147,7 +148,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController, screeningController = defaultScreeningController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -162,10 +163,10 @@ export function App({ controller = sessionController, screeningController = defa
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} />;
 }
 
-function AuthenticatedApp({ session, onLogout, screeningController }) {
+function AuthenticatedApp({ session, onLogout, screeningController, candidateController }) {
   const currentRole = session.role || "未知角色";
   const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
@@ -183,6 +184,8 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
   const [candidateMode, setCandidateMode] = useState("list");
   const [candidateRecords, setCandidateRecords] = useState(initialCandidateRecords);
   const [candidateOrigin, setCandidateOrigin] = useState(null);
+  const [candidateDetailState, setCandidateDetailState] = useState(null);
+  const candidateLoadRef = useRef(null);
   const [candidatePreset, setCandidatePreset] = useState(null);
   const [currentScenario, setCurrentScenario] = useState("default");
   const [interviewMode, setInterviewMode] = useState("list");
@@ -196,6 +199,7 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
   const [selectedPoolId, setSelectedPoolId] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
+  const [screeningViewState, setScreeningViewState] = useState(null);
   const [recentTask, setRecentTask] = useState(() => {
     return recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null;
   });
@@ -248,6 +252,8 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
     window.localStorage.removeItem(LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY);
     setRecentTask(recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null);
   }, [recentTaskStorageKey]);
+
+  useEffect(() => () => candidateLoadRef.current?.abort(), []);
 
   function notify(message) {
     setToast(message);
@@ -382,7 +388,38 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
     setActiveJob(record.name);
   }
 
-  function openCandidate(summary) {
+  async function loadServerCandidate(context) {
+    candidateLoadRef.current?.abort();
+    const abortController = new AbortController();
+    candidateLoadRef.current = abortController;
+    setCandidateDetailState({ status: "loading", context, error: "" });
+    setSelectedCandidate(null);
+    try {
+      const candidate = await candidateController.loadReview({
+        ...context,
+        actor: { id: session.user?.id, name: roleIdentity.name },
+      }, { signal: abortController.signal });
+      if (candidateLoadRef.current !== abortController) return;
+      setSelectedCandidate(candidate);
+      setCandidateDetailState({ status: "ready", context, error: "" });
+    } catch (error) {
+      if (error?.name === "AbortError" || candidateLoadRef.current !== abortController) return;
+      setCandidateDetailState({ status: "error", context, error: "请检查网络连接后重试；未加载任何本地示例数据。" });
+    } finally {
+      if (candidateLoadRef.current === abortController) candidateLoadRef.current = null;
+    }
+  }
+
+  function openCandidate(summary, nextScreeningViewState = null) {
+    if (summary.serverBacked === true) {
+      if (!summary.candidateId) return;
+      setCandidateOrigin({ activeNav, screeningTask, screeningViewState: nextScreeningViewState });
+      setScreeningTask(null);
+      setActiveNav("候选人");
+      setCandidateMode("detail");
+      void loadServerCandidate({ candidateId: summary.candidateId, jobId: summary.jobId, position: summary.position, evidence: summary.evidence });
+      return;
+    }
     let candidate = candidateRecords.find((item) => (summary.fileId && item.sourceFileId === summary.fileId) || (summary.email && item.email === summary.email))
       || candidateRecords.find((item) => item.name === summary.name);
     if (!candidate) {
@@ -393,16 +430,21 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
     setScreeningTask(null);
     setActiveNav("候选人");
     setSelectedCandidate(candidate);
+    setCandidateDetailState(null);
     setCandidateMode("detail");
   }
 
   function backFromCandidateDetail() {
+    candidateLoadRef.current?.abort();
+    candidateLoadRef.current = null;
     if (candidateOrigin) {
       setActiveNav(candidateOrigin.activeNav);
       setScreeningTask(candidateOrigin.screeningTask);
+      setScreeningViewState(candidateOrigin.screeningViewState || null);
       setCandidateOrigin(null);
     }
     setSelectedCandidate(null);
+    setCandidateDetailState(null);
     setCandidateMode("list");
   }
 
@@ -640,7 +682,7 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
@@ -663,7 +705,7 @@ function AuthenticatedApp({ session, onLogout, screeningController }) {
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
-        {screeningTask && <ScreeningTaskView task={screeningTask} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
+        {screeningTask && <ScreeningTaskView task={screeningTask} initialViewState={screeningViewState} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
       </main>
 
       {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onRunCreated={persistRecentServerTask} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} onNotify={notify} actorName={roleIdentity.name} />}

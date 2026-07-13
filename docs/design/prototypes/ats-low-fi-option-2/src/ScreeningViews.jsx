@@ -80,6 +80,29 @@ export function candidateDisplayName(file, serverBacked) {
   return file.candidate ? `${file.candidate}（待核验）` : "候选人姓名待核验";
 }
 
+export function canOpenCandidateReview(file, serverBacked) {
+  const completed = file?.status === "success" || file?.status === "partial";
+  if (!completed) return false;
+  return serverBacked !== true || (typeof file?.candidateId === "string" && file.candidateId.trim().length > 0);
+}
+
+export function candidateReviewContext(file, task) {
+  return {
+    candidateId: file.candidateId,
+    jobId: task.jobId,
+    position: task.position,
+    evidence: {
+      ruleScore: file.ruleScore,
+      llmScore: file.llmScore,
+      recommendation: file.recommendation,
+      matched: file.matched,
+      missing: file.missing,
+      risk: file.risk,
+      llmReason: file.llmReason,
+    },
+  };
+}
+
 export function serverIssueMessage(file) {
   if (file.status === "partial") return file.llmRetryable ? "LLM 评估未完成，规则结果已保留；可使用下方“重试 LLM”操作。" : "LLM 评估未完成，规则结果已保留；当前没有可用的 LLM 重试操作。";
   if (file.status === "failed") return file.retryable ? "文件处理失败，可使用下方“重新解析”操作。" : "文件处理失败，当前没有可用的重试操作。";
@@ -97,6 +120,17 @@ export function isAdvanceSelectable(file, serverBacked) {
     && file?.application_stage === "new"
     && Number.isInteger(file?.application_version)
     && file.application_version > 0;
+}
+
+export function restoreScreeningViewState(viewState, task) {
+  if (viewState?.taskId !== task?.id) return { query: "", filter: "全部", selected: [] };
+  const validFilters = ["全部", "处理中", "成功", "部分成功", "失败"];
+  const selected = Array.isArray(viewState.selected) ? viewState.selected : [];
+  return {
+    query: typeof viewState.query === "string" ? viewState.query : "",
+    filter: validFilters.includes(viewState.filter) ? viewState.filter : "全部",
+    selected: selected.filter((id) => task.files.some((file) => file.id === id && isAdvanceSelectable(file, task.serverBacked))),
+  };
 }
 
 export function advanceItems(files, selectedIds) {
@@ -309,11 +343,12 @@ export function ImportWizard({ activeJob, recentTask, onClose, onCreateTask, onR
   );
 }
 
-export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onOpenCandidate, onNotify, controller = defaultScreeningController }) {
+export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskChange, onBack, onOpenCandidate, onNotify, controller = defaultScreeningController }) {
+  const restoredViewState = restoreScreeningViewState(initialViewState, initialTask);
   const [task, setTask] = useState(initialTask);
-  const [filter, setFilter] = useState("全部");
-  const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState([]);
+  const [filter, setFilter] = useState(restoredViewState.filter);
+  const [query, setQuery] = useState(restoredViewState.query);
+  const [selected, setSelected] = useState(restoredViewState.selected);
   const [pollError, setPollError] = useState("");
   const [bulkError, setBulkError] = useState("");
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
@@ -324,8 +359,11 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
   const bulkAbortRef = useRef(null);
 
   useEffect(() => {
+    const nextViewState = restoreScreeningViewState(initialViewState, initialTask);
     setTask(initialTask);
-    setSelected([]);
+    setFilter(nextViewState.filter);
+    setQuery(nextViewState.query);
+    setSelected(nextViewState.selected);
     setBulkError("");
     setBulkSubmitting(false);
     bulkAbortRef.current?.abort();
@@ -483,7 +521,7 @@ export function ScreeningTaskView({ task: initialTask, onTaskChange, onBack, onO
           <div className="screening-table-head"><label><input type="checkbox" disabled={bulkSubmitting || selectableIds.length === 0} aria-label="选择全部可推进结果" checked={allSelected} onChange={() => setSelected(allSelected ? selected.filter((id) => !selectableIds.includes(id)) : [...new Set([...selected, ...selectableIds])])} /></label><span>候选人 / 文件</span><span>状态</span><span>建议</span><span>规则分</span><span>LLM 分</span><span>命中 / 缺失</span><span>风险与操作</span></div>
           {filtered.map((file) => <div className="screening-row" key={file.id}>
             <label><input type="checkbox" disabled={bulkSubmitting || !isAdvanceSelectable(file, task.serverBacked)} aria-label={`选择 ${file.candidate || file.name}`} checked={selected.includes(file.id)} onChange={() => setSelected((current) => current.includes(file.id) ? current.filter((id) => id !== file.id) : [...current, file.id])} /></label>
-            <button className="screening-identity" type="button" disabled={task.serverBacked || !['success','partial'].includes(file.status)} title={task.serverBacked ? "候选人姓名与详情待核验，候选人模块接入服务端后开放" : !['success','partial'].includes(file.status) ? "处理成功后可查看候选人" : undefined} onClick={() => onOpenCandidate({ name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ruleScore: file.ruleScore, llmScore: file.llmScore, recommendation: file.recommendation, matched: file.matched, missing: file.missing, risk: file.risk })}><strong>{candidateDisplayName(file, task.serverBacked)}</strong><small>{file.name}</small></button>
+            <button className="screening-identity" type="button" disabled={!canOpenCandidateReview(file, task.serverBacked)} title={!canOpenCandidateReview(file, task.serverBacked) ? (task.serverBacked && !file.candidateId ? "服务端尚未生成候选人记录" : "处理成功后可查看候选人") : undefined} onClick={() => onOpenCandidate(task.serverBacked ? { serverBacked: true, ...candidateReviewContext(file, task) } : { name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ruleScore: file.ruleScore, llmScore: file.llmScore, recommendation: file.recommendation, matched: file.matched, missing: file.missing, risk: file.risk }, { taskId: task.id, query, filter, selected })}><strong>{candidateDisplayName(file, task.serverBacked)}</strong><small>{file.name}</small></button>
             <span><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{(file.status === "failed" || file.status === "cancelled") && <X size={13} />}{statusLabel(file.status)}</span></span>
             <span className="recommendation-cell">{file.status === "queued" ? "等待处理" : file.status === "cancelled" ? "未处理" : file.recommendation}</span>
             <span className="score-source"><strong>{file.status === "queued" ? "—" : (file.ruleScore ?? "—")}</strong><small>规则</small></span>

@@ -90,7 +90,7 @@ def test_bulk_reject_validation_and_all_or_nothing_stale_version(tmp_path):
         stale=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"stale"}); assert stale.status_code==409
     with app.state.identity_store.sync_session() as db: assert db.get(Application,application.id).stage=="new" and db.scalar(select(func.count(ApplicationStageEvent.id)))==0
 
-def test_bulk_reject_persists_human_reason_without_audit_text(tmp_path):
+def test_bulk_reject_persists_reason_in_stage_event_without_audit_text(tmp_path):
     app,run,item=scored_item(tmp_path)
     with app.state.identity_store.sync_session() as db:
         application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
@@ -99,5 +99,6 @@ def test_bulk_reject_persists_human_reason_without_audit_text(tmp_path):
     with TestClient(app) as client:
         headers=login(client,"admin@example.test"); response=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"reject"}); assert response.status_code==200
     with app.state.identity_store.sync_session() as db:
-        assert db.get(Application,application_id).human_conclusion==reason
+        assert db.get(Application,application_id).human_conclusion is None
+        assert db.scalar(select(ApplicationStageEvent)).payload["reason_text"]==reason
         audit=db.scalar(select(AuditLog).where(AuditLog.event_type=="application.stage_changed")); assert reason not in str(audit.metadata_json)

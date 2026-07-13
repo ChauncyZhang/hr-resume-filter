@@ -27,7 +27,7 @@ def principal(role: str) -> Principal:
         ("recruiter", RecruitingAction.PREVIEW, True),
         ("recruiter", RecruitingAction.ISSUE_TICKET, True),
         ("recruiter", RecruitingAction.DOWNLOAD, True),
-        ("recruiter", RecruitingAction.RECOMMEND, False),
+        ("recruiter", RecruitingAction.RECOMMEND, True),
         ("hiring_manager", RecruitingAction.READ, True),
         ("hiring_manager", RecruitingAction.COMMENT, True),
         ("hiring_manager", RecruitingAction.RECOMMEND, True),

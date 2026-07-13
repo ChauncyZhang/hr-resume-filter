@@ -105,12 +105,13 @@ def _apply_application_transition(db, application, target, *, actor_user_id, tra
     application.stage = target
     application.version += 1
     application.updated_at = datetime.now(timezone.utc)
-    if target == "rejected" and reason_text and reason_text.strip():
-        application.human_conclusion = reason_text.strip()
     safe_payload = {"from_stage": source, "to_stage": target}
     if reason_code:
         safe_payload["reason_code"] = reason_code
-    db.add(ApplicationStageEvent(organization_id=application.organization_id, application_id=application.id, actor_user_id=actor_user_id, event_type="application.stage_changed", payload=safe_payload))
+    event_payload = dict(safe_payload)
+    if reason_text and reason_text.strip():
+        event_payload["reason_text"] = reason_text.strip()
+    db.add(ApplicationStageEvent(organization_id=application.organization_id, application_id=application.id, actor_user_id=actor_user_id, event_type="application.stage_changed", payload=event_payload))
     db.add(AuditLog(organization_id=application.organization_id, actor_user_id=actor_user_id, event_type="application.stage_changed", outcome="success", trace_id=trace_id, metadata_json=safe_payload))
     db.flush()
     return application

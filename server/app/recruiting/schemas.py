@@ -65,6 +65,7 @@ class VersionOut(ApiModel):
 
 class NoteOut(ApiModel):
     id: str
+    application_id: str
     body: str
     author_id: str
     created_at: str | None = None
@@ -81,6 +82,7 @@ class TimelineEventOut(ApiModel):
     id: str
     event_type: str
     summary: str
+    actor_id: str
     created_at: str
 
 

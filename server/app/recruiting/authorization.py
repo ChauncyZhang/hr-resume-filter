@@ -24,6 +24,7 @@ ROLE_ACTIONS = {
     "recruiting_admin": set(RecruitingAction),
     "recruiter": {
         RecruitingAction.READ, RecruitingAction.COMMENT,
+        RecruitingAction.RECOMMEND,
         RecruitingAction.MANAGE_CANDIDATE, RecruitingAction.MANAGE_JOB,
         RecruitingAction.CREATE_VERSION, RecruitingAction.TRANSITION,
         RecruitingAction.PREVIEW, RecruitingAction.ISSUE_TICKET,
@@ -52,11 +53,12 @@ class RecruitingAuthorizationService:
             return True
         branches = []
         if "recruiter" in principal.roles and action in ROLE_ACTIONS["recruiter"]:
+            recruiter_grants = ("job_owner",) if action == RecruitingAction.RECOMMEND else ("job_owner", "job_recruiter")
             branches.append(exists().where(
                 JobCollaborator.organization_id == job.organization_id,
                 JobCollaborator.job_id == job.id,
                 JobCollaborator.user_id == principal.user_id,
-                JobCollaborator.access_role.in_(("job_owner", "job_recruiter")),
+                JobCollaborator.access_role.in_(recruiter_grants),
             ))
         if "hiring_manager" in principal.roles and action in ROLE_ACTIONS["hiring_manager"]:
             branches.append(exists().where(

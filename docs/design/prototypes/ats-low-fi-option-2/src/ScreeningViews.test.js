@@ -3,6 +3,7 @@ import { after, before, test } from "node:test";
 import { createServer } from "vite";
 
 let helpers;
+let candidateHelpers;
 let vite;
 
 before(async () => {
@@ -13,6 +14,7 @@ before(async () => {
     appType: "custom",
   });
   helpers = await vite.ssrLoadModule("/src/ScreeningViews.jsx");
+  candidateHelpers = await vite.ssrLoadModule("/src/CandidateViews.jsx");
 });
 
 after(async () => {
@@ -132,4 +134,60 @@ test("server retry stays locked while the refreshed row remains failed and retry
   assert.deepEqual(helpers.reconcileRetryingIds(["item-1"], [
     { id: "item-1", status: "failed", retryable: false },
   ]), []);
+});
+
+test("server result opens review only from a completed row with a candidate id", () => {
+  assert.equal(helpers.canOpenCandidateReview({ status: "success", candidateId: "candidate-1" }, true), true);
+  assert.equal(helpers.canOpenCandidateReview({ status: "partial", candidateId: "candidate-2" }, true), true);
+  assert.equal(helpers.canOpenCandidateReview({ status: "failed", candidateId: "candidate-3" }, true), false);
+  assert.equal(helpers.canOpenCandidateReview({ status: "success", candidateId: "" }, true), false);
+  assert.equal(helpers.canOpenCandidateReview({ status: "success", candidate: "同名候选人" }, true), false);
+  assert.equal(helpers.canOpenCandidateReview({ status: "success" }, false), true);
+});
+
+test("server review context keeps candidate identity separate from display fields", () => {
+  const context = helpers.candidateReviewContext({
+    candidateId: "candidate-1", candidate: "未核验姓名", email: "derived@example.com",
+    ruleScore: 81, llmScore: 78, recommendation: "可沟通", matched: "Python", missing: "Kubernetes", risk: "待确认", llmReason: "匹配",
+  }, { jobId: "job-1", position: "AI 工程师" });
+
+  assert.deepEqual(context, {
+    candidateId: "candidate-1",
+    jobId: "job-1",
+    position: "AI 工程师",
+    evidence: { ruleScore: 81, llmScore: 78, recommendation: "可沟通", matched: "Python", missing: "Kubernetes", risk: "待确认", llmReason: "匹配" },
+  });
+  assert.equal("email" in context, false);
+  assert.equal("candidate" in context, false);
+});
+
+test("screening view context restores filters and only still-selectable rows", () => {
+  assert.equal(typeof helpers.restoreScreeningViewState, "function");
+  assert.deepEqual(helpers.restoreScreeningViewState({
+    taskId: "task-1",
+    query: "zhang",
+    filter: "成功",
+    selected: ["candidate-1", "candidate-2", "missing"],
+  }, {
+    id: "task-1",
+    serverBacked: true,
+    files: [
+      { id: "candidate-1", status: "success", application_stage: "new", application_version: 3 },
+      { id: "candidate-2", status: "success", application_stage: "review", application_version: 4 },
+    ],
+  }), {
+    query: "zhang",
+    filter: "成功",
+    selected: ["candidate-1"],
+  });
+});
+
+test("server candidate detail exposes only connected tabs and reports conflicts safely", () => {
+  assert.deepEqual(candidateHelpers.candidateDetailTabs(true), ["档案与简历", "职位申请", "筛选证据", "时间线"]);
+  assert.match(candidateHelpers.candidateMutationError({ status: 409 }), /其他成员更新/);
+  assert.doesNotMatch(candidateHelpers.candidateMutationError(new Error("database internal.example")), /database|internal/);
+  assert.equal(candidateHelpers.resumeDisplayName({ original_filename: "真实简历.pdf" }), "真实简历.pdf");
+  assert.equal(candidateHelpers.resumeDisplayName(null), "暂无可用简历");
+  assert.deepEqual(candidateHelpers.candidateTransitionOptions("待决策", true), ["已通过", "已淘汰"]);
+  assert.deepEqual(candidateHelpers.candidateTransitionOptions("待决策", false), ["已录用", "已淘汰"]);
 });

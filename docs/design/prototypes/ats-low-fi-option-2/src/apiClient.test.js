@@ -149,3 +149,31 @@ test("request 将 AbortSignal 原样传给 fetch", async () => {
 
   assert.equal(receivedSignal, controller.signal);
 });
+
+test("download 保留 CSRF 防护并以附件返回二进制内容", async () => {
+  const calls = [];
+  const client = createApiClient({
+    fetchImpl: async (path, options) => {
+      calls.push({ path, options });
+      if (path === "/api/v1/me") {
+        return new Response(JSON.stringify({ data: { id: "user-1" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": "csrf-token" },
+        });
+      }
+      return new Response(new Blob(["resume bytes"], { type: "application/pdf" }), {
+        status: 200,
+        headers: { "Content-Type": "application/pdf", "Content-Disposition": "attachment; filename*=UTF-8''candidate.pdf" },
+      });
+    },
+  });
+
+  await client.getMe();
+  const result = await client.download("/api/v1/download-tickets/consume", { method: "POST", body: { token: "one-time" } });
+
+  assert.equal(await result.blob.text(), "resume bytes");
+  assert.equal(result.filename, "candidate.pdf");
+  assert.equal(calls[1].options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(calls[1].options.headers.get("Content-Type"), "application/json");
+  assert.equal(calls[1].options.body, JSON.stringify({ token: "one-time" }));
+});

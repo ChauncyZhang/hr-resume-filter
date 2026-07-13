@@ -18,7 +18,7 @@ from server.app.identity.service import InvalidSession
 from server.app.recruiting.cursor import CursorCodec, InvalidCursor
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import (
-    Application, Candidate, CandidateContact, CandidateEvent, CandidateNote,
+    Application, ApplicationStageEvent, Candidate, CandidateContact, CandidateEvent, CandidateNote,
     DownloadTicket, JobJdVersion, Resume, ScreeningRuleVersion,
 )
 from server.app.recruiting.security import ContactCipher
@@ -98,6 +98,7 @@ class CandidatePatch(StrictModel):
 
 
 class NoteCreate(StrictModel):
+    application_id: UUID
     body: str = Field(min_length=1, max_length=4000)
 
     @field_validator("body")
@@ -173,6 +174,29 @@ def _job_scope(principal: Principal, action: RecruitingAction = RecruitingAction
 
 def _candidate_scope(principal: Principal, action: RecruitingAction = RecruitingAction.READ):
     return AUTH.candidate_predicate(principal, action)
+
+
+def _resume_application_scope(principal: Principal, action: RecruitingAction):
+    return exists().where(
+        Application.organization_id == Resume.organization_id,
+        Application.resume_id == Resume.id,
+        exists().where(
+            Job.organization_id == Application.organization_id,
+            Job.id == Application.job_id,
+            AUTH.job_predicate(principal, action, Job),
+        ),
+    )
+
+
+def _load_candidate_application(db, principal: Principal, candidate_id: UUID, application_id: UUID, action: RecruitingAction):
+    return db.scalar(select(Application).join(
+        Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)
+    ).where(
+        Application.organization_id == principal.organization_id,
+        Application.id == application_id,
+        Application.candidate_id == candidate_id,
+        AUTH.job_predicate(principal, action, Job),
+    ))
 
 
 def _job_data(job: Job) -> dict[str, Any]:
@@ -416,12 +440,23 @@ def timeline(candidate_id: UUID, request: Request):
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate(db, principal, candidate_id, RecruitingAction.READ) is None: return _denied(request)
-        global_events = db.scalars(select(CandidateEvent).where(
+        candidate_events = db.scalars(select(CandidateEvent).where(
             CandidateEvent.organization_id == principal.organization_id,
             CandidateEvent.candidate_id == candidate_id,
-            CandidateEvent.event_type.in_(("candidate.created", "candidate.corrected", "candidate.note_added")),
+            CandidateEvent.event_type.in_(("candidate.created", "candidate.corrected", "candidate.note_added", "application.created", "application.updated")),
         )).all()
-        from server.app.recruiting.models import ApplicationStageEvent
+        authorized_application_ids = {str(value) for value in db.scalars(select(Application.id).join(
+            Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)
+        ).where(
+            Application.organization_id == principal.organization_id,
+            Application.candidate_id == candidate_id,
+            AUTH.job_predicate(principal, RecruitingAction.READ, Job),
+        )).all()}
+        global_events = [
+            row for row in candidate_events
+            if row.event_type in ("candidate.created", "candidate.corrected")
+            or row.payload.get("application_id") in authorized_application_ids
+        ]
         stage_events = db.scalars(select(ApplicationStageEvent).join(
             Application, and_(Application.organization_id == ApplicationStageEvent.organization_id, Application.id == ApplicationStageEvent.application_id)
         ).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(
@@ -429,19 +464,37 @@ def timeline(candidate_id: UUID, request: Request):
             Application.candidate_id == candidate_id,
             AUTH.job_predicate(principal, RecruitingAction.READ, Job),
         )).all()
-        summaries = {"candidate.created": "Candidate created", "candidate.corrected": "Candidate profile corrected", "candidate.note_added": "Candidate note added", "application.stage_changed": "Application stage changed"}
+        summaries = {
+            "candidate.created": "Candidate created",
+            "candidate.corrected": "Candidate profile corrected",
+            "candidate.note_added": "Candidate note added",
+            "application.created": "Application created",
+            "application.updated": "Application updated",
+        }
         rows = sorted([*global_events, *stage_events], key=lambda row: (row.created_at, row.id), reverse=True)
-        return {"data": [{"id": str(row.id), "event_type": row.event_type, "summary": summaries[row.event_type], "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
+        def summary(row):
+            if row.event_type != "application.stage_changed":
+                return summaries[row.event_type]
+            source = row.payload.get("from_stage")
+            target = row.payload.get("to_stage")
+            text = f"Application stage changed from {source} to {target}" if source and target else "Application stage changed"
+            reason = row.payload.get("reason_text")
+            return f"{text}: {reason.strip()}" if isinstance(reason, str) and reason.strip() else text
+        return {"data": [{"id": str(row.id), "event_type": row.event_type, "summary": summary(row), "actor_id": str(row.actor_user_id), "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
 
 
 @router.get("/candidates/{candidate_id}/notes", response_model=NoteCollection)
-def notes(candidate_id: UUID, request: Request):
+def notes(candidate_id: UUID, request: Request, application_id: UUID = Query(...)):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_candidate(db, principal, candidate_id, RecruitingAction.READ) is None: return _denied(request)
-        rows = db.scalars(select(CandidateNote).where(CandidateNote.organization_id == principal.organization_id, CandidateNote.candidate_id == candidate_id).order_by(CandidateNote.created_at)).all()
-        return {"data": [{"id": str(row.id), "body": row.payload["body"], "author_id": str(row.actor_user_id), "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
+        if _load_candidate_application(db, principal, candidate_id, application_id, RecruitingAction.READ) is None: return _denied(request)
+        rows = db.scalars(select(CandidateNote).where(
+            CandidateNote.organization_id == principal.organization_id,
+            CandidateNote.candidate_id == candidate_id,
+            CandidateNote.payload["application_id"].as_string() == str(application_id),
+        ).order_by(CandidateNote.created_at)).all()
+        return {"data": [{"id": str(row.id), "application_id": row.payload["application_id"], "body": row.payload["body"], "author_id": str(row.actor_user_id), "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
 
 
 @router.post("/candidates/{candidate_id}/notes", status_code=201, response_model=NoteResource)
@@ -449,10 +502,11 @@ def add_note(candidate_id: UUID, payload: NoteCreate, request: Request):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
-        if _load_candidate(db, principal, candidate_id, RecruitingAction.COMMENT) is None: return _denied(request)
-        note = CandidateNote(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note", payload={"body": payload.body}); db.add(note); db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note_added", payload={})); db.flush()
-        db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="candidate.note_added", outcome="success", trace_id=request.state.trace_id, metadata_json={"candidate_id": str(candidate_id), "note_id": str(note.id)})); db.commit()
-        return _resource({"id": str(note.id), "body": payload.body, "author_id": str(principal.user_id)}, 201)
+        if _load_candidate_application(db, principal, candidate_id, payload.application_id, RecruitingAction.COMMENT) is None: return _denied(request)
+        application_id = str(payload.application_id)
+        note = CandidateNote(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note", payload={"application_id": application_id, "body": payload.body}); db.add(note); db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note_added", payload={"application_id": application_id})); db.flush()
+        db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="candidate.note_added", outcome="success", trace_id=request.state.trace_id, metadata_json={"candidate_id": str(candidate_id), "application_id": application_id, "note_id": str(note.id)})); db.commit()
+        return _resource({"id": str(note.id), "application_id": application_id, "body": payload.body, "author_id": str(principal.user_id), "created_at": note.created_at.isoformat()}, 201)
 
 
 @router.get("/candidates/{candidate_id}/resumes", response_model=ResumeCollection)
@@ -461,12 +515,20 @@ def resumes(candidate_id: UUID, request: Request):
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate(db, principal, candidate_id) is None: return _denied(request)
-        rows = db.scalars(select(Resume).where(Resume.organization_id == principal.organization_id, Resume.candidate_id == candidate_id).order_by(Resume.version_number)).all()
+        rows = db.scalars(select(Resume).where(
+            Resume.organization_id == principal.organization_id,
+            Resume.candidate_id == candidate_id,
+            _resume_application_scope(principal, RecruitingAction.READ),
+        ).order_by(Resume.version_number)).all()
         return {"data": [{"id": str(row.id), "candidate_id": str(row.candidate_id), "version_number": row.version_number, "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
 
 
 def _load_resume(db, principal: Principal, resume_id: UUID, action: RecruitingAction):
-    return db.scalar(select(Resume).join(Candidate, and_(Candidate.organization_id == Resume.organization_id, Candidate.id == Resume.candidate_id)).where(Resume.organization_id == principal.organization_id, Resume.id == resume_id, _candidate_scope(principal, action)))
+    return db.scalar(select(Resume).where(
+        Resume.organization_id == principal.organization_id,
+        Resume.id == resume_id,
+        _resume_application_scope(principal, action),
+    ))
 
 
 @router.get("/resumes/{resume_id}/preview", response_model=PreviewResource)
@@ -545,6 +607,8 @@ def create_application(job_id: UUID, payload: ApplicationCreate, request: Reques
     if isinstance(key, JSONResponse): return key
     with request.app.state.identity_store.sync_session() as db:
         if _load_job(db, principal, job_id, RecruitingAction.TRANSITION) is None: return _denied(request)
+        owner_id = payload.owner_id or principal.user_id
+        if not _eligible_recruiter(db, principal.organization_id, owner_id): return _denied(request)
         candidate = _load_candidate(db, principal, payload.candidate_id, RecruitingAction.MANAGE_CANDIDATE)
         resume = db.scalar(select(Resume).where(
             Resume.organization_id == principal.organization_id,
@@ -555,7 +619,7 @@ def create_application(job_id: UUID, payload: ApplicationCreate, request: Reques
             return _denied(request)
         try:
             def action():
-                item = create_application_record(db, organization_id=principal.organization_id, candidate_id=payload.candidate_id, job_id=job_id, resume_id=payload.resume_id, owner_id=payload.owner_id or principal.user_id, source=payload.source)
+                item = create_application_record(db, organization_id=principal.organization_id, candidate_id=payload.candidate_id, job_id=job_id, resume_id=payload.resume_id, owner_id=owner_id, source=payload.source)
                 db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=item.candidate_id, actor_user_id=principal.user_id, event_type="application.created", payload={"application_id": str(item.id), "job_id": str(job_id)})); db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="application.created", outcome="success", trace_id=request.state.trace_id, metadata_json={"application_id": str(item.id), "job_id": str(job_id)})); return 201, {"data": _application_data(item)}
             status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.create", key, {"job_id": job_id, **payload.model_dump()}, action); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
         except Exception as error: db.rollback(); return _problem_for(request, error)
@@ -571,11 +635,17 @@ def patch_application(application_id: UUID, payload: ApplicationPatch, request: 
     if isinstance(principal, JSONResponse): return principal
     if isinstance(expected, JSONResponse): return expected
     with request.app.state.identity_store.sync_session() as db:
-        action = RecruitingAction.RECOMMEND if set(payload.model_dump(exclude_unset=True)) == {"human_conclusion"} else RecruitingAction.MANAGE_CANDIDATE
-        item = _load_application(db, principal, application_id, action)
-        if item is None: return _denied(request)
+        changes = payload.model_dump(exclude_unset=True)
+        field_actions = {"owner_id": RecruitingAction.MANAGE_CANDIDATE, "human_conclusion": RecruitingAction.RECOMMEND}
+        required_actions = {field_actions[field] for field in changes} or {RecruitingAction.MANAGE_CANDIDATE}
+        item = None
+        for action in required_actions:
+            item = _load_application(db, principal, application_id, action)
+            if item is None: return _denied(request)
+        if "owner_id" in changes and (changes["owner_id"] is None or not _eligible_recruiter(db, principal.organization_id, changes["owner_id"])):
+            return _denied(request)
         try:
-            item = patch_application_record(db, principal.organization_id, application_id, payload.model_dump(exclude_unset=True), expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
+            item = patch_application_record(db, principal.organization_id, application_id, changes, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
             db.commit(); return _resource(_application_data(item))
         except ResourceVersionConflict as error:
             db.rollback(); return _problem_for(request, error)
@@ -589,5 +659,8 @@ def transition_application(application_id: UUID, payload: Transition, request: R
     with request.app.state.identity_store.sync_session() as db:
         if _load_application(db, principal, application_id, RecruitingAction.TRANSITION) is None: return _denied(request)
         try:
-            status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.transition", key, {"application_id": application_id, **payload.model_dump()}, lambda: (200, {"data": _application_data(transition_application_record(db, application_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id, reason_code=payload.reason_code, reason_text=payload.reason_text))})); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
+            def action():
+                item = transition_application_record(db, application_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id, reason_code=payload.reason_code, reason_text=payload.reason_text)
+                return 200, {"data": _application_data(item)}
+            status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.transition", key, {"application_id": application_id, **payload.model_dump()}, action); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
         except Exception as error: db.rollback(); return _problem_for(request, error)

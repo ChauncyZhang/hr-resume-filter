@@ -30,7 +30,7 @@ async function parseResponse(response) {
 export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
   let csrfToken = null;
 
-  async function request(path, options = {}) {
+  async function fetchResponse(path, options = {}) {
     const method = (options.method || "GET").toUpperCase();
     const isLogin = path === "/api/v1/auth/login";
     const refreshesCsrf = isLogin || path === "/api/v1/me";
@@ -64,6 +64,11 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
       csrfToken = null;
     }
 
+    return response;
+  }
+
+  async function request(path, options = {}) {
+    const response = await fetchResponse(path, options);
     const payload = await parseResponse(response);
     if (!response.ok) {
       const isProblem = (response.headers.get("Content-Type") || "").toLowerCase().includes("application/problem+json");
@@ -78,8 +83,34 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     return payload;
   }
 
+  async function download(path, options = {}) {
+    const response = await fetchResponse(path, options);
+    if (!response.ok) {
+      const payload = await parseResponse(response);
+      const isProblem = (response.headers.get("Content-Type") || "").toLowerCase().includes("application/problem+json");
+      throw new ApiError({
+        status: response.status,
+        code: isProblem ? safeString(payload?.code, "request_failed") : "request_failed",
+        title: isProblem ? safeString(payload?.title, "请求失败") : "请求失败",
+        detail: isProblem ? safeString(payload?.detail) : "",
+        kind: response.status >= 500 ? "unavailable" : "request",
+      });
+    }
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const quoted = disposition.match(/filename="([^"]+)"/i)?.[1];
+    let filename = "resume";
+    try {
+      filename = encoded ? decodeURIComponent(encoded) : quoted || filename;
+    } catch {
+      filename = "resume";
+    }
+    return { blob: await response.blob(), filename };
+  }
+
   return {
     request,
+    download,
     async login(credentials) {
       const response = await request("/api/v1/auth/login", { method: "POST", body: credentials });
       return response?.data ?? null;
