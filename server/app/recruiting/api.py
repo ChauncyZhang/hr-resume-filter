@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 from collections import Counter
 from datetime import datetime
@@ -420,22 +421,25 @@ def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request:
 @router.get("/jobs", response_model=JobCollection)
 def list_jobs(
     request: Request,
-    q: str | None = Query(None, max_length=200),
+    q: str | None = None,
     status: Literal["draft", "open", "paused", "closed", "archived"] | None = None,
     department_id: UUID | None = None,
     owner_id: UUID | None = None,
     cursor: str | None = None,
     limit: int = Query(50, ge=1, le=100),
 ):
+    trimmed_q = q.strip() if q else ""
+    if len(trimmed_q) > 200:
+        return problem(request, 422, "validation_failed", "The request could not be completed.")
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
-    normalized_q = q.strip().casefold() if q else ""
-    cursor_scope = hashlib.sha256("\x1f".join((
-        normalized_q,
-        status or "",
-        str(department_id) if department_id else "",
-        str(owner_id) if owner_id else "",
-    )).encode()).hexdigest()
+    normalized_q = trimmed_q.casefold()
+    cursor_scope = hashlib.sha256(json.dumps({
+        "department_id": str(department_id) if department_id else None,
+        "owner_id": str(owner_id) if owner_id else None,
+        "q": normalized_q,
+        "status": status,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     cursor_sort = "jobs:-updated_at" if not any((normalized_q, status, department_id, owner_id)) else f"jobs:-updated_at:{cursor_scope}"
     with request.app.state.identity_store.sync_session() as db:
         department = aliased(Department)
@@ -445,7 +449,7 @@ def list_jobs(
         base_conditions = [Job.organization_id == principal.organization_id, _job_scope(principal)]
         page_conditions = list(base_conditions)
         if normalized_q:
-            page_conditions.append(Job.title.ilike(f"%{normalized_q}%"))
+            page_conditions.append(Job.title.icontains(normalized_q, autoescape=True))
         if status:
             page_conditions.append(Job.status == status)
         if department_id:

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from tempfile import SpooledTemporaryFile
@@ -9,8 +11,10 @@ from sqlalchemy import event
 
 from server.app.core.settings import Settings
 from server.app.identity.models import Department, Organization, User, UserRole, UserStatus, Job, JobCollaborator
+from server.app.identity.policy import Principal
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
+from server.app.recruiting import api as recruiting_api
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, IdempotencyRecord, JobJdVersion, Resume, ScreeningRuleVersion
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.identity.models import AuditLog
@@ -329,7 +333,7 @@ def test_system_admin_and_interviewer_have_no_recruiting_access_by_role_alone(tm
             assert denied.status_code == 404 and denied.json()["code"] == "resource_not_found"
 
 
-def test_job_list_read_model_enriches_rows_filters_and_uses_full_scope_facets(tmp_path) -> None:
+def test_job_list_read_model_enriches_rows_filters_and_uses_full_scope_facets(tmp_path, monkeypatch) -> None:
     app = make_app(tmp_path)
     admin_id = seed_user(app, "recruiting_admin", "job-list-admin@example.test")
     owner_id = seed_user(app, "recruiter", "job-list-owner@example.test")
@@ -368,8 +372,13 @@ def test_job_list_read_model_enriches_rows_filters_and_uses_full_scope_facets(tm
             "hiring_owner": str(hiring_owner_id),
         }
 
+    monkeypatch.setattr(recruiting_api, "_principal", lambda request: Principal(
+        user_id=admin_id,
+        organization_id=admin.organization_id,
+        roles=frozenset({"recruiting_admin"}),
+        active=True,
+    ))
     with TestClient(app) as client:
-        login(client, "job-list-admin@example.test")
         statements = []
         def count_statement(conn, cursor, statement, parameters, context, executemany):
             statements.append(statement)
@@ -387,8 +396,7 @@ def test_job_list_read_model_enriches_rows_filters_and_uses_full_scope_facets(tm
         overlong_q = client.get("/api/v1/jobs", params={"q": "x" * 201})
 
     assert page.status_code == 200
-    read_model_statements = [statement for statement in statements if "FROM jobs" in statement or "JOIN jobs" in statement or "FROM applications" in statement]
-    assert len(read_model_statements) <= 3
+    assert len(statements) == 3
     row = page.json()["data"][0]
     assert row["department_name"] == "Engineering"
     assert row["owner_name"] == "Recruiting Owner"
@@ -442,6 +450,18 @@ def test_job_list_facets_funnels_and_rows_exclude_unauthorized_and_cross_tenant_
         cross_tenant = Job(organization_id=other_org.id, title="Cross Tenant Job", department_id=other_department.id, owner_id=other_user.id, status="paused")
         db.add(cross_tenant); db.flush()
         db.add(JobCollaborator(organization_id=recruiter.organization_id, job_id=allowed.id, user_id=recruiter_id, access_role="job_recruiter"))
+        denied_candidate = Candidate(organization_id=recruiter.organization_id, display_name="Denied Funnel Candidate")
+        denied_file = FileObject(organization_id=recruiter.organization_id, storage_key="private/denied-job-funnel", original_filename="denied.pdf", mime_type="application/pdf", size_bytes=1, sha256="7" * 64, uploaded_by=recruiter_id)
+        cross_candidate = Candidate(organization_id=other_org.id, display_name="Cross Tenant Funnel Candidate")
+        cross_file = FileObject(organization_id=other_org.id, storage_key="private/cross-job-funnel", original_filename="cross.pdf", mime_type="application/pdf", size_bytes=1, sha256="8" * 64, uploaded_by=other_user.id)
+        db.add_all([denied_candidate, denied_file, cross_candidate, cross_file]); db.flush()
+        denied_resume = Resume(organization_id=recruiter.organization_id, candidate_id=denied_candidate.id, file_object_id=denied_file.id, version_number=1)
+        cross_resume = Resume(organization_id=other_org.id, candidate_id=cross_candidate.id, file_object_id=cross_file.id, version_number=1)
+        db.add_all([denied_resume, cross_resume]); db.flush()
+        db.add_all([
+            Application(organization_id=recruiter.organization_id, candidate_id=denied_candidate.id, job_id=denied.id, resume_id=denied_resume.id, owner_id=denied_owner_id, stage="rejected"),
+            Application(organization_id=other_org.id, candidate_id=cross_candidate.id, job_id=cross_tenant.id, resume_id=cross_resume.id, owner_id=other_user.id, stage="hired"),
+        ])
         db.commit()
 
     with TestClient(app) as client:
@@ -453,6 +473,8 @@ def test_job_list_facets_funnels_and_rows_exclude_unauthorized_and_cross_tenant_
     assert response.json()["meta"]["departments"] == [{"id": str(allowed_department.id), "name": "Allowed Department"}]
     assert response.json()["meta"]["owners"] == [{"id": str(recruiter_id), "name": "Allowed Owner"}]
     assert response.json()["meta"]["status_counts"] == {"draft": 0, "open": 1, "paused": 0, "closed": 0, "archived": 0}
+    assert response.json()["data"][0]["funnel"] == {"stages": {}, "total": 0}
+    assert "rejected" not in response.text and "hired" not in response.text
     assert "Denied" not in response.text and "Cross Tenant" not in response.text and "Other" not in response.text
 
 
@@ -481,6 +503,72 @@ def test_job_list_filtered_cursor_is_stable_and_rejects_filter_mismatch(tmp_path
     assert mismatch.status_code == 422 and mismatch.json()["code"] == "validation_failed"
     assert legacy_page.status_code == 200
     assert [row["title"] for row in legacy_page.json()["data"]] == ["Engineer 2", "Engineer 1", "Engineer 0"]
+
+
+def test_job_list_cursor_scope_canonicalization_prevents_delimiter_collisions(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "job-list-collision@example.test")
+    base = datetime(2026, 6, 2, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        for index in range(2):
+            db.add(Job(organization_id=admin.organization_id, title=f"Engineer\x1fopen {index}", owner_id=admin_id, status="open", updated_at=base + timedelta(hours=index)))
+        db.commit()
+        organization_id = str(admin.organization_id)
+
+    with TestClient(app) as client:
+        login(client, "job-list-collision@example.test")
+        first = client.get("/api/v1/jobs", params={"q": "Engineer\x1fopen", "status": "open", "limit": 1})
+        token = first.json()["meta"]["next_cursor"]
+        mismatch = client.get("/api/v1/jobs", params={"q": "Engineer\x1fopen", "status": "draft", "limit": 1, "cursor": token})
+
+    assert first.status_code == 200
+    assert token is not None
+    canonical = json.dumps({
+        "department_id": None,
+        "owner_id": None,
+        "q": "engineer\x1fopen",
+        "status": "open",
+    }, sort_keys=True, separators=(",", ":"))
+    scope_hash = hashlib.sha256(canonical.encode()).hexdigest()
+    app.state.recruiting_cursor.decode(token, organization_id, f"jobs:-updated_at:{scope_hash}")
+    assert mismatch.status_code == 422 and mismatch.json()["code"] == "validation_failed"
+
+
+def test_job_list_search_treats_sql_wildcards_as_literal_text(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "job-list-wildcards@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        for title in ("100% Engineer", "100X Engineer", "Level_One", "LevelXOne"):
+            db.add(Job(organization_id=admin.organization_id, title=title, owner_id=admin_id))
+        db.commit()
+
+    with TestClient(app) as client:
+        login(client, "job-list-wildcards@example.test")
+        percent = client.get("/api/v1/jobs", params={"q": "%"})
+        underscore = client.get("/api/v1/jobs", params={"q": "_"})
+
+    assert [row["title"] for row in percent.json()["data"]] == ["100% Engineer"]
+    assert [row["title"] for row in underscore.json()["data"]] == ["Level_One"]
+
+
+def test_job_list_search_validates_length_after_trimming(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "job-list-length@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        db.add(Job(organization_id=admin.organization_id, title="x" * 200, owner_id=admin_id))
+        db.commit()
+
+    with TestClient(app) as client:
+        login(client, "job-list-length@example.test")
+        boundary = client.get("/api/v1/jobs", params={"q": f"  {'x' * 200}  "})
+        overlong = client.get("/api/v1/jobs", params={"q": f"  {'x' * 201}  "})
+
+    assert boundary.status_code == 200
+    assert [row["title"] for row in boundary.json()["data"]] == ["x" * 200]
+    assert overlong.status_code == 422 and overlong.json()["code"] == "validation_failed"
 
 
 def test_recruiting_mutations_preserve_central_csrf_boundary(tmp_path) -> None:
