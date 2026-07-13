@@ -105,6 +105,8 @@ def create_app(
     app.include_router(screening_router)
     from server.app.llm.api import router as llm_router
     app.include_router(llm_router)
+    from server.app.interviews.api import router as interview_router
+    app.include_router(interview_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):

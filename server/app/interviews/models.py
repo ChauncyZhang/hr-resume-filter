@@ -34,6 +34,8 @@ class Interview(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid)
     version: Mapped[int] = mapped_column(Integer, default=1)
     calendar_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    calendar_organizer: Mapped[dict] = mapped_column(JSON_DOCUMENT, default=dict)
+    calendar_attendees: Mapped[list] = mapped_column(JSON_DOCUMENT, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     __table_args__ = (

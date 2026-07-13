@@ -135,11 +135,15 @@ def _insert_interview(connection, identifiers, *, status="draft"):
             INSERT INTO interviews(
               id, organization_id, application_id, round_name, method, timezone,
               starts_at, ends_at, status, notification_status, invitation_status,
-              owner_id, created_by, version, calendar_sequence, created_at, updated_at
+              owner_id, created_by, version, calendar_sequence,
+              calendar_organizer, calendar_attendees, created_at, updated_at
             ) VALUES (
               :id, :organization, :application, 'First round', 'video', 'Asia/Shanghai',
               :starts_at, :ends_at, :status, 'not_sent', 'artifact_ready',
-              :owner, :owner, 1, 0, now(), now()
+              :owner, :owner, 1, 0,
+              jsonb_build_object('name', 'Owner', 'email', 'owner@test'),
+              jsonb_build_array(jsonb_build_object('name', 'Interviewer', 'email', 'interviewer@test')),
+              now(), now()
             )
             """
         ),
