@@ -1,7 +1,8 @@
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any, Literal
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ApiModel(BaseModel):
@@ -39,6 +40,60 @@ class JobOut(ApiModel):
     status: str
     version: int
     updated_at: str
+
+
+RuleItem = Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class JobDefinitionCommand(ApiModel):
+    title: str = Field(min_length=1, max_length=200)
+    department_id: UUID | None = None
+    headcount: int = Field(ge=1, le=1000)
+    priority: Literal["high", "normal", "low"]
+    hiring_owner_id: UUID | None = None
+    description: str = Field(min_length=1, max_length=50_000)
+    location: str = Field(max_length=200)
+    process_template: str = Field(min_length=1, max_length=100)
+    llm_enabled: bool
+    must_have: list[RuleItem] = Field(max_length=100)
+    nice_to_have: list[RuleItem] = Field(max_length=100)
+    publish: bool
+
+    @field_validator("title", "description", "process_template")
+    @classmethod
+    def nonblank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be blank")
+        return value.strip()
+
+    @field_validator("must_have", "nice_to_have")
+    @classmethod
+    def nonblank_rules(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values):
+            raise ValueError("rule items must not be blank")
+        return [value.strip() for value in values]
+
+
+class JobJdDefinitionOut(ApiModel):
+    id: str
+    version_number: int
+    description: str
+    location: str
+    process_template: str
+    llm_enabled: bool
+
+
+class ScreeningRulesDefinitionOut(ApiModel):
+    id: str
+    version_number: int
+    must_have: list[str]
+    nice_to_have: list[str]
+
+
+class JobDefinitionOut(ApiModel):
+    job: JobOut
+    jd: JobJdDefinitionOut | None
+    rules: ScreeningRulesDefinitionOut | None
 
 
 class CandidateOut(ApiModel):
@@ -132,6 +187,7 @@ class PreviewOut(ApiModel):
 
 
 class JobResource(ApiModel): data: JobOut
+class JobDefinitionResource(ApiModel): data: JobDefinitionOut
 class JobCollection(ApiModel): data: list[JobOut]; meta: Meta
 class CandidateResource(ApiModel): data: CandidateOut
 class CandidateCollection(ApiModel): data: list[CandidateListOut]; meta: CandidateMeta

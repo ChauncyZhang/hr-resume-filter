@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 
 
 class InvalidStateTransition(Exception): pass
@@ -153,6 +153,76 @@ def patch_job_record(db, organization_id, job_id, changes, *, expected_version, 
     db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.updated", outcome="success", trace_id=trace_id, metadata_json={"fields": sorted(changes)}))
     db.flush()
     return row
+
+
+def create_job_definition_record(db, organization_id, actor_user_id, command, *, trace_id):
+    from server.app.identity.models import AuditLog, Job, JobCollaborator
+    from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
+
+    job = Job(
+        organization_id=organization_id,
+        owner_id=actor_user_id,
+        status="open" if command["publish"] else "draft",
+        **{key: command[key] for key in ("title", "department_id", "headcount", "priority", "hiring_owner_id")},
+    )
+    db.add(job)
+    db.flush()
+    jd = JobJdVersion(
+        organization_id=organization_id,
+        job_id=job.id,
+        version_number=1,
+        content={key: command[key] for key in ("description", "location", "process_template", "llm_enabled")},
+        created_by=actor_user_id,
+    )
+    rules = ScreeningRuleVersion(
+        organization_id=organization_id,
+        job_id=job.id,
+        version_number=1,
+        content={key: command[key] for key in ("must_have", "nice_to_have")},
+        created_by=actor_user_id,
+    )
+    db.add_all([
+        JobCollaborator(organization_id=organization_id, job_id=job.id, user_id=actor_user_id, access_role="job_owner"),
+        jd,
+        rules,
+    ])
+    db.flush()
+    safe_metadata = {"job_id": str(job.id), "jd_version_number": 1, "rule_version_number": 1, "status": job.status}
+    db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.definition_created", outcome="success", trace_id=trace_id, metadata_json=safe_metadata))
+    if command["publish"]:
+        db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.published", outcome="success", trace_id=trace_id, metadata_json={"job_id": str(job.id), "from_status": "draft", "to_status": "open"}))
+    db.flush()
+    return job, jd, rules
+
+
+def replace_job_definition_record(db, organization_id, job_id, actor_user_id, command, *, expected_version, trace_id):
+    from server.app.identity.models import AuditLog, Job
+    from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
+
+    job = db.scalar(select(Job).where(Job.organization_id == organization_id, Job.id == job_id).with_for_update())
+    if job is None or job.version != expected_version:
+        raise ResourceVersionConflict
+    if command["publish"] and job.status != "draft":
+        raise InvalidStateTransition
+    source_status = job.status
+    for key in ("title", "department_id", "headcount", "priority", "hiring_owner_id"):
+        setattr(job, key, command[key])
+    if command["publish"]:
+        job.status = "open"
+    job.version += 1
+    job.updated_at = datetime.now(timezone.utc)
+    jd_number = (db.scalar(select(func.max(JobJdVersion.version_number)).where(JobJdVersion.organization_id == organization_id, JobJdVersion.job_id == job_id)) or 0) + 1
+    rule_number = (db.scalar(select(func.max(ScreeningRuleVersion.version_number)).where(ScreeningRuleVersion.organization_id == organization_id, ScreeningRuleVersion.job_id == job_id)) or 0) + 1
+    jd = JobJdVersion(organization_id=organization_id, job_id=job_id, version_number=jd_number, content={key: command[key] for key in ("description", "location", "process_template", "llm_enabled")}, created_by=actor_user_id)
+    rules = ScreeningRuleVersion(organization_id=organization_id, job_id=job_id, version_number=rule_number, content={key: command[key] for key in ("must_have", "nice_to_have")}, created_by=actor_user_id)
+    db.add_all([jd, rules])
+    db.flush()
+    safe_metadata = {"job_id": str(job.id), "job_version": job.version, "jd_version_number": jd_number, "rule_version_number": rule_number, "published": command["publish"]}
+    db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.definition_replaced", outcome="success", trace_id=trace_id, metadata_json=safe_metadata))
+    if command["publish"]:
+        db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.published", outcome="success", trace_id=trace_id, metadata_json={"job_id": str(job.id), "from_status": source_status, "to_status": "open"}))
+    db.flush()
+    return job, jd, rules
 
 
 def patch_candidate_record(db, organization_id, candidate_id, changes, *, expected_version, actor_user_id, trace_id):

@@ -27,7 +27,7 @@ from server.app.recruiting.http import content_disposition
 from server.app.recruiting.storage import MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, StorageObjectTooLarge, StorageReadFailed
 from server.app.recruiting.schemas import (
     ApplicationCollection, ApplicationResource, CandidateCollection, CandidateResource,
-    FunnelResource, JobCollection, JobResource, NoteCollection, NoteResource,
+    FunnelResource, JobCollection, JobDefinitionCommand, JobDefinitionResource, JobResource, NoteCollection, NoteResource,
     PreviewResource, ResumeCollection, TicketResource, TimelineCollection,
     VersionCollection, VersionResource, Problem,
 )
@@ -35,8 +35,10 @@ from server.app.recruiting.service import (
     ActiveApplicationExists, IdempotencyConflict, InvalidAggregateRelationship,
     InvalidStateTransition, ResourceVersionConflict, SystemClock, SystemTokens,
     TicketInvalid, consume_download_ticket_record, create_application_record,
+    create_job_definition_record,
     issue_download_ticket_record, persisted_idempotent, transition_application_record,
     transition_job_record, patch_job_record, patch_candidate_record, patch_application_record,
+    replace_job_definition_record,
 )
 
 
@@ -204,6 +206,20 @@ def _job_data(job: Job) -> dict[str, Any]:
     return {"id": str(job.id), "title": job.title, "department_id": str(job.department_id) if job.department_id else None, "headcount": job.headcount, "priority": job.priority, "hiring_owner_id": str(job.hiring_owner_id) if job.hiring_owner_id else None, "owner_id": str(job.owner_id), "status": job.status, "version": job.version, "updated_at": job.updated_at.isoformat()}
 
 
+def _job_definition_data(job: Job, jd: JobJdVersion | None, rules: ScreeningRuleVersion | None) -> dict[str, Any]:
+    return {
+        "job": _job_data(job),
+        "jd": None if jd is None else {"id": str(jd.id), "version_number": jd.version_number, **jd.content},
+        "rules": None if rules is None else {"id": str(rules.id), "version_number": rules.version_number, **rules.content},
+    }
+
+
+def _job_definition_response(body: dict[str, Any], status: int) -> JSONResponse:
+    response = JSONResponse(body, status_code=status)
+    response.headers["ETag"] = f'"{body["data"]["job"]["version"]}"'
+    return response
+
+
 def _candidate_data(db, candidate: Candidate, principal: Principal) -> dict[str, Any]:
     contacts = db.scalars(select(CandidateContact).where(CandidateContact.organization_id == candidate.organization_id, CandidateContact.candidate_id == candidate.id)).all()
     return {"id": str(candidate.id), "display_name": candidate.display_name, "current_title": candidate.current_title, "location": candidate.location, "owner_id": str(candidate.owner_id) if candidate.owner_id else None, "version": candidate.version, "updated_at": candidate.updated_at.isoformat(), "contacts": [{"kind": item.kind, "value": item.masked_value} for item in contacts]}
@@ -306,6 +322,83 @@ def _resource(data: dict[str, Any], status: int = 200) -> JSONResponse:
     if "version" in data:
         response.headers["ETag"] = f'"{data["version"]}"'
     return response
+
+
+@router.post("/job-definitions", status_code=201, response_model=JobDefinitionResource)
+def create_job_definition(payload: JobDefinitionCommand, request: Request, idempotency_key: str | None = Header(None)):
+    principal = _principal(request)
+    key = _idempotency(request, idempotency_key)
+    for value in (principal, key):
+        if isinstance(value, JSONResponse):
+            return value
+    if not AUTH.role_allows(principal, RecruitingAction.MANAGE_JOB):
+        return _denied(request)
+    command = payload.model_dump()
+    with request.app.state.identity_store.sync_session() as db:
+        try:
+            status, body = persisted_idempotent(
+                db,
+                principal.organization_id,
+                principal.user_id,
+                "job_definition.create",
+                key,
+                command,
+                lambda: (201, {"data": _job_definition_data(*create_job_definition_record(db, principal.organization_id, principal.user_id, command, trace_id=request.state.trace_id))}),
+            )
+            db.commit()
+            return _job_definition_response(body, status)
+        except IdempotencyConflict as error:
+            db.rollback()
+            return _problem_for(request, error)
+        except Exception:
+            db.rollback()
+            raise
+
+
+@router.get("/job-definitions/{job_id}", response_model=JobDefinitionResource)
+def get_job_definition(job_id: UUID, request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    with request.app.state.identity_store.sync_session() as db:
+        job = _load_job(db, principal, job_id)
+        if job is None:
+            return _denied(request)
+        jd = db.scalar(select(JobJdVersion).where(JobJdVersion.organization_id == principal.organization_id, JobJdVersion.job_id == job_id).order_by(JobJdVersion.version_number.desc()))
+        rules = db.scalar(select(ScreeningRuleVersion).where(ScreeningRuleVersion.organization_id == principal.organization_id, ScreeningRuleVersion.job_id == job_id).order_by(ScreeningRuleVersion.version_number.desc()))
+        return _job_definition_response({"data": _job_definition_data(job, jd, rules)}, 200)
+
+
+@router.put("/job-definitions/{job_id}", response_model=JobDefinitionResource)
+def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request: Request, if_match: str | None = Header(None), idempotency_key: str | None = Header(None)):
+    principal = _principal(request)
+    expected = _expected_version(request, if_match)
+    key = _idempotency(request, idempotency_key)
+    for value in (principal, expected, key):
+        if isinstance(value, JSONResponse):
+            return value
+    command = payload.model_dump()
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_job(db, principal, job_id, RecruitingAction.MANAGE_JOB) is None:
+            return _denied(request)
+        try:
+            status, body = persisted_idempotent(
+                db,
+                principal.organization_id,
+                principal.user_id,
+                f"job_definition.replace:{job_id}",
+                key,
+                command,
+                lambda: (200, {"data": _job_definition_data(*replace_job_definition_record(db, principal.organization_id, job_id, principal.user_id, command, expected_version=expected, trace_id=request.state.trace_id))}),
+            )
+            db.commit()
+            return _job_definition_response(body, status)
+        except (IdempotencyConflict, InvalidStateTransition, ResourceVersionConflict) as error:
+            db.rollback()
+            return _problem_for(request, error)
+        except Exception:
+            db.rollback()
+            raise
 
 
 @router.get("/jobs", response_model=JobCollection, response_model_exclude_none=True)

@@ -5,12 +5,13 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 
 from server.app.core.settings import Settings
 from server.app.identity.models import Organization, User, UserRole, UserStatus, Job, JobCollaborator
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
-from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, JobJdVersion, Resume, ScreeningRuleVersion
+from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, IdempotencyRecord, JobJdVersion, Resume, ScreeningRuleVersion
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.identity.models import AuditLog
 from server.app.recruiting.storage import StorageReadFailed
@@ -83,6 +84,25 @@ def login(client, email: str):
     )
     assert response.status_code == 200
     return {"Origin": "https://hr.example.test", "X-CSRF-Token": response.headers["X-CSRF-Token"]}
+
+
+def job_definition_payload(**changes):
+    payload = {
+        "title": "Platform Engineer",
+        "department_id": None,
+        "headcount": 2,
+        "priority": "high",
+        "hiring_owner_id": None,
+        "description": "Build reliable hiring infrastructure.",
+        "location": "Shanghai",
+        "process_template": "standard",
+        "llm_enabled": True,
+        "must_have": ["Python", "SQL"],
+        "nice_to_have": ["FastAPI"],
+        "publish": False,
+    }
+    payload.update(changes)
+    return payload
 
 
 def seed_screening_results(db, application, file_id, actor_id, results):
@@ -158,6 +178,8 @@ def test_recruiting_openapi_registers_complete_task_3b_contract_without_secret_f
         schema = client.get("/openapi.json").json()
 
     expected = {
+        "/api/v1/job-definitions": {"post"},
+        "/api/v1/job-definitions/{job_id}": {"get", "put"},
         "/api/v1/jobs": {"get", "post"},
         "/api/v1/jobs/{job_id}": {"get", "patch"},
         "/api/v1/jobs/{job_id}/transitions": {"post"},
@@ -844,3 +866,155 @@ def test_candidate_list_cursor_uses_selected_application_time_and_candidate_id_t
     listed_updated_at = datetime.fromisoformat(refreshed.json()["data"][0]["application"]["updated_at"]).replace(tzinfo=timezone.utc)
     transitioned_updated_at = datetime.fromisoformat(transitioned.json()["data"]["updated_at"])
     assert listed_updated_at == transitioned_updated_at
+
+
+@pytest.mark.parametrize(("publish", "expected_status"), [(False, "draft"), (True, "open")])
+def test_create_job_definition_atomically_creates_typed_versions(tmp_path, publish, expected_status) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    payload = job_definition_payload(publish=publish)
+    with TestClient(app) as client:
+        headers = {**login(client, "admin@example.test"), "Idempotency-Key": f"create-{expected_status}"}
+        response = client.post("/api/v1/job-definitions", json=payload, headers=headers)
+    assert response.status_code == 201
+    assert response.headers["etag"] == '"1"'
+    data = response.json()["data"]
+    assert data["job"]["status"] == expected_status
+    assert data["jd"] == {"id": data["jd"]["id"], "version_number": 1, "description": payload["description"], "location": payload["location"], "process_template": payload["process_template"], "llm_enabled": payload["llm_enabled"]}
+    assert data["rules"] == {"id": data["rules"]["id"], "version_number": 1, "must_have": payload["must_have"], "nice_to_have": payload["nice_to_have"]}
+    with app.state.identity_store.sync_session() as db:
+        assert db.query(Job).count() == db.query(JobJdVersion).count() == db.query(ScreeningRuleVersion).count() == 1
+
+
+def test_get_job_definition_returns_latest_versions_and_legacy_nulls(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        legacy = Job(organization_id=admin.organization_id, title="Legacy", owner_id=admin.id)
+        db.add(legacy); db.commit(); legacy_id = str(legacy.id)
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        created = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "latest-definition"})
+        job_id = created.json()["data"]["job"]["id"]
+        updated = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(description="Latest description", must_have=["Python 3.12"]), headers={**headers, "Idempotency-Key": "replace-definition", "If-Match": '"1"'})
+        latest = client.get(f"/api/v1/job-definitions/{job_id}")
+        legacy_response = client.get(f"/api/v1/job-definitions/{legacy_id}")
+    assert updated.status_code == latest.status_code == legacy_response.status_code == 200
+    assert latest.json()["data"]["jd"]["version_number"] == 2
+    assert latest.json()["data"]["jd"]["description"] == "Latest description"
+    assert latest.json()["data"]["rules"]["version_number"] == 2
+    assert legacy_response.json()["data"]["jd"] is None
+    assert legacy_response.json()["data"]["rules"] is None
+
+
+def test_replace_job_definition_appends_history_and_obeys_publish_state_rules(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        created = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "create"})
+        job_id = created.json()["data"]["job"]["id"]
+        replaced = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title="Principal Engineer", publish=True), headers={**headers, "Idempotency-Key": "replace", "If-Match": '"1"'})
+        stale = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title="Stale"), headers={**headers, "Idempotency-Key": "stale", "If-Match": '"1"'})
+        invalid_publish = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title="Still open", publish=True), headers={**headers, "Idempotency-Key": "publish-again", "If-Match": '"2"'})
+        preserved = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title="Open replacement"), headers={**headers, "Idempotency-Key": "preserve-open", "If-Match": '"2"'})
+        replay = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title="Open replacement"), headers={**headers, "Idempotency-Key": "preserve-open", "If-Match": '"2"'})
+        replay_conflict = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title="Different replacement"), headers={**headers, "Idempotency-Key": "preserve-open", "If-Match": '"3"'})
+    assert replaced.status_code == 200 and replaced.headers["etag"] == '"2"'
+    assert replaced.json()["data"]["job"]["status"] == "open"
+    assert replaced.json()["data"]["jd"]["version_number"] == replaced.json()["data"]["rules"]["version_number"] == 2
+    assert stale.status_code == 409 and stale.json()["code"] == "resource_version_conflict"
+    assert invalid_publish.status_code == 409 and invalid_publish.json()["code"] == "invalid_state_transition"
+    assert preserved.status_code == replay.status_code == 200
+    assert preserved.json() == replay.json()
+    assert preserved.headers["etag"] == replay.headers["etag"] == '"3"'
+    assert preserved.json()["data"]["job"]["status"] == "open"
+    assert replay_conflict.status_code == 409 and replay_conflict.json()["code"] == "idempotency_conflict"
+    with app.state.identity_store.sync_session() as db:
+        assert [row.version_number for row in db.query(JobJdVersion).order_by(JobJdVersion.version_number)] == [1, 2, 3]
+        assert [row.version_number for row in db.query(ScreeningRuleVersion).order_by(ScreeningRuleVersion.version_number)] == [1, 2, 3]
+
+
+def test_job_definition_idempotency_replays_and_rejects_body_conflicts(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    with TestClient(app) as client:
+        headers = {**login(client, "admin@example.test"), "Idempotency-Key": "same-create"}
+        first = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers=headers)
+        replay = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers=headers)
+        conflict = client.post("/api/v1/job-definitions", json=job_definition_payload(title="Different"), headers=headers)
+    assert first.status_code == replay.status_code == 201
+    assert first.json() == replay.json()
+    assert first.headers["etag"] == replay.headers["etag"] == '"1"'
+    assert conflict.status_code == 409 and conflict.json()["code"] == "idempotency_conflict"
+    with app.state.identity_store.sync_session() as db:
+        assert db.query(Job).count() == db.query(IdempotencyRecord).count() == 1
+
+
+def test_job_definition_failure_rolls_back_aggregate_and_idempotency(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    def fail_rule_write(mapper, connection, target):
+        raise RuntimeError("injected rule write failure")
+    event.listen(ScreeningRuleVersion, "before_insert", fail_rule_write)
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**login(client, "admin@example.test"), "Idempotency-Key": "will-rollback"})
+    finally:
+        event.remove(ScreeningRuleVersion, "before_insert", fail_rule_write)
+    assert response.status_code == 500
+    with app.state.identity_store.sync_session() as db:
+        assert db.query(Job).count() == 0
+        assert db.query(JobJdVersion).count() == 0
+        assert db.query(ScreeningRuleVersion).count() == 0
+        assert db.query(IdempotencyRecord).count() == 0
+
+
+def test_job_definition_access_is_non_disclosing_and_audit_metadata_is_redacted(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    seed_user(app, "system_admin", "system@example.test")
+    with app.state.identity_store.sync_session() as db:
+        other_org = Organization(slug="other", name="Other", status="active")
+        other_user = User(organization=other_org, email="other@example.test", normalized_email="other@example.test", display_name="other", password_hash=PasswordService().hash("correct horse"))
+        other_user.roles.append(UserRole(role="recruiting_admin"))
+        db.add(other_user); db.flush()
+        cross_tenant_job = Job(organization_id=other_org.id, title="Other tenant", owner_id=other_user.id)
+        db.add(cross_tenant_job); db.commit(); cross_tenant_job_id = str(cross_tenant_job.id)
+    secret_description = "secret JD content marker"
+    secret_rule = "secret rule content marker"
+    with TestClient(app) as client:
+        admin_headers = login(client, "admin@example.test")
+        created = client.post("/api/v1/job-definitions", json=job_definition_payload(description=secret_description, must_have=[secret_rule]), headers={**admin_headers, "Idempotency-Key": "secure-create"})
+        job_id = created.json()["data"]["job"]["id"]
+        cross_tenant = client.get(f"/api/v1/job-definitions/{cross_tenant_job_id}")
+        system_headers = login(client, "system@example.test")
+        denied_get = client.get(f"/api/v1/job-definitions/{job_id}")
+        denied_put = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(), headers={**system_headers, "If-Match": '"1"', "Idempotency-Key": "denied"})
+    assert denied_get.status_code == denied_put.status_code == 404
+    assert denied_get.json()["code"] == denied_put.json()["code"] == "resource_not_found"
+    assert cross_tenant.status_code == 404 and cross_tenant.json()["code"] == "resource_not_found"
+    with app.state.identity_store.sync_session() as db:
+        audit_text = repr([row.metadata_json for row in db.query(AuditLog).filter(AuditLog.event_type.like("job.%"))])
+        assert secret_description not in audit_text
+        assert secret_rule not in audit_text
+
+
+def test_job_definition_preconditions_and_bounded_validation_are_enforced(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "admin@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        missing_key = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers=headers)
+        blank_description = client.post("/api/v1/job-definitions", json=job_definition_payload(description="   "), headers={**headers, "Idempotency-Key": "blank-description"})
+        blank_rule = client.post("/api/v1/job-definitions", json=job_definition_payload(must_have=["Python", " "]), headers={**headers, "Idempotency-Key": "blank-rule"})
+        invalid_priority = client.post("/api/v1/job-definitions", json=job_definition_payload(priority="urgent"), headers={**headers, "Idempotency-Key": "bad-priority"})
+        created = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "valid"})
+        job_id = created.json()["data"]["job"]["id"]
+        missing_match = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "missing-match"})
+        malformed_match = client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "malformed-match", "If-Match": "1"})
+    assert missing_key.status_code == 428 and missing_key.json()["code"] == "idempotency_key_required"
+    assert blank_description.status_code == blank_rule.status_code == invalid_priority.status_code == 422
+    assert missing_match.status_code == 428 and missing_match.json()["code"] == "precondition_required"
+    assert malformed_match.status_code == 422 and malformed_match.json()["code"] == "validation_failed"
