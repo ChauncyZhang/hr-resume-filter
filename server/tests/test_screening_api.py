@@ -9,9 +9,9 @@ from server.app.core.settings import Settings
 from server.app.identity.models import Job, JobCollaborator, Organization, User, UserRole
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
-from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
+from server.app.recruiting.models import Candidate, CandidateContact, JobJdVersion, Resume, ScreeningRuleVersion
 from server.app.screening.storage import StorageWriteFailed
-from server.app.screening.models import ScreeningItem
+from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.queue.models import BackgroundJob
 from sqlalchemy import select
 
@@ -41,6 +41,15 @@ def app_and_seed(tmp_path):
 def login(client,email):
     response=client.post("/api/v1/auth/login",json={"organization_slug":"acme","email":email,"password":"correct"},headers={"Origin":"https://hr.example.test"}); assert response.status_code==200; return {"Origin":"https://hr.example.test","X-CSRF-Token":response.headers["X-CSRF-Token"]}
 
+def enrich_item(db,item_id,name,*,score=81,recommendation="可沟通",created_at=None,result_id=None):
+    item=db.get(ScreeningItem,uuid.UUID(item_id)); run=db.get(ScreeningRun,item.run_id)
+    candidate=Candidate(organization_id=item.organization_id,display_name=name,owner_id=run.created_by); db.add(candidate); db.flush()
+    item.candidate_id=candidate.id; item.status="scored"
+    result=ScreeningResult(id=result_id or uuid.uuid4(),organization_id=item.organization_id,item_id=item.id,rule_engine_version=f"rule-{uuid.uuid4()}",rule_score=score,recommendation=recommendation,required_hits=["Python"],required_missing=["Kubernetes"],bonus_hits=["LLM"],estimated_years=5,risks=["项目规模待确认"],questions=[])
+    if created_at is not None: result.created_at=created_at
+    db.add(result); db.commit()
+    return candidate,result
+
 def test_screening_api_create_upload_read_replay_and_scope(tmp_path):
     app,storage,job_id=app_and_seed(tmp_path)
     with TestClient(app) as client:
@@ -50,6 +59,7 @@ def test_screening_api_create_upload_read_replay_and_scope(tmp_path):
         upload_headers={**headers,"Idempotency-Key":"item-1"}
         uploaded=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("../ Candidate\n.txt",b"Python 5\xe5\xb9\xb4","text/plain")},headers=upload_headers); assert uploaded.status_code==201; item=uploaded.json()["data"]
         assert item["filename"]=="Candidate.txt" and item["status"]=="queued" and "storage_key" not in item and "sha256" not in item
+        assert item["candidate_id"] is None and item["candidate_name"] is None and item["rule_result"] is None
         replay=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("../ Candidate\n.txt",b"Python 5\xe5\xb9\xb4","text/plain")},headers=upload_headers); assert replay.status_code==201 and replay.json()==uploaded.json() and storage.writes==1
         conflict=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("other.txt",b"Different","text/plain")},headers=upload_headers); assert conflict.status_code==409 and conflict.json()["code"]=="idempotency_conflict"
         assert storage.writes==1
@@ -104,6 +114,60 @@ def test_screening_item_cursor_is_created_at_id_keyset_with_between_page_insert(
         inserted=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("third.txt",b"third","text/plain")},headers={**headers,"Idempotency-Key":"third"}).json()["data"]["id"]
         cursor=page1.json()["meta"]["next_cursor"]; page2=client.get(f"/api/v1/screening-runs/{run['id']}/items?limit=10&cursor={cursor}",headers=headers)
         assert [row["id"] for row in page2.json()["data"]]==[ids[1],inserted]
+
+def test_screening_items_return_exact_candidate_and_newest_rule_result(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("alice.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":"item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            created_at=datetime.now(timezone.utc); candidate,old=enrich_item(db,item["id"],"Alice Zhang",score=40,recommendation="暂缓",created_at=created_at,result_id=uuid.UUID(int=1))
+            newest=ScreeningResult(id=uuid.UUID(int=2),organization_id=old.organization_id,item_id=old.item_id,rule_engine_version="rule-newest",rule_score=81,recommendation="可沟通",required_hits=["Python"],required_missing=["Kubernetes"],bonus_hits=["LLM"],estimated_years=5,risks=["项目规模待确认"],questions=[],created_at=created_at); db.add(newest); db.commit(); candidate_id=str(candidate.id)
+        response=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers); assert response.status_code==200
+    assert response.json()["data"][0]["candidate_id"]==candidate_id
+    assert response.json()["data"][0]["candidate_name"]=="Alice Zhang"
+    assert response.json()["data"][0]["rule_result"]=={"score":81,"recommendation":"可沟通","required_hits":["Python"],"required_missing":["Kubernetes"],"bonus_hits":["LLM"],"risks":["项目规模待确认"]}
+
+def test_failed_screening_item_hides_legacy_rule_result(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("failed.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":"item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            enrich_item(db,item["id"],"Failed Candidate")
+            stored=db.get(ScreeningItem,uuid.UUID(item["id"])); stored.status="failed"; stored.safe_error_code="scoring_failed"; db.commit()
+        response=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers)
+    assert response.status_code==200 and response.json()["data"][0]["rule_result"] is None
+
+def test_screening_item_enrichment_stays_paired_across_cursor_pages(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        items=[client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"{name}.txt",name.encode(),"text/plain")},headers={**headers,"Idempotency-Key":name}).json()["data"] for name in ("first","second")]
+        with app.state.identity_store.sync_session() as db:
+            enrich_item(db,items[0]["id"],"First Candidate",score=81)
+            enrich_item(db,items[1]["id"],"Second Candidate",score=62,recommendation="需人工复核")
+        first=client.get(f"/api/v1/screening-runs/{run['id']}/items?limit=1",headers=headers).json()
+        second=client.get(f"/api/v1/screening-runs/{run['id']}/items?limit=1&cursor={first['meta']['next_cursor']}",headers=headers).json()
+    assert (first["data"][0]["candidate_name"],first["data"][0]["rule_result"]["score"])==("First Candidate",81)
+    assert (second["data"][0]["candidate_name"],second["data"][0]["rule_result"]["score"])==("Second Candidate",62)
+
+def test_screening_item_enrichment_is_job_scoped_and_data_minimized(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
+        item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("secret.txt",b"raw resume secret","text/plain")},headers={**headers,"Idempotency-Key":"item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            candidate,_=enrich_item(db,item["id"],"Scoped Candidate")
+            stored=db.get(ScreeningItem,uuid.UUID(item["id"])); resume=Resume(organization_id=stored.organization_id,candidate_id=candidate.id,file_object_id=stored.file_object_id,version_number=1,parsed_text="raw resume secret"); db.add(resume); db.flush(); stored.resume_id=resume.id
+            db.add(CandidateContact(organization_id=stored.organization_id,candidate_id=candidate.id,kind="email",ciphertext=b"ciphertext",lookup_hash="a"*64,masked_value="private@example.test")); db.commit()
+        allowed=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers); assert allowed.status_code==200
+        client.post("/api/v1/auth/logout",headers=headers); denied_headers=login(client,"system@example.test"); denied=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=denied_headers)
+    forbidden={"contacts","candidate_contacts","email","phone","parsed_text","resume_text","storage_key","quarantine_cleanup_key","prompt_version_id","request_field_manifest","provider_error","provider_error_body","api_key"}
+    response_keys={key for row in allowed.json()["data"] for key in row}
+    assert forbidden.isdisjoint(response_keys)
+    assert all(secret not in allowed.text for secret in ("raw resume secret","private@example.test","ciphertext","quarantine/"))
+    assert denied.status_code==404 and "Scoped Candidate" not in denied.text and "rule_result" not in denied.text
 
 def test_start_run_is_authorized_idempotent_and_enqueues_each_item_atomically(tmp_path):
     app,_,job_id=app_and_seed(tmp_path)

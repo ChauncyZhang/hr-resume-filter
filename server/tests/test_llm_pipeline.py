@@ -213,7 +213,15 @@ def test_permanent_provider_failure_is_terminal_and_tenant_payload_cannot_cross_
         finalize_llm_dead_letter(db,job,"provider_auth_failed",datetime.now(timezone.utc)); db.commit()
         assert item.status == "scored" and item.llm_status == "failed"
         assert item.llm_safe_error_code=="provider_auth_failed"
-        assert db.get(ScreeningRun, item.run_id).status == "partial"
+        assert db.get(ScreeningRun, item.run_id).status == "partial"; run_id=item.run_id
+
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); response=client.get(f"/api/v1/screening-runs/{run_id}/items",headers=headers)
+    assert response.status_code==200
+    api_item=response.json()["data"][0]
+    assert api_item["llm_evaluation"] is None
+    assert api_item["rule_result"] is not None
+    assert api_item["rule_result"]["score"]==db_rule_score(app,job.payload["screening_item_id"])
 
     job.attempts=2
     asyncio.run(pipeline.evaluate_item(job))
@@ -224,6 +232,11 @@ def test_permanent_provider_failure_is_terminal_and_tenant_payload_cannot_cross_
     with pytest.raises(PermanentJobError) as missing:
         asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, Gateway(), cipher).evaluate_item(other_tenant_job))
     assert missing.value.safe_code == "screening_item_missing"
+
+
+def db_rule_score(app,item_id):
+    with app.state.identity_store.sync_session() as db:
+        return db.scalar(select(RuleResult.rule_score).where(RuleResult.item_id==uuid.UUID(item_id)))
 
 
 def test_request_is_bounded_hashed_after_redaction_and_contains_only_rule_facts(tmp_path):
