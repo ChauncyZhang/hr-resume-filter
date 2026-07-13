@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event
+from sqlalchemy import event, func, select
 
 from server.app.core.settings import Settings
 from server.app.identity.models import Department, Organization, User, UserRole, UserStatus, Job, JobCollaborator
@@ -1313,14 +1313,56 @@ def test_job_definition_legacy_content_cannot_override_version_identity(tmp_path
     assert response.json()["data"]["rules"]["version_number"] == 1
 
 
-def test_job_definition_incomplete_legacy_content_returns_stable_problem(tmp_path) -> None:
+def test_job_definition_normalizes_text_only_legacy_content(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        job = Job(organization_id=admin.organization_id, title="Legacy text", owner_id=admin.id)
+        db.add(job); db.flush()
+        jd = JobJdVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"text": "old shape"})
+        rules = ScreeningRuleVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={})
+        db.add_all([jd, rules]); db.commit(); job_id, jd_id, rules_id = str(job.id), str(jd.id), str(rules.id)
+    with TestClient(app) as client:
+        login(client, "admin@example.test")
+        response = client.get(f"/api/v1/job-definitions/{job_id}")
+    assert response.status_code == 200
+    assert response.json()["data"]["jd"] == {
+        "id": jd_id,
+        "version_number": 1,
+        "description": "old shape",
+        "location": "",
+        "process_template": "默认招聘流程",
+        "llm_enabled": False,
+    }
+    assert response.json()["data"]["rules"] == {
+        "id": rules_id,
+        "version_number": 1,
+        "must_have": [],
+        "nice_to_have": [],
+    }
+    with app.state.identity_store.sync_session() as db:
+        stored_jd = db.get(JobJdVersion, UUID(jd_id))
+        stored_rules = db.get(ScreeningRuleVersion, UUID(rules_id))
+        assert stored_jd.content == {"text": "old shape"}
+        assert stored_rules.content == {}
+        assert db.scalar(select(func.count()).select_from(JobJdVersion).where(JobJdVersion.job_id == UUID(job_id))) == 1
+        assert db.scalar(select(func.count()).select_from(ScreeningRuleVersion).where(ScreeningRuleVersion.job_id == UUID(job_id))) == 1
+
+
+@pytest.mark.parametrize("legacy_content", [
+    {"legacy": "unsupported shape"},
+    {"text": "old shape", "unexpected": "unsupported shape"},
+    {"text": "old shape", "description": "typed", "location": "", "process_template": "standard", "llm_enabled": False},
+])
+def test_job_definition_unsupported_legacy_content_returns_stable_problem(tmp_path, legacy_content) -> None:
     app = make_app(tmp_path)
     admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
     with app.state.identity_store.sync_session() as db:
         admin = db.get(User, admin_id)
         job = Job(organization_id=admin.organization_id, title="Incomplete legacy", owner_id=admin.id)
         db.add(job); db.flush()
-        db.add(JobJdVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"text": "old shape"}))
+        db.add(JobJdVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content=legacy_content))
         db.commit(); job_id = str(job.id)
     with TestClient(app, raise_server_exceptions=False) as client:
         login(client, "admin@example.test")
@@ -1328,7 +1370,25 @@ def test_job_definition_incomplete_legacy_content_returns_stable_problem(tmp_pat
     assert response.status_code == 409
     assert response.headers["content-type"].startswith("application/problem+json")
     assert response.json()["code"] == "job_definition_incompatible"
+    assert "unsupported shape" not in response.text
     assert "old shape" not in response.text
+
+
+def test_job_definition_non_object_legacy_rules_return_stable_problem(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        job = Job(organization_id=admin.organization_id, title="Malformed legacy rules", owner_id=admin.id)
+        db.add(job); db.flush()
+        jd = JobJdVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"description": "Safe", "location": "", "process_template": "standard", "llm_enabled": False})
+        rules = ScreeningRuleVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content=[])
+        db.add_all([jd, rules]); db.commit(); job_id = str(job.id)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        login(client, "admin@example.test")
+        response = client.get(f"/api/v1/job-definitions/{job_id}")
+    assert response.status_code == 409
+    assert response.json()["code"] == "job_definition_incompatible"
 
 
 def test_replace_job_definition_failure_rolls_back_every_change(tmp_path) -> None:

@@ -209,13 +209,35 @@ def _job_data(job: Job) -> dict[str, Any]:
     return {"id": str(job.id), "title": job.title, "department_id": str(job.department_id) if job.department_id else None, "headcount": job.headcount, "priority": job.priority, "hiring_owner_id": str(job.hiring_owner_id) if job.hiring_owner_id else None, "owner_id": str(job.owner_id), "status": job.status, "version": job.version, "updated_at": job.updated_at.isoformat()}
 
 
+def _job_jd_definition(jd: JobJdVersion) -> dict[str, Any]:
+    content = jd.content if isinstance(jd.content, dict) else {}
+    if "text" in content:
+        if set(content) == {"text"} and isinstance(content["text"], str):
+            content = {
+                "description": content["text"],
+                "location": "",
+                "process_template": "默认招聘流程",
+                "llm_enabled": False,
+            }
+        else:
+            content = {}
+    return {"id": str(jd.id), "version_number": jd.version_number, **{key: content.get(key) for key in ("description", "location", "process_template", "llm_enabled")}}
+
+
+def _screening_rules_definition(rules: ScreeningRuleVersion) -> dict[str, Any]:
+    content = rules.content
+    if isinstance(content, dict) and not content:
+        content = {"must_have": [], "nice_to_have": []}
+    elif not isinstance(content, dict):
+        content = {}
+    return {"id": str(rules.id), "version_number": rules.version_number, **{key: content.get(key) for key in ("must_have", "nice_to_have")}}
+
+
 def _job_definition_data(job: Job, jd: JobJdVersion | None, rules: ScreeningRuleVersion | None) -> dict[str, Any]:
-    jd_content = jd.content if jd is not None and isinstance(jd.content, dict) else {}
-    rules_content = rules.content if rules is not None and isinstance(rules.content, dict) else {}
     return {
         "job": _job_data(job),
-        "jd": None if jd is None else {"id": str(jd.id), "version_number": jd.version_number, **{key: jd_content.get(key) for key in ("description", "location", "process_template", "llm_enabled")}},
-        "rules": None if rules is None else {"id": str(rules.id), "version_number": rules.version_number, **{key: rules_content.get(key) for key in ("must_have", "nice_to_have")}},
+        "jd": None if jd is None else _job_jd_definition(jd),
+        "rules": None if rules is None else _screening_rules_definition(rules),
     }
 
 
