@@ -15,6 +15,7 @@ def production_settings(**overrides: object) -> Settings:
         "object_storage_bucket": "resumes",
         "contact_encryption_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         "contact_lookup_secret": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+        "llm_config_encryption_key": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
         "cors_origins": ["https://hr.example.com"],
     }
     values.update(overrides)
@@ -87,7 +88,7 @@ def test_production_accepts_explicit_origins_and_non_placeholder_secrets() -> No
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("contact_encryption_key", "change-me"), ("contact_lookup_secret", "placeholder")],
+    [("contact_encryption_key", "change-me"), ("contact_lookup_secret", "placeholder"), ("llm_config_encryption_key", "change-me")],
 )
 def test_production_rejects_placeholder_contact_secrets(field: str, value: str) -> None:
     with pytest.raises(ValidationError):

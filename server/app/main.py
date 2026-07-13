@@ -91,10 +91,20 @@ def create_app(
     )
     app.state.resume_storage = resume_storage
     app.state.quarantine_storage = quarantine_storage
+    from server.app.llm.gateway import OpenAiCompatibleGateway
+    from server.app.llm.policy import ProviderAllowlist
+    from server.app.llm.security import ApiKeyCipher
+    llm_key=settings.llm_config_encryption_key.get_secret_value()
+    if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
+    app.state.llm_key_cipher=ApiKeyCipher(llm_key.encode())
+    app.state.llm_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
+    app.state.llm_gateway=OpenAiCompatibleGateway(app.state.llm_allowlist)
     app.include_router(identity_router)
     app.include_router(recruiting_router)
     from server.app.screening.api import router as screening_router
     app.include_router(screening_router)
+    from server.app.llm.api import router as llm_router
+    app.include_router(llm_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):

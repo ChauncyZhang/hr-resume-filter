@@ -31,6 +31,8 @@ class Settings(BaseModel):
     object_storage_bucket: str = "resumes"
     contact_encryption_key: SecretStr = SecretStr("change-me")
     contact_lookup_secret: SecretStr = SecretStr("change-me")
+    llm_config_encryption_key: SecretStr = SecretStr("change-me")
+    llm_provider_allowlist: dict[str, dict[str, object]] = Field(default_factory=dict)
     object_storage_secure: bool = False
     object_storage_connect_timeout_seconds: float = Field(default=1, gt=0)
     object_storage_read_timeout_seconds: float = Field(default=3, gt=0)
@@ -78,6 +80,7 @@ class Settings(BaseModel):
             self.object_storage_secret_key.strip().lower(),
             self.contact_encryption_key.get_secret_value().strip().lower(),
             self.contact_lookup_secret.get_secret_value().strip().lower(),
+            self.llm_config_encryption_key.get_secret_value().strip().lower(),
         )
         database_url = urlsplit(self.database_url)
         if not database_url.scheme or not database_url.hostname:
@@ -92,19 +95,19 @@ class Settings(BaseModel):
             raise ValueError("production credentials must not use placeholders")
         if not all(credentials):
             raise ValueError("production credentials are required")
-        contact_values = [self.contact_encryption_key.get_secret_value(), self.contact_lookup_secret.get_secret_value()]
+        contact_values = [self.contact_encryption_key.get_secret_value(), self.contact_lookup_secret.get_secret_value(), self.llm_config_encryption_key.get_secret_value()]
         if any(re.fullmatch(r"[A-Za-z0-9_-]{43}=", value) is None for value in contact_values):
-            raise ValueError("contact keys must use padded base64url")
+            raise ValueError("encryption keys must use padded base64url")
         try:
             decoded = [base64.b64decode(value, altchars=b"-_", validate=True) for value in contact_values]
         except (ValueError, base64.binascii.Error):
-            raise ValueError("contact keys must be base64url") from None
+            raise ValueError("encryption keys must be base64url") from None
         if any(len(value) != 32 for value in decoded):
-            raise ValueError("contact keys must decode to 32 bytes")
+            raise ValueError("encryption keys must decode to 32 bytes")
         if any(len(set(value)) < 16 for value in decoded):
-            raise ValueError("contact keys must be high entropy")
-        if decoded[0] == decoded[1]:
-            raise ValueError("contact keys must be independent")
+            raise ValueError("encryption keys must be high entropy")
+        if len({bytes(value) for value in decoded}) != len(decoded):
+            raise ValueError("encryption keys must be independent")
         if "*" in self.cors_origins:
             raise ValueError("wildcard CORS is forbidden in production")
         if any(not origin.startswith("https://") for origin in self.cors_origins):
@@ -123,6 +126,7 @@ class Settings(BaseModel):
             "OBJECT_STORAGE_BUCKET": "object_storage_bucket",
             "CONTACT_ENCRYPTION_KEY": "contact_encryption_key",
             "CONTACT_LOOKUP_SECRET": "contact_lookup_secret",
+            "LLM_CONFIG_ENCRYPTION_KEY": "llm_config_encryption_key",
             "OBJECT_STORAGE_SECURE": "object_storage_secure",
             "OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS": "object_storage_connect_timeout_seconds",
             "OBJECT_STORAGE_READ_TIMEOUT_SECONDS": "object_storage_read_timeout_seconds",
@@ -153,4 +157,6 @@ class Settings(BaseModel):
                 values[field_name] = os.environ[env_name]
         if "CORS_ORIGINS" in os.environ:
             values["cors_origins"] = json.loads(os.environ["CORS_ORIGINS"])
+        if "LLM_PROVIDER_ALLOWLIST_JSON" in os.environ:
+            values["llm_provider_allowlist"] = json.loads(os.environ["LLM_PROVIDER_ALLOWLIST_JSON"])
         return cls.model_validate(values)

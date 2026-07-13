@@ -70,5 +70,18 @@ maintenance boundary: stop writes, decrypt and re-encrypt all
 contacts, recompute lookup hashes, reconcile row counts and duplicate constraints, then deploy
 both new values atomically. Online dual-key rotation is outside Phase 2.
 
+LLM provider API keys use another independent high-entropy 32-byte base64url
+`LLM_CONFIG_ENCRYPTION_KEY`. Deployment operators define the available providers and models
+with `LLM_PROVIDER_ALLOWLIST_JSON`; system administrators can select only these IDs and cannot
+submit a Base URL. For example:
+
+```text
+LLM_PROVIDER_ALLOWLIST_JSON={"openai":{"base_url":"https://api.openai.com/v1","models":["gpt-4.1-mini"]}}
+```
+
+Production provider URLs must use HTTPS on port 443. Connection tests resolve and validate all
+provider addresses, pin one public address for the TLS request, reject redirects, and send only a
+constant health-check prompt. No JD or resume content is sent by the settings connection test.
+
 Candidate notes are append-only MVP facts, matching JD, rule, resume, stage-event, and
 candidate-event history. Corrections create a new note/event instead of editing prior text.
