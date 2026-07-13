@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func,select
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
-from server.app.recruiting.models import Application,ApplicationStageEvent
+from server.app.recruiting.models import Application,ApplicationStageEvent,FileObject
 from server.app.identity.models import AuditLog
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.actions import retry_screening_item
@@ -44,6 +44,27 @@ def test_retry_rejects_permanent_active_and_manager_scope(tmp_path):
         headers=login(client,"admin@example.test"); rejected=client.post(f"/api/v1/screening-items/{item['id']}/retry",headers={**headers,"Idempotency-Key":"retry"}); assert rejected.status_code==409 and rejected.json()["code"]=="screening_item_not_retryable"
         client.post("/api/v1/auth/logout",headers=headers); manager=login(client,"manager@example.test"); assert client.post(f"/api/v1/screening-items/{item['id']}/retry",headers={**manager,"Idempotency-Key":"manager"}).status_code==404
 
+def test_retry_recomputes_stale_counters_and_rejects_unavailable_file(tmp_path):
+    app,run,item=failed_item(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); stored=db.get(ScreeningItem,uuid.UUID(item["id"])); file=db.get(FileObject,stored.file_object_id)
+        aggregate.succeeded_count=1; aggregate.failed_count=0; aggregate.processed_count=1
+        db.commit()
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        response=client.post(f"/api/v1/screening-items/{item['id']}/retry",headers={**headers,"Idempotency-Key":"recompute"})
+        assert response.status_code==200
+        assert response.json()["data"]["run"]["processed_count"]==0
+        assert response.json()["data"]["run"]["succeeded_count"]==0
+
+    other=tmp_path/"deleted"; other.mkdir(); app,run,item=failed_item(other)
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); file=db.get(FileObject,stored.file_object_id); file.storage_state="deleted"; db.commit()
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        response=client.post(f"/api/v1/screening-items/{item['id']}/retry",headers={**headers,"Idempotency-Key":"deleted"})
+        assert response.status_code==409 and response.json()["code"]=="screening_item_not_retryable"
+
 def scored_item(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))
     with app.state.identity_store.sync_session() as db:
@@ -68,3 +89,15 @@ def test_bulk_reject_validation_and_all_or_nothing_stale_version(tmp_path):
         headers=login(client,"admin@example.test"); missing=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"reject","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"missing"}); assert missing.status_code==422
         stale=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"stale"}); assert stale.status_code==409
     with app.state.identity_store.sync_session() as db: assert db.get(Application,application.id).stage=="new" and db.scalar(select(func.count(ApplicationStageEvent.id)))==0
+
+def test_bulk_reject_persists_human_reason_without_audit_text(tmp_path):
+    app,run,item=scored_item(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
+    reason="候选人明确表示暂不考虑该岗位"
+    payload={"command":"reject","reason_code":"candidate_declined","reason_text":reason,"items":[{"item_id":item["id"],"expected_application_version":version}]}
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test"); response=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"reject"}); assert response.status_code==200
+    with app.state.identity_store.sync_session() as db:
+        assert db.get(Application,application_id).human_conclusion==reason
+        audit=db.scalar(select(AuditLog).where(AuditLog.event_type=="application.stage_changed")); assert reason not in str(audit.metadata_json)

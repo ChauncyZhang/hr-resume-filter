@@ -105,6 +105,8 @@ def _apply_application_transition(db, application, target, *, actor_user_id, tra
     application.stage = target
     application.version += 1
     application.updated_at = datetime.now(timezone.utc)
+    if target == "rejected" and reason_text and reason_text.strip():
+        application.human_conclusion = reason_text.strip()
     safe_payload = {"from_stage": source, "to_stage": target}
     if reason_code:
         safe_payload["reason_code"] = reason_code
