@@ -19,6 +19,7 @@ export function mapServerRoles(roles = []) {
 }
 
 export function getSessionMessage(error) {
+  if (error === "expired") return "登录状态已过期，请重新登录。";
   if (error === "authentication") return "登录信息不正确或账号暂不可用，请核对后重试。";
   if (error === "unavailable") return "服务暂时无法连接，请稍后重试。";
   if (error === "logout_failed") return "退出失败，请稍后重试。";
@@ -49,12 +50,22 @@ export function createSessionController(client) {
   let bootstrapPromise = null;
   let logoutPromise = null;
   let bootstrapped = false;
+  let sessionEpoch = Number.isInteger(client.getAuthEpoch?.()) ? client.getAuthEpoch() : 0;
   const listeners = new Set();
 
   function setState(next) {
     state = Object.freeze(next);
     for (const listener of listeners) listener();
   }
+
+  function handleUnauthorized(requestEpoch = sessionEpoch) {
+    if (requestEpoch !== sessionEpoch) return;
+    if (state.status === "authenticated" || state.status === "forbidden") {
+      setState(anonymousState("expired"));
+    }
+  }
+
+  const unregisterUnauthorized = client.setUnauthorizedHandler?.(handleUnauthorized);
 
   return {
     getSnapshot() {
@@ -63,6 +74,9 @@ export function createSessionController(client) {
     subscribe(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
+    },
+    dispose() {
+      if (typeof unregisterUnauthorized === "function") unregisterUnauthorized();
     },
     bootstrap() {
       if (bootstrapped) return Promise.resolve(state);
@@ -90,6 +104,8 @@ export function createSessionController(client) {
       try {
         await client.login(credentials);
         const user = await client.getMe();
+        const nextEpoch = client.advanceAuthEpoch?.();
+        sessionEpoch = Number.isInteger(nextEpoch) ? nextEpoch : sessionEpoch + 1;
         setState(authenticatedState(user));
         return user;
       } catch (error) {
@@ -108,7 +124,18 @@ export function createSessionController(client) {
           client.clearCsrf?.();
           setState(anonymousState());
         } catch (error) {
-          setState(authenticatedState(authenticatedUser, { error: "logout_failed" }));
+          if (error instanceof ApiError && error.status === 401) {
+            client.clearCsrf?.();
+            if (state.status !== "anonymous" || state.error !== "expired") {
+              setState(anonymousState("expired"));
+            }
+          } else if (
+            (state.status === "authenticated" || state.status === "forbidden")
+            && state.user === authenticatedUser
+            && state.loggingOut
+          ) {
+            setState(authenticatedState(authenticatedUser, { error: "logout_failed" }));
+          }
           throw error;
         } finally {
           logoutPromise = null;

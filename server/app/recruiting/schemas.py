@@ -14,6 +14,15 @@ class Meta(ApiModel):
     next_cursor: str | None = None
 
 
+class OwnerFacetOut(ApiModel):
+    id: str
+    name: str
+
+
+class CandidateMeta(Meta):
+    owners: list[OwnerFacetOut]
+
+
 class ContactOut(ApiModel):
     kind: str
     value: str
@@ -41,6 +50,26 @@ class CandidateOut(ApiModel):
     version: int
     updated_at: str
     contacts: list[ContactOut]
+
+
+class CandidateApplicationSummaryOut(ApiModel):
+    id: str
+    job_id: str
+    job_title: str
+    resume_id: str
+    owner_id: str
+    owner_name: str
+    stage: str
+    source: str
+    human_conclusion: str | None
+    version: int
+    updated_at: str
+    rule_score: int | None
+    recommendation: str | None
+
+
+class CandidateListOut(CandidateOut):
+    application: CandidateApplicationSummaryOut | None
 
 
 class ApplicationOut(ApiModel):
@@ -105,7 +134,7 @@ class PreviewOut(ApiModel):
 class JobResource(ApiModel): data: JobOut
 class JobCollection(ApiModel): data: list[JobOut]; meta: Meta
 class CandidateResource(ApiModel): data: CandidateOut
-class CandidateCollection(ApiModel): data: list[CandidateOut]; meta: Meta
+class CandidateCollection(ApiModel): data: list[CandidateListOut]; meta: CandidateMeta
 class ApplicationResource(ApiModel): data: ApplicationOut
 class ApplicationCollection(ApiModel): data: list[ApplicationOut]; meta: Meta
 class VersionResource(ApiModel): data: VersionOut

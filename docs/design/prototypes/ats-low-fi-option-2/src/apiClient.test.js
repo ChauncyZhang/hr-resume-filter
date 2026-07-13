@@ -177,3 +177,115 @@ test("download 保留 CSRF 防护并以附件返回二进制内容", async () =>
   assert.equal(calls[1].options.headers.get("Content-Type"), "application/json");
   assert.equal(calls[1].options.body, JSON.stringify({ token: "one-time" }));
 });
+
+test("normal request 401 clears CSRF and notifies the unauthorized handler once", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ data: { id: "user-1" } }, { headers: { "X-CSRF-Token": "csrf-token" } }),
+    jsonResponse({ code: "authentication_required" }, { status: 401 }),
+    jsonResponse({ data: { ok: true } }),
+  ];
+  let notifications = 0;
+  const client = createApiClient({ fetchImpl: async (path, options) => {
+    calls.push({ path, options });
+    return responses.shift();
+  } });
+  assert.equal(typeof client.setUnauthorizedHandler, "function");
+  client.setUnauthorizedHandler(() => { notifications += 1; });
+
+  await client.getMe();
+  await assert.rejects(client.request("/api/v1/jobs", { method: "POST", body: {} }), ApiError);
+  await client.request("/api/v1/jobs", { method: "POST", body: {} });
+
+  assert.equal(notifications, 1);
+  assert.equal(calls[1].options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(calls[2].options.headers.get("X-CSRF-Token"), null);
+});
+
+test("401 notification carries the auth epoch captured when the request started", async () => {
+  let resolveOldRequest;
+  const epochs = [];
+  const client = createApiClient({
+    fetchImpl: () => new Promise((resolve) => { resolveOldRequest = resolve; }),
+  });
+  client.setUnauthorizedHandler((requestEpoch) => { epochs.push(requestEpoch); });
+
+  const oldRequest = client.request("/api/v1/jobs");
+  assert.equal(client.advanceAuthEpoch(), 1);
+  resolveOldRequest(jsonResponse({ code: "authentication_required" }, { status: 401 }));
+
+  await assert.rejects(oldRequest, ApiError);
+  assert.deepEqual(epochs, [0]);
+  assert.equal(client.getAuthEpoch(), 1);
+});
+
+test("download 401 notifies the unauthorized handler once", async () => {
+  let notifications = 0;
+  const client = createApiClient({ fetchImpl: async () => jsonResponse(null, { status: 401 }) });
+  assert.equal(typeof client.setUnauthorizedHandler, "function");
+  client.setUnauthorizedHandler(() => { notifications += 1; });
+
+  await assert.rejects(client.download("/api/v1/download-tickets/consume", { method: "POST" }), ApiError);
+
+  assert.equal(notifications, 1);
+});
+
+test("login 401 does not notify the unauthorized handler", async () => {
+  let notifications = 0;
+  const client = createApiClient({ fetchImpl: async () => jsonResponse(null, { status: 401 }) });
+  assert.equal(typeof client.setUnauthorizedHandler, "function");
+  client.setUnauthorizedHandler(() => { notifications += 1; });
+
+  await assert.rejects(client.login({ email: "hr@example.test", password: "wrong" }), ApiError);
+
+  assert.equal(notifications, 0);
+});
+
+test("GET /me 401 does not notify the unauthorized handler", async () => {
+  let notifications = 0;
+  const client = createApiClient({ fetchImpl: async () => jsonResponse(null, { status: 401 }) });
+  assert.equal(typeof client.setUnauthorizedHandler, "function");
+  client.setUnauthorizedHandler(() => { notifications += 1; });
+
+  await assert.rejects(client.getMe(), ApiError);
+
+  assert.equal(notifications, 0);
+});
+
+test("unauthorized handler exceptions do not mask the safe API error", async () => {
+  const client = createApiClient({ fetchImpl: async () => jsonResponse({
+    code: "authentication_required",
+    title: "Authentication required",
+    detail: "Sign in again.",
+  }, { status: 401, headers: { "Content-Type": "application/problem+json" } }) });
+  client.setUnauthorizedHandler(() => { throw new Error("subscriber internals"); });
+
+  await assert.rejects(client.request("/api/v1/jobs"), (error) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 401);
+    assert.equal(error.code, "authentication_required");
+    assert.equal(error.detail, "Sign in again.");
+    assert.equal(error.message.includes("subscriber internals"), false);
+    return true;
+  });
+});
+
+test("unauthorized unregister only clears the handler it registered", async () => {
+  let firstNotifications = 0;
+  let secondNotifications = 0;
+  const client = createApiClient({ fetchImpl: async () => jsonResponse(null, { status: 401 }) });
+  const unregisterFirst = client.setUnauthorizedHandler(() => { firstNotifications += 1; });
+  const unregisterSecond = client.setUnauthorizedHandler(() => { secondNotifications += 1; });
+
+  assert.equal(typeof unregisterFirst, "function");
+  assert.equal(typeof unregisterSecond, "function");
+  unregisterFirst();
+  await assert.rejects(client.request("/api/v1/jobs"), ApiError);
+
+  assert.equal(firstNotifications, 0);
+  assert.equal(secondNotifications, 1);
+
+  unregisterSecond();
+  await assert.rejects(client.request("/api/v1/jobs"), ApiError);
+  assert.equal(secondNotifications, 1);
+});

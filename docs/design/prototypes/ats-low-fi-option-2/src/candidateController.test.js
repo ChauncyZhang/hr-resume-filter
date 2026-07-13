@@ -1,12 +1,174 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createCandidateController, normalizeCandidateReview } from "./candidateController.js";
+import { createCandidateController, mergeCandidateRecords, normalizeCandidateReview } from "./candidateController.js";
 
 const candidateId = "candidate-1";
 const jobId = "job-1";
 const response = (data) => ({ data });
 
-test("candidate review loads only the selected server candidate and current job application", async () => {
+test("candidate list safely encodes supported filters and normalizes server rows", async () => {
+  const calls = [];
+  const signal = new AbortController().signal;
+  const client = {
+    async request(path, options) {
+      calls.push({ path, options });
+      return {
+        data: [{
+          id: "candidate/一",
+          display_name: "李 嘉明",
+          current_title: "AI & RAG 工程师",
+          location: "北京",
+          contacts: [{ kind: "phone", value: "138****2468" }, { kind: "email", value: "li***@mail.com" }],
+          updated_at: "2026-07-13T09:00:00+00:00",
+          application: {
+            id: "application-1",
+            job_id: "job/一",
+            job_title: "平台 & AI",
+            owner_id: "owner-1",
+            owner_name: "张小北",
+            stage: "review",
+            source: "本地上传",
+            updated_at: "2026-07-13T10:00:00+00:00",
+            rule_score: 81,
+            recommendation: "可沟通",
+          },
+        }],
+        meta: {
+          limit: 50,
+          next_cursor: "next/一",
+          owners: [{ id: "owner-2", name: "陈雨" }, { id: "owner-1", name: "张小北" }],
+        },
+      };
+    },
+  };
+
+  const result = await createCandidateController({ client }).listCandidates({
+    q: "李 & 明",
+    jobId: "job/一",
+    stage: "待复核",
+    ownerId: "owner/一",
+    minScore: 0,
+    cursor: "cursor/一",
+    limit: 50,
+  }, { signal });
+
+  assert.deepEqual(calls, [{
+    path: "/api/v1/candidates?q=%E6%9D%8E+%26+%E6%98%8E&job_id=job%2F%E4%B8%80&stage=review&owner_id=owner%2F%E4%B8%80&min_score=0&cursor=cursor%2F%E4%B8%80&limit=50",
+    options: { signal },
+  }]);
+  assert.equal(result.nextCursor, "next/一");
+  assert.deepEqual(result.ownerOptions, [{ id: "owner-2", name: "陈雨" }, { id: "owner-1", name: "张小北" }]);
+  assert.deepEqual(result.records[0], {
+    id: "application-1",
+    serverBacked: true,
+    candidateId: "candidate/一",
+    applicationId: "application-1",
+    jobId: "job/一",
+    ownerId: "owner-1",
+    name: "李 嘉明",
+    role: "AI & RAG 工程师",
+    company: "",
+    position: "平台 & AI",
+    stage: "待复核",
+    score: 81,
+    ruleScore: 81,
+    recommendation: "可沟通",
+    source: "本地上传",
+    owner: "张小北",
+    city: "北京",
+    phone: "138****2468",
+    email: "li***@mail.com",
+    lastActivity: "07/13 18:00",
+    evidence: { ruleScore: 81, recommendation: "可沟通" },
+  });
+});
+
+test("candidate list omits empty and all-selector filters and preserves null evidence", async () => {
+  const calls = [];
+  const client = { async request(path, options) {
+    calls.push({ path, options });
+    return {
+      data: [{ id: "candidate-2", display_name: "待补充", application: null }],
+      meta: { limit: 50, next_cursor: null },
+    };
+  } };
+
+  const result = await createCandidateController({ client }).listCandidates({
+    q: "  ", jobId: "全部职位", stage: "全部阶段", ownerId: "全部负责人", minScore: "不限分数", cursor: "", limit: 50,
+  });
+
+  assert.deepEqual(calls, [{ path: "/api/v1/candidates?limit=50", options: {} }]);
+  assert.equal(result.nextCursor, null);
+  assert.equal(result.records[0].id, "candidate-2");
+  assert.equal(result.records[0].stage, "无当前申请");
+  assert.equal(result.records[0].score, "-");
+  assert.equal(result.records[0].ruleScore, null);
+  assert.equal(result.records[0].recommendation, "待人工复核");
+  assert.deepEqual(result.records[0].evidence, { ruleScore: null, recommendation: "待人工复核" });
+});
+
+test("candidate list omits an empty minimum score instead of coercing it to zero", async () => {
+  const calls = [];
+  const client = { async request(path, options) {
+    calls.push({ path, options });
+    return { data: [], meta: { limit: 50, next_cursor: null } };
+  } };
+
+  await createCandidateController({ client }).listCandidates({ minScore: "   ", limit: 50 });
+
+  assert.deepEqual(calls, [{ path: "/api/v1/candidates?limit=50", options: {} }]);
+});
+
+test("candidate list forwards AbortSignal and propagates request errors unchanged", async () => {
+  const failure = new Error("network unavailable");
+  const signal = new AbortController().signal;
+  const client = { async request(path, options) {
+    assert.equal(path, "/api/v1/candidates?limit=50");
+    assert.deepEqual(options, { signal });
+    throw failure;
+  } };
+
+  await assert.rejects(
+    createCandidateController({ client }).listCandidates({ limit: 50 }, { signal }),
+    (error) => error === failure,
+  );
+});
+
+test("jobs list supplies server ids and titles for the candidate position filter", async () => {
+  const signal = new AbortController().signal;
+  const calls = [];
+  const client = { async request(path, options) {
+    calls.push({ path, options });
+    if (path === "/api/v1/jobs?limit=100") return { data: [{ id: "job-1", title: "AI 工程师" }], meta: { next_cursor: "next/一" } };
+    if (path === "/api/v1/jobs?limit=100&cursor=next%2F%E4%B8%80") return { data: [{ id: "job-2", title: "平台工程师" }], meta: { next_cursor: null } };
+    throw new Error(`unexpected request ${path}`);
+  } };
+
+  assert.deepEqual(await createCandidateController({ client }).listJobs({ signal }), [
+    { id: "job-1", title: "AI 工程师" },
+    { id: "job-2", title: "平台工程师" },
+  ]);
+  assert.deepEqual(calls, [
+    { path: "/api/v1/jobs?limit=100", options: { signal } },
+    { path: "/api/v1/jobs?limit=100&cursor=next%2F%E4%B8%80", options: { signal } },
+  ]);
+});
+
+test("candidate page append deduplicates by application id and falls back to candidate id", () => {
+  const current = [
+    { id: "row-1", applicationId: "application-1", candidateId: "candidate-1", name: "旧记录" },
+    { id: "candidate-2", applicationId: "", candidateId: "candidate-2", name: "无申请" },
+  ];
+  const incoming = [
+    { id: "row-1-new", applicationId: "application-1", candidateId: "candidate-1", name: "更新记录" },
+    { id: "candidate-2-new", applicationId: null, candidateId: "candidate-2", name: "无申请重复" },
+    { id: "row-3", applicationId: "application-3", candidateId: "candidate-3", name: "新增记录" },
+  ];
+
+  assert.deepEqual(mergeCandidateRecords(current, incoming), [current[0], current[1], incoming[2]]);
+});
+
+test("candidate review loads the exact selected application when the same candidate applies to one job twice", async () => {
   const calls = [];
   const client = {
     async request(path) {
@@ -18,9 +180,11 @@ test("candidate review loads only the selected server candidate and current job 
       });
       if (path === `/api/v1/candidates/${candidateId}/applications`) return response([
         { id: "application-other", candidate_id: candidateId, job_id: "job-2", resume_id: "resume-2", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: null, version: 4, updated_at: "2026-07-12T09:00:00+00:00" },
+        { id: "application-older", candidate_id: candidateId, job_id: jobId, resume_id: "resume-old", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: "暂不合适：历史申请", version: 5, updated_at: "2026-07-12T10:00:00+00:00" },
         { id: "application-1", candidate_id: candidateId, job_id: jobId, resume_id: "resume-1", owner_id: "user-1", stage: "review", source: "本地上传", human_conclusion: "需要补充：确认到岗时间", version: 2, updated_at: "2026-07-13T09:00:00+00:00" },
       ]);
       if (path === `/api/v1/candidates/${candidateId}/resumes`) return response([
+        { id: "resume-old", candidate_id: candidateId, version_number: 1, created_at: "2026-07-12T08:00:00+00:00" },
         { id: "resume-1", candidate_id: candidateId, version_number: 1, created_at: "2026-07-13T08:00:00+00:00" },
       ]);
       if (path === `/api/v1/candidates/${candidateId}/notes?application_id=application-1`) return response([
@@ -35,7 +199,7 @@ test("candidate review loads only the selected server candidate and current job 
   };
 
   const review = await createCandidateController({ client }).loadReview({
-    candidateId, jobId, position: "AI 工程师", actor: { id: "user-1", name: "张小北" },
+    candidateId, applicationId: "application-1", jobId, position: "AI 工程师", actor: { id: "user-1", name: "张小北" },
     evidence: { ruleScore: 81, llmScore: 78, recommendation: "可沟通", matched: "Python、RAG", missing: "Kubernetes", risk: "项目规模待确认" },
   });
 
@@ -60,9 +224,9 @@ test("candidate review loads only the selected server candidate and current job 
 test("normalization refuses cross-job fallback and preserves masked contacts only", () => {
   const review = normalizeCandidateReview({
     candidate: { id: candidateId, display_name: "候选人", contacts: [{ kind: "phone", value: "139****0000" }] },
-    applications: [{ id: "wrong", job_id: "job-2", stage: "review", source: "manual", version: 1 }],
+    applications: [{ id: "wrong", candidate_id: candidateId, job_id: "job-2", stage: "review", source: "manual", version: 1 }],
     resumes: [], notes: [], timeline: [],
-    context: { jobId, position: "AI 工程师", actor: { id: "user-1", name: "张小北" }, evidence: {} },
+    context: { applicationId: "wrong", jobId, position: "AI 工程师", actor: { id: "user-1", name: "张小北" }, evidence: {} },
   });
 
   assert.equal(review.application, null);

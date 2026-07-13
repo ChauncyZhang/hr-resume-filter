@@ -29,8 +29,28 @@ async function parseResponse(response) {
 
 export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
   let csrfToken = null;
+  let unauthorizedHandler = null;
+  let authEpoch = 0;
+
+  function notifyUnauthorized(requestEpoch) {
+    try {
+      unauthorizedHandler?.(requestEpoch);
+    } catch {
+      // Session notifications cannot replace the response's safe ApiError.
+    }
+  }
+
+  async function parsePayload(response, requestEpoch, notifySession) {
+    try {
+      return await parseResponse(response);
+    } catch (error) {
+      if (notifySession) notifyUnauthorized(requestEpoch);
+      throw error;
+    }
+  }
 
   async function fetchResponse(path, options = {}) {
+    const requestEpoch = authEpoch;
     const method = (options.method || "GET").toUpperCase();
     const isLogin = path === "/api/v1/auth/login";
     const refreshesCsrf = isLogin || path === "/api/v1/me";
@@ -60,41 +80,45 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     if (refreshesCsrf && response.ok) {
       const responseCsrf = response.headers.get("X-CSRF-Token");
       if (responseCsrf) csrfToken = responseCsrf;
-    } else if (response.status === 401) {
+    } else if (response.status === 401 && requestEpoch === authEpoch) {
       csrfToken = null;
     }
 
-    return response;
+    return { response, requestEpoch, notifySession: response.status === 401 && !refreshesCsrf };
   }
 
   async function request(path, options = {}) {
-    const response = await fetchResponse(path, options);
-    const payload = await parseResponse(response);
+    const { response, requestEpoch, notifySession } = await fetchResponse(path, options);
+    const payload = await parsePayload(response, requestEpoch, notifySession);
     if (!response.ok) {
       const isProblem = (response.headers.get("Content-Type") || "").toLowerCase().includes("application/problem+json");
-      throw new ApiError({
+      const error = new ApiError({
         status: response.status,
         code: isProblem ? safeString(payload?.code, "request_failed") : "request_failed",
         title: isProblem ? safeString(payload?.title, "请求失败") : "请求失败",
         detail: isProblem ? safeString(payload?.detail) : "",
         kind: response.status >= 500 ? "unavailable" : "request",
       });
+      if (notifySession) notifyUnauthorized(requestEpoch);
+      throw error;
     }
     return payload;
   }
 
   async function download(path, options = {}) {
-    const response = await fetchResponse(path, options);
+    const { response, requestEpoch, notifySession } = await fetchResponse(path, options);
     if (!response.ok) {
-      const payload = await parseResponse(response);
+      const payload = await parsePayload(response, requestEpoch, notifySession);
       const isProblem = (response.headers.get("Content-Type") || "").toLowerCase().includes("application/problem+json");
-      throw new ApiError({
+      const error = new ApiError({
         status: response.status,
         code: isProblem ? safeString(payload?.code, "request_failed") : "request_failed",
         title: isProblem ? safeString(payload?.title, "请求失败") : "请求失败",
         detail: isProblem ? safeString(payload?.detail) : "",
         kind: response.status >= 500 ? "unavailable" : "request",
       });
+      if (notifySession) notifyUnauthorized(requestEpoch);
+      throw error;
     }
     const disposition = response.headers.get("Content-Disposition") || "";
     const encoded = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
@@ -124,6 +148,20 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     },
     clearCsrf() {
       csrfToken = null;
+    },
+    getAuthEpoch() {
+      return authEpoch;
+    },
+    advanceAuthEpoch() {
+      authEpoch += 1;
+      return authEpoch;
+    },
+    setUnauthorizedHandler(handler) {
+      const registeredHandler = typeof handler === "function" ? handler : null;
+      unauthorizedHandler = registeredHandler;
+      return () => {
+        if (unauthorizedHandler === registeredHandler) unauthorizedHandler = null;
+      };
     },
   };
 }

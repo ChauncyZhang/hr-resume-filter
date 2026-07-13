@@ -78,8 +78,62 @@ function normalizeTimelineEvent(item, actor) {
   };
 }
 
+function normalizeCandidateListItem(candidate) {
+  const application = candidate?.application || null;
+  const ruleScore = Number.isInteger(application?.rule_score) ? application.rule_score : null;
+  const recommendation = safeString(application?.recommendation, "待人工复核");
+  const candidateId = safeString(candidate?.id);
+  const applicationId = safeString(application?.id);
+  return {
+    id: applicationId || candidateId,
+    serverBacked: true,
+    candidateId,
+    applicationId,
+    jobId: safeString(application?.job_id),
+    ownerId: safeString(application?.owner_id),
+    name: safeString(candidate?.display_name, "未命名候选人"),
+    role: safeString(candidate?.current_title, "当前职称未填写"),
+    company: "",
+    position: safeString(application?.job_title, "无当前申请"),
+    stage: application ? (API_TO_UI_STAGE[application.stage] || "未知阶段") : "无当前申请",
+    score: ruleScore ?? "-",
+    ruleScore,
+    recommendation,
+    source: safeString(application?.source, "未记录"),
+    owner: safeString(application?.owner_name, "未分配"),
+    city: safeString(candidate?.location, "地点未填写"),
+    phone: contactValue(candidate?.contacts, "phone"),
+    email: contactValue(candidate?.contacts, "email"),
+    lastActivity: displayDateTime(application?.updated_at || candidate?.updated_at),
+    evidence: { ruleScore, recommendation },
+  };
+}
+
+export function mergeCandidateRecords(current, incoming) {
+  const seen = new Set(safeArray(current).map((item) => item?.applicationId || item?.candidateId).filter(Boolean));
+  return [...safeArray(current), ...safeArray(incoming).filter((item) => {
+    const key = item?.applicationId || item?.candidateId;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  })];
+}
+
+function normalizeOwnerFacets(owners) {
+  return safeArray(owners).map((item) => ({ id: safeString(item?.id), name: safeString(item?.name) })).filter((item) => item.id && item.name);
+}
+
+function selectApplication(applications, candidateId, context) {
+  return safeArray(applications).find((item) => (
+    item?.candidate_id === candidateId
+    && item?.job_id === context.jobId
+    && (!context.applicationId || item?.id === context.applicationId)
+  )) || null;
+}
+
 export function normalizeCandidateReview({ candidate, applications, resumes, notes, timeline, context }) {
-  const application = safeArray(applications).find((item) => item?.job_id === context.jobId) || null;
+  const candidateId = safeString(candidate?.id);
+  const application = selectApplication(applications, candidateId, context);
   const resume = application
     ? safeArray(resumes).find((item) => item?.id === application.resume_id) || null
     : null;
@@ -89,7 +143,7 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
   const matched = safeString(evidence.matched);
 
   return {
-    id: safeString(candidate?.id),
+    id: candidateId,
     serverBacked: true,
     name: safeString(candidate?.display_name, "未命名候选人"),
     role: safeString(candidate?.current_title, "当前职称未填写"),
@@ -134,6 +188,44 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
 }
 
 export function createCandidateController({ client = apiClient, idempotencyKey = () => globalThis.crypto.randomUUID() } = {}) {
+  async function listCandidates(filters = {}, { signal } = {}) {
+    const params = new URLSearchParams();
+    const query = safeString(filters.q).trim();
+    const jobId = safeString(filters.jobId).trim();
+    const stage = safeString(filters.stage).trim();
+    const ownerId = safeString(filters.ownerId).trim();
+    const cursor = safeString(filters.cursor).trim();
+    const minScoreRaw = filters.minScore == null ? "" : String(filters.minScore).trim();
+    const minScore = minScoreRaw ? Number(minScoreRaw) : Number.NaN;
+    const limit = Number(filters.limit);
+    if (query) params.set("q", query);
+    if (jobId && jobId !== "全部职位") params.set("job_id", jobId);
+    if (stage && stage !== "全部阶段") params.set("stage", UI_TO_API_STAGE[stage] || stage);
+    if (ownerId && ownerId !== "全部负责人") params.set("owner_id", ownerId);
+    if (Number.isFinite(minScore) && minScore >= 0 && minScore <= 100) params.set("min_score", String(minScore));
+    if (cursor) params.set("cursor", cursor);
+    if (Number.isInteger(limit) && limit > 0) params.set("limit", String(limit));
+    const result = await client.request(`/api/v1/candidates?${params.toString()}`, signalOption(signal));
+    return {
+      records: safeArray(result?.data).map(normalizeCandidateListItem),
+      nextCursor: safeString(result?.meta?.next_cursor) || null,
+      ownerOptions: normalizeOwnerFacets(result?.meta?.owners),
+    };
+  }
+
+  async function listJobs({ signal } = {}) {
+    const jobs = [];
+    let cursor = "";
+    do {
+      const params = new URLSearchParams({ limit: "100" });
+      if (cursor) params.set("cursor", cursor);
+      const result = await client.request(`/api/v1/jobs?${params.toString()}`, signalOption(signal));
+      jobs.push(...safeArray(result?.data).map((item) => ({ id: safeString(item?.id), title: safeString(item?.title) })).filter((item) => item.id && item.title));
+      cursor = safeString(result?.meta?.next_cursor);
+    } while (cursor);
+    return jobs;
+  }
+
   async function loadReview(context, { signal } = {}) {
     if (!safeString(context?.candidateId)) throw codedError("CANDIDATE_ID_REQUIRED", "candidate id required");
     const root = `/api/v1/candidates/${context.candidateId}`;
@@ -144,12 +236,15 @@ export function createCandidateController({ client = apiClient, idempotencyKey =
       client.request(`${root}/resumes`, options),
       client.request(`${root}/timeline`, options),
     ]);
-    const application = safeArray(applications?.data).find((item) => item?.job_id === context.jobId) || null;
+    const candidateData = candidate?.data;
+    if (safeString(candidateData?.id) !== context.candidateId) throw codedError("CANDIDATE_MISMATCH", "candidate mismatch");
+    const application = selectApplication(applications?.data, context.candidateId, context);
+    if (context.applicationId && !application) throw codedError("APPLICATION_MISMATCH", "application mismatch");
     const notes = application
       ? await client.request(`${root}/notes?application_id=${encodeURIComponent(application.id)}`, options)
       : { data: [] };
     return normalizeCandidateReview({
-      candidate: candidate?.data,
+      candidate: candidateData,
       applications: applications?.data,
       resumes: resumes?.data,
       notes: notes?.data,
@@ -200,7 +295,7 @@ export function createCandidateController({ client = apiClient, idempotencyKey =
     return client.download("/api/v1/download-tickets/consume", { method: "POST", body: { token: ticket?.data?.token }, ...signalOption(signal) });
   }
 
-  return { loadReview, saveConclusion, transition, addNote, previewResume, downloadResume };
+  return { listCandidates, listJobs, loadReview, saveConclusion, transition, addNote, previewResume, downloadResume };
 }
 
 export const candidateController = createCandidateController();

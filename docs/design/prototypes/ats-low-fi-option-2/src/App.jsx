@@ -413,11 +413,11 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   function openCandidate(summary, nextScreeningViewState = null) {
     if (summary.serverBacked === true) {
       if (!summary.candidateId) return;
-      setCandidateOrigin({ activeNav, screeningTask, screeningViewState: nextScreeningViewState });
+      setCandidateOrigin(activeNav === "候选人" && !screeningTask ? null : { activeNav, screeningTask, screeningViewState: nextScreeningViewState });
       setScreeningTask(null);
       setActiveNav("候选人");
       setCandidateMode("detail");
-      void loadServerCandidate({ candidateId: summary.candidateId, jobId: summary.jobId, position: summary.position, evidence: summary.evidence });
+      void loadServerCandidate({ candidateId: summary.candidateId, applicationId: summary.applicationId, jobId: summary.jobId, position: summary.position, evidence: summary.evidence });
       return;
     }
     let candidate = candidateRecords.find((item) => (summary.fileId && item.sourceFileId === summary.fileId) || (summary.email && item.email === summary.email))
@@ -682,7 +682,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
         )}
 
         {!screeningTask && activeNav === "面试" && (

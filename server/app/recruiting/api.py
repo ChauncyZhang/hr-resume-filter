@@ -21,6 +21,7 @@ from server.app.recruiting.models import (
     Application, ApplicationStageEvent, Candidate, CandidateContact, CandidateEvent, CandidateNote,
     DownloadTicket, JobJdVersion, Resume, ScreeningRuleVersion,
 )
+from server.app.screening.models import ScreeningResult
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.http import content_disposition
 from server.app.recruiting.storage import MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, StorageObjectTooLarge, StorageReadFailed
@@ -208,6 +209,85 @@ def _candidate_data(db, candidate: Candidate, principal: Principal) -> dict[str,
     return {"id": str(candidate.id), "display_name": candidate.display_name, "current_title": candidate.current_title, "location": candidate.location, "owner_id": str(candidate.owner_id) if candidate.owner_id else None, "version": candidate.version, "updated_at": candidate.updated_at.isoformat(), "contacts": [{"kind": item.kind, "value": item.masked_value} for item in contacts]}
 
 
+def _latest_screening_results(organization_id: UUID):
+    return select(
+        ScreeningResult.organization_id,
+        ScreeningResult.application_id,
+        ScreeningResult.rule_score,
+        ScreeningResult.recommendation,
+        func.row_number().over(
+            partition_by=(ScreeningResult.organization_id, ScreeningResult.application_id),
+            order_by=(ScreeningResult.created_at.desc(), ScreeningResult.id.desc()),
+        ).label("result_rank"),
+    ).where(
+        ScreeningResult.organization_id == organization_id,
+        ScreeningResult.application_id.is_not(None),
+    ).subquery()
+
+
+def _candidate_application_summaries(db, organization_id: UUID, application_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
+    if not application_ids:
+        return {}
+    latest_result = _latest_screening_results(organization_id)
+    rows = db.execute(select(
+        Application,
+        Job.title,
+        User.display_name,
+        latest_result.c.rule_score,
+        latest_result.c.recommendation,
+    ).join(
+        Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id),
+    ).join(
+        User, and_(User.organization_id == Application.organization_id, User.id == Application.owner_id),
+    ).outerjoin(
+        latest_result,
+        and_(
+            latest_result.c.organization_id == Application.organization_id,
+            latest_result.c.application_id == Application.id,
+            latest_result.c.result_rank == 1,
+        ),
+    ).where(
+        Application.organization_id == organization_id,
+        Application.id.in_(application_ids),
+    )).all()
+    return {
+        application.id: {
+            "id": str(application.id),
+            "job_id": str(application.job_id),
+            "job_title": job_title,
+            "resume_id": str(application.resume_id),
+            "owner_id": str(application.owner_id),
+            "owner_name": owner_name,
+            "stage": application.stage,
+            "source": application.source,
+            "human_conclusion": application.human_conclusion,
+            "version": application.version,
+            "updated_at": application.updated_at.isoformat(),
+            "rule_score": rule_score,
+            "recommendation": recommendation,
+        }
+        for application, job_title, owner_name, rule_score, recommendation in rows
+    }
+
+
+def _candidate_search_condition(request: Request, query: str):
+    contact_conditions = [CandidateContact.masked_value.ilike(f"%{query}%")]
+    for kind in ("email", "phone"):
+        try:
+            contact_conditions.append(CandidateContact.lookup_hash == request.app.state.contact_cipher.protect(kind, query).lookup_hash)
+        except ValueError:
+            pass
+    return or_(
+        Candidate.display_name.ilike(f"%{query}%"),
+        Candidate.current_title.ilike(f"%{query}%"),
+        exists().where(
+            CandidateContact.organization_id == Candidate.organization_id,
+            CandidateContact.candidate_id == Candidate.id,
+            or_(*contact_conditions),
+        ),
+    )
+
+
 def _eligible_recruiter(db, organization_id: UUID, user_id: UUID) -> bool:
     return db.scalar(select(exists().where(
         User.organization_id == organization_id,
@@ -343,40 +423,108 @@ def funnel(job_id: UUID, request: Request):
 
 
 @router.get("/candidates", response_model=CandidateCollection)
-def list_candidates(request: Request, job_id: UUID | None = None, stage: str | None = None, owner_id: UUID | None = None, source: str | None = None, q: str | None = Query(None, max_length=200), cursor: str | None = None, limit: int = Query(50, ge=1, le=100), sort: str = "-updated_at"):
+def list_candidates(request: Request, job_id: UUID | None = None, stage: str | None = None, owner_id: UUID | None = None, source: str | None = None, min_score: int | None = Query(None, ge=0, le=100), q: str | None = Query(None, max_length=200), cursor: str | None = None, limit: int = Query(50, ge=1, le=100), sort: str = "-updated_at"):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
     if sort != "-updated_at": return problem(request, 422, "validation_failed", "Unsupported sort order.")
     with request.app.state.identity_store.sync_session() as db:
-        query = select(Candidate).where(Candidate.organization_id == principal.organization_id, _candidate_scope(principal))
-        if owner_id: query = query.where(Candidate.owner_id == owner_id)
-        if q: query = query.where(or_(Candidate.display_name.ilike(f"%{q}%"), Candidate.current_title.ilike(f"%{q}%")))
-        if any((job_id, stage, source)):
-            filtered_application = aliased(Application)
+        selected_application = aliased(Application)
+        selected_job = aliased(Job)
+        latest_result = _latest_screening_results(principal.organization_id)
+
+        def application_conditions(application, job, include_owner: bool):
             conditions = [
-                filtered_application.organization_id == Candidate.organization_id,
-                filtered_application.candidate_id == Candidate.id,
-                exists().where(
-                    Job.organization_id == filtered_application.organization_id,
-                    Job.id == filtered_application.job_id,
-                    AUTH.job_predicate(principal, RecruitingAction.READ, Job),
-                ),
+                application.organization_id == principal.organization_id,
+                AUTH.job_predicate(principal, RecruitingAction.READ, job),
             ]
-            if job_id: conditions.append(filtered_application.job_id == job_id)
-            if stage: conditions.append(filtered_application.stage == stage)
-            if source: conditions.append(filtered_application.source == source)
-            query = query.where(exists().where(*conditions))
+            if job_id: conditions.append(application.job_id == job_id)
+            if stage: conditions.append(application.stage == stage)
+            if include_owner and owner_id: conditions.append(application.owner_id == owner_id)
+            if source: conditions.append(application.source == source)
+            if min_score is not None: conditions.append(latest_result.c.rule_score >= min_score)
+            return conditions
+
+        ranked_applications = select(
+            selected_application.organization_id,
+            selected_application.candidate_id,
+            selected_application.id.label("application_id"),
+            selected_application.updated_at.label("application_updated_at"),
+            func.row_number().over(
+                partition_by=(selected_application.organization_id, selected_application.candidate_id),
+                order_by=(selected_application.updated_at.desc(), selected_application.id.desc()),
+            ).label("application_rank"),
+        ).join(
+            selected_job,
+            and_(selected_job.organization_id == selected_application.organization_id, selected_job.id == selected_application.job_id),
+        ).outerjoin(
+            latest_result,
+            and_(
+                latest_result.c.organization_id == selected_application.organization_id,
+                latest_result.c.application_id == selected_application.id,
+                latest_result.c.result_rank == 1,
+            ),
+        ).where(*application_conditions(selected_application, selected_job, True)).subquery()
+        sort_updated_at = func.coalesce(ranked_applications.c.application_updated_at, Candidate.updated_at)
+        query = select(Candidate, ranked_applications.c.application_id, sort_updated_at.label("sort_updated_at")).outerjoin(
+            ranked_applications,
+            and_(
+                ranked_applications.c.organization_id == Candidate.organization_id,
+                ranked_applications.c.candidate_id == Candidate.id,
+                ranked_applications.c.application_rank == 1,
+            ),
+        ).where(Candidate.organization_id == principal.organization_id, _candidate_scope(principal))
+        if q: query = query.where(_candidate_search_condition(request, q))
+        if any(value is not None for value in (job_id, stage, owner_id, source, min_score)):
+            query = query.where(ranked_applications.c.application_id.is_not(None))
+        cursor_sort = "candidates:-application_updated_at"
         if cursor:
             try:
-                decoded = request.app.state.recruiting_cursor.decode(cursor, str(principal.organization_id), sort)
-                updated_at = datetime.fromisoformat(decoded["updated_at"])
-                query = query.where(or_(Candidate.updated_at < updated_at, and_(Candidate.updated_at == updated_at, Candidate.id < UUID(decoded["id"]))))
+                decoded = request.app.state.recruiting_cursor.decode(cursor, str(principal.organization_id), cursor_sort)
+                updated_at = datetime.fromisoformat(decoded["value"])
+                query = query.where(or_(sort_updated_at < updated_at, and_(sort_updated_at == updated_at, Candidate.id < UUID(decoded["id"]))))
             except Exception as error: return _problem_for(request, InvalidCursor() if not isinstance(error, InvalidCursor) else error)
-        rows = db.scalars(query.distinct().order_by(Candidate.updated_at.desc(), Candidate.id.desc()).limit(limit + 1)).all()
+        rows = db.execute(query.order_by(sort_updated_at.desc(), Candidate.id.desc()).limit(limit + 1)).all()
         next_cursor = None
         if len(rows) > limit:
-            last = rows[limit - 1]; next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), sort, last.updated_at.isoformat(), str(last.id)); rows = rows[:limit]
-        return {"data": [_candidate_data(db, row, principal) for row in rows], "meta": {"limit": limit, "next_cursor": next_cursor}}
+            last = rows[limit - 1]
+            next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), cursor_sort, last.sort_updated_at.isoformat(), str(last[0].id))
+            rows = rows[:limit]
+        application_ids = [application_id for _, application_id, _ in rows if application_id is not None]
+        summaries = _candidate_application_summaries(db, principal.organization_id, application_ids)
+        data = []
+        for candidate, application_id, _ in rows:
+            item = _candidate_data(db, candidate, principal)
+            item["application"] = summaries.get(application_id)
+            data.append(item)
+
+        facet_application = aliased(Application)
+        facet_job = aliased(Job)
+        facet_owner = aliased(User)
+        owner_query = select(facet_owner.id, facet_owner.display_name).select_from(facet_application).join(
+            facet_job,
+            and_(facet_job.organization_id == facet_application.organization_id, facet_job.id == facet_application.job_id),
+        ).join(
+            Candidate,
+            and_(Candidate.organization_id == facet_application.organization_id, Candidate.id == facet_application.candidate_id),
+        ).join(
+            facet_owner,
+            and_(facet_owner.organization_id == facet_application.organization_id, facet_owner.id == facet_application.owner_id),
+        ).outerjoin(
+            latest_result,
+            and_(
+                latest_result.c.organization_id == facet_application.organization_id,
+                latest_result.c.application_id == facet_application.id,
+                latest_result.c.result_rank == 1,
+            ),
+        ).where(
+            *application_conditions(facet_application, facet_job, False),
+            Candidate.organization_id == principal.organization_id,
+            _candidate_scope(principal),
+        )
+        if q: owner_query = owner_query.where(_candidate_search_condition(request, q))
+        owner_rows = db.execute(owner_query.distinct().order_by(facet_owner.display_name, facet_owner.id)).all()
+        owners = [{"id": str(facet_owner_id), "name": facet_owner_name} for facet_owner_id, facet_owner_name in owner_rows]
+        return {"data": data, "meta": {"limit": limit, "next_cursor": next_cursor, "owners": owners}}
 
 
 @router.post("/candidates", status_code=201, response_model=CandidateResource)

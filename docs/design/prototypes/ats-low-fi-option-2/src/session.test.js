@@ -150,3 +150,154 @@ test("认证身份使用 /me 显示名而不是原型角色夹具", () => {
   });
   assert.deepEqual(getSessionIdentity({}, null), { name: "当前用户", title: "未配置角色" });
 });
+
+test("unauthorized notification expires authenticated and forbidden sessions", async () => {
+  for (const sessionUser of [user, { display_name: "受限用户", roles: ["future_role"] }]) {
+    let unauthorizedHandler;
+    const controller = createSessionController({
+      setUnauthorizedHandler: (handler) => { unauthorizedHandler = handler; },
+      getMe: async () => sessionUser,
+    });
+    await controller.bootstrap();
+
+    assert.equal(typeof unauthorizedHandler, "function");
+    unauthorizedHandler();
+
+    assert.deepEqual(controller.getSnapshot(), {
+      status: "anonymous",
+      user: null,
+      role: null,
+      submitting: false,
+      loggingOut: false,
+      error: "expired",
+    });
+    assert.equal(getSessionMessage("expired"), "登录状态已过期，请重新登录。");
+  }
+});
+
+test("a late 401 from the expired epoch cannot invalidate a newly authenticated session", async () => {
+  let unauthorizedHandler;
+  let epoch = 0;
+  const controller = createSessionController({
+    setUnauthorizedHandler: (handler) => { unauthorizedHandler = handler; },
+    getAuthEpoch: () => epoch,
+    advanceAuthEpoch: () => { epoch += 1; return epoch; },
+    getMe: async () => user,
+    login: async () => null,
+  });
+  await controller.bootstrap();
+  const expiredEpoch = epoch;
+
+  unauthorizedHandler(expiredEpoch);
+  assert.equal(controller.getSnapshot().status, "anonymous");
+  await controller.login({ email: "hr@example.test", password: "correct horse" });
+  assert.equal(controller.getSnapshot().status, "authenticated");
+
+  unauthorizedHandler(expiredEpoch);
+  assert.equal(controller.getSnapshot().status, "authenticated");
+  assert.equal(controller.getSnapshot().error, null);
+});
+
+test("unauthorized notification does not overwrite bootstrap, anonymous, or login errors", async () => {
+  let unauthorizedHandler;
+  let snapshotDuringLogin;
+  let controller;
+  const client = {
+    setUnauthorizedHandler: (handler) => { unauthorizedHandler = handler; },
+    getMe: async () => { throw new ApiError({ status: 401 }); },
+    login: async () => {
+      unauthorizedHandler();
+      snapshotDuringLogin = controller.getSnapshot();
+      throw new ApiError({ status: 401 });
+    },
+  };
+  controller = createSessionController(client);
+
+  assert.equal(typeof unauthorizedHandler, "function");
+  unauthorizedHandler();
+  assert.equal(controller.getSnapshot().status, "bootstrapping");
+  assert.equal(controller.getSnapshot().error, null);
+
+  await controller.bootstrap();
+  unauthorizedHandler();
+  assert.equal(controller.getSnapshot().status, "anonymous");
+  assert.equal(controller.getSnapshot().error, null);
+
+  await assert.rejects(controller.login({}), ApiError);
+  assert.equal(snapshotDuringLogin.submitting, true);
+  assert.equal(snapshotDuringLogin.error, null);
+  assert.equal(controller.getSnapshot().error, "authentication");
+});
+
+test("logout 401 clears CSRF and leaves the local session expired", async () => {
+  let cleared = false;
+  const controller = createSessionController({
+    getMe: async () => user,
+    logout: async () => { throw new ApiError({ status: 401 }); },
+    clearCsrf: () => { cleared = true; },
+  });
+  await controller.bootstrap();
+
+  await assert.rejects(controller.logout(), ApiError);
+
+  assert.equal(cleared, true);
+  assert.deepEqual(controller.getSnapshot(), {
+    status: "anonymous",
+    user: null,
+    role: null,
+    submitting: false,
+    loggingOut: false,
+    error: "expired",
+  });
+});
+
+test("non-401 logout failure does not restore a session expired by a concurrent request", async () => {
+  let unauthorizedHandler;
+  let rejectLogout;
+  const controller = createSessionController({
+    setUnauthorizedHandler: (handler) => { unauthorizedHandler = handler; },
+    getMe: async () => user,
+    logout: () => new Promise((_resolve, reject) => { rejectLogout = reject; }),
+  });
+  await controller.bootstrap();
+
+  const logoutPromise = controller.logout();
+  unauthorizedHandler();
+  rejectLogout(new ApiError({ status: 503 }));
+
+  await assert.rejects(logoutPromise, ApiError);
+  assert.deepEqual(controller.getSnapshot(), {
+    status: "anonymous",
+    user: null,
+    role: null,
+    submitting: false,
+    loggingOut: false,
+    error: "expired",
+  });
+});
+
+test("dispose unregisters the session controller's unauthorized handler idempotently", async () => {
+  let unauthorizedHandler = null;
+  let unregisterCalls = 0;
+  const controller = createSessionController({
+    setUnauthorizedHandler: (handler) => {
+      unauthorizedHandler = handler;
+      return () => {
+        if (unauthorizedHandler === handler) {
+          unauthorizedHandler = null;
+          unregisterCalls += 1;
+        }
+      };
+    },
+    getMe: async () => user,
+  });
+  await controller.bootstrap();
+
+  assert.equal(typeof controller.dispose, "function");
+  controller.dispose();
+  controller.dispose();
+
+  assert.equal(unauthorizedHandler, null);
+  assert.equal(unregisterCalls, 1);
+  assert.equal(controller.getSnapshot().status, "authenticated");
+});

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from tempfile import SpooledTemporaryFile
 from uuid import UUID
 
@@ -9,7 +10,8 @@ from server.app.core.settings import Settings
 from server.app.identity.models import Organization, User, UserRole, UserStatus, Job, JobCollaborator
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
-from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, Resume
+from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, JobJdVersion, Resume, ScreeningRuleVersion
+from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.identity.models import AuditLog
 from server.app.recruiting.storage import StorageReadFailed
 
@@ -81,6 +83,34 @@ def login(client, email: str):
     )
     assert response.status_code == 200
     return {"Origin": "https://hr.example.test", "X-CSRF-Token": response.headers["X-CSRF-Token"]}
+
+
+def seed_screening_results(db, application, file_id, actor_id, results):
+    version_number = db.query(JobJdVersion).filter_by(job_id=application.job_id).count() + 1
+    jd = JobJdVersion(organization_id=application.organization_id, job_id=application.job_id, version_number=version_number, content={"text": "JD"}, created_by=actor_id)
+    rule = ScreeningRuleVersion(organization_id=application.organization_id, job_id=application.job_id, version_number=version_number, content={}, created_by=actor_id)
+    db.add_all([jd, rule]); db.flush()
+    run = ScreeningRun(organization_id=application.organization_id, job_id=application.job_id, jd_version_id=jd.id, rule_version_id=rule.id, source="upload", status="completed", total_count=1, processed_count=1, succeeded_count=1, failed_count=0, created_by=actor_id)
+    db.add(run); db.flush()
+    item = ScreeningItem(organization_id=application.organization_id, run_id=run.id, file_object_id=file_id, candidate_id=application.candidate_id, resume_id=application.resume_id, application_id=application.id, status="scored", attempts=1)
+    db.add(item); db.flush()
+    for engine, score, recommendation, created_at in results:
+        db.add(ScreeningResult(
+            organization_id=application.organization_id,
+            item_id=item.id,
+            application_id=application.id,
+            resume_id=application.resume_id,
+            rule_engine_version=engine,
+            rule_score=score,
+            recommendation=recommendation,
+            required_hits=[],
+            required_missing=[],
+            bonus_hits=[],
+            estimated_years=0,
+            risks=[],
+            questions=[],
+            created_at=created_at,
+        ))
 
 
 def seed_same_candidate_cross_job(app, recruiter_id):
@@ -582,3 +612,235 @@ def test_download_storage_failure_leaves_ticket_usable_and_has_no_success_audit(
         with app.state.identity_store.sync_session() as db:
             assert db.query(DownloadTicket).one().consumed_at is None
             assert db.query(AuditLog).filter_by(event_type="resume.downloaded").count() == 0
+
+
+def test_candidate_list_returns_selected_application_and_latest_screening_result(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "admin-list@example.test")
+    first_owner_id = seed_user(app, "recruiter", "first-owner@example.test")
+    second_owner_id = seed_user(app, "recruiter", "second-owner@example.test")
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        db.get(User, first_owner_id).display_name = "First Owner"
+        db.get(User, second_owner_id).display_name = "Second Owner"
+        matching_job = Job(organization_id=admin.organization_id, title="Platform Engineer", owner_id=admin_id)
+        newer_job = Job(organization_id=admin.organization_id, title="Product Engineer", owner_id=admin_id)
+        candidate = Candidate(organization_id=admin.organization_id, display_name="Alice", owner_id=second_owner_id, updated_at=base)
+        matching_file = FileObject(organization_id=admin.organization_id, storage_key="private/matching", original_filename="matching.pdf", mime_type="application/pdf", size_bytes=1, sha256="a" * 64, uploaded_by=admin_id)
+        newer_file = FileObject(organization_id=admin.organization_id, storage_key="private/newer", original_filename="newer.pdf", mime_type="application/pdf", size_bytes=1, sha256="b" * 64, uploaded_by=admin_id)
+        db.add_all([matching_job, newer_job, candidate, matching_file, newer_file]); db.flush()
+        matching_resume = Resume(organization_id=admin.organization_id, candidate_id=candidate.id, file_object_id=matching_file.id, version_number=1)
+        newer_resume = Resume(organization_id=admin.organization_id, candidate_id=candidate.id, file_object_id=newer_file.id, version_number=2)
+        db.add_all([matching_resume, newer_resume]); db.flush()
+        matching = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=matching_job.id, resume_id=matching_resume.id, owner_id=first_owner_id, stage="review", source="upload", updated_at=base)
+        newer = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=newer_job.id, resume_id=newer_resume.id, owner_id=second_owner_id, stage="new", source="manual", updated_at=base + timedelta(hours=1))
+        db.add_all([matching, newer]); db.flush()
+        seed_screening_results(db, matching, matching_file.id, admin_id, [
+            ("rule-old", 95, "优先沟通", base),
+            ("rule-latest", 81, "可沟通", base + timedelta(minutes=1)),
+        ])
+        seed_screening_results(db, newer, newer_file.id, admin_id, [("rule-newer", 60, "暂缓", base)])
+        db.commit()
+        ids = {
+            "candidate": str(candidate.id),
+            "matching_application": str(matching.id),
+            "newer_application": str(newer.id),
+            "matching_job": str(matching_job.id),
+            "matching_resume": str(matching_resume.id),
+            "first_owner": str(first_owner_id),
+        }
+
+    with TestClient(app) as client:
+        login(client, "admin-list@example.test")
+        unfiltered = client.get("/api/v1/candidates")
+        filtered = client.get(
+            "/api/v1/candidates",
+            params={"job_id": ids["matching_job"], "stage": "review", "source": "upload", "owner_id": ids["first_owner"], "min_score": 80},
+        )
+        above_latest = client.get("/api/v1/candidates", params={"job_id": ids["matching_job"], "min_score": 90})
+        owner_filtered = client.get("/api/v1/candidates", params={"owner_id": ids["first_owner"], "limit": 1})
+
+    assert unfiltered.status_code == filtered.status_code == above_latest.status_code == 200
+    assert unfiltered.json()["data"][0]["application"]["id"] == ids["newer_application"]
+    assert filtered.json()["data"] == [{
+        **{key: value for key, value in filtered.json()["data"][0].items() if key != "application"},
+        "application": {
+            "id": ids["matching_application"],
+            "job_id": ids["matching_job"],
+            "job_title": "Platform Engineer",
+            "resume_id": ids["matching_resume"],
+            "owner_id": ids["first_owner"],
+            "owner_name": "First Owner",
+            "stage": "review",
+            "source": "upload",
+            "human_conclusion": None,
+            "version": 1,
+            "updated_at": base.replace(tzinfo=None).isoformat(),
+            "rule_score": 81,
+            "recommendation": "可沟通",
+        },
+    }]
+    assert filtered.json()["data"][0]["id"] == ids["candidate"]
+    assert above_latest.json()["data"] == []
+    assert owner_filtered.status_code == 200
+    assert owner_filtered.json()["meta"]["owners"] == [
+        {"id": ids["first_owner"], "name": "First Owner"},
+        {"id": str(second_owner_id), "name": "Second Owner"},
+    ]
+
+
+def test_candidate_list_never_selects_or_filters_on_unauthorized_applications(tmp_path) -> None:
+    app = make_app(tmp_path)
+    recruiter_id = seed_user(app, "recruiter", "scoped-list@example.test")
+    denied_owner_id = seed_user(app, "recruiter", "denied-owner@example.test")
+    base = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        recruiter = db.get(User, recruiter_id)
+        allowed_job = Job(organization_id=recruiter.organization_id, title="Allowed", owner_id=recruiter_id)
+        denied_job = Job(organization_id=recruiter.organization_id, title="Denied", owner_id=denied_owner_id)
+        candidate = Candidate(organization_id=recruiter.organization_id, display_name="Scoped", owner_id=recruiter_id)
+        allowed_file = FileObject(organization_id=recruiter.organization_id, storage_key="private/list-allowed", original_filename="allowed.pdf", mime_type="application/pdf", size_bytes=1, sha256="c" * 64, uploaded_by=recruiter_id)
+        denied_file = FileObject(organization_id=recruiter.organization_id, storage_key="private/list-denied", original_filename="denied.pdf", mime_type="application/pdf", size_bytes=1, sha256="d" * 64, uploaded_by=recruiter_id)
+        db.add_all([allowed_job, denied_job, candidate, allowed_file, denied_file]); db.flush()
+        allowed_resume = Resume(organization_id=recruiter.organization_id, candidate_id=candidate.id, file_object_id=allowed_file.id, version_number=1)
+        denied_resume = Resume(organization_id=recruiter.organization_id, candidate_id=candidate.id, file_object_id=denied_file.id, version_number=2)
+        db.add_all([allowed_resume, denied_resume]); db.flush()
+        allowed = Application(organization_id=recruiter.organization_id, candidate_id=candidate.id, job_id=allowed_job.id, resume_id=allowed_resume.id, owner_id=recruiter_id, updated_at=base)
+        denied = Application(organization_id=recruiter.organization_id, candidate_id=candidate.id, job_id=denied_job.id, resume_id=denied_resume.id, owner_id=denied_owner_id, updated_at=base + timedelta(hours=1))
+        db.add_all([allowed, denied]); db.flush()
+        db.add(JobCollaborator(organization_id=recruiter.organization_id, job_id=allowed_job.id, user_id=recruiter_id, access_role="job_recruiter"))
+        seed_screening_results(db, allowed, allowed_file.id, recruiter_id, [("allowed", 70, "可沟通", base)])
+        seed_screening_results(db, denied, denied_file.id, denied_owner_id, [("denied", 99, "优先沟通", base)])
+        db.commit()
+        allowed_id, denied_job_id, denied_owner = str(allowed.id), str(denied_job.id), str(denied_owner_id)
+
+    with TestClient(app) as client:
+        login(client, "scoped-list@example.test")
+        unfiltered = client.get("/api/v1/candidates")
+        by_job = client.get("/api/v1/candidates", params={"job_id": denied_job_id})
+        by_owner = client.get("/api/v1/candidates", params={"owner_id": denied_owner})
+        by_score = client.get("/api/v1/candidates", params={"min_score": 90})
+
+    assert unfiltered.status_code == by_job.status_code == by_owner.status_code == by_score.status_code == 200
+    assert unfiltered.json()["data"][0]["application"]["id"] == allowed_id
+    assert unfiltered.json()["meta"]["owners"] == [{"id": str(recruiter_id), "name": "recruiter"}]
+    assert by_job.json()["data"] == []
+    assert by_owner.json()["data"] == []
+    assert by_owner.json()["meta"]["owners"] == [{"id": str(recruiter_id), "name": "recruiter"}]
+    assert by_score.json()["data"] == []
+
+
+def test_candidate_list_min_score_excludes_missing_results_and_validates_range(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "score-list@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        job = Job(organization_id=admin.organization_id, title="Scored Job", owner_id=admin_id)
+        scored = Candidate(organization_id=admin.organization_id, display_name="Scored")
+        missing = Candidate(organization_id=admin.organization_id, display_name="Missing")
+        scored_file = FileObject(organization_id=admin.organization_id, storage_key="private/scored", original_filename="scored.pdf", mime_type="application/pdf", size_bytes=1, sha256="e" * 64, uploaded_by=admin_id)
+        missing_file = FileObject(organization_id=admin.organization_id, storage_key="private/missing", original_filename="missing.pdf", mime_type="application/pdf", size_bytes=1, sha256="f" * 64, uploaded_by=admin_id)
+        db.add_all([job, scored, missing, scored_file, missing_file]); db.flush()
+        scored_resume = Resume(organization_id=admin.organization_id, candidate_id=scored.id, file_object_id=scored_file.id, version_number=1)
+        missing_resume = Resume(organization_id=admin.organization_id, candidate_id=missing.id, file_object_id=missing_file.id, version_number=1)
+        db.add_all([scored_resume, missing_resume]); db.flush()
+        scored_app = Application(organization_id=admin.organization_id, candidate_id=scored.id, job_id=job.id, resume_id=scored_resume.id, owner_id=admin_id)
+        missing_app = Application(organization_id=admin.organization_id, candidate_id=missing.id, job_id=job.id, resume_id=missing_resume.id, owner_id=admin_id, stage="rejected")
+        db.add_all([scored_app, missing_app]); db.flush()
+        seed_screening_results(db, scored_app, scored_file.id, admin_id, [("scored", 0, "暂缓", datetime(2026, 3, 1, tzinfo=timezone.utc))])
+        db.commit()
+        scored_id, missing_id = str(scored.id), str(missing.id)
+
+    with TestClient(app) as client:
+        login(client, "score-list@example.test")
+        unfiltered = client.get("/api/v1/candidates")
+        minimum = client.get("/api/v1/candidates", params={"min_score": 0})
+        below = client.get("/api/v1/candidates", params={"min_score": -1})
+        above = client.get("/api/v1/candidates", params={"min_score": 101})
+
+    rows = {row["id"]: row for row in unfiltered.json()["data"]}
+    assert rows[missing_id]["application"]["rule_score"] is None
+    assert rows[missing_id]["application"]["recommendation"] is None
+    assert [row["id"] for row in minimum.json()["data"]] == [scored_id]
+    assert below.status_code == above.status_code == 422
+    assert below.json()["code"] == above.json()["code"] == "validation_failed"
+
+
+def test_candidate_list_searches_profile_and_contact_fields(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "recruiting_admin", "search-list@example.test")
+    with TestClient(app) as client:
+        headers = login(client, "search-list@example.test")
+        created = {
+            "name": client.post("/api/v1/candidates", json={"display_name": "Name Match"}, headers=headers).json()["data"]["id"],
+            "title": client.post("/api/v1/candidates", json={"display_name": "Title Candidate", "current_title": "Distributed Systems Lead"}, headers=headers).json()["data"]["id"],
+            "email": client.post("/api/v1/candidates", json={"display_name": "Email Candidate", "contacts": [{"kind": "email", "value": "person@example.com"}]}, headers=headers).json()["data"]["id"],
+            "phone": client.post("/api/v1/candidates", json={"display_name": "Phone Candidate", "contacts": [{"kind": "phone", "value": "+86 138 0000 2468"}]}, headers=headers).json()["data"]["id"],
+        }
+
+        queries = {
+            "name": "Name Match",
+            "title": "Distributed Systems",
+            "email": "person@example.com",
+            "phone": "+86 138 0000 2468",
+        }
+        results = {
+            field: [row["id"] for row in client.get("/api/v1/candidates", params={"q": query}).json()["data"]]
+            for field, query in queries.items()
+        }
+
+    assert results == {field: [candidate_id] for field, candidate_id in created.items()}
+
+
+def test_candidate_list_cursor_uses_selected_application_time_and_candidate_id_tiebreaker(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "cursor-list@example.test")
+    base = datetime(2026, 4, 1, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        job = Job(organization_id=admin.organization_id, title="Cursor Job", owner_id=admin_id)
+        db.add(job); db.flush()
+        expected_rows = []
+        transition_target = None
+        application_times = [base + timedelta(hours=2), base + timedelta(hours=1), base + timedelta(hours=1), base]
+        for index, application_time in enumerate(application_times):
+            candidate = Candidate(organization_id=admin.organization_id, display_name=f"Candidate {index}", updated_at=base + timedelta(days=index))
+            file = FileObject(organization_id=admin.organization_id, storage_key=f"private/cursor-{index}", original_filename=f"{index}.pdf", mime_type="application/pdf", size_bytes=1, sha256=str(index) * 64, uploaded_by=admin_id)
+            db.add_all([candidate, file]); db.flush()
+            resume = Resume(organization_id=admin.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1)
+            db.add(resume); db.flush()
+            application = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=job.id, resume_id=resume.id, owner_id=admin_id, stage="new", updated_at=application_time)
+            db.add(application); db.flush()
+            expected_rows.append((application_time, candidate.id, application.id))
+            if index == 3:
+                transition_target = (str(candidate.id), str(application.id))
+        db.commit()
+
+    expected_rows.sort(key=lambda row: (row[0], row[1]), reverse=True)
+
+    with TestClient(app) as client:
+        headers = login(client, "cursor-list@example.test")
+        first = client.get("/api/v1/candidates", params={"limit": 2})
+        second = client.get("/api/v1/candidates", params={"limit": 2, "cursor": first.json()["meta"]["next_cursor"]})
+        third = client.get("/api/v1/candidates", params={"limit": 2, "cursor": second.json()["meta"]["next_cursor"]}) if second.json()["meta"]["next_cursor"] else None
+        transitioned = client.post(
+            f"/api/v1/applications/{transition_target[1]}/transitions",
+            json={"target": "review"},
+            headers={**headers, "If-Match": '"1"', "Idempotency-Key": "candidate-list-reorder"},
+        )
+        refreshed = client.get("/api/v1/candidates", params={"limit": 2})
+
+    responses = [first, second] + ([third] if third is not None else [])
+    assert all(response.status_code == 200 for response in responses)
+    rows = [row for response in responses for row in response.json()["data"]]
+    assert [row["id"] for row in rows] == [str(candidate_id) for _, candidate_id, _ in expected_rows]
+    assert [row["application"]["id"] for row in rows] == [str(application_id) for _, _, application_id in expected_rows]
+    assert first.json()["meta"]["next_cursor"] is not None
+    assert responses[-1].json()["meta"]["next_cursor"] is None
+    assert transitioned.status_code == refreshed.status_code == 200
+    assert refreshed.json()["data"][0]["id"] == transition_target[0]
+    assert refreshed.json()["data"][0]["application"]["id"] == transition_target[1]
+    listed_updated_at = datetime.fromisoformat(refreshed.json()["data"][0]["application"]["updated_at"]).replace(tzinfo=timezone.utc)
+    transitioned_updated_at = datetime.fromisoformat(transitioned.json()["data"]["updated_at"])
+    assert listed_updated_at == transitioned_updated_at
