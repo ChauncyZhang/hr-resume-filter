@@ -2,11 +2,11 @@ import hashlib
 import json
 import re
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query, Request
+from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import and_, exists, func, or_, select
@@ -30,7 +30,7 @@ from server.app.recruiting.schemas import (
     ApplicationCollection, ApplicationResource, CandidateCollection, CandidateResource,
     FunnelResource, JobCollection, JobDefinitionCommand, JobDefinitionResource, JobResource, NoteCollection, NoteResource,
     PreviewResource, ResumeCollection, TicketResource, TimelineCollection,
-    VersionCollection, VersionResource, Problem,
+    VersionCollection, VersionResource, WorkbenchResource, Problem,
 )
 from server.app.recruiting.service import (
     ActiveApplicationExists, IdempotencyConflict, InvalidAggregateRelationship,
@@ -52,6 +52,8 @@ router = APIRouter(prefix="/api/v1", responses=PROBLEM_RESPONSES)
 ETAG = re.compile(r'^"([1-9][0-9]*)"$')
 AUTH = RecruitingAuthorizationService()
 JOB_STATUSES = ("draft", "open", "paused", "closed", "archived")
+WORKBENCH_STAGES = ("new", "review", "contact", "interview_pending", "interviewing", "decision")
+WORKBENCH_TASK_STAGES = ("contact", "interview_pending", "decision")
 
 
 class StrictModel(BaseModel):
@@ -231,6 +233,20 @@ def _screening_rules_definition(rules: ScreeningRuleVersion) -> dict[str, Any]:
     elif not isinstance(content, dict):
         content = {}
     return {"id": str(rules.id), "version_number": rules.version_number, **{key: content.get(key) for key in ("must_have", "nice_to_have")}}
+
+
+def _workbench_candidate_data(row) -> dict[str, Any]:
+    return {
+        "application_id": str(row.application_id),
+        "candidate_id": str(row.candidate_id),
+        "job_id": str(row.job_id),
+        "display_name": row.display_name,
+        "current_title": row.current_title,
+        "location": row.location,
+        "source": row.source,
+        "stage": row.stage,
+        "updated_at": row.updated_at,
+    }
 
 
 def _job_definition_data(job: Job, jd: JobJdVersion | None, rules: ScreeningRuleVersion | None) -> dict[str, Any]:
@@ -438,6 +454,96 @@ def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request:
         except Exception:
             db.rollback()
             raise
+
+
+@router.get("/workbench", response_model=WorkbenchResource)
+def get_workbench(request: Request, response: Response):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    if not AUTH.role_allows(principal, RecruitingAction.READ):
+        return _denied(request)
+    response.headers["Cache-Control"] = "no-store"
+
+    with request.app.state.identity_store.sync_session() as db:
+        job_rows = db.execute(select(
+            Job,
+            Department.name.label("department_name"),
+        ).outerjoin(
+            Department,
+            and_(Department.organization_id == Job.organization_id, Department.id == Job.department_id),
+        ).where(
+            Job.organization_id == principal.organization_id,
+            Job.status == "open",
+            AUTH.job_predicate(principal, RecruitingAction.READ, Job),
+        ).order_by(Job.updated_at.desc(), Job.id.desc()).limit(20)).all()
+
+        jobs = []
+        jobs_by_id = {}
+        for job, department_name in job_rows:
+            stages = {stage: {"count": 0, "items": []} for stage in WORKBENCH_STAGES}
+            data = {
+                "id": str(job.id),
+                "title": job.title,
+                "department_name": department_name,
+                "status": "open",
+                "updated_at": job.updated_at,
+                "active_count": 0,
+                "stages": stages,
+            }
+            jobs.append(data)
+            jobs_by_id[job.id] = data
+
+        tasks = {stage: {"count": 0, "items": []} for stage in WORKBENCH_TASK_STAGES}
+        if jobs_by_id:
+            application_rows = db.execute(select(
+                Application.id.label("application_id"),
+                Application.candidate_id,
+                Application.job_id,
+                Application.source,
+                Application.stage,
+                Application.updated_at,
+                Candidate.display_name,
+                Candidate.current_title,
+                Candidate.location,
+            ).join(
+                Candidate,
+                and_(
+                    Candidate.organization_id == Application.organization_id,
+                    Candidate.id == Application.candidate_id,
+                ),
+            ).join(
+                Job,
+                and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id),
+            ).where(
+                Application.organization_id == principal.organization_id,
+                Application.job_id.in_(jobs_by_id),
+                Application.stage.in_(WORKBENCH_STAGES),
+                AUTH.job_predicate(principal, RecruitingAction.READ, Job),
+            ).order_by(Application.updated_at.desc(), Application.id.desc())).all()
+
+            for row in application_rows:
+                job = jobs_by_id[row.job_id]
+                stage = job["stages"][row.stage]
+                stage["count"] += 1
+                job["active_count"] += 1
+                item = _workbench_candidate_data(row)
+                if len(stage["items"]) < 5:
+                    stage["items"].append(item)
+                if row.stage in tasks:
+                    task = tasks[row.stage]
+                    task["count"] += 1
+                    if len(task["items"]) < 5:
+                        task["items"].append(item)
+
+        return {
+            "data": {
+                "generated_at": datetime.now(timezone.utc),
+                "jobs": jobs,
+                "tasks": tasks,
+                "interviews": {"available": False, "upcoming": [], "pending_feedback": []},
+            },
+        }
 
 
 @router.get("/jobs", response_model=JobCollection)

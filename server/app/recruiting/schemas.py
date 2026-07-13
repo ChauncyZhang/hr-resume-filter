@@ -211,6 +211,64 @@ class PreviewOut(ApiModel):
     text: str
 
 
+WorkbenchStage = Literal["new", "review", "contact", "interview_pending", "interviewing", "decision"]
+
+
+class WorkbenchCandidateOut(ApiModel):
+    application_id: str
+    candidate_id: str
+    job_id: str
+    display_name: str
+    current_title: str | None
+    location: str | None
+    source: str
+    stage: WorkbenchStage
+    updated_at: datetime
+
+
+class WorkbenchStageOut(ApiModel):
+    count: int = Field(ge=0)
+    items: list[WorkbenchCandidateOut] = Field(max_length=5)
+
+
+class WorkbenchStagesOut(ApiModel):
+    new: WorkbenchStageOut
+    review: WorkbenchStageOut
+    contact: WorkbenchStageOut
+    interview_pending: WorkbenchStageOut
+    interviewing: WorkbenchStageOut
+    decision: WorkbenchStageOut
+
+
+class WorkbenchJobOut(ApiModel):
+    id: str
+    title: str
+    department_name: str | None
+    status: Literal["open"]
+    updated_at: datetime
+    active_count: int = Field(ge=0)
+    stages: WorkbenchStagesOut
+
+
+class WorkbenchTasksOut(ApiModel):
+    contact: WorkbenchStageOut
+    interview_pending: WorkbenchStageOut
+    decision: WorkbenchStageOut
+
+
+class WorkbenchInterviewsOut(ApiModel):
+    available: Literal[False]
+    upcoming: list[Any] = Field(default_factory=list, max_length=0)
+    pending_feedback: list[Any] = Field(default_factory=list, max_length=0)
+
+
+class WorkbenchOut(ApiModel):
+    generated_at: datetime
+    jobs: list[WorkbenchJobOut] = Field(max_length=20)
+    tasks: WorkbenchTasksOut
+    interviews: WorkbenchInterviewsOut
+
+
 class JobResource(ApiModel): data: JobOut
 class JobDefinitionResource(ApiModel): data: JobDefinitionOut
 class JobCollection(ApiModel): data: list[JobListOut]; meta: JobMeta
@@ -227,6 +285,7 @@ class TimelineCollection(ApiModel): data: list[TimelineEventOut]; meta: Meta
 class FunnelResource(ApiModel): data: FunnelOut
 class TicketResource(ApiModel): data: TicketOut
 class PreviewResource(ApiModel): data: PreviewOut
+class WorkbenchResource(ApiModel): data: WorkbenchOut
 
 
 class Problem(ApiModel):
