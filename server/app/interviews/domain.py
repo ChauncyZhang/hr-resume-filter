@@ -8,6 +8,29 @@ ConflictKind = Literal["hard", "soft"]
 
 
 @dataclass(frozen=True)
+class CalendarContact:
+    name: str
+    email: str
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("calendar contact name must not be empty")
+        if (
+            self.email != self.email.strip()
+            or self.email.lower().startswith("mailto:")
+            or self.email.count("@") != 1
+            or any(character.isspace() or ord(character) < 32 for character in self.email)
+        ):
+            raise ValueError("calendar contact email must be a plain email address")
+
+
+DEFAULT_CALENDAR_ORGANIZER = CalendarContact(name="HR Resume Filter", email="recruiting@hr-resume-filter.local")
+DEFAULT_CALENDAR_ATTENDEES = (
+    CalendarContact(name="Interview participant", email="participant@hr-resume-filter.local"),
+)
+
+
+@dataclass(frozen=True)
 class ScheduleSlot:
     interview_id: UUID
     starts_at: datetime
@@ -46,6 +69,15 @@ def _escape_text(value: str) -> str:
     return normalized.replace("\\", "\\\\").replace("\n", "\\n").replace(";", "\\;").replace(",", "\\,")
 
 
+def _escape_parameter_text(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.replace("^", "^^").replace('"', "^'").replace("\n", "^n")
+
+
+def _contact_line(property_name: str, contact: CalendarContact) -> str:
+    return f'{property_name};CN="{_escape_parameter_text(contact.name)}":mailto:{contact.email}'
+
+
 def _fold_line(line: str) -> list[str]:
     folded: list[str] = []
     current = ""
@@ -78,24 +110,32 @@ def build_calendar_invitation(
     description: str,
     sequence: int,
     dtstamp: datetime,
+    status: str = "scheduled",
+    organizer: CalendarContact = DEFAULT_CALENDAR_ORGANIZER,
+    attendees: tuple[CalendarContact, ...] = DEFAULT_CALENDAR_ATTENDEES,
 ) -> bytes:
     if duration_minutes <= 0:
         raise ValueError("duration_minutes must be positive")
     if sequence < 0:
         raise ValueError("sequence must not be negative")
+    if status not in {"draft", "scheduled", "confirmed", "completed", "pending_feedback", "feedback_completed", "rescheduled", "cancelled", "no_show"}:
+        raise ValueError("unsupported calendar status")
     ends_at = starts_at + timedelta(minutes=duration_minutes)
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//HR Resume Filter//Recruiting Interview//CN",
         "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
+        "METHOD:CANCEL" if status == "cancelled" else "METHOD:REQUEST",
         "BEGIN:VEVENT",
         f"UID:{interview_id}@hr-resume-filter",
         f"DTSTAMP:{_utc_stamp(dtstamp)}",
         f"DTSTART:{_utc_stamp(starts_at)}",
         f"DTEND:{_utc_stamp(ends_at)}",
         f"SEQUENCE:{sequence}",
+        *(["STATUS:CANCELLED"] if status == "cancelled" else []),
+        _contact_line("ORGANIZER", organizer),
+        *(_contact_line("ATTENDEE", attendee) for attendee in attendees),
         f"SUMMARY:{_escape_text(summary)}",
         f"LOCATION:{_escape_text(location)}",
         f"DESCRIPTION:{_escape_text(description)}",
