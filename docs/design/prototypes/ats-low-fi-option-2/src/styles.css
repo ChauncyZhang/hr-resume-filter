@@ -45,6 +45,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .login-message { min-height: 22px; margin-top: -3px; color: #b04750; line-height: 1.5; font-size: 13px; }
 .login-submit { width: 100%; min-height: 42px; }
 .login-footnote { margin: 0; color: #758491; font-size: 12px; }
+.access-denied-page { min-height: 100dvh; padding: 24px; display: grid; place-items: center; background: #f4f6f8; }
+.access-denied-card { width: min(440px, 100%); padding: 34px; border: 1px solid #d9e1e7; border-radius: 8px; background: #fff; box-shadow: 0 12px 32px rgba(37, 59, 77, .07); text-align: center; }
+.access-denied-icon { width: 48px; height: 48px; margin: 0 auto 14px; border-radius: 50%; display: grid; place-items: center; color: #8d4b52; background: #f8ecee; }
+.access-denied-identity { margin: 0 0 5px; color: #647685; font-size: 13px; }
+.access-denied-card h1 { margin: 0; font-size: 21px; }
+.access-denied-card > p:not(.access-denied-identity) { margin: 13px 0 22px; color: #657684; line-height: 1.7; }
+.access-denied-card .button { min-width: 132px; }
+.access-denied-error { margin: -7px 0 16px; color: #a13f49; font-size: 13px; }
 .logout-action { flex: 0 0 auto; border: 1px solid var(--line); color: #526979; }
 
 .app-shell { min-height: 100vh; display: flex; background: #f5f7f9; }

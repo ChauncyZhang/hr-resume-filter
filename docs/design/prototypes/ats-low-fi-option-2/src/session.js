@@ -35,7 +35,8 @@ function anonymousState(error = null, submitting = false) {
 }
 
 function authenticatedState(user, { loggingOut = false, error = null } = {}) {
-  return { status: "authenticated", user, role: mapServerRoles(user?.roles), submitting: false, loggingOut, error };
+  const role = mapServerRoles(user?.roles);
+  return { status: role ? "authenticated" : "forbidden", user, role, submitting: false, loggingOut, error };
 }
 
 function errorKind(error) {
@@ -98,7 +99,7 @@ export function createSessionController(client) {
     },
     logout() {
       if (logoutPromise) return logoutPromise;
-      if (state.status !== "authenticated") return Promise.resolve();
+      if (!new Set(["authenticated", "forbidden"]).has(state.status)) return Promise.resolve();
       const authenticatedUser = state.user;
       setState(authenticatedState(authenticatedUser, { loggingOut: true }));
       logoutPromise = (async () => {

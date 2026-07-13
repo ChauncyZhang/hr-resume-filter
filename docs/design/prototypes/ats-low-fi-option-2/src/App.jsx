@@ -32,7 +32,7 @@ import { SettingsWorkspace } from "./SettingsViews.jsx";
 import { syntheticResumeFilesFor } from "./syntheticResumeFixtures.js";
 import { canPerformAction, getAllowedNavItems, getDefaultNavItem } from "./roleCapabilities.js";
 import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts, saveInterview, submitInterviewFeedback, validateWorkflowState } from "./ux08Workflow.js";
-import { LoginView, SessionLoadingView } from "./LoginView.jsx";
+import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 
 const navItems = [
@@ -155,6 +155,10 @@ export function App({ controller = sessionController }) {
   if (session.status === "bootstrapping") return <SessionLoadingView />;
   if (session.status === "anonymous") {
     return <LoginView error={session.error} submitting={session.submitting} onLogin={(credentials) => controller.login(credentials)} />;
+  }
+  if (session.status !== "authenticated") {
+    const identity = getSessionIdentity(session.user, null);
+    return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
   return <AuthenticatedApp session={session} onLogout={() => controller.logout()} />;
 }

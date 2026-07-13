@@ -32,6 +32,19 @@ test("bootstrap 使用 /me 身份并进入 authenticated", async () => {
   assert.equal(controller.getSnapshot().role, "HR 招聘专员");
 });
 
+test("/me 返回未知或缺失角色时保留身份并进入 forbidden", async () => {
+  for (const roles of [["future_role"], [], undefined]) {
+    const deniedUser = { display_name: "受限用户", ...(roles === undefined ? {} : { roles }) };
+    const controller = createSessionController({ getMe: async () => deniedUser });
+
+    await controller.bootstrap();
+
+    assert.equal(controller.getSnapshot().status, "forbidden");
+    assert.equal(controller.getSnapshot().user, deniedUser);
+    assert.equal(controller.getSnapshot().role, null);
+  }
+});
+
 test("登录按 login 再 /me 的顺序执行并只保存 /me 用户", async () => {
   const calls = [];
   const controller = createSessionController({
@@ -93,6 +106,24 @@ test("成功退出后才清除认证身份和内存 CSRF", async () => {
   assert.equal(cleared, true);
   assert.equal(controller.getSnapshot().status, "anonymous");
   assert.equal(controller.getSnapshot().user, null);
+});
+
+test("forbidden 会话仍可成功退出", async () => {
+  let logoutCalls = 0;
+  let cleared = false;
+  const deniedUser = { display_name: "受限用户", roles: ["future_role"] };
+  const controller = createSessionController({
+    getMe: async () => deniedUser,
+    logout: async () => { logoutCalls += 1; },
+    clearCsrf: () => { cleared = true; },
+  });
+  await controller.bootstrap();
+
+  await controller.logout();
+
+  assert.equal(logoutCalls, 1);
+  assert.equal(cleared, true);
+  assert.equal(controller.getSnapshot().status, "anonymous");
 });
 
 test("服务端角色仅映射到现有三个原型角色", () => {
