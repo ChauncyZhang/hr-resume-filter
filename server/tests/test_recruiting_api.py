@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event
 
 from server.app.core.settings import Settings
-from server.app.identity.models import Organization, User, UserRole, UserStatus, Job, JobCollaborator
+from server.app.identity.models import Department, Organization, User, UserRole, UserStatus, Job, JobCollaborator
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, IdempotencyRecord, JobJdVersion, Resume, ScreeningRuleVersion
@@ -327,6 +327,160 @@ def test_system_admin_and_interviewer_have_no_recruiting_access_by_role_alone(tm
             assert jobs["data"] == [] and jobs["meta"]["limit"] == 50
             denied = client.post("/api/v1/candidates", json={"display_name": "Forbidden"}, headers={"Origin": "https://hr.example.test", "X-CSRF-Token": client.get('/api/v1/me', headers={'Sec-Fetch-Site': 'same-origin'}).headers['X-CSRF-Token']})
             assert denied.status_code == 404 and denied.json()["code"] == "resource_not_found"
+
+
+def test_job_list_read_model_enriches_rows_filters_and_uses_full_scope_facets(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "job-list-admin@example.test")
+    owner_id = seed_user(app, "recruiter", "job-list-owner@example.test")
+    hiring_owner_id = seed_user(app, "hiring_manager", "job-list-manager@example.test")
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        db.get(User, admin_id).display_name = "Admin Owner"
+        db.get(User, owner_id).display_name = "Recruiting Owner"
+        db.get(User, hiring_owner_id).display_name = "Hiring Owner"
+        engineering = Department(organization_id=admin.organization_id, name="Engineering")
+        product = Department(organization_id=admin.organization_id, name="Product")
+        db.add_all([engineering, product]); db.flush()
+        jobs = [
+            Job(organization_id=admin.organization_id, title="  Platform Engineer  ", department_id=engineering.id, owner_id=owner_id, hiring_owner_id=hiring_owner_id, status="open", updated_at=base + timedelta(hours=5)),
+            Job(organization_id=admin.organization_id, title="Backend Engineer", department_id=engineering.id, owner_id=owner_id, status="draft", updated_at=base + timedelta(hours=4)),
+            Job(organization_id=admin.organization_id, title="Product Manager", department_id=product.id, owner_id=admin_id, status="paused", updated_at=base + timedelta(hours=3)),
+            Job(organization_id=admin.organization_id, title="Closed Role", owner_id=admin_id, status="closed", updated_at=base + timedelta(hours=2)),
+            Job(organization_id=admin.organization_id, title="Archived Role", owner_id=admin_id, status="archived", updated_at=base + timedelta(hours=1)),
+        ]
+        db.add_all(jobs); db.flush()
+        for index, stage in enumerate(("new", "new", "review")):
+            candidate = Candidate(organization_id=admin.organization_id, display_name=f"Secret Candidate {index}")
+            file = FileObject(organization_id=admin.organization_id, storage_key=f"private/job-list-{index}", original_filename=f"secret-{index}.pdf", mime_type="application/pdf", size_bytes=1, sha256=str(index + 1) * 64, uploaded_by=admin_id)
+            db.add_all([candidate, file]); db.flush()
+            resume = Resume(organization_id=admin.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1, parsed_text="secret resume text")
+            db.add(resume); db.flush()
+            db.add(Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=jobs[0].id, resume_id=resume.id, owner_id=owner_id, stage=stage, human_conclusion="secret note"))
+        db.add(JobJdVersion(organization_id=admin.organization_id, job_id=jobs[0].id, version_number=1, content={"description": "secret JD text"}, created_by=admin_id))
+        db.add(ScreeningRuleVersion(organization_id=admin.organization_id, job_id=jobs[0].id, version_number=1, content={"must_have": ["secret rule text"]}, created_by=admin_id))
+        db.commit()
+        ids = {
+            "engineering": str(engineering.id),
+            "product": str(product.id),
+            "owner": str(owner_id),
+            "hiring_owner": str(hiring_owner_id),
+        }
+
+    with TestClient(app) as client:
+        login(client, "job-list-admin@example.test")
+        statements = []
+        def count_statement(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+        event.listen(app.state.identity_store.engine, "before_cursor_execute", count_statement)
+        try:
+            page = client.get("/api/v1/jobs", params={"limit": 1})
+        finally:
+            event.remove(app.state.identity_store.engine, "before_cursor_execute", count_statement)
+        by_q = client.get("/api/v1/jobs", params={"q": "  PLATFORM engineer  "})
+        by_status = client.get("/api/v1/jobs", params={"status": "draft"})
+        by_department = client.get("/api/v1/jobs", params={"department_id": ids["product"]})
+        by_hiring_owner = client.get("/api/v1/jobs", params={"owner_id": ids["hiring_owner"]})
+        by_fallback_owner = client.get("/api/v1/jobs", params={"owner_id": ids["owner"]})
+        invalid_status = client.get("/api/v1/jobs", params={"status": "unknown"})
+        overlong_q = client.get("/api/v1/jobs", params={"q": "x" * 201})
+
+    assert page.status_code == 200
+    read_model_statements = [statement for statement in statements if "FROM jobs" in statement or "JOIN jobs" in statement or "FROM applications" in statement]
+    assert len(read_model_statements) <= 3
+    row = page.json()["data"][0]
+    assert row["department_name"] == "Engineering"
+    assert row["owner_name"] == "Recruiting Owner"
+    assert row["hiring_owner_name"] == "Hiring Owner"
+    assert row["funnel"] == {"stages": {"new": 2, "review": 1}, "total": 3}
+    assert page.json()["meta"] == {
+        "limit": 1,
+        "next_cursor": page.json()["meta"]["next_cursor"],
+        "departments": [
+            {"id": ids["engineering"], "name": "Engineering"},
+            {"id": ids["product"], "name": "Product"},
+        ],
+        "owners": [
+            {"id": str(admin_id), "name": "Admin Owner"},
+            {"id": ids["hiring_owner"], "name": "Hiring Owner"},
+            {"id": ids["owner"], "name": "Recruiting Owner"},
+        ],
+        "status_counts": {"draft": 1, "open": 1, "paused": 1, "closed": 1, "archived": 1},
+    }
+    assert [item["title"] for item in by_q.json()["data"]] == ["  Platform Engineer  "]
+    assert [item["title"] for item in by_status.json()["data"]] == ["Backend Engineer"]
+    assert [item["title"] for item in by_department.json()["data"]] == ["Product Manager"]
+    assert [item["title"] for item in by_hiring_owner.json()["data"]] == ["  Platform Engineer  "]
+    assert [item["title"] for item in by_fallback_owner.json()["data"]] == ["Backend Engineer"]
+    assert invalid_status.status_code == overlong_q.status_code == 422
+    serialized = repr(page.json()).casefold()
+    for secret in ("candidate", "secret", "description", "must_have", "human_conclusion", "parsed_text", "screening"):
+        assert secret not in serialized
+
+
+def test_job_list_facets_funnels_and_rows_exclude_unauthorized_and_cross_tenant_facts(tmp_path) -> None:
+    app = make_app(tmp_path)
+    recruiter_id = seed_user(app, "recruiter", "job-list-scoped@example.test")
+    denied_owner_id = seed_user(app, "recruiter", "job-list-denied@example.test")
+    with app.state.identity_store.sync_session() as db:
+        recruiter = db.get(User, recruiter_id)
+        recruiter.display_name = "Allowed Owner"
+        denied_owner = db.get(User, denied_owner_id)
+        denied_owner.display_name = "Denied Owner"
+        allowed_department = Department(organization_id=recruiter.organization_id, name="Allowed Department")
+        denied_department = Department(organization_id=recruiter.organization_id, name="Denied Department")
+        db.add_all([allowed_department, denied_department]); db.flush()
+        allowed = Job(organization_id=recruiter.organization_id, title="Allowed Job", department_id=allowed_department.id, owner_id=recruiter_id, status="open")
+        denied = Job(organization_id=recruiter.organization_id, title="Denied Job", department_id=denied_department.id, owner_id=denied_owner_id, status="closed")
+        other_org = Organization(slug="other-job-list", name="Other", status="active")
+        db.add(other_org); db.flush()
+        other_user = User(organization_id=other_org.id, email="other-job-list@example.test", normalized_email="other-job-list@example.test", display_name="Other Owner", password_hash=PasswordService().hash("correct horse"))
+        other_user.roles.append(UserRole(role="recruiter"))
+        other_department = Department(organization_id=other_org.id, name="Other Department")
+        db.add_all([allowed, denied, other_user, other_department]); db.flush()
+        cross_tenant = Job(organization_id=other_org.id, title="Cross Tenant Job", department_id=other_department.id, owner_id=other_user.id, status="paused")
+        db.add(cross_tenant); db.flush()
+        db.add(JobCollaborator(organization_id=recruiter.organization_id, job_id=allowed.id, user_id=recruiter_id, access_role="job_recruiter"))
+        db.commit()
+
+    with TestClient(app) as client:
+        login(client, "job-list-scoped@example.test")
+        response = client.get("/api/v1/jobs")
+
+    assert response.status_code == 200
+    assert [row["title"] for row in response.json()["data"]] == ["Allowed Job"]
+    assert response.json()["meta"]["departments"] == [{"id": str(allowed_department.id), "name": "Allowed Department"}]
+    assert response.json()["meta"]["owners"] == [{"id": str(recruiter_id), "name": "Allowed Owner"}]
+    assert response.json()["meta"]["status_counts"] == {"draft": 0, "open": 1, "paused": 0, "closed": 0, "archived": 0}
+    assert "Denied" not in response.text and "Cross Tenant" not in response.text and "Other" not in response.text
+
+
+def test_job_list_filtered_cursor_is_stable_and_rejects_filter_mismatch(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "job-list-cursor@example.test")
+    base = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+        for index in range(3):
+            db.add(Job(organization_id=admin.organization_id, title=f"Engineer {index}", owner_id=admin_id, status="open", updated_at=base + timedelta(hours=index)))
+        newest = Job(organization_id=admin.organization_id, title="Draft Engineer", owner_id=admin_id, status="draft", updated_at=base + timedelta(hours=4))
+        db.add(newest); db.commit()
+        legacy_cursor = app.state.recruiting_cursor.encode(str(admin.organization_id), "jobs:-updated_at", newest.updated_at.isoformat(), str(newest.id))
+
+    with TestClient(app) as client:
+        login(client, "job-list-cursor@example.test")
+        first = client.get("/api/v1/jobs", params={"q": " engineer ", "status": "open", "limit": 2})
+        second = client.get("/api/v1/jobs", params={"q": "ENGINEER", "status": "open", "limit": 2, "cursor": first.json()["meta"]["next_cursor"]})
+        mismatch = client.get("/api/v1/jobs", params={"q": "engineer", "status": "draft", "limit": 2, "cursor": first.json()["meta"]["next_cursor"]})
+        legacy_page = client.get("/api/v1/jobs", params={"cursor": legacy_cursor})
+
+    assert first.status_code == second.status_code == 200
+    assert [row["title"] for row in first.json()["data"] + second.json()["data"]] == ["Engineer 2", "Engineer 1", "Engineer 0"]
+    assert second.json()["meta"]["next_cursor"] is None
+    assert mismatch.status_code == 422 and mismatch.json()["code"] == "validation_failed"
+    assert legacy_page.status_code == 200
+    assert [row["title"] for row in legacy_page.json()["data"]] == ["Engineer 2", "Engineer 1", "Engineer 0"]
 
 
 def test_recruiting_mutations_preserve_central_csrf_boundary(tmp_path) -> None:

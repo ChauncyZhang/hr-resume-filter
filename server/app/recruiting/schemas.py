@@ -17,6 +17,11 @@ class Meta(ApiModel):
 
 class OwnerFacetOut(ApiModel):
     id: str
+    name: str = Field(min_length=1)
+
+
+class DepartmentFacetOut(ApiModel):
+    id: str
     name: str
 
 
@@ -40,6 +45,26 @@ class JobOut(ApiModel):
     status: str
     version: int
     updated_at: str
+
+
+class JobFunnelOut(ApiModel):
+    stages: dict[str, int]
+    total: int
+
+
+class JobListOut(JobOut):
+    department_name: str | None
+    owner_name: str = Field(min_length=1)
+    hiring_owner_name: str | None
+    funnel: JobFunnelOut
+
+
+class JobMeta(ApiModel):
+    limit: int
+    next_cursor: str | None
+    departments: list[DepartmentFacetOut]
+    owners: list[OwnerFacetOut]
+    status_counts: dict[str, int]
 
 
 RuleItem = Annotated[str, Field(min_length=1, max_length=500)]
@@ -188,7 +213,7 @@ class PreviewOut(ApiModel):
 
 class JobResource(ApiModel): data: JobOut
 class JobDefinitionResource(ApiModel): data: JobDefinitionOut
-class JobCollection(ApiModel): data: list[JobOut]; meta: Meta
+class JobCollection(ApiModel): data: list[JobListOut]; meta: JobMeta
 class CandidateResource(ApiModel): data: CandidateOut
 class CandidateCollection(ApiModel): data: list[CandidateListOut]; meta: CandidateMeta
 class ApplicationResource(ApiModel): data: ApplicationOut

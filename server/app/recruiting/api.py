@@ -2,7 +2,7 @@ import hashlib
 import re
 from collections import Counter
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Header, Query, Request
@@ -12,7 +12,7 @@ from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
 from server.app.identity.api import problem, session_token
-from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
+from server.app.identity.models import AuditLog, Department, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.recruiting.cursor import CursorCodec, InvalidCursor
@@ -50,6 +50,7 @@ PROBLEM_RESPONSES = {
 router = APIRouter(prefix="/api/v1", responses=PROBLEM_RESPONSES)
 ETAG = re.compile(r'^"([1-9][0-9]*)"$')
 AUTH = RecruitingAuthorizationService()
+JOB_STATUSES = ("draft", "open", "paused", "closed", "archived")
 
 
 class StrictModel(BaseModel):
@@ -416,26 +417,132 @@ def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request:
             raise
 
 
-@router.get("/jobs", response_model=JobCollection, response_model_exclude_none=True)
-def list_jobs(request: Request, cursor: str | None = None, limit: int = Query(50, ge=1, le=100)):
+@router.get("/jobs", response_model=JobCollection)
+def list_jobs(
+    request: Request,
+    q: str | None = Query(None, max_length=200),
+    status: Literal["draft", "open", "paused", "closed", "archived"] | None = None,
+    department_id: UUID | None = None,
+    owner_id: UUID | None = None,
+    cursor: str | None = None,
+    limit: int = Query(50, ge=1, le=100),
+):
     principal = _principal(request)
     if isinstance(principal, JSONResponse): return principal
+    normalized_q = q.strip().casefold() if q else ""
+    cursor_scope = hashlib.sha256("\x1f".join((
+        normalized_q,
+        status or "",
+        str(department_id) if department_id else "",
+        str(owner_id) if owner_id else "",
+    )).encode()).hexdigest()
+    cursor_sort = "jobs:-updated_at" if not any((normalized_q, status, department_id, owner_id)) else f"jobs:-updated_at:{cursor_scope}"
     with request.app.state.identity_store.sync_session() as db:
-        query = select(Job).where(Job.organization_id == principal.organization_id, _job_scope(principal))
+        department = aliased(Department)
+        owner = aliased(User)
+        hiring_owner = aliased(User)
+        effective_owner_id = func.coalesce(Job.hiring_owner_id, Job.owner_id)
+        base_conditions = [Job.organization_id == principal.organization_id, _job_scope(principal)]
+        page_conditions = list(base_conditions)
+        if normalized_q:
+            page_conditions.append(Job.title.ilike(f"%{normalized_q}%"))
+        if status:
+            page_conditions.append(Job.status == status)
+        if department_id:
+            page_conditions.append(Job.department_id == department_id)
+        if owner_id:
+            page_conditions.append(effective_owner_id == owner_id)
+        query = select(
+            Job,
+            department.name.label("department_name"),
+            owner.display_name.label("owner_name"),
+            hiring_owner.display_name.label("hiring_owner_name"),
+        ).outerjoin(
+            department,
+            and_(department.organization_id == Job.organization_id, department.id == Job.department_id),
+        ).join(
+            owner,
+            and_(owner.organization_id == Job.organization_id, owner.id == Job.owner_id),
+        ).outerjoin(
+            hiring_owner,
+            and_(hiring_owner.organization_id == Job.organization_id, hiring_owner.id == Job.hiring_owner_id),
+        ).where(*page_conditions)
         if cursor:
             try:
-                decoded = request.app.state.recruiting_cursor.decode(cursor, str(principal.organization_id), "jobs:-updated_at")
-                updated_at = datetime.fromisoformat(decoded["updated_at"])
+                decoded = request.app.state.recruiting_cursor.decode(cursor, str(principal.organization_id), cursor_sort)
+                updated_at = datetime.fromisoformat(decoded["value"])
                 query = query.where(or_(Job.updated_at < updated_at, and_(Job.updated_at == updated_at, Job.id < UUID(decoded["id"]))))
             except Exception:
                 return _problem_for(request, InvalidCursor())
-        rows = db.scalars(query.order_by(Job.updated_at.desc(), Job.id.desc()).limit(limit + 1)).all()
+        rows = db.execute(query.order_by(Job.updated_at.desc(), Job.id.desc()).limit(limit + 1)).all()
         next_cursor = None
         if len(rows) > limit:
-            last = rows[limit - 1]
-            next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), "jobs:-updated_at", last.updated_at.isoformat(), str(last.id))
+            last = rows[limit - 1][0]
+            next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), cursor_sort, last.updated_at.isoformat(), str(last.id))
             rows = rows[:limit]
-        return {"data": [_job_data(row) for row in rows], "meta": {"limit": limit, "next_cursor": next_cursor}}
+        page_job_ids = [row[0].id for row in rows]
+        funnel_counts: dict[UUID, dict[str, int]] = {}
+        if page_job_ids:
+            for job_id, stage, count in db.execute(select(
+                Application.job_id,
+                Application.stage,
+                func.count(Application.id),
+            ).where(
+                Application.organization_id == principal.organization_id,
+                Application.job_id.in_(page_job_ids),
+            ).group_by(Application.job_id, Application.stage)):
+                funnel_counts.setdefault(job_id, {})[stage] = count
+
+        facet_rows = db.execute(select(
+            Job.status,
+            department.id.label("department_id"),
+            department.name.label("department_name"),
+            func.coalesce(hiring_owner.id, owner.id).label("owner_id"),
+            func.coalesce(hiring_owner.display_name, owner.display_name).label("owner_name"),
+        ).outerjoin(
+            department,
+            and_(department.organization_id == Job.organization_id, department.id == Job.department_id),
+        ).join(
+            owner,
+            and_(owner.organization_id == Job.organization_id, owner.id == Job.owner_id),
+        ).outerjoin(
+            hiring_owner,
+            and_(hiring_owner.organization_id == Job.organization_id, hiring_owner.id == Job.hiring_owner_id),
+        ).where(*base_conditions)).all()
+        departments = {
+            department_id: department_name
+            for _, department_id, department_name, _, _ in facet_rows
+            if department_id is not None
+        }
+        owners = {effective_id: effective_name for _, _, _, effective_id, effective_name in facet_rows}
+        status_counts = Counter(status_value for status_value, _, _, _, _ in facet_rows)
+
+        data = []
+        for job, department_name, owner_name, hiring_owner_name in rows:
+            stages = funnel_counts.get(job.id, {})
+            data.append({
+                **_job_data(job),
+                "department_name": department_name,
+                "owner_name": owner_name,
+                "hiring_owner_name": hiring_owner_name,
+                "funnel": {"stages": stages, "total": sum(stages.values())},
+            })
+        return {
+            "data": data,
+            "meta": {
+                "limit": limit,
+                "next_cursor": next_cursor,
+                "departments": [
+                    {"id": str(facet_id), "name": name}
+                    for facet_id, name in sorted(departments.items(), key=lambda item: (item[1].casefold(), str(item[0])))
+                ],
+                "owners": [
+                    {"id": str(facet_id), "name": name}
+                    for facet_id, name in sorted(owners.items(), key=lambda item: (item[1].casefold(), str(item[0])))
+                ],
+                "status_counts": {status_value: status_counts.get(status_value, 0) for status_value in JOB_STATUSES},
+            },
+        }
 
 
 @router.post("/jobs", status_code=201, response_model=JobResource)
