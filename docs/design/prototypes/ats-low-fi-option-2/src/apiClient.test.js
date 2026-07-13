@@ -126,3 +126,16 @@ test("网络失败被标记为服务不可用错误且不透传底层消息", as
     return true;
   });
 });
+
+test("request 将 AbortSignal 原样传给 fetch", async () => {
+  const controller = new AbortController();
+  let receivedSignal;
+  const client = createApiClient({ fetchImpl: async (_url, options) => {
+    receivedSignal = options.signal;
+    return jsonResponse({ data: [] });
+  } });
+
+  await client.request("/api/v1/jobs?limit=100", { signal: controller.signal });
+
+  assert.equal(receivedSignal, controller.signal);
+});

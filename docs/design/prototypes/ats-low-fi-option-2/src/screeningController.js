@@ -1,0 +1,206 @@
+import { apiClient as defaultApiClient } from "./apiClient.js";
+
+const TERMINAL_RUN_STATUSES = new Set(["complete", "partial", "failed", "cancelled"]);
+const SUCCESSFUL_LLM_STATUSES = new Set(["succeeded", "skipped", "not_requested"]);
+
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeString(value) {
+  return typeof value === "string" ? value : "";
+}
+
+function safeCount(value) {
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+function safeScore(value) {
+  return Number.isFinite(value) ? value : null;
+}
+
+function safeStrings(value) {
+  return Array.isArray(value) ? value.filter((entry) => typeof entry === "string") : [];
+}
+
+function normalizeRunStatus(status) {
+  if (status === "completed") return "complete";
+  if (["partial", "failed", "cancelled"].includes(status)) return status;
+  return "running";
+}
+
+function normalizeFile(item) {
+  const ruleResult = isRecord(item?.rule_result) ? item.rule_result : null;
+  const llmEvaluation = isRecord(item?.llm_evaluation) ? item.llm_evaluation : null;
+  const hasFinalRuleResult = item?.status === "scored" && ruleResult !== null;
+  let status = item?.status === "queued" ? "queued" : "running";
+
+  if (item?.status === "failed" || item?.status === "cancelled") {
+    status = "failed";
+  } else if (hasFinalRuleResult && item?.llm_status === "failed") {
+    status = "partial";
+  } else if (hasFinalRuleResult && SUCCESSFUL_LLM_STATUSES.has(item?.llm_status)) {
+    status = "success";
+  }
+
+  const matched = [
+    ...safeStrings(ruleResult?.required_hits),
+    ...safeStrings(ruleResult?.bonus_hits),
+  ].join("、");
+  const risks = [
+    ...safeStrings(ruleResult?.risks),
+    ...safeStrings(llmEvaluation?.risks),
+  ].join("、");
+  const error = status === "partial"
+    ? safeString(item?.llm_error_code)
+    : status === "failed" ? safeString(item?.error_code) : "";
+
+  return {
+    id: safeString(item?.id),
+    name: safeString(item?.filename),
+    candidate: safeString(item?.candidate_name),
+    status,
+    ruleScore: safeScore(ruleResult?.score),
+    llmScore: safeScore(llmEvaluation?.score),
+    matched,
+    missing: safeStrings(ruleResult?.required_missing).join("、"),
+    recommendation: safeString(ruleResult?.recommendation),
+    risk: risks,
+    error,
+    application_stage: safeString(item?.application_stage) || null,
+    application_version: Number.isInteger(item?.application_version) ? item.application_version : null,
+  };
+}
+
+export function normalizeScreeningTask(run, items) {
+  const safeRun = isRecord(run) ? run : {};
+  return {
+    id: safeString(safeRun.id),
+    jobId: safeString(safeRun.job_id),
+    source: safeString(safeRun.source),
+    status: normalizeRunStatus(safeRun.status),
+    completed: safeCount(safeRun.processed_count),
+    total: safeCount(safeRun.total_count),
+    files: Array.isArray(items) ? items.map(normalizeFile) : [],
+  };
+}
+
+function defaultIdempotencyKey() {
+  return globalThis.crypto.randomUUID();
+}
+
+function abortError() {
+  return new DOMException("Aborted", "AbortError");
+}
+
+function defaultWait(milliseconds, { signal } = {}) {
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function withSignal(signal) {
+  return signal ? { signal } : {};
+}
+
+function resourceData(response) {
+  return response?.data ?? null;
+}
+
+export function createScreeningController({
+  client = defaultApiClient,
+  createIdempotencyKey = defaultIdempotencyKey,
+  wait = defaultWait,
+} = {}) {
+  async function listJobs({ signal } = {}) {
+    const response = await client.request("/api/v1/jobs?limit=100", withSignal(signal));
+    return Array.isArray(response?.data)
+      ? response.data.filter(isRecord).map((job) => ({ id: safeString(job.id), title: safeString(job.title) }))
+      : [];
+  }
+
+  async function createRun(jobId, { signal } = {}) {
+    const response = await client.request(`/api/v1/jobs/${encodeURIComponent(jobId)}/screening-runs`, {
+      method: "POST",
+      body: { source: "upload" },
+      idempotencyKey: createIdempotencyKey(),
+      ...withSignal(signal),
+    });
+    return resourceData(response);
+  }
+
+  async function uploadFiles(runId, files, { signal } = {}) {
+    const uploads = Array.from(files, (file) => {
+      if (!(file instanceof File)) throw new TypeError("screening uploads require File objects");
+      const body = new FormData();
+      body.append("file", file);
+      return client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/items`, {
+        method: "POST",
+        body,
+        idempotencyKey: createIdempotencyKey(),
+        ...withSignal(signal),
+      }).then(resourceData);
+    });
+    return Promise.all(uploads);
+  }
+
+  async function startRun(runId, { signal } = {}) {
+    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/start`, {
+      method: "POST",
+      idempotencyKey: createIdempotencyKey(),
+      ...withSignal(signal),
+    });
+    return resourceData(response);
+  }
+
+  async function getRun(runId, { signal } = {}) {
+    return resourceData(await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}`, withSignal(signal)));
+  }
+
+  async function getItems(runId, { signal } = {}) {
+    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/items?limit=100`, withSignal(signal));
+    return Array.isArray(response?.data) ? response.data : [];
+  }
+
+  async function retryItem(itemId, { signal } = {}) {
+    const response = await client.request(`/api/v1/screening-items/${encodeURIComponent(itemId)}/retry`, {
+      method: "POST",
+      idempotencyKey: createIdempotencyKey(),
+      ...withSignal(signal),
+    });
+    return resourceData(response);
+  }
+
+  async function pollRun(runId, { signal, intervalMs = 1000, onSnapshot } = {}) {
+    try {
+      while (!signal?.aborted) {
+        const [run, items] = await Promise.all([
+          getRun(runId, { signal }),
+          getItems(runId, { signal }),
+        ]);
+        if (signal?.aborted) return null;
+        const snapshot = normalizeScreeningTask(run, items);
+        onSnapshot?.(snapshot);
+        if (TERMINAL_RUN_STATUSES.has(snapshot.status)) return snapshot;
+        await wait(intervalMs, { signal });
+      }
+      return null;
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") return null;
+      throw error;
+    }
+  }
+
+  return { listJobs, createRun, uploadFiles, startRun, getRun, getItems, retryItem, pollRun };
+}
+
+export const screeningController = createScreeningController();
