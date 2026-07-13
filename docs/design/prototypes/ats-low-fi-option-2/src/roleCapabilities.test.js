@@ -65,6 +65,16 @@ test("面试官不能搜索候选人或导入简历", () => {
   assert.equal(canPerformAction("面试官", "提交面试反馈"), true);
 });
 
+test("用人经理只访问被授权招聘协作页面且不能执行 HR 管理动作", () => {
+  assert.deepEqual(getAllowedNavItems("用人经理"), ["工作台", "职位", "候选人", "面试", "报表"]);
+  assert.equal(canPerformAction("用人经理", "候选人搜索"), true);
+  assert.equal(canPerformAction("用人经理", "提交面试反馈"), true);
+  assert.equal(canPerformAction("用人经理", "新建职位"), false);
+  assert.equal(canPerformAction("用人经理", "导入简历"), false);
+  assert.equal(canPerformAction("用人经理", "推进候选人"), false);
+  assert.equal(getSettingsAccess("用人经理"), "无");
+});
+
 test("角色身份映射包含姓名和职务且不会暴露可变内部状态", () => {
   assert.deepEqual(getRoleIdentity("招聘管理员"), { name: "周明", title: "招聘管理员" });
   assert.deepEqual(getRoleIdentity("HR 招聘专员"), { name: "张小北", title: "HR 招聘专员" });

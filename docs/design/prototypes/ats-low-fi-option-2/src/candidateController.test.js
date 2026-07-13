@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createCandidateController, mergeCandidateRecords, normalizeCandidateReview } from "./candidateController.js";
+import { createCandidateController, mergeCandidateRecords, normalizeCandidateReview, resolveCandidateJobPreset } from "./candidateController.js";
 
 const candidateId = "candidate-1";
 const jobId = "job-1";
 const response = (data) => ({ data });
+
+test("candidate preset resolves by stable job id before a duplicate title", () => {
+  const jobs = [
+    { id: "job-1", title: "AI 工程师" },
+    { id: "job-2", title: "AI 工程师" },
+  ];
+
+  assert.equal(resolveCandidateJobPreset(jobs, { jobId: "job-2", position: "AI 工程师" }), "job-2");
+  assert.equal(resolveCandidateJobPreset(jobs, { position: "AI 工程师" }), "job-1");
+  assert.equal(resolveCandidateJobPreset(jobs, { jobId: "missing", position: "AI 工程师" }), "全部职位");
+  assert.equal(resolveCandidateJobPreset(jobs, { position: "全部职位" }), "全部职位");
+});
 
 test("candidate list safely encodes supported filters and normalizes server rows", async () => {
   const calls = [];

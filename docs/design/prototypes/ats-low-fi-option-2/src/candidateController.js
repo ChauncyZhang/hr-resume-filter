@@ -119,6 +119,15 @@ export function mergeCandidateRecords(current, incoming) {
   })];
 }
 
+export function resolveCandidateJobPreset(jobs, initialFilters) {
+  const records = safeArray(jobs);
+  const requestedId = safeString(initialFilters?.jobId).trim();
+  if (requestedId) return records.some((job) => job?.id === requestedId) ? requestedId : "全部职位";
+  const requestedTitle = safeString(initialFilters?.position).trim();
+  if (!requestedTitle || requestedTitle === "全部职位") return "全部职位";
+  return records.find((job) => job?.title === requestedTitle)?.id || "全部职位";
+}
+
 function normalizeOwnerFacets(owners) {
   return safeArray(owners).map((item) => ({ id: safeString(item?.id), name: safeString(item?.name) })).filter((item) => item.id && item.name);
 }

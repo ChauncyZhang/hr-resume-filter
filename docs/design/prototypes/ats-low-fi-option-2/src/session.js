@@ -14,7 +14,8 @@ export function mapServerRoles(roles = []) {
   if (values.has("system_admin")) return "系统管理员";
   if (values.has("recruiting_admin")) return "招聘管理员";
   if (values.has("recruiter")) return "HR 招聘专员";
-  if (values.has("hiring_manager") || values.has("interviewer")) return "面试官";
+  if (values.has("hiring_manager")) return "用人经理";
+  if (values.has("interviewer")) return "面试官";
   return null;
 }
 

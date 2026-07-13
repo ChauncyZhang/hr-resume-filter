@@ -25,7 +25,7 @@ import {
   LoaderCircle,
   RotateCcw,
 } from "lucide-react";
-import { mergeCandidateRecords } from "./candidateController.js";
+import { mergeCandidateRecords, resolveCandidateJobPreset } from "./candidateController.js";
 
 const baseTimeline = [
   { time: "今天 10:30", actor: "系统", action: "完成规则评分与 LLM 辅助评估" },
@@ -121,18 +121,18 @@ function CandidateList({ controller, onOpen, initialFilters }) {
 
   useEffect(() => {
     setStage(initialFilters?.stage || "全部阶段");
-    const presetPosition = initialFilters?.position || "全部职位";
-    if (presetPosition === "全部职位") setPosition("全部职位");
-    else if (jobsReady) setPosition(jobs.find((job) => job.title === presetPosition)?.id || "全部职位");
+    if (jobsReady || (!initialFilters?.jobId && (!initialFilters?.position || initialFilters.position === "全部职位"))) {
+      setPosition(resolveCandidateJobPreset(jobs, initialFilters));
+    }
   }, [initialFilters, jobs, jobsReady]);
 
-  const needsPositionPreset = Boolean(initialFilters?.position && initialFilters.position !== "全部职位");
-  const presetJobId = jobs.find((job) => job.title === initialFilters?.position)?.id;
+  const needsPositionPreset = Boolean(initialFilters?.jobId || (initialFilters?.position && initialFilters.position !== "全部职位"));
+  const presetJobId = jobsReady ? resolveCandidateJobPreset(jobs, initialFilters) : null;
   const presetRequestKey = needsPositionPreset ? `${jobsReady}:${presetJobId || ""}` : "";
 
   useEffect(() => {
     if (needsPositionPreset && !jobsReady) return undefined;
-    if (presetJobId && position !== presetJobId) return undefined;
+    if (needsPositionPreset && position !== presetJobId) return undefined;
     const abortController = new AbortController();
     requestRef.current?.abort();
     requestRef.current = abortController;

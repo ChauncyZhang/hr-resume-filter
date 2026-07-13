@@ -7,7 +7,6 @@ import {
   ChevronRight,
   CircleAlert,
   FileText,
-  Filter,
   Home,
   Import,
   LayoutList,
@@ -37,6 +36,7 @@ import { getSessionIdentity, getSessionMessage, sessionController } from "./sess
 import { screeningController as defaultScreeningController } from "./screeningController.js";
 import { candidateController as defaultCandidateController } from "./candidateController.js";
 import { jobController as defaultJobController } from "./jobController.js";
+import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
 import {
   appendJobPage,
   createInitialJobWorkspaceState,
@@ -58,64 +58,15 @@ const navItems = [
 ];
 
 const stageMeta = [
-  ["新简历", 22],
-  ["待复核", 8],
-  ["待沟通", 6],
-  ["待安排", 4],
-  ["面试中", 5],
-  ["待决策", 3],
+  "新简历",
+  "待复核",
+  "待沟通",
+  "待安排",
+  "面试中",
+  "待决策",
 ];
 
 const emptyStages = stageMeta.map(() => []);
-
-const jobData = {
-  "AI 工程师": {
-    count: 12,
-    stages: [
-      [
-        { name: "候 A1", role: "AI 算法工程师", company: "字节", age: "3 小时前", tag: "来自 智联" },
-        { name: "候 A2", role: "算法工程师", company: "百度", age: "5 小时前", tag: "来自 拉勾" },
-        { name: "候 A3", role: "深度学习工程师", company: "商汤", age: "1 天前", tag: "来自 猎聘" },
-        { name: "候 A4", role: "NLP 算法工程师", company: "科大讯飞", age: "1 天前", tag: "来自 内推" },
-        { name: "候 A5", role: "算法工程师", company: "快手", age: "2 天前", tag: "来自 BOSS 直聘" },
-      ],
-      [
-        { name: "候 B1", role: "算法工程师", company: "腾讯", age: "1 天前", tag: "来自 猎聘" },
-        { name: "候 B2", role: "AI 研究员", company: "阿里", age: "2 天前", tag: "来自 拉勾" },
-        { name: "候 B3", role: "计算机视觉工程师", company: "美团", age: "2 天前", tag: "来自 内推" },
-        { name: "候 B4", role: "算法工程师", company: "字节", age: "3 天前", tag: "来自 猎聘" },
-        { name: "候 B5", role: "NLP 算法工程师", company: "百度", age: "3 天前", tag: "来自 智联" },
-      ],
-      [
-        { name: "候 C1", role: "算法工程师", company: "字节", age: "今天", schedule: "今日 15:00" },
-        { name: "候 C2", role: "AI 工程师", company: "腾讯", age: "昨天", schedule: "今日 16:30" },
-        { name: "候 C3", role: "算法工程师", company: "美团", age: "2 天前", schedule: "明日 10:00" },
-        { name: "候 C4", role: "深度学习工程师", company: "商汤", age: "2 天前", schedule: "明日 14:00" },
-        { name: "候 C5", role: "NLP 算法工程师", company: "百度", age: "3 天前", schedule: "07-13 10:00" },
-      ],
-      [
-        { name: "候 D1", role: "算法工程师", company: "快手", age: "昨天", tag: "待安排面试" },
-        { name: "候 D2", role: "AI 工程师", company: "阿里", age: "2 天前", tag: "待安排面试" },
-        { name: "候 D3", role: "计算机视觉工程师", company: "字节", age: "2 天前", tag: "待安排面试" },
-        { name: "候 D4", role: "算法工程师", company: "小米", age: "3 天前", tag: "待安排面试" },
-      ],
-      [
-        { name: "候 E1", role: "一面 · 进行中", company: "", age: "", schedule: "今天 10:00", interviewer: "面试官：李明" },
-        { name: "候 E2", role: "二面 · 进行中", company: "", age: "", schedule: "今天 14:00", interviewer: "面试官：王磊" },
-        { name: "候 E3", role: "三面 · 进行中", company: "", age: "", schedule: "07-12 10:00", interviewer: "面试官：张敏" },
-        { name: "候 E4", role: "一面 · 已安排", company: "", age: "", schedule: "07-13 15:00", interviewer: "面试官：赵强" },
-        { name: "候 E5", role: "一面 · 已安排", company: "", age: "", schedule: "07-13 16:30", interviewer: "面试官：李明" },
-      ],
-      [
-        { name: "候 F1", role: "HR 评估中", company: "", age: "", note: "预计 07-13 前完成" },
-        { name: "候 F2", role: "用人经理评估中", company: "", age: "", note: "预计 07-14 前完成" },
-        { name: "候 F3", role: "HR 评估中", company: "", age: "", note: "预计 07-15 前完成" },
-      ],
-    ],
-  },
-  "Java 后端工程师": { count: 8 },
-  产品经理: { count: 6 },
-};
 
 function IconButton({ label, children, className = "", onClick, disabled = false }) {
   return (
@@ -131,14 +82,40 @@ function CandidateCard({ candidate, onOpen }) {
       <div className="candidate-line">
         <span className="avatar-mini"><UserRound size={11} /></span>
         <strong>{candidate.name}</strong>
-        <span className="age">{candidate.age}</span>
+        <span className="age">{candidate.age || candidate.lastActivity}</span>
       </div>
       <div className="candidate-role">{candidate.role}{candidate.company ? ` · ${candidate.company}` : ""}</div>
       {candidate.schedule && <div className="meta-line"><CalendarDays size={13} />{candidate.schedule}</div>}
       {candidate.interviewer && <div className="meta-line"><FileText size={13} />{candidate.interviewer}</div>}
       {candidate.note && <div className="candidate-note">{candidate.note}</div>}
-      {candidate.tag && <span className="source-tag">{candidate.tag}</span>}
+      {(candidate.tag || candidate.source) && <span className="source-tag">{candidate.tag || `来自 ${candidate.source}`}</span>}
     </button>
+  );
+}
+
+function WorkbenchSkeleton() {
+  return (
+    <div className="page-body workbench-skeleton" role="status" aria-live="polite" aria-label="正在加载工作台">
+      <section className="main-column">
+        <div className="job-switcher">
+          <span className="switcher-label">当前职位</span>
+          <div className="job-tabs skeleton-tabs" aria-hidden="true">
+            {[0, 1, 2].map((item) => <span key={item} />)}
+          </div>
+        </div>
+        <section className="pipeline-panel">
+          <header className="pipeline-header"><div className="skeleton-heading" aria-hidden="true"><span /><span /></div></header>
+          <div className="kanban skeleton-kanban" aria-hidden="true">
+            {stageMeta.map((stage) => <section className="stage" key={stage}><header><span /></header><div className="stage-list"><span /><span /></div></section>)}
+          </div>
+        </section>
+        <span className="workbench-loading-label">正在加载工作台</span>
+      </section>
+      <aside className="right-rail" aria-hidden="true">
+        <section className="rail-section skeleton-rail"><span /><span /><span /></section>
+        <section className="rail-section skeleton-rail compact"><span /><span /></section>
+      </aside>
+    </div>
   );
 }
 
@@ -157,7 +134,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -172,10 +149,10 @@ export function App({ controller = sessionController, screeningController = defa
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} />;
 }
 
-function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController }) {
+function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController }) {
   const currentRole = session.role || "未知角色";
   const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
@@ -185,8 +162,9 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [modal, setModal] = useState(null);
   const [selectedCandidate, setSelectedCandidate] = useState(null);
   const [toast, setToast] = useState("");
-  const [filterOnlyUrgent, setFilterOnlyUrgent] = useState(false);
-  const [jobs, setJobs] = useState(Object.keys(jobData));
+  const [workbenchState, setWorkbenchState] = useState({ status: currentRole === "面试官" ? "unavailable" : "loading", data: null, error: "" });
+  const [activeWorkbenchJobId, setActiveWorkbenchJobId] = useState(null);
+  const workbenchLoadRef = useRef(null);
   const [jobMode, setJobMode] = useState("list");
   const [selectedJob, setSelectedJob] = useState(null);
   const [jobState, setJobState] = useState(createInitialJobWorkspaceState);
@@ -218,35 +196,15 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     return recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null;
   });
 
-  const stages = useMemo(() => stageMeta.map(([stage]) => candidateRecords.filter((candidate) => candidate.position === activeJob && candidate.stage === stage).map((candidate) => {
-    const latestInterview = candidate.interviews?.at(-1);
-    return { name: candidate.name, role: candidate.role, company: candidate.company, age: candidate.lastActivity, tag: candidate.stage === "待安排" ? "待安排面试" : `来自 ${candidate.source}`, schedule: latestInterview?.time, interviewer: latestInterview?.interviewer ? `面试官：${latestInterview.interviewer}` : null, note: candidate.stage === "待决策" ? "等待 HR 决策" : null };
-  })), [activeJob, candidateRecords]);
-  const visibleStageMeta = stageMeta.map(([name], index) => [name, stages[index].length]);
-  const pendingScheduleCandidates = useMemo(() => candidateRecords.filter((candidate) => candidate.stage === "待安排"), [candidateRecords]);
-  const pendingFeedbackInterviews = useMemo(() => interviewRecords.filter((interview) => interview.feedbackStatus === "待反馈"), [interviewRecords]);
-  const upcomingInterviewDays = useMemo(() => {
-    const labels = new Map();
-    interviewRecords
-      .filter((interview) => interview.date >= "2026-07-11" && interview.status !== "已取消")
-      .forEach((interview) => {
-        const label = interview.dateLabel || interview.date;
-        labels.set(label, (labels.get(label) || 0) + 1);
-      });
-    return [...labels.entries()].sort(([left], [right]) => left.localeCompare(right)).slice(0, 4);
-  }, [interviewRecords]);
-  const duplicateCandidateGroups = useMemo(() => {
-    const identityCounts = new Map();
-    candidateRecords.forEach((candidate) => {
-      const identity = candidate.email || candidate.phone || candidate.name;
-      identityCounts.set(identity, (identityCounts.get(identity) || 0) + 1);
-    });
-    return [...identityCounts.values()].filter((count) => count > 1).length;
-  }, [candidateRecords]);
+  const workbenchJobs = workbenchState.data?.jobs || [];
+  const activeWorkbenchJob = workbenchJobs.find((job) => job.id === activeWorkbenchJobId) || workbenchJobs[0] || null;
+  const stages = activeWorkbenchJob ? stageMeta.map((stage) => activeWorkbenchJob.stages[stage]?.items || []) : emptyStages;
+  const visibleStageMeta = stageMeta.map((name, index) => [name, activeWorkbenchJob?.stages[name]?.count || 0, stages[index].length]);
+  const emptyTaskGroup = { count: 0, items: [] };
+  const workbenchTasks = workbenchState.data?.tasks || { contact: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup };
   const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
   const roleIdentity = getSessionIdentity(session.user, currentRole);
   const sessionMessage = getSessionMessage(session.error);
-  const myPendingFeedbackInterviews = pendingFeedbackInterviews.filter((item) => item.interviewers.includes(roleIdentity.name));
   const screeningSummary = useMemo(() => {
     if (!recentTask?.files?.length) return null;
     return {
@@ -257,6 +215,32 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     };
   }, [recentTask]);
   const workflowValidation = useMemo(() => validateWorkflowState({ positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships }), [candidateRecords, interviewRecords, positionRecords, talentMemberships, talentPools]);
+
+  const loadWorkbench = useCallback(async () => {
+    if (currentRole === "面试官") return null;
+    workbenchLoadRef.current?.abort();
+    const controller = new AbortController();
+    workbenchLoadRef.current = controller;
+    setWorkbenchState((current) => ({ status: "loading", data: current.data, error: "" }));
+    try {
+      const data = await workbenchController.load({ signal: controller.signal });
+      if (workbenchLoadRef.current !== controller) return null;
+      setWorkbenchState({ status: "ready", data, error: "" });
+      if (data.jobs[0]) {
+        setActiveWorkbenchJobId((current) => data.jobs.some((job) => job.id === current) ? current : data.jobs[0].id);
+        setActiveJob((current) => data.jobs.some((job) => job.name === current) ? current : data.jobs[0].name);
+      } else {
+        setActiveWorkbenchJobId(null);
+      }
+      return data;
+    } catch (error) {
+      if (error?.name === "AbortError" || workbenchLoadRef.current !== controller) return null;
+      setWorkbenchState((current) => ({ status: "error", data: current.data, error: "工作台加载失败，请检查网络后重试。" }));
+      return null;
+    } finally {
+      if (workbenchLoadRef.current === controller) workbenchLoadRef.current = null;
+    }
+  }, [currentRole, workbenchController]);
 
   const loadJobs = useCallback(async (filters, { append = false, cursor = null, mutation = false } = {}) => {
     jobListRequestRef.current?.controller.abort();
@@ -270,7 +254,6 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
       setJobState((current) => append ? appendJobPage(current, requestId, page) : mutation ? succeedJobMutationRefresh(current, requestId, page) : succeedJobRequest(current, requestId, page));
       if (!append && !filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
         setPositionRecords(page.records);
-        setJobs(page.records.map((record) => record.name));
         if (page.records[0]) setActiveJob((current) => page.records.some((record) => record.name === current) ? current : page.records[0].name);
       }
       return page;
@@ -305,7 +288,6 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
       setSelectedJob(complete);
       if (!filters.q && filters.status === "全部" && !filters.departmentId && !filters.ownerId) {
         setPositionRecords(page.records);
-        setJobs(page.records.map((record) => record.name));
       }
       return complete;
     } catch (error) {
@@ -328,6 +310,14 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
       jobMutationRefreshRef.current = null;
     };
   }, [loadJobs]);
+
+  useEffect(() => {
+    if (activeNav === "工作台" && currentRole !== "面试官") void loadWorkbench();
+    return () => {
+      workbenchLoadRef.current?.abort();
+      workbenchLoadRef.current = null;
+    };
+  }, [activeNav, currentRole, loadWorkbench]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
@@ -466,11 +456,6 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setActiveNav("职位");
     setSelectedJob(null);
     setJobMode("form");
-  }
-
-  function registerJob(record) {
-    setJobs((current) => current.includes(record.name) ? current : [...current, record.name]);
-    setActiveJob(record.name);
   }
 
   async function loadServerCandidate(context) {
@@ -655,30 +640,32 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         </header>
 
         {!screeningTask && activeNav === "工作台" && currentRole === "面试官" && <div className="interviewer-workbench">
-          <header><div><h2>我的面试工作台</h2><p>仅展示你参与的面试和待提交反馈。</p></div><span>{myPendingFeedbackInterviews.length} 项待反馈</span></header>
-          <section><h3>待提交反馈</h3>{myPendingFeedbackInterviews.map((interview) => <button type="button" key={interview.id} onClick={() => openFeedbackInterview(interview)}><span><strong>{interview.candidate}</strong><small>{interview.position} · {interview.round}</small></span><span>{interview.dateLabel} {interview.time}<ChevronRight size={16} /></span></button>)}{myPendingFeedbackInterviews.length === 0 && <p>暂无待提交反馈</p>}</section>
-          <section><h3>我的面试</h3>{interviewRecords.filter((item) => item.interviewers.includes(roleIdentity.name) && item.feedbackStatus !== "待反馈").slice(0, 6).map((interview) => <button type="button" key={interview.id} onClick={() => openFeedbackInterview(interview)}><span><strong>{interview.candidate}</strong><small>{interview.position} · {interview.round}</small></span><span>{interview.dateLabel} {interview.time}<ChevronRight size={16} /></span></button>)}</section>
+          <header><div><h2>我的面试工作台</h2><p>面试安排与反馈将在服务端面试模块接入后显示。</p></div><span>尚未接入</span></header>
+          <section className="workbench-unavailable"><CalendarDays size={24} /><div><strong>暂无可读取的面试数据</strong><p>当前页面不会展示本地示例面试，避免与真实招聘安排混淆。</p></div></section>
         </div>}
 
-        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && <div className="page-body">
+        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "loading" && !workbenchState.data && <WorkbenchSkeleton />}
+        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "error" && !workbenchState.data && <div className="workbench-status error" role="alert"><CircleAlert size={22} /><div><strong>工作台暂时无法加载</strong><p>{workbenchState.error}</p></div><button className="button secondary" type="button" onClick={() => void loadWorkbench()}>重试</button></div>}
+        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "ready" && workbenchJobs.length === 0 && <div className="workbench-status empty"><BriefcaseBusiness size={24} /><div><strong>暂无在招职位</strong><p>{canPerformAction(currentRole, "新建职位") ? "发布职位并导入简历后，这里会显示真实招聘进展。" : "暂无被授权的在招职位，请联系招聘负责人确认职位协作范围。"}</p></div></div>}
+        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && activeWorkbenchJob && <div className="page-body" aria-busy={workbenchState.status === "loading"}>
           <section className="main-column">
+            {workbenchState.status === "error" && <div className="workbench-inline-error" role="alert"><CircleAlert size={17} /><span>{workbenchState.error}，当前展示上次成功数据。</span><button type="button" onClick={() => void loadWorkbench()}>重新加载</button></div>}
             <div className="job-switcher">
               <span className="switcher-label">当前职位</span>
               <div className="job-tabs">
-                {jobs.slice(0, 3).map((job) => (
-                  <button key={job} type="button" className={activeJob === job ? "job-tab selected" : "job-tab"} onClick={() => setActiveJob(job)}>
-                    <strong>{job}</strong><span>{candidateRecords.filter((candidate) => candidate.position === job && !["已录用", "已淘汰", "已撤回"].includes(candidate.stage)).length} 人进行中</span>
+                {workbenchJobs.slice(0, 3).map((job) => (
+                  <button key={job.id} type="button" aria-pressed={activeWorkbenchJob.id === job.id} className={activeWorkbenchJob.id === job.id ? "job-tab selected" : "job-tab"} onClick={() => { setActiveWorkbenchJobId(job.id); setActiveJob(job.name); }}>
+                    <strong>{job.name}</strong><span>{job.activeCount} 人进行中</span>
                   </button>
                 ))}
-                <button className="more-jobs" type="button" onClick={() => notify("已展示全部在招职位")}>更多职位<ChevronDown size={15} /></button>
+                {workbenchJobs.length > 3 && <button className="more-jobs" type="button" onClick={() => { setActiveNav("职位"); setJobMode("list"); }}>更多职位<ChevronDown size={15} /></button>}
               </div>
             </div>
 
             <section className="pipeline-panel">
               <header className="pipeline-header">
-                <div><h2>{activeJob}</h2><span>全职 · 北京 · 技术部</span></div>
+                <div><h2>{activeWorkbenchJob.name}</h2><span>{activeWorkbenchJob.department}</span></div>
                 <div className="pipeline-tools">
-                  <button type="button" className={filterOnlyUrgent ? "text-tool active" : "text-tool"} onClick={() => setFilterOnlyUrgent((value) => !value)}><Filter size={15} />筛选</button>
                   <button type="button" className="text-tool" onClick={() => setView((value) => value === "board" ? "list" : "board")}><LayoutList size={16} />{view === "board" ? "视图" : "看板"}</button>
                   <IconButton label="更多操作" onClick={() => notify("已打开职位操作菜单")}><MoreHorizontal size={19} /></IconButton>
                 </div>
@@ -686,67 +673,59 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
 
               {view === "board" ? (
                 <div className="kanban" aria-label="候选人招聘阶段">
-                  {visibleStageMeta.map(([name, count], index) => (
+                  {visibleStageMeta.map(([name, count, loadedCount], index) => (
                     <section className="stage" key={name}>
-                      <header><strong>{name}</strong><span>{filterOnlyUrgent ? Math.min(count, 3) : count}</span></header>
+                      <header><strong>{name}</strong><span>{count}</span></header>
                       <div className="stage-list">
-                        {stages[index].slice(0, filterOnlyUrgent ? 2 : 5).map((candidate) => (
-                          <CandidateCard key={candidate.name} candidate={candidate} onOpen={openCandidate} />
+                        {stages[index].slice(0, 5).map((candidate) => (
+                          <CandidateCard key={candidate.applicationId || candidate.id} candidate={candidate} onOpen={openCandidate} />
                         ))}
                       </div>
-                      <button className="load-more" type="button" onClick={() => notify(`${name}已加载更多候选人`)}><Plus size={14} />加载更多 ({Math.max(0, count - stages[index].length)})</button>
+                      {count > loadedCount && <button className="load-more" type="button" onClick={() => { setCandidatePreset({ jobId: activeWorkbenchJob.id, position: activeWorkbenchJob.name, stage: name }); setActiveNav("候选人"); }}><Plus size={14} />查看其余 {count - loadedCount} 人</button>}
                     </section>
                   ))}
                 </div>
               ) : (
                 <div className="list-view">
                   <div className="list-head"><span>候选人</span><span>当前阶段</span><span>最近进展</span><span>操作</span></div>
-                  {stages.flat().slice(0, 10).map((candidate, index) => (
-                    <button type="button" className="list-row" key={candidate.name} onClick={() => openCandidate(candidate)}>
+                  {stages.flat().slice(0, 10).map((candidate) => (
+                    <button type="button" className="list-row" key={candidate.applicationId || candidate.id} onClick={() => openCandidate(candidate)}>
                       <span><span className="avatar-mini"><UserRound size={11} /></span><strong>{candidate.name}</strong></span>
                       <span>{visibleStageMeta.find((_, stageIndex) => stages[stageIndex].includes(candidate))?.[0]}</span>
-                      <span>{candidate.age || candidate.schedule || candidate.note}</span>
+                      <span>{candidate.lastActivity || candidate.age || candidate.schedule || candidate.note}</span>
                       <ChevronRight size={16} />
                     </button>
                   ))}
                 </div>
               )}
 
-              {duplicateCandidateGroups > 0 && <div className="duplicate-alert">
-                <CircleAlert size={19} />
-                <div><strong>发现重复候选人</strong><span>系统检测到 {duplicateCandidateGroups} 组重复候选人，建议合并以避免重复跟进。</span></div>
-                <button className="button small secondary" type="button" onClick={() => setModal("duplicates")}>去处理（{duplicateCandidateGroups}）</button>
-                <IconButton label="忽略提醒" onClick={() => notify("本次提醒已忽略")}><X size={17} /></IconButton>
-              </div>}
             </section>
-            <footer className="updated">更新时间：2026-07-11 11:05 <button type="button" onClick={() => notify("数据已刷新")}>刷新</button></footer>
+            <footer className="updated">更新时间：{workbenchState.data?.generatedAt ? new Date(workbenchState.data.generatedAt).toLocaleString("zh-CN", { hour12: false }) : "刚刚"} <button type="button" onClick={() => void loadWorkbench()}>刷新</button></footer>
           </section>
 
           <aside className="right-rail">
             <section className="rail-section">
               <header><h3>待处理事项</h3><IconButton label="更多"><MoreHorizontal size={18} /></IconButton></header>
               <div className="rail-group">
-                <div className="rail-group-title"><span className="status-dot red" />超期沟通（6）<button type="button" onClick={() => setFilterOnlyUrgent(true)}>查看全部</button></div>
-                {["候 C3  已超期 1 天", "候 C4  已超期 1 天", "候 C5  已超期 1 天"].map((item) => <button className="rail-item" type="button" key={item} onClick={() => notify("已定位到对应候选人")}>{item}<small>算法工程师 · 北京</small></button>)}
-                <button className="expand-link" type="button">展开 3 项<ChevronDown size={14} /></button>
+                <div className="rail-group-title"><span className="status-dot red" />待沟通（{workbenchTasks.contact.count}）<button type="button" onClick={() => { setCandidatePreset({ position: "全部职位", stage: "待沟通" }); setActiveNav("候选人"); }}>查看全部</button></div>
+                {workbenchTasks.contact.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.contact.count === 0 && <p>暂无待沟通候选人</p>}
               </div>
               <div className="rail-group">
-                <div className="rail-group-title"><span className="status-dot orange" />待安排面试（{pendingScheduleCandidates.length}）<button type="button" onClick={openInterviewList}>查看全部</button></div>
-                {pendingScheduleCandidates.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.id} onClick={() => openScheduleInterview(candidate)}>{candidate.name}　等待安排<small>{candidate.position} · {candidate.city}</small></button>)}
-                {pendingScheduleCandidates.length === 0 && <p>暂无待安排面试</p>}
+                <div className="rail-group-title"><span className="status-dot orange" />待安排面试（{workbenchTasks.interviewPending.count}）<button type="button" onClick={() => { setCandidatePreset({ position: "全部职位", stage: "待安排" }); setActiveNav("候选人"); }}>查看全部</button></div>
+                {workbenchTasks.interviewPending.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.interviewPending.count === 0 && <p>暂无待安排面试</p>}
               </div>
               <div className="rail-group compact">
-                <div className="rail-group-title"><span className="status-dot blue" />待反馈面试（{pendingFeedbackInterviews.length}）<button type="button" onClick={openInterviewList}>查看全部</button></div>
-                {pendingFeedbackInterviews.slice(0, 3).map((interview) => <button className="rail-item" type="button" key={interview.id} onClick={() => openFeedbackInterview(interview)}>{interview.candidate}　{interview.dateLabel} {interview.round}</button>)}
-                {pendingFeedbackInterviews.length === 0 && <p>暂无待提交反馈</p>}
+                <div className="rail-group-title"><span className="status-dot blue" />待决策（{workbenchTasks.decision.count}）<button type="button" onClick={() => { setCandidatePreset({ position: "全部职位", stage: "待决策" }); setActiveNav("候选人"); }}>查看全部</button></div>
+                {workbenchTasks.decision.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.decision.count === 0 && <p>暂无待决策候选人</p>}
               </div>
             </section>
 
             <section className="rail-section calendar-card">
-              <header><h3>面试日历（未来 7 天）</h3><button type="button" onClick={openInterviewList}>查看日历</button></header>
-              {upcomingInterviewDays.map(([day, count]) => <button type="button" className="calendar-row" key={day} onClick={openInterviewList}><span>{day}</span><strong>{count} 场</strong></button>)}
-              {upcomingInterviewDays.length === 0 && <div className="calendar-empty-slot">未来 7 天暂无面试</div>}
-              <button className="more-calendar" type="button">更多<MoreHorizontal size={15} /></button>
+              <header><h3>面试日历（未来 7 天）</h3></header>
+              <div className="calendar-empty-slot">面试服务尚未接入，当前不展示示例日程</div>
             </section>
           </aside>
         </div>}
@@ -769,7 +748,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
         )}
 
         {!screeningTask && activeNav === "面试" && (

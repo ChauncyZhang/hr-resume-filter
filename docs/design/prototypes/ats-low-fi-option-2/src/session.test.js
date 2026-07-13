@@ -126,11 +126,11 @@ test("forbidden 会话仍可成功退出", async () => {
   assert.equal(controller.getSnapshot().status, "anonymous");
 });
 
-test("服务端角色仅映射到现有三个原型角色", () => {
+test("服务端角色映射到独立的产品角色且按高权限优先", () => {
   assert.equal(mapServerRoles(["system_admin"]), "系统管理员");
   assert.equal(mapServerRoles(["recruiting_admin"]), "招聘管理员");
   assert.equal(mapServerRoles(["recruiter"]), "HR 招聘专员");
-  assert.equal(mapServerRoles(["hiring_manager"]), "面试官");
+  assert.equal(mapServerRoles(["hiring_manager"]), "用人经理");
   assert.equal(mapServerRoles(["interviewer"]), "面试官");
   assert.equal(mapServerRoles(["unknown_role"]), null);
   assert.equal(mapServerRoles(["interviewer", "recruiting_admin"]), "招聘管理员");

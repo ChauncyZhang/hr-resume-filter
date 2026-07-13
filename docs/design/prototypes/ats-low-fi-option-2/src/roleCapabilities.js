@@ -1,5 +1,6 @@
 const RECRUITING_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "人才库", "报表", "设置"];
 const INTERVIEWER_NAV_ITEMS = ["工作台", "面试"];
+const HIRING_MANAGER_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "报表"];
 const ALL_SETTINGS_SECTIONS = ["组织与权限", "流程与评价模板", "AI 设置", "审计与数据治理"];
 
 const RECRUITING_ACTIONS = [
@@ -38,6 +39,12 @@ const ROLE_CAPABILITIES = {
     navItems: RECRUITING_NAV_ITEMS,
     actions: RECRUITING_ACTIONS,
     settingsAccess: "有限",
+  },
+  用人经理: {
+    identity: { name: "用人经理", title: "用人经理" },
+    navItems: HIRING_MANAGER_NAV_ITEMS,
+    actions: ["候选人搜索", "提交面试反馈", "查看报表"],
+    settingsAccess: "无",
   },
   面试官: {
     identity: { name: "王磊", title: "技术面试官" },
