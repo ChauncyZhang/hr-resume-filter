@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
@@ -37,6 +37,7 @@ from server.app.recruiting.service import (
     TicketInvalid, consume_download_ticket_record, create_application_record,
     create_job_definition_record,
     issue_download_ticket_record, persisted_idempotent, transition_application_record,
+    lock_job_for_version_write,
     transition_job_record, patch_job_record, patch_candidate_record, patch_application_record,
     replace_job_definition_record,
 )
@@ -207,16 +208,22 @@ def _job_data(job: Job) -> dict[str, Any]:
 
 
 def _job_definition_data(job: Job, jd: JobJdVersion | None, rules: ScreeningRuleVersion | None) -> dict[str, Any]:
+    jd_content = jd.content if jd is not None and isinstance(jd.content, dict) else {}
+    rules_content = rules.content if rules is not None and isinstance(rules.content, dict) else {}
     return {
         "job": _job_data(job),
-        "jd": None if jd is None else {"id": str(jd.id), "version_number": jd.version_number, **jd.content},
-        "rules": None if rules is None else {"id": str(rules.id), "version_number": rules.version_number, **rules.content},
+        "jd": None if jd is None else {"id": str(jd.id), "version_number": jd.version_number, **{key: jd_content.get(key) for key in ("description", "location", "process_template", "llm_enabled")}},
+        "rules": None if rules is None else {"id": str(rules.id), "version_number": rules.version_number, **{key: rules_content.get(key) for key in ("must_have", "nice_to_have")}},
     }
 
 
-def _job_definition_response(body: dict[str, Any], status: int) -> JSONResponse:
-    response = JSONResponse(body, status_code=status)
-    response.headers["ETag"] = f'"{body["data"]["job"]["version"]}"'
+def _job_definition_response(request: Request, body: dict[str, Any], status: int) -> JSONResponse:
+    try:
+        serialized = JobDefinitionResource.model_validate(body).model_dump(mode="json")
+    except ValidationError:
+        return problem(request, 409, "job_definition_incompatible", "The stored job definition is incompatible with this API contract.")
+    response = JSONResponse(serialized, status_code=status)
+    response.headers["ETag"] = f'"{serialized["data"]["job"]["version"]}"'
     return response
 
 
@@ -345,8 +352,12 @@ def create_job_definition(payload: JobDefinitionCommand, request: Request, idemp
                 command,
                 lambda: (201, {"data": _job_definition_data(*create_job_definition_record(db, principal.organization_id, principal.user_id, command, trace_id=request.state.trace_id))}),
             )
+            response = _job_definition_response(request, body, status)
+            if response.status_code >= 400:
+                db.rollback()
+                return response
             db.commit()
-            return _job_definition_response(body, status)
+            return response
         except IdempotencyConflict as error:
             db.rollback()
             return _problem_for(request, error)
@@ -366,7 +377,7 @@ def get_job_definition(job_id: UUID, request: Request):
             return _denied(request)
         jd = db.scalar(select(JobJdVersion).where(JobJdVersion.organization_id == principal.organization_id, JobJdVersion.job_id == job_id).order_by(JobJdVersion.version_number.desc()))
         rules = db.scalar(select(ScreeningRuleVersion).where(ScreeningRuleVersion.organization_id == principal.organization_id, ScreeningRuleVersion.job_id == job_id).order_by(ScreeningRuleVersion.version_number.desc()))
-        return _job_definition_response({"data": _job_definition_data(job, jd, rules)}, 200)
+        return _job_definition_response(request, {"data": _job_definition_data(job, jd, rules)}, 200)
 
 
 @router.put("/job-definitions/{job_id}", response_model=JobDefinitionResource)
@@ -391,8 +402,12 @@ def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request:
                 command,
                 lambda: (200, {"data": _job_definition_data(*replace_job_definition_record(db, principal.organization_id, job_id, principal.user_id, command, expected_version=expected, trace_id=request.state.trace_id))}),
             )
+            response = _job_definition_response(request, body, status)
+            if response.status_code >= 400:
+                db.rollback()
+                return response
             db.commit()
-            return _job_definition_response(body, status)
+            return response
         except (IdempotencyConflict, InvalidStateTransition, ResourceVersionConflict) as error:
             db.rollback()
             return _problem_for(request, error)
@@ -486,6 +501,7 @@ def _versions(job_id: UUID, request: Request, model, payload: VersionCreate | No
         action = RecruitingAction.CREATE_VERSION if payload is not None else RecruitingAction.READ
         if _load_job(db, principal, job_id, action) is None: return _denied(request)
         if payload is not None:
+            if lock_job_for_version_write(db, principal.organization_id, job_id) is None: return _denied(request)
             number = (db.scalar(select(func.max(model.version_number)).where(model.organization_id == principal.organization_id, model.job_id == job_id)) or 0) + 1
             row = model(organization_id=principal.organization_id, job_id=job_id, version_number=number, content=payload.content, created_by=principal.user_id); db.add(row); db.flush()
             db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="job.version_created", outcome="success", trace_id=request.state.trace_id, metadata_json={"job_id": str(job_id), "version_number": number, "version_type": model.__tablename__}))

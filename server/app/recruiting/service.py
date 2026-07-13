@@ -155,6 +155,12 @@ def patch_job_record(db, organization_id, job_id, changes, *, expected_version, 
     return row
 
 
+def lock_job_for_version_write(db, organization_id, job_id):
+    from server.app.identity.models import Job
+
+    return db.scalar(select(Job).where(Job.organization_id == organization_id, Job.id == job_id).with_for_update())
+
+
 def create_job_definition_record(db, organization_id, actor_user_id, command, *, trace_id):
     from server.app.identity.models import AuditLog, Job, JobCollaborator
     from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
@@ -189,8 +195,6 @@ def create_job_definition_record(db, organization_id, actor_user_id, command, *,
     db.flush()
     safe_metadata = {"job_id": str(job.id), "jd_version_number": 1, "rule_version_number": 1, "status": job.status}
     db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.definition_created", outcome="success", trace_id=trace_id, metadata_json=safe_metadata))
-    if command["publish"]:
-        db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.published", outcome="success", trace_id=trace_id, metadata_json={"job_id": str(job.id), "from_status": "draft", "to_status": "open"}))
     db.flush()
     return job, jd, rules
 
@@ -199,7 +203,7 @@ def replace_job_definition_record(db, organization_id, job_id, actor_user_id, co
     from server.app.identity.models import AuditLog, Job
     from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
 
-    job = db.scalar(select(Job).where(Job.organization_id == organization_id, Job.id == job_id).with_for_update())
+    job = lock_job_for_version_write(db, organization_id, job_id)
     if job is None or job.version != expected_version:
         raise ResourceVersionConflict
     if command["publish"] and job.status != "draft":

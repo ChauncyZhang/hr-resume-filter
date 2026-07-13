@@ -1,21 +1,21 @@
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from threading import Barrier, Event
 from datetime import datetime, timedelta, timezone
 import os
 import subprocess
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from server.app.core.settings import Settings
-from server.app.identity.models import Organization, User, UserRole, UserStatus
+from server.app.identity.models import Job, Organization, User, UserRole, UserStatus
 from server.app.identity.security import PasswordService
 from server.app.identity.service import AuthenticationFailed, Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
-from server.app.recruiting.models import CandidateEvent
+from server.app.recruiting.models import CandidateEvent, IdempotencyRecord, JobJdVersion, ScreeningRuleVersion
 from server.app.recruiting.service import (IdempotencyConflict, ResourceVersionConflict, TicketInvalid, consume_download_ticket_record, issue_download_ticket_record, persisted_idempotent, transition_application_record, transition_job_record, patch_application_record, patch_candidate_record, patch_job_record)
 from server.app.main import create_app
 
@@ -67,6 +67,120 @@ class FixedToken:
 class Probe:
     async def check(self):
         pass
+
+
+def job_definition_payload(**changes):
+    payload = {"title": "Concurrent role", "department_id": None, "headcount": 1, "priority": "normal", "hiring_owner_id": None, "description": "Concurrent JD", "location": "Remote", "process_template": "standard", "llm_enabled": False, "must_have": ["Python"], "nice_to_have": [], "publish": False}
+    payload.update(changes)
+    return payload
+
+
+def seed_pg_admin(store, slug):
+    user_id, organization_id = seed_pg_user(store, slug)
+    with store.sync_session() as db:
+        db.add(UserRole(user_id=user_id, role="recruiting_admin")); db.commit()
+    return user_id, organization_id
+
+
+def pg_app_and_headers(pg_store, slug):
+    seed_pg_admin(pg_store, slug)
+    app = create_app(settings=Settings(environment="test", database_url=os.environ["POSTGRES_SMOKE_URL"], cors_origins=["https://hr.example.test"]), database_probe=Probe(), storage_probe=Probe())
+    client = TestClient(app, raise_server_exceptions=False)
+    login = client.post("/api/v1/auth/login", json={"organization_slug": slug, "email": "user@example.test", "password": "correct"}, headers={"Origin": "https://hr.example.test"})
+    assert login.status_code == 200
+    return app, client, {"Origin": "https://hr.example.test", "X-CSRF-Token": login.headers["X-CSRF-Token"]}
+
+
+def test_postgres_two_puts_with_same_version_return_success_and_conflict_without_500(pg_store) -> None:
+    app, client, headers = pg_app_and_headers(pg_store, "job-definition-two-put")
+    created = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "create-two-put"})
+    job_id = created.json()["data"]["job"]["id"]
+    barrier = Barrier(2, timeout=5)
+
+    def replace(index):
+        barrier.wait()
+        return client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(title=f"Concurrent {index}"), headers={**headers, "If-Match": '"1"', "Idempotency-Key": f"replace-{index}"})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(replace, (1, 2)))
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    assert all(response.status_code != 500 for response in responses)
+    assert next(response for response in responses if response.status_code == 409).json()["code"] == "resource_version_conflict"
+    job_uuid = UUID(job_id)
+    with pg_store.sync_session() as db:
+        assert db.get(Job, job_uuid).version == 2
+        assert db.query(JobJdVersion).filter_by(job_id=job_uuid).count() == 2
+        assert db.query(ScreeningRuleVersion).filter_by(job_id=job_uuid).count() == 2
+    client.close()
+
+
+@pytest.mark.parametrize(("legacy_path", "table_name"), [("jd-versions", "job_jd_versions"), ("rule-versions", "screening_rule_versions")])
+def test_postgres_put_and_legacy_version_write_share_job_lock_without_500(pg_store, legacy_path, table_name) -> None:
+    app, client, headers = pg_app_and_headers(pg_store, f"job-definition-mixed-{legacy_path}")
+    created = client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "create-mixed"})
+    job_id = created.json()["data"]["job"]["id"]
+    old_read_max = Event()
+    release_old = Event()
+    observed_legacy_sql = []
+
+    def pause_legacy_after_max(connection, cursor, statement, parameters, context, executemany):
+        normalized = " ".join(statement.lower().split())
+        observed_legacy_sql.append(normalized)
+        if not old_read_max.is_set() and "max(" in normalized and f"{table_name}.version_number" in normalized:
+            old_read_max.set()
+            assert release_old.wait(timeout=5)
+
+    event.listen(app.state.identity_store.engine, "after_cursor_execute", pause_legacy_after_max)
+    try:
+        def legacy_write():
+            return client.post(f"/api/v1/jobs/{job_id}/{legacy_path}", json={"content": {"legacy": "concurrent"}}, headers=headers)
+
+        def replacement():
+            return client.put(f"/api/v1/job-definitions/{job_id}", json=job_definition_payload(description="replacement concurrent"), headers={**headers, "If-Match": '"1"', "Idempotency-Key": "mixed-replace"})
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            old_future = executor.submit(legacy_write)
+            assert old_read_max.wait(timeout=5), observed_legacy_sql
+            put_future = executor.submit(replacement)
+            try:
+                put_future.result(timeout=0.5)
+            except FutureTimeout:
+                pass
+            finally:
+                release_old.set()
+            responses = [old_future.result(timeout=5), put_future.result(timeout=5)]
+    finally:
+        release_old.set()
+        event.remove(app.state.identity_store.engine, "after_cursor_execute", pause_legacy_after_max)
+        client.close()
+    assert sorted(response.status_code for response in responses) == [200, 201]
+    assert all(response.status_code != 500 for response in responses)
+    job_uuid = UUID(job_id)
+    with pg_store.sync_session() as db:
+        jd_versions = [row.version_number for row in db.query(JobJdVersion).filter_by(job_id=job_uuid).order_by(JobJdVersion.version_number)]
+        rule_versions = [row.version_number for row in db.query(ScreeningRuleVersion).filter_by(job_id=job_uuid).order_by(ScreeningRuleVersion.version_number)]
+        assert (jd_versions, rule_versions) == (([1, 2, 3], [1, 2]) if legacy_path == "jd-versions" else ([1, 2], [1, 2, 3]))
+
+
+def test_postgres_first_same_idempotency_key_concurrency_replays_one_create(pg_store) -> None:
+    app, client, headers = pg_app_and_headers(pg_store, "job-definition-idempotency")
+    barrier = Barrier(2, timeout=5)
+
+    def create(_):
+        barrier.wait()
+        return client.post("/api/v1/job-definitions", json=job_definition_payload(), headers={**headers, "Idempotency-Key": "same-first-key"})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(create, (1, 2)))
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json() == responses[1].json()
+    assert all(response.status_code != 500 for response in responses)
+    with pg_store.sync_session() as db:
+        assert db.query(Job).count() == 1
+        assert db.query(JobJdVersion).count() == 1
+        assert db.query(ScreeningRuleVersion).count() == 1
+        assert db.query(IdempotencyRecord).filter_by(idempotency_key="same-first-key").count() == 1
+    client.close()
 
 
 def test_postgres_api_applies_recruiter_scope_inside_job_candidate_and_funnel_queries(pg_store) -> None:
