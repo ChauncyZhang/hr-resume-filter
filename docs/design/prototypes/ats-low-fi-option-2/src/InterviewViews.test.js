@@ -32,34 +32,35 @@ const form = {
 
 test("feedback drafts are isolated by interview id", () => {
   const storage = createStorage();
-  saveInterviewFeedbackDraft("INT-001", form, storage);
+  saveInterviewFeedbackDraft("USER-001", "INT-001", form, storage);
 
-  assert.equal(JSON.stringify(loadInterviewFeedbackDraft({ id: "INT-001" }, storage)), JSON.stringify(form));
-  assert.equal(loadInterviewFeedbackDraft({ id: "INT-002" }, storage), null);
+  assert.equal(JSON.stringify(loadInterviewFeedbackDraft("USER-001", { id: "INT-001" }, storage)), JSON.stringify(form));
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-002" }, storage), null);
+  assert.equal(loadInterviewFeedbackDraft("USER-002", { id: "INT-001" }, storage), null);
 });
 
 test("submitted feedback never loads a local draft", () => {
   const storage = createStorage();
-  saveInterviewFeedbackDraft("INT-001", form, storage);
+  saveInterviewFeedbackDraft("USER-001", "INT-001", form, storage);
 
-  assert.equal(loadInterviewFeedbackDraft({ id: "INT-001", feedback: { canEdit: false } }, storage), null);
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-001", feedback: { canEdit: false } }, storage), null);
 });
 
 test("invalid or unavailable storage falls back without throwing", () => {
-  const invalidStorage = createStorage({ [getInterviewFeedbackDraftKey("INT-001")]: "not-json" });
+  const invalidStorage = createStorage({ [getInterviewFeedbackDraftKey("USER-001", "INT-001")]: "not-json" });
   const unavailableStorage = { getItem() { throw new Error("blocked"); } };
 
-  assert.equal(loadInterviewFeedbackDraft({ id: "INT-001" }, invalidStorage), null);
-  assert.equal(loadInterviewFeedbackDraft({ id: "INT-001" }, unavailableStorage), null);
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-001" }, invalidStorage), null);
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-001" }, unavailableStorage), null);
 });
 
 test("clearing a submitted draft removes only that interview draft", () => {
   const storage = createStorage();
-  saveInterviewFeedbackDraft("INT-001", form, storage);
-  saveInterviewFeedbackDraft("INT-002", { ...form, conclusion: "保留" }, storage);
+  saveInterviewFeedbackDraft("USER-001", "INT-001", form, storage);
+  saveInterviewFeedbackDraft("USER-001", "INT-002", { ...form, conclusion: "保留" }, storage);
 
-  clearInterviewFeedbackDraft("INT-001", storage);
+  clearInterviewFeedbackDraft("USER-001", "INT-001", storage);
 
-  assert.equal(loadInterviewFeedbackDraft({ id: "INT-001" }, storage), null);
-  assert.equal(loadInterviewFeedbackDraft({ id: "INT-002" }, storage).conclusion, "保留");
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-001" }, storage), null);
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-002" }, storage).conclusion, "保留");
 });

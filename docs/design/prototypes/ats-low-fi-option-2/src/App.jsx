@@ -21,22 +21,22 @@ import {
   UserRoundSearch,
   X,
 } from "lucide-react";
-import { initialPositionRecords, JobsWorkspace } from "./JobViews.jsx";
+import { JobsWorkspace } from "./JobViews.jsx";
 import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
 import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
-import { initialInterviewRecords, InterviewsWorkspace } from "./InterviewViews.jsx";
+import { InterviewsWorkspace } from "./InterviewViews.jsx";
 import { initialTalentMemberships, initialTalentPools, TalentPoolWorkspace } from "./TalentPoolViews.jsx";
 import { ReportWorkspace } from "./ReportViews.jsx";
 import { SettingsWorkspace } from "./SettingsViews.jsx";
-import { syntheticResumeFilesFor } from "./syntheticResumeFixtures.js";
 import { canPerformAction, getAllowedNavItems, getDefaultNavItem } from "./roleCapabilities.js";
-import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts, saveInterview, submitInterviewFeedback, validateWorkflowState } from "./ux08Workflow.js";
+import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts } from "./ux08Workflow.js";
 import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 import { screeningController as defaultScreeningController } from "./screeningController.js";
 import { candidateController as defaultCandidateController } from "./candidateController.js";
 import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
+import { deriveCandidateInterviews, interviewController as defaultInterviewController } from "./interviewController.js";
 import {
   appendJobPage,
   createInitialJobWorkspaceState,
@@ -134,7 +134,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController, interviewController = defaultInterviewController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -149,10 +149,10 @@ export function App({ controller = sessionController, screeningController = defa
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} interviewController={interviewController} />;
 }
 
-function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController }) {
+function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController, interviewController }) {
   const currentRole = session.role || "未知角色";
   const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
@@ -179,10 +179,10 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [candidateDetailState, setCandidateDetailState] = useState(null);
   const candidateLoadRef = useRef(null);
   const [candidatePreset, setCandidatePreset] = useState(null);
-  const [currentScenario, setCurrentScenario] = useState("default");
   const [interviewMode, setInterviewMode] = useState("list");
-  const [interviewRecords, setInterviewRecords] = useState(initialInterviewRecords);
-  const [selectedInterview, setSelectedInterview] = useState(null);
+  const [interviewState, setInterviewState] = useState({ status: "loading", records: [], tasks: [], error: "" });
+  const [selectedInterviewId, setSelectedInterviewId] = useState(null);
+  const interviewLoadRef = useRef(null);
   const [scheduleCandidateId, setScheduleCandidateId] = useState(null);
   const [interviewOrigin, setInterviewOrigin] = useState(null);
   const [talentMode, setTalentMode] = useState("list");
@@ -204,6 +204,15 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const workbenchTasks = workbenchState.data?.tasks || { contact: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup };
   const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
   const roleIdentity = getSessionIdentity(session.user, currentRole);
+  const interviewRecords = interviewState.records;
+  const selectedInterview = interviewRecords.find((record) => record.id === selectedInterviewId) || null;
+  const selectedCandidateWithInterviews = useMemo(() => selectedCandidate ? { ...selectedCandidate, interviews: deriveCandidateInterviews(selectedCandidate.id, interviewRecords) } : null, [interviewRecords, selectedCandidate]);
+  const interviewCandidates = useMemo(() => {
+    if (!selectedCandidateWithInterviews) return candidateRecords;
+    return candidateRecords.some((candidate) => candidate.id === selectedCandidateWithInterviews.id || candidate.candidateId === selectedCandidateWithInterviews.id)
+      ? candidateRecords
+      : [selectedCandidateWithInterviews, ...candidateRecords];
+  }, [candidateRecords, selectedCandidateWithInterviews]);
   const sessionMessage = getSessionMessage(session.error);
   const screeningSummary = useMemo(() => {
     if (!recentTask?.files?.length) return null;
@@ -214,7 +223,41 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
       failed: recentTask.files.filter((file) => file.status === "failed").length,
     };
   }, [recentTask]);
-  const workflowValidation = useMemo(() => validateWorkflowState({ positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships }), [candidateRecords, interviewRecords, positionRecords, talentMemberships, talentPools]);
+
+  const loadInterviews = useCallback(async () => {
+    interviewLoadRef.current?.abort();
+    const controller = new AbortController();
+    interviewLoadRef.current = controller;
+    setInterviewState((current) => ({ ...current, status: "loading", error: "" }));
+    try {
+      const [page, tasks] = await Promise.all([
+        interviewController.list({}, { signal: controller.signal }),
+        interviewController.listMyTasks({ signal: controller.signal }),
+      ]);
+      if (interviewLoadRef.current !== controller) return null;
+      setInterviewState({ status: "ready", records: page.records, tasks, error: "" });
+      setSelectedInterviewId((current) => current && page.records.some((record) => record.id === current) ? current : null);
+      return page.records;
+    } catch (error) {
+      if (error?.name === "AbortError" || interviewLoadRef.current !== controller) return null;
+      setInterviewState((current) => ({ ...current, status: "error", error: "面试加载失败，请检查网络后重试。" }));
+      return null;
+    } finally {
+      if (interviewLoadRef.current === controller) interviewLoadRef.current = null;
+    }
+  }, [interviewController]);
+
+  const refreshInterviewsAfterMutation = useCallback(async (record) => {
+    if (record?.id) {
+      setInterviewState((current) => ({
+        ...current,
+        records: current.records.some((item) => item.id === record.id)
+          ? current.records.map((item) => item.id === record.id ? { ...item, ...record } : item)
+          : [record, ...current.records],
+      }));
+    }
+    await loadInterviews();
+  }, [loadInterviews]);
 
   const loadWorkbench = useCallback(async () => {
     if (currentRole === "面试官") return null;
@@ -312,6 +355,14 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   }, [loadJobs]);
 
   useEffect(() => {
+    void loadInterviews();
+    return () => {
+      interviewLoadRef.current?.abort();
+      interviewLoadRef.current = null;
+    };
+  }, [loadInterviews]);
+
+  useEffect(() => {
     if (activeNav === "工作台" && currentRole !== "面试官") void loadWorkbench();
     return () => {
       workbenchLoadRef.current?.abort();
@@ -367,13 +418,12 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   }, []);
 
   function workflowState() {
-    return { positions: positionRecords, candidates: candidateRecords, interviews: interviewRecords, pools: talentPools, memberships: talentMemberships };
+    return { positions: positionRecords, candidates: candidateRecords, interviews: [], pools: talentPools, memberships: talentMemberships };
   }
 
   function applyWorkflowState(next) {
     setPositionRecords(next.positions);
     setCandidateRecords(next.candidates);
-    setInterviewRecords(next.interviews);
     setTalentPools(next.pools);
     setTalentMemberships(next.memberships);
   }
@@ -387,69 +437,6 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     if (action === "添加标签") next.candidates = next.candidates.map((candidate) => candidateIds.includes(candidate.id) && !candidate.tags.includes("批量复核") ? { ...candidate, tags: [...candidate.tags, "批量复核"] } : candidate);
     applyWorkflowState(next);
     return { previousState: previous, affectedCount: new Set(candidateIds).size };
-  }
-
-  function resetScenario(scenario) {
-    const baseCandidates = structuredClone(initialCandidateRecords);
-    const basePositions = recalculatePositionCounts(structuredClone(initialPositionRecords), baseCandidates);
-    const baseInterviews = structuredClone(initialInterviewRecords);
-    const basePools = structuredClone(initialTalentPools);
-    const baseMemberships = structuredClone(initialTalentMemberships);
-    setCandidateRecords(baseCandidates);
-    setPositionRecords(basePositions);
-    setInterviewRecords(baseInterviews);
-    setTalentPools(basePools);
-    setTalentMemberships(baseMemberships);
-    setActiveNav("工作台");
-    setActiveJob("AI 工程师");
-    setScreeningTask(null);
-    setRecentTask(null);
-    setSelectedCandidate(null);
-    setCandidateMode("list");
-    setSelectedInterview(null);
-    setInterviewMode("list");
-    setScheduleCandidateId(null);
-    setSelectedPoolId(null);
-    setTalentMode("list");
-    setSelectedJob(null);
-    setJobMode("list");
-    setImportOpen(false);
-    if (recentTaskStorageKey) window.localStorage.removeItem(recentTaskStorageKey);
-
-    if (scenario === "new-position") {
-      setActiveNav("职位");
-      setSelectedJob(basePositions.find((position) => position.name === "AI 工程师"));
-      setJobMode("detail");
-    }
-    if (scenario === "partial-screening") {
-      const files = syntheticResumeFilesFor("AI 工程师").map((file) => ({ ...file, status: file.expectedParseStatus === "failed" ? "failed" : file.expectedLlmStatus === "failed" ? "partial" : "success", traceId: file.expectedParseStatus === "failed" ? "TR-PARSE-4081" : file.expectedLlmStatus === "failed" ? "TR-LLM-4297" : null, error: file.expectedParseStatus === "failed" ? "PDF 文本层损坏，未能提取有效内容" : file.expectedLlmStatus === "failed" ? "LLM 请求额度暂时不可用，已保留规则评分" : null }));
-      const task = { id: "SCR-UX08-PARTIAL", position: "AI 工程师", source: "UX-08 合成数据", note: "部分失败恢复验收", llmEnabled: true, creator: "张小北", createdAt: "刚刚", status: "partial", stage: "已完成", completed: files.length, elapsed: 56, files, serverBacked: false };
-      setScreeningTask(task);
-      setRecentTask(task);
-    }
-    if (scenario === "pending-feedback") {
-      setActiveNav("面试");
-      setSelectedInterview(baseInterviews.find((interview) => interview.id === "INT-002"));
-      setInterviewMode("feedback");
-    }
-    if (scenario === "talent-reactivation") {
-      setActiveNav("人才库");
-      setSelectedPoolId("POOL-FOLLOW");
-      setTalentMode("detail");
-    }
-    if (scenario === "empty") {
-      setCandidateRecords([]);
-      setPositionRecords(recalculatePositionCounts(basePositions, []));
-      setInterviewRecords([]);
-      setTalentMemberships([]);
-      setTalentPools(basePools.map((pool) => ({ ...pool, memberIds: [] })));
-      setActiveNav("候选人");
-    }
-    if (scenario === "restricted") {
-      setActiveNav("报表");
-    }
-    setCurrentScenario(scenario);
-    notify(`已切换到“${scenario}”验收场景`);
   }
 
   function openJobForm() {
@@ -522,7 +509,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setScreeningTask(null);
     setActiveNav("面试");
     setInterviewMode("list");
-    setSelectedInterview(null);
+    setSelectedInterviewId(null);
     setScheduleCandidateId(null);
     setInterviewOrigin(null);
   }
@@ -532,7 +519,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setScreeningTask(null);
     setActiveNav("面试");
     setInterviewMode("schedule");
-    setSelectedInterview(interview);
+    setSelectedInterviewId(interview?.id || null);
     setScheduleCandidateId(candidate?.id || null);
   }
 
@@ -543,7 +530,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setScreeningTask(null);
     setActiveNav("面试");
     setInterviewMode("feedback");
-    setSelectedInterview(interview);
+    setSelectedInterviewId(interview.id);
     setScheduleCandidateId(null);
   }
 
@@ -554,14 +541,6 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setSelectedCandidate(interviewOrigin.selectedCandidate);
     setScreeningTask(interviewOrigin.screeningTask);
     setInterviewOrigin(null);
-  }
-
-  function syncInterviewToCandidate(interview) {
-    const next = interview.feedbackStatus === "已提交" && interview.feedback
-      ? submitInterviewFeedback(workflowState(), interview.id, interview.feedback)
-      : saveInterview(workflowState(), interview);
-    applyWorkflowState(next);
-    if (selectedCandidate?.id === interview.candidateId) setSelectedCandidate(next.candidates.find((candidate) => candidate.id === interview.candidateId));
   }
 
   function addCandidatesToTalentPool(candidateIds, poolId = "POOL-FOLLOW") {
@@ -608,7 +587,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
                   setCandidatePreset(null);
                 } else if (label === "面试") {
                   setInterviewMode("list");
-                  setSelectedInterview(null);
+                  setSelectedInterviewId(null);
                 } else if (label === "人才库") {
                   setTalentMode("list");
                 } else if (!['工作台', '报表', '设置'].includes(label)) {
@@ -639,9 +618,12 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
           </div>
         </header>
 
-        {!screeningTask && activeNav === "工作台" && currentRole === "面试官" && <div className="interviewer-workbench">
-          <header><div><h2>我的面试工作台</h2><p>面试安排与反馈将在服务端面试模块接入后显示。</p></div><span>尚未接入</span></header>
-          <section className="workbench-unavailable"><CalendarDays size={24} /><div><strong>暂无可读取的面试数据</strong><p>当前页面不会展示本地示例面试，避免与真实招聘安排混淆。</p></div></section>
+        {!screeningTask && activeNav === "工作台" && currentRole === "面试官" && <div className="interviewer-workbench" aria-busy={interviewState.status === "loading"}>
+          <header><div><h2>我的面试工作台</h2><p>显示服务端分配给你的面试和待反馈任务。</p></div><span>{interviewState.tasks.length} 项待办</span></header>
+          {interviewState.status === "loading" && interviewState.tasks.length === 0 && <section className="workbench-unavailable" role="status"><CalendarDays size={24} /><div><strong>正在加载面试任务</strong><p>请稍候。</p></div></section>}
+          {interviewState.status === "error" && interviewState.tasks.length === 0 && <section className="workbench-unavailable" role="alert"><CircleAlert size={24} /><div><strong>面试任务加载失败</strong><p>{interviewState.error}</p><button className="button secondary" type="button" onClick={() => void loadInterviews()}>重试</button></div></section>}
+          {interviewState.status === "ready" && interviewState.tasks.length === 0 && <section className="workbench-unavailable"><CalendarDays size={24} /><div><strong>暂无待处理面试任务</strong><p>新的安排和反馈任务会在这里显示。</p></div></section>}
+          {interviewState.tasks.length > 0 && <section className="rail-section">{interviewState.tasks.map((task) => <button className="rail-item" type="button" key={task.id} onClick={() => task.type === "interview_feedback" ? openFeedbackInterview(task.interviewId) : openInterviewList()}><strong>{task.candidate} · {task.round}</strong><small>{task.position} · {task.startsAt ? new Date(task.startsAt).toLocaleString("zh-CN", { hour12: false }) : "时间未记录"}</small></button>)}</section>}
         </div>}
 
         {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "loading" && !workbenchState.data && <WorkbenchSkeleton />}
@@ -725,7 +707,9 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
 
             <section className="rail-section calendar-card">
               <header><h3>面试日历（未来 7 天）</h3></header>
-              <div className="calendar-empty-slot">面试服务尚未接入，当前不展示示例日程</div>
+              {interviewRecords.slice(0, 4).map((record) => <button className="rail-item" type="button" key={record.id} onClick={() => { setActiveNav("面试"); setInterviewMode("list"); }}><strong>{record.candidate} · {record.round}</strong><small>{record.dateLabel} {record.time} · {record.interviewers.join("、")}</small></button>)}
+              {interviewState.status === "ready" && interviewRecords.length === 0 && <div className="calendar-empty-slot">未来暂无面试安排</div>}
+              {interviewState.status === "error" && interviewRecords.length === 0 && <div className="calendar-empty-slot">面试日历加载失败</div>}
             </section>
           </aside>
         </div>}
@@ -748,11 +732,11 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidate} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidateWithInterviews} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
-          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterview={selectedInterview} setSelectedInterview={setSelectedInterview} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} setRecords={setInterviewRecords} candidates={candidateRecords} onNotify={notify} onBack={backFromInterview} onRecordSaved={syncInterviewToCandidate} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} />
+          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterviewId={selectedInterviewId} setSelectedInterviewId={setSelectedInterviewId} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} status={interviewState.status} error={interviewState.error} onRetry={() => void loadInterviews()} candidates={interviewCandidates} onNotify={notify} onBack={backFromInterview} onRecordsChanged={refreshInterviewsAfterMutation} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} actorId={session.user?.id} controller={interviewController} />
         )}
 
         {!screeningTask && activeNav === "人才库" && (
