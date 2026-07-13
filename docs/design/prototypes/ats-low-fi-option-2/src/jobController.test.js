@@ -1,0 +1,363 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { ApiError } from "./apiClient.js";
+import jobController, { createJobController } from "./jobController.js";
+
+const JOB_ID = "11111111-1111-4111-8111-111111111111";
+const DEPARTMENT_ID = "22222222-2222-4222-8222-222222222222";
+const OWNER_ID = "33333333-3333-4333-8333-333333333333";
+const HIRING_OWNER_ID = "44444444-4444-4444-8444-444444444444";
+
+function apiJob(changes = {}) {
+  return {
+    id: JOB_ID,
+    title: "平台工程师",
+    department_id: DEPARTMENT_ID,
+    department_name: "技术部",
+    headcount: 3,
+    priority: "high",
+    hiring_owner_id: HIRING_OWNER_ID,
+    hiring_owner_name: "招聘经理",
+    owner_id: OWNER_ID,
+    owner_name: "招聘负责人",
+    status: "open",
+    version: 7,
+    updated_at: "2026-07-13T03:05:00Z",
+    funnel: {
+      stages: { new: 9, review: 4, interview_pending: 2, interviewing: 3, decision: 1 },
+      total: 19,
+    },
+    ...changes,
+  };
+}
+
+function definitionResource(changes = {}) {
+  return {
+    data: {
+      job: apiJob(changes.job),
+      jd: {
+        id: "jd-1",
+        version_number: 3,
+        description: "建设可靠的招聘平台。",
+        location: "上海",
+        process_template: "技术岗位标准流程",
+        llm_enabled: true,
+        ...changes.jd,
+      },
+      rules: {
+        id: "rules-1",
+        version_number: 4,
+        must_have: ["JavaScript", "React"],
+        nice_to_have: ["Vite"],
+        ...changes.rules,
+      },
+    },
+  };
+}
+
+function queuedClient(responses) {
+  const calls = [];
+  return {
+    calls,
+    client: {
+      async request(path, options = {}) {
+        calls.push({ path, options });
+        const response = responses.shift();
+        if (response instanceof Error) throw response;
+        return typeof response === "function" ? response(path, options) : response;
+      },
+    },
+  };
+}
+
+test("exports the job controller factory and default controller", () => {
+  assert.equal(typeof createJobController, "function");
+  assert.equal(typeof jobController.listJobs, "function");
+});
+
+test("listJobs encodes supplied filters and fully normalizes records and facets", async () => {
+  const response = {
+    data: [apiJob()],
+    meta: {
+      next_cursor: "next/page",
+      departments: [{ id: DEPARTMENT_ID, name: "技术部" }],
+      owners: [{ id: HIRING_OWNER_ID, name: "招聘经理" }],
+      status_counts: { draft: 2, open: 5, paused: 1, closed: 3, archived: 4 },
+    },
+  };
+  const { client, calls } = queuedClient([response]);
+  const signal = new AbortController().signal;
+  const controller = createJobController({ client });
+
+  const result = await controller.listJobs({
+    q: "  平台 & 架构  ",
+    status: "招聘中",
+    departmentId: DEPARTMENT_ID,
+    ownerId: HIRING_OWNER_ID,
+    cursor: "next/page",
+    limit: 100,
+    ignored: "never-send",
+  }, { signal });
+
+  assert.equal(calls[0].path, `/api/v1/jobs?q=%E5%B9%B3%E5%8F%B0+%26+%E6%9E%B6%E6%9E%84&status=open&department_id=${DEPARTMENT_ID}&owner_id=${HIRING_OWNER_ID}&cursor=next%2Fpage&limit=100`);
+  assert.deepEqual(calls[0].options, { signal });
+  assert.deepEqual(result, {
+    records: [{
+      id: JOB_ID,
+      serverBacked: true,
+      version: 7,
+      title: "平台工程师",
+      name: "平台工程师",
+      departmentId: DEPARTMENT_ID,
+      department: "技术部",
+      ownerId: HIRING_OWNER_ID,
+      owner: "招聘经理",
+      headcount: 3,
+      status: "招聘中",
+      priority: "高",
+      updated: new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date("2026-07-13T03:05:00Z")),
+      updatedAt: "2026-07-13T03:05:00Z",
+      funnel: { new: 9, review: 4, interview_pending: 2, interviewing: 3, decision: 1 },
+      candidates: 19,
+      review: 4,
+      interview: 5,
+      decision: 1,
+    }],
+    nextCursor: "next/page",
+    departments: [{ id: DEPARTMENT_ID, name: "技术部" }],
+    owners: [{ id: HIRING_OWNER_ID, name: "招聘经理" }],
+    statusCounts: { 草稿: 2, 招聘中: 5, 已暂停: 1, 已关闭: 3, 已归档: 4 },
+  });
+});
+
+test("listJobs omits invalid filters and safely defaults malformed optional values", async () => {
+  const { client, calls } = queuedClient([{
+    data: [apiJob({
+      department_id: null,
+      department_name: null,
+      hiring_owner_id: null,
+      hiring_owner_name: null,
+      headcount: "3",
+      priority: "urgent",
+      status: "unknown",
+      version: null,
+      updated_at: "bad-date",
+      funnel: { stages: { review: "4", interviewing: -2 }, total: "19" },
+    })],
+    meta: {
+      next_cursor: 42,
+      departments: [{ id: DEPARTMENT_ID, name: "" }, null, { id: DEPARTMENT_ID, name: "技术部" }],
+      owners: [{ id: "", name: "无效" }, { id: OWNER_ID, name: "招聘负责人" }],
+      status_counts: { open: "5", paused: -1 },
+    },
+  }]);
+  const controller = createJobController({ client });
+
+  const result = await controller.listJobs({
+    q: " ", status: "全部状态", departmentId: "not-a-uuid", ownerId: "not-a-uuid", cursor: "", limit: 101,
+  });
+
+  assert.equal(calls[0].path, "/api/v1/jobs");
+  assert.deepEqual(calls[0].options, {});
+  assert.deepEqual(result.departments, [{ id: DEPARTMENT_ID, name: "技术部" }]);
+  assert.deepEqual(result.owners, [{ id: OWNER_ID, name: "招聘负责人" }]);
+  assert.deepEqual(result.statusCounts, { 草稿: 0, 招聘中: 0, 已暂停: 0, 已关闭: 0, 已归档: 0 });
+  assert.equal(result.nextCursor, null);
+  assert.deepEqual(result.records[0], {
+    id: JOB_ID,
+    serverBacked: true,
+    version: null,
+    title: "平台工程师",
+    name: "平台工程师",
+    departmentId: "",
+    department: "",
+    ownerId: OWNER_ID,
+    owner: "招聘负责人",
+    headcount: 0,
+    status: "",
+    priority: "",
+    updated: "未记录",
+    updatedAt: "bad-date",
+    funnel: { review: 0, interviewing: 0 },
+    candidates: 0,
+    review: 0,
+    interview: 0,
+    decision: 0,
+  });
+});
+
+test("loadDefinition starts definition and funnel requests concurrently and propagates the signal", async () => {
+  const signal = new AbortController().signal;
+  const calls = [];
+  let resolveDefinition;
+  let resolveFunnel;
+  const client = {
+    request(path, options) {
+      calls.push({ path, options });
+      return new Promise((resolve) => {
+        if (path.includes("job-definitions")) resolveDefinition = resolve;
+        else resolveFunnel = resolve;
+      });
+    },
+  };
+  const pending = createJobController({ client }).loadDefinition(JOB_ID, { signal });
+  await Promise.resolve();
+
+  assert.deepEqual(calls, [
+    { path: `/api/v1/job-definitions/${JOB_ID}`, options: { signal } },
+    { path: `/api/v1/jobs/${JOB_ID}/funnel`, options: { signal } },
+  ]);
+
+  resolveDefinition(definitionResource({ job: { funnel: undefined } }));
+  resolveFunnel({ data: { job_id: JOB_ID, stages: { review: 2, interviewing: 1 }, total: 6 } });
+  const result = await pending;
+  assert.equal(result.jd, "建设可靠的招聘平台。");
+  assert.equal(result.location, "上海");
+  assert.equal(result.process, "技术岗位标准流程");
+  assert.equal(result.llmEnabled, true);
+  assert.deepEqual(result.mustHave, ["JavaScript", "React"]);
+  assert.deepEqual(result.niceToHave, ["Vite"]);
+  assert.equal(result.jdId, "jd-1");
+  assert.equal(result.jdVersion, 3);
+  assert.equal(result.rulesId, "rules-1");
+  assert.equal(result.rulesVersion, 4);
+  assert.equal(result.candidates, 6);
+  assert.equal(result.review, 2);
+  assert.equal(result.interview, 1);
+});
+
+test("loadDefinition gives legacy definitions safe blanks without invented version identity", async () => {
+  const { client } = queuedClient([
+    { data: { job: apiJob({ funnel: undefined }), jd: null, rules: null } },
+    { data: { job_id: JOB_ID, stages: null, total: null } },
+  ]);
+
+  const result = await createJobController({ client }).loadDefinition(JOB_ID);
+
+  assert.deepEqual({
+    jd: result.jd,
+    location: result.location,
+    process: result.process,
+    llmEnabled: result.llmEnabled,
+    mustHave: result.mustHave,
+    niceToHave: result.niceToHave,
+    jdId: result.jdId,
+    jdVersion: result.jdVersion,
+    rulesId: result.rulesId,
+    rulesVersion: result.rulesVersion,
+  }, {
+    jd: "", location: "", process: "", llmEnabled: false, mustHave: [], niceToHave: [],
+    jdId: null, jdVersion: null, rulesId: null, rulesVersion: null,
+  });
+});
+
+test("saveDefinition maps the complete UI form for draft, publish, and versioned update", async () => {
+  const responses = [
+    definitionResource({ job: { status: "draft" } }),
+    definitionResource({ job: { status: "open" } }),
+    definitionResource({ job: { status: "open", version: 8 } }),
+  ];
+  const { client, calls } = queuedClient(responses);
+  const keys = ["create-draft", "create-published", "update-definition"];
+  const controller = createJobController({ client, idempotencyKey: () => keys.shift() });
+  const signal = new AbortController().signal;
+  const values = {
+    name: "  平台工程师  ",
+    department: "技术部",
+    departmentId: DEPARTMENT_ID,
+    location: "  上海  ",
+    headcount: 3,
+    owner: "招聘经理",
+    ownerId: HIRING_OWNER_ID,
+    priority: "高",
+    jd: "  建设可靠的招聘平台。  ",
+    mustHave: " JavaScript、React， ",
+    niceToHave: [" Vite ", ""],
+    process: "  技术岗位标准流程  ",
+    llmEnabled: true,
+  };
+
+  const draft = await controller.saveDefinition(values, { publish: false, signal });
+  const published = await controller.saveDefinition(values, { publish: true, signal });
+  const updated = await controller.saveDefinition(values, { job: { id: JOB_ID, version: 7 }, publish: false, signal });
+
+  const baseBody = {
+    title: "平台工程师",
+    department_id: DEPARTMENT_ID,
+    headcount: 3,
+    priority: "high",
+    hiring_owner_id: HIRING_OWNER_ID,
+    description: "建设可靠的招聘平台。",
+    location: "上海",
+    process_template: "技术岗位标准流程",
+    llm_enabled: true,
+    must_have: ["JavaScript", "React"],
+    nice_to_have: ["Vite"],
+  };
+  assert.deepEqual(calls, [
+    { path: "/api/v1/job-definitions", options: { method: "POST", body: { ...baseBody, publish: false }, idempotencyKey: "create-draft", signal } },
+    { path: "/api/v1/job-definitions", options: { method: "POST", body: { ...baseBody, publish: true }, idempotencyKey: "create-published", signal } },
+    { path: `/api/v1/job-definitions/${JOB_ID}`, options: { method: "PUT", body: { ...baseBody, publish: false }, ifMatch: '"7"', idempotencyKey: "update-definition", signal } },
+  ]);
+  assert.equal(draft.status, "草稿");
+  assert.equal(published.status, "招聘中");
+  assert.equal(updated.version, 8);
+  assert.equal(updated.jd, "建设可靠的招聘平台。");
+});
+
+test("transition maps pause, resume, close, and archive targets with mutation headers", async () => {
+  const { client, calls } = queuedClient([
+    { data: apiJob({ status: "paused", version: 8 }) },
+    { data: apiJob({ status: "open", version: 9 }) },
+    { data: apiJob({ status: "closed", version: 10 }) },
+    { data: apiJob({ status: "archived", version: 11 }) },
+  ]);
+  const keys = ["pause", "resume", "close", "archive"];
+  const controller = createJobController({ client, idempotencyKey: () => keys.shift() });
+  const signal = new AbortController().signal;
+
+  await controller.transition({ id: JOB_ID, version: 7, status: "招聘中" }, "已暂停", { signal });
+  await controller.transition({ id: JOB_ID, version: 8, status: "已暂停" }, "招聘中", { signal });
+  await controller.transition({ id: JOB_ID, version: 9, status: "招聘中" }, "已关闭", { signal });
+  const archived = await controller.transition({ id: JOB_ID, version: 10, status: "已关闭" }, "已归档", { signal });
+
+  assert.deepEqual(calls.map(({ path, options }) => ({ path, options })), [
+    { path: `/api/v1/jobs/${JOB_ID}/transitions`, options: { method: "POST", body: { target: "paused" }, ifMatch: '"7"', idempotencyKey: "pause", signal } },
+    { path: `/api/v1/jobs/${JOB_ID}/transitions`, options: { method: "POST", body: { target: "open" }, ifMatch: '"8"', idempotencyKey: "resume", signal } },
+    { path: `/api/v1/jobs/${JOB_ID}/transitions`, options: { method: "POST", body: { target: "closed" }, ifMatch: '"9"', idempotencyKey: "close", signal } },
+    { path: `/api/v1/jobs/${JOB_ID}/transitions`, options: { method: "POST", body: { target: "archived" }, ifMatch: '"10"', idempotencyKey: "archive", signal } },
+  ]);
+  assert.equal(archived.status, "已归档");
+  assert.equal(archived.version, 11);
+});
+
+test("mutations reject missing identity, missing version, and unsupported transitions before network I/O", async () => {
+  const { client, calls } = queuedClient([]);
+  const controller = createJobController({ client });
+  const form = { name: "职位" };
+
+  await assert.rejects(() => controller.saveDefinition(form, { job: { version: 1 } }), { code: "JOB_ID_REQUIRED" });
+  await assert.rejects(() => controller.saveDefinition(form, { job: { id: JOB_ID } }), { code: "JOB_VERSION_REQUIRED" });
+  await assert.rejects(() => controller.transition({ version: 1, status: "招聘中" }, "已暂停"), { code: "JOB_ID_REQUIRED" });
+  await assert.rejects(() => controller.transition({ id: JOB_ID, status: "招聘中" }, "已暂停"), { code: "JOB_VERSION_REQUIRED" });
+  await assert.rejects(() => controller.transition({ id: JOB_ID, version: 1, status: "招聘中" }, "已归档"), { code: "JOB_TRANSITION_UNSUPPORTED" });
+  await assert.rejects(() => controller.transition({ id: JOB_ID, version: 1, status: "未知" }, "已暂停"), { code: "JOB_TRANSITION_UNSUPPORTED" });
+  assert.equal(calls.length, 0);
+});
+
+test("ApiError and AbortError identities pass through unchanged", async () => {
+  const apiError = new ApiError({ status: 409, code: "resource_version_conflict" });
+  const abortError = new DOMException("aborted", "AbortError");
+  const api = queuedClient([apiError]);
+  const aborted = queuedClient([abortError]);
+
+  await assert.rejects(
+    () => createJobController({ client: api.client }).listJobs(),
+    (error) => error === apiError,
+  );
+  await assert.rejects(
+    () => createJobController({ client: aborted.client }).loadDefinition(JOB_ID),
+    (error) => error === abortError,
+  );
+});
