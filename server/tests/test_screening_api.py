@@ -8,8 +8,9 @@ from fastapi.testclient import TestClient
 from server.app.core.settings import Settings
 from server.app.identity.models import Job, JobCollaborator, Organization, User, UserRole
 from server.app.identity.security import PasswordService
+from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.main import create_app
-from server.app.recruiting.models import Candidate, CandidateContact, JobJdVersion, Resume, ScreeningRuleVersion
+from server.app.recruiting.models import Candidate, CandidateContact, FileObject, JobJdVersion, Resume, ScreeningRuleVersion
 from server.app.screening.storage import StorageWriteFailed
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.queue.models import BackgroundJob
@@ -38,8 +39,19 @@ def app_and_seed(tmp_path):
     with app.state.identity_store.sync_session() as db:
         org=Organization(slug="acme",name="Acme",status="active"); admin=User(organization=org,email="admin@example.test",normalized_email="admin@example.test",display_name="Admin",password_hash=PasswordService().hash("correct")); admin.roles.append(UserRole(role="recruiting_admin")); system=User(organization=org,email="system@example.test",normalized_email="system@example.test",display_name="System",password_hash=PasswordService().hash("correct")); system.roles.append(UserRole(role="system_admin")); manager=User(organization=org,email="manager@example.test",normalized_email="manager@example.test",display_name="Manager",password_hash=PasswordService().hash("correct")); manager.roles.append(UserRole(role="hiring_manager")); db.add_all([admin,system,manager]); db.flush(); job=Job(organization_id=org.id,title="Engineer",owner_id=admin.id,status="draft"); db.add(job); db.flush(); db.add(JobCollaborator(organization_id=org.id,job_id=job.id,user_id=manager.id,access_role="job_manager")); jd=JobJdVersion(organization_id=org.id,job_id=job.id,version_number=1,content={"text":"required: Python"},created_by=admin.id); rule=ScreeningRuleVersion(organization_id=org.id,job_id=job.id,version_number=1,content={},created_by=admin.id); db.add_all([jd,rule]); db.commit(); return app,storage,job.id
 
-def login(client,email):
-    response=client.post("/api/v1/auth/login",json={"organization_slug":"acme","email":email,"password":"correct"},headers={"Origin":"https://hr.example.test"}); assert response.status_code==200; return {"Origin":"https://hr.example.test","X-CSRF-Token":response.headers["X-CSRF-Token"]}
+def login(client,email,organization_slug="acme"):
+    response=client.post("/api/v1/auth/login",json={"organization_slug":organization_slug,"email":email,"password":"correct"},headers={"Origin":"https://hr.example.test"}); assert response.status_code==200; return {"Origin":"https://hr.example.test","X-CSRF-Token":response.headers["X-CSRF-Token"]}
+
+def json_keys_and_scalar_values(value):
+    keys=set(); values=[]
+    def visit(node):
+        if isinstance(node,dict):
+            for key,nested in node.items(): keys.add(key); visit(nested)
+        elif isinstance(node,list):
+            for nested in node: visit(nested)
+        else: values.append(node)
+    visit(value)
+    return keys,values
 
 def enrich_item(db,item_id,name,*,score=81,recommendation="可沟通",created_at=None,result_id=None):
     item=db.get(ScreeningItem,uuid.UUID(item_id)); run=db.get(ScreeningRun,item.run_id)
@@ -158,16 +170,42 @@ def test_screening_item_enrichment_is_job_scoped_and_data_minimized(tmp_path):
         headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"run"}).json()["data"]
         item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("secret.txt",b"raw resume secret","text/plain")},headers={**headers,"Idempotency-Key":"item"}).json()["data"]
         with app.state.identity_store.sync_session() as db:
-            candidate,_=enrich_item(db,item["id"],"Scoped Candidate")
+            candidate,result=enrich_item(db,item["id"],"Scoped Candidate")
             stored=db.get(ScreeningItem,uuid.UUID(item["id"])); resume=Resume(organization_id=stored.organization_id,candidate_id=candidate.id,file_object_id=stored.file_object_id,version_number=1,parsed_text="raw resume secret"); db.add(resume); db.flush(); stored.resume_id=resume.id
-            db.add(CandidateContact(organization_id=stored.organization_id,candidate_id=candidate.id,kind="email",ciphertext=b"ciphertext",lookup_hash="a"*64,masked_value="private@example.test")); db.commit()
+            db.add(CandidateContact(organization_id=stored.organization_id,candidate_id=candidate.id,kind="email",ciphertext=b"contact-ciphertext-secret",lookup_hash="c"*64,masked_value="private@example.test"))
+            file_object=db.get(FileObject,stored.file_object_id); storage_key=file_object.storage_key; file_object.quarantine_cleanup_key="cleanup/private-storage-key"
+            aggregate=db.get(ScreeningRun,stored.run_id)
+            prompt=PromptVersion(organization_id=stored.organization_id,name="screening",version_number=1,content={"system":"private prompt body","metadata":{"owner":"private prompt metadata"}},content_hash="p"*64,created_by=aggregate.created_by)
+            config=LlmProviderConfig(organization_id=stored.organization_id,provider_id="private-provider-id",model="private-provider-model",encrypted_api_key=b"private-encrypted-api-key",enabled=True,allowed_job_ids=[],version=1,created_by=aggregate.created_by,updated_by=aggregate.created_by)
+            db.add_all([prompt,config]); db.flush()
+            invocation=LlmInvocation(organization_id=stored.organization_id,config_id=config.id,prompt_version_id=prompt.id,screening_result_id=result.id,provider_id=config.provider_id,model=config.model,request_field_manifest=["private-provider-request"],status="succeeded",usage={"provider_metadata":{"request_id":"private-provider-request-id"},"provider_error_body":{"message":"private-provider-error-body"}},trace_id="private-provider-trace")
+            db.add(invocation); db.flush()
+            db.add(LlmScreeningEvaluation(organization_id=stored.organization_id,screening_result_id=result.id,invocation_id=invocation.id,prompt_version_id=prompt.id,score=82,recommendation="可沟通",summary="Safe summary",strengths=["Safe strength"],gaps=[],risks=[],interview_questions=[]))
+            stored.llm_status="succeeded"; stored.llm_attempts=1; db.commit()
         allowed=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers); assert allowed.status_code==200
         client.post("/api/v1/auth/logout",headers=headers); denied_headers=login(client,"system@example.test"); denied=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=denied_headers)
-    forbidden={"contacts","candidate_contacts","email","phone","parsed_text","resume_text","storage_key","quarantine_cleanup_key","prompt_version_id","request_field_manifest","provider_error","provider_error_body","api_key"}
-    response_keys={key for row in allowed.json()["data"] for key in row}
+    response_keys,response_values=json_keys_and_scalar_values(allowed.json())
+    forbidden={"contacts","candidate_contacts","email","phone","parsed_text","resume_text","raw_resume_text","storage_key","quarantine_cleanup_key","prompt","prompt_id","prompt_version_id","prompt_metadata","request_field_manifest","input_sha256","provider","provider_id","provider_metadata","provider_request","provider_response","api_key","encrypted_api_key","provider_error","provider_error_body","error_body","unsanitized_error"}
+    assert {"rule_result","required_hits","llm_evaluation","summary"}.issubset(response_keys) and "Python" in response_values and "Safe summary" in response_values
     assert forbidden.isdisjoint(response_keys)
-    assert all(secret not in allowed.text for secret in ("raw resume secret","private@example.test","ciphertext","quarantine/"))
+    forbidden_values=("raw resume secret","private@example.test","contact-ciphertext-secret","c"*64,storage_key,"quarantine/","cleanup/private-storage-key","private prompt body","private prompt metadata","p"*64,"private-provider-id","private-provider-model","private-encrypted-api-key","private-provider-request","private-provider-request-id","private-provider-error-body","private-provider-trace")
+    assert all(secret not in str(response_values) for secret in forbidden_values)
     assert denied.status_code==404 and "Scoped Candidate" not in denied.text and "rule_result" not in denied.text
+
+def test_screening_items_cannot_cross_organization_boundary(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        first_headers=login(client,"admin@example.test"); run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**first_headers,"Idempotency-Key":"run"}).json()["data"]
+        item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("tenant-secret.txt",b"Python","text/plain")},headers={**first_headers,"Idempotency-Key":"item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            candidate,result=enrich_item(db,item["id"],"First Tenant Secret Candidate")
+            result.required_hits=["ORG_A_REQUIRED_SECRET"]; result.required_missing=["ORG_A_MISSING_SECRET"]; result.bonus_hits=["ORG_A_BONUS_SECRET"]; result.risks=["ORG_A_RISK_SECRET"]
+            second_org=Organization(slug="other",name="Other",status="active"); second_admin=User(organization=second_org,email="admin@other.test",normalized_email="admin@other.test",display_name="Other Admin",password_hash=PasswordService().hash("correct")); second_admin.roles.append(UserRole(role="recruiting_admin")); db.add(second_admin); db.commit(); candidate_id=str(candidate.id); rule_facts=[*result.required_hits,*result.required_missing,*result.bonus_hits,*result.risks]
+        client.post("/api/v1/auth/logout",headers=first_headers); second_headers=login(client,"admin@other.test","other")
+        denied=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=second_headers)
+    assert denied.status_code==404
+    run_facts=(str(job_id),run["jd_version_id"],run["rule_version_id"],run["created_at"])
+    assert all(secret not in denied.text for secret in (*run_facts,candidate_id,"First Tenant Secret Candidate",*rule_facts))
 
 def test_start_run_is_authorized_idempotent_and_enqueues_each_item_atomically(tmp_path):
     app,_,job_id=app_and_seed(tmp_path)
