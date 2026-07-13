@@ -34,6 +34,8 @@ import { canPerformAction, getAllowedNavItems, getDefaultNavItem } from "./roleC
 import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts, saveInterview, submitInterviewFeedback, validateWorkflowState } from "./ux08Workflow.js";
 import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
+import { screeningController as defaultScreeningController } from "./screeningController.js";
+import { parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
 
 const navItems = [
   ["工作台", Home],
@@ -145,7 +147,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -160,10 +162,10 @@ export function App({ controller = sessionController }) {
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} />;
 }
 
-function AuthenticatedApp({ session, onLogout }) {
+function AuthenticatedApp({ session, onLogout, screeningController }) {
   const currentRole = session.role || "未知角色";
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
   const [activeJob, setActiveJob] = useState("AI 工程师");
@@ -194,11 +196,7 @@ function AuthenticatedApp({ session, onLogout }) {
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [recentTask, setRecentTask] = useState(() => {
-    try {
-      return JSON.parse(window.localStorage.getItem("ats_recent_screening_task")) || null;
-    } catch {
-      return null;
-    }
+    return parseRecentScreeningTask(window.localStorage.getItem("ats_recent_screening_task"));
   });
 
   const stages = useMemo(() => stageMeta.map(([stage]) => candidateRecords.filter((candidate) => candidate.position === activeJob && candidate.stage === stage).map((candidate) => {
@@ -260,6 +258,12 @@ function AuthenticatedApp({ session, onLogout }) {
   const handleTaskChange = useCallback((task) => {
     setScreeningTask(task);
     setRecentTask(task);
+    if (task?.serverBacked) {
+      const serialized = serializeRecentScreeningTask(task);
+      if (serialized) window.localStorage.setItem("ats_recent_screening_task", serialized);
+    } else {
+      window.localStorage.removeItem("ats_recent_screening_task");
+    }
   }, []);
 
   const updateCandidateRecords = useCallback((update) => {
@@ -327,7 +331,7 @@ function AuthenticatedApp({ session, onLogout }) {
     }
     if (scenario === "partial-screening") {
       const files = syntheticResumeFilesFor("AI 工程师").map((file) => ({ ...file, status: file.expectedParseStatus === "failed" ? "failed" : file.expectedLlmStatus === "failed" ? "partial" : "success", traceId: file.expectedParseStatus === "failed" ? "TR-PARSE-4081" : file.expectedLlmStatus === "failed" ? "TR-LLM-4297" : null, error: file.expectedParseStatus === "failed" ? "PDF 文本层损坏，未能提取有效内容" : file.expectedLlmStatus === "failed" ? "LLM 请求额度暂时不可用，已保留规则评分" : null }));
-      const task = { id: "SCR-UX08-PARTIAL", position: "AI 工程师", source: "UX-08 合成数据", note: "部分失败恢复验收", llmEnabled: true, creator: "张小北", createdAt: "刚刚", status: "partial", stage: "已完成", completed: files.length, elapsed: 56, files };
+      const task = { id: "SCR-UX08-PARTIAL", position: "AI 工程师", source: "UX-08 合成数据", note: "部分失败恢复验收", llmEnabled: true, creator: "张小北", createdAt: "刚刚", status: "partial", stage: "已完成", completed: files.length, elapsed: 56, files, serverBacked: false };
       setScreeningTask(task);
       setRecentTask(task);
     }
@@ -648,10 +652,10 @@ function AuthenticatedApp({ session, onLogout }) {
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
-        {screeningTask && <ScreeningTaskView task={screeningTask} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
+        {screeningTask && <ScreeningTaskView task={screeningTask} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
       </main>
 
-      {importOpen && <ImportWizard activeJob={activeJob} jobs={jobs} recentTask={recentTask} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} actorName={roleIdentity.name} />}
+      {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} onNotify={notify} actorName={roleIdentity.name} />}
 
       {modal === "duplicates" && (
         <Modal title="处理重复候选人" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>暂不处理</button><button className="button primary" type="button" onClick={() => { setModal(null); notify("2 组候选人已合并"); }}>确认合并</button></>}>
