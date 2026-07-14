@@ -1,4 +1,4 @@
-from sqlalchemy import CheckConstraint, Index, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint, Index, UniqueConstraint
 
 from server.app.governance.models import RetentionPolicy
 from server.app.identity.models import AuditLog, Organization
@@ -19,10 +19,15 @@ def test_governance_model_contract_is_registered() -> None:
         "created_at",
         "updated_at",
     }
-    assert not table.c.updated_by.nullable
+    assert table.c.updated_by.nullable
     assert any(
         isinstance(constraint, UniqueConstraint)
         and [column.name for column in constraint.columns] == ["organization_id"]
+        for constraint in table.constraints
+    )
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and [column.name for column in constraint.columns] == ["organization_id", "id"]
         for constraint in table.constraints
     )
     checks = {
@@ -35,7 +40,20 @@ def test_governance_model_contract_is_registered() -> None:
         "talent_pool_days BETWEEN 30 AND 3650",
         "backup_window_days BETWEEN 30 AND 3650",
         "version >= 1",
+        "version = 1 OR updated_by IS NOT NULL",
     } <= checks
+    updater_fks = [
+        constraint
+        for constraint in table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+        and [column.name for column in constraint.columns]
+        == ["organization_id", "updated_by"]
+    ]
+    assert len(updater_fks) == 1
+    assert [element.target_fullname for element in updater_fks[0].elements] == [
+        "users.organization_id",
+        "users.id",
+    ]
 
 
 def test_existing_models_expose_governance_foundation_columns_and_index() -> None:
@@ -49,6 +67,20 @@ def test_existing_models_expose_governance_foundation_columns_and_index() -> Non
     assert audit_columns.resource_type.nullable
     assert audit_columns.resource_id.nullable
     assert audit_columns.ip_hash.nullable
+
+    organization_policy_fks = [
+        constraint
+        for constraint in Organization.__table__.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+        and [column.name for column in constraint.columns] == ["id", "retention_policy_id"]
+    ]
+    assert len(organization_policy_fks) == 1
+    assert [element.target_fullname for element in organization_policy_fks[0].elements] == [
+        "retention_policies.organization_id",
+        "retention_policies.id",
+    ]
+    assert organization_policy_fks[0].deferrable is True
+    assert organization_policy_fks[0].initially == "DEFERRED"
 
     assert any(
         isinstance(index, Index)

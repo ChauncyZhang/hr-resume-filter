@@ -15,19 +15,20 @@ branch_labels = None
 depends_on = None
 
 
-RESOURCE_KEYS = (
-    "candidate_id",
-    "application_id",
-    "job_id",
-    "resume_id",
-    "run_id",
-    "item_id",
-    "interview_id",
-    "pool_id",
-    "membership_id",
-    "export_id",
-    "config_id",
-)
+LEGACY_KEY_BY_RESOURCE_TYPE = {
+    "candidate": "candidate_id",
+    "application": "application_id",
+    "job": "job_id",
+    "resume": "resume_id",
+    "screening_run": "run_id",
+    "screening_item": "item_id",
+    "interview": "interview_id",
+    "talent_pool": "pool_id",
+    "talent_pool_membership": "membership_id",
+    "report_export": "export_id",
+    "llm_config": "config_id",
+}
+RESOURCE_KEYS = tuple(LEGACY_KEY_BY_RESOURCE_TYPE.values())
 
 
 def _month_start(value: date) -> date:
@@ -66,11 +67,11 @@ def _resource_type_sql() -> str:
           WHEN event_type LIKE 'application.%' AND metadata_json ? 'application_id' THEN 'application'
           WHEN event_type LIKE 'job.%' AND metadata_json ? 'job_id' THEN 'job'
           WHEN event_type LIKE 'resume.%' AND metadata_json ? 'resume_id' THEN 'resume'
+          WHEN event_type LIKE 'screening.item_%' AND metadata_json ? 'item_id' THEN 'screening_item'
           WHEN event_type LIKE 'screening.%' AND metadata_json ? 'run_id' THEN 'screening_run'
-          WHEN event_type LIKE 'screening.%' AND metadata_json ? 'item_id' THEN 'screening_item'
           WHEN event_type LIKE 'interview.%' AND metadata_json ? 'interview_id' THEN 'interview'
+          WHEN event_type LIKE 'talent_pool.member_%' AND metadata_json ? 'membership_id' THEN 'talent_pool_membership'
           WHEN event_type LIKE 'talent_pool.%' AND metadata_json ? 'pool_id' THEN 'talent_pool'
-          WHEN event_type LIKE 'talent_pool.%' AND metadata_json ? 'membership_id' THEN 'talent_pool_membership'
           WHEN event_type LIKE 'report_export.%' AND metadata_json ? 'export_id' THEN 'report_export'
           WHEN event_type LIKE 'llm.%' AND metadata_json ? 'config_id' THEN 'llm_config'
           ELSE NULL
@@ -85,11 +86,11 @@ def _resource_id_sql() -> str:
           WHEN event_type LIKE 'application.%' THEN metadata_json ->> 'application_id'
           WHEN event_type LIKE 'job.%' THEN metadata_json ->> 'job_id'
           WHEN event_type LIKE 'resume.%' THEN metadata_json ->> 'resume_id'
-          WHEN event_type LIKE 'screening.%' AND metadata_json ? 'run_id' THEN metadata_json ->> 'run_id'
-          WHEN event_type LIKE 'screening.%' THEN metadata_json ->> 'item_id'
+          WHEN event_type LIKE 'screening.item_%' THEN metadata_json ->> 'item_id'
+          WHEN event_type LIKE 'screening.%' THEN metadata_json ->> 'run_id'
           WHEN event_type LIKE 'interview.%' THEN metadata_json ->> 'interview_id'
-          WHEN event_type LIKE 'talent_pool.%' AND metadata_json ? 'pool_id' THEN metadata_json ->> 'pool_id'
-          WHEN event_type LIKE 'talent_pool.%' THEN metadata_json ->> 'membership_id'
+          WHEN event_type LIKE 'talent_pool.member_%' THEN metadata_json ->> 'membership_id'
+          WHEN event_type LIKE 'talent_pool.%' THEN metadata_json ->> 'pool_id'
           WHEN event_type LIKE 'report_export.%' THEN metadata_json ->> 'export_id'
           WHEN event_type LIKE 'llm.%' THEN metadata_json ->> 'config_id'
           ELSE NULL
@@ -104,14 +105,19 @@ def _upgrade_retention() -> None:
         sa.Column(
             "organization_id",
             postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("organizations.id", ondelete="CASCADE"),
+            sa.ForeignKey(
+                "organizations.id",
+                ondelete="CASCADE",
+                deferrable=True,
+                initially="DEFERRED",
+            ),
             nullable=False,
         ),
         sa.Column("terminal_days", sa.Integer(), nullable=False, server_default="365"),
         sa.Column("talent_pool_days", sa.Integer(), nullable=False, server_default="730"),
         sa.Column("backup_window_days", sa.Integer(), nullable=False, server_default="90"),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
-        sa.Column("updated_by", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("updated_by", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.UniqueConstraint("organization_id", name="uq_retention_policies_organization_id"),
@@ -131,6 +137,10 @@ def _upgrade_retention() -> None:
             "backup_window_days BETWEEN 30 AND 3650", name="ck_retention_policies_backup_window_days"
         ),
         sa.CheckConstraint("version >= 1", name="ck_retention_policies_version"),
+        sa.CheckConstraint(
+            "version = 1 OR updated_by IS NOT NULL",
+            name="ck_retention_policies_updated_by_version",
+        ),
     )
     op.add_column(
         "organizations",
@@ -139,9 +149,7 @@ def _upgrade_retention() -> None:
     op.execute(
         """
         INSERT INTO retention_policies(id, organization_id, updated_by)
-        SELECT md5(o.id::text || '-retention-policy')::uuid,
-               o.id,
-               (SELECT u.id FROM users u WHERE u.organization_id = o.id ORDER BY u.created_at, u.id LIMIT 1)
+        SELECT md5(o.id::text || '-retention-policy')::uuid, o.id, NULL
         FROM organizations o
         """
     )
@@ -163,6 +171,28 @@ def _upgrade_retention() -> None:
         ondelete="RESTRICT",
         deferrable=True,
         initially="DEFERRED",
+    )
+    op.execute(
+        """
+        CREATE FUNCTION seed_organization_retention_policy() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.retention_policy_id IS NULL THEN
+            NEW.retention_policy_id := md5(NEW.id::text || '-retention-policy')::uuid;
+          END IF;
+          INSERT INTO retention_policies(id, organization_id, updated_by)
+          VALUES (NEW.retention_policy_id, NEW.id, NULL);
+          RETURN NEW;
+        END;
+        $$
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER organizations_seed_retention_policy
+        BEFORE INSERT ON organizations
+        FOR EACH ROW EXECUTE FUNCTION seed_organization_retention_policy()
+        """
     )
 
 
@@ -350,17 +380,21 @@ def _downgrade_audit() -> None:
         sa.Column("metadata_json", postgresql.JSONB(), nullable=False, server_default="{}"),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
+    legacy_key = "CASE resource_type " + " ".join(
+        f"WHEN '{resource_type}' THEN '{key}'"
+        for resource_type, key in LEGACY_KEY_BY_RESOURCE_TYPE.items()
+    ) + " ELSE NULL END"
     op.execute(
-        """
+        f"""
         INSERT INTO audit_logs(
           id, organization_id, actor_user_id, event_type, outcome,
           trace_id, metadata_json, created_at
         )
         SELECT id, organization_id, actor_user_id, event_type, outcome, trace_id,
                metadata_json || CASE
-                 WHEN resource_type IS NOT NULL AND resource_id IS NOT NULL
-                   THEN jsonb_build_object(resource_type || '_id', resource_id::text)
-                 ELSE '{}'::jsonb
+                 WHEN ({legacy_key}) IS NOT NULL AND resource_id IS NOT NULL
+                   THEN jsonb_build_object(({legacy_key}), resource_id::text)
+                 ELSE '{{}}'::jsonb
                END,
                created_at
         FROM audit_logs_0016
@@ -379,6 +413,8 @@ def downgrade() -> None:
     op.drop_index("ix_idempotency_records_expires_at", table_name="idempotency_records")
     op.drop_column("idempotency_records", "expires_at")
     op.drop_column("candidates", "retention_due_at")
+    op.execute("DROP TRIGGER organizations_seed_retention_policy ON organizations")
+    op.execute("DROP FUNCTION seed_organization_retention_policy()")
     op.drop_constraint("fk_organizations_retention_policy", "organizations", type_="foreignkey")
     op.drop_column("organizations", "retention_policy_id")
     op.drop_table("retention_policies")

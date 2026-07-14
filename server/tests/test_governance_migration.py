@@ -5,6 +5,9 @@ import uuid
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
+from server.app.identity.bootstrap import bootstrap_system_admin
+from server.app.identity.store import IdentityStore
+
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured"
@@ -127,7 +130,7 @@ def test_0016_backfills_populated_0015_and_preserves_audit_on_downgrade() -> Non
             ids,
         ).one()
         assert policy[1:5] == (365, 730, 90, 1)
-        assert policy.updated_by == ids["user"]
+        assert policy.updated_by is None
         assert policy.id == policy.retention_policy_id
         assert connection.scalar(
             text("SELECT retention_due_at IS NULL FROM candidates WHERE id = :candidate"), ids
@@ -187,4 +190,248 @@ def test_0016_backfills_populated_0015_and_preserves_audit_on_downgrade() -> Non
             connection.execute(text("DELETE FROM audit_logs WHERE id = :audit"), ids)
 
     _alembic(url, "upgrade", "head")
+    engine.dispose()
+
+
+def test_0016_seeds_zero_user_organization_with_system_actor_policy() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    _alembic(url, "downgrade", "base")
+    _alembic(url, "upgrade", "0015_reports_exports")
+    organization_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO organizations(id, slug, name, status, created_at, updated_at)
+                VALUES (:id, 'zero-user', 'Zero user', 'active', now(), now())
+                """
+            ),
+            {"id": organization_id},
+        )
+
+    _alembic(url, "upgrade", "0016_governance_audit_retention")
+    with engine.connect() as connection:
+        policy = connection.execute(
+            text(
+                """
+                SELECT p.version, p.updated_by, o.retention_policy_id = p.id
+                FROM organizations o
+                JOIN retention_policies p ON p.organization_id = o.id
+                WHERE o.id = :id
+                """
+            ),
+            {"id": organization_id},
+        ).one()
+        assert policy == (1, None, True)
+
+    with pytest.raises(Exception, match="ck_retention_policies_updated_by_version"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE retention_policies SET version = 2 WHERE organization_id = :id"
+                ),
+                {"id": organization_id},
+            )
+
+    updater_id = uuid.uuid4()
+    other_organization_id = uuid.uuid4()
+    other_updater_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO users(
+                  id, organization_id, email, normalized_email, display_name,
+                  password_hash, status, authorization_version, created_at, updated_at
+                ) VALUES (
+                  :user, :org, 'updater@test', 'updater@test', 'Updater',
+                  'x', 'active', 1, now(), now()
+                )
+                """
+            ),
+            {"org": organization_id, "user": updater_id},
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE retention_policies
+                SET version = 2, updated_by = :user
+                WHERE organization_id = :org
+                """
+            ),
+            {"org": organization_id, "user": updater_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO organizations(id, slug, name, status, created_at, updated_at)
+                VALUES (:org, 'other-org', 'Other org', 'active', now(), now())
+                """
+            ),
+            {"org": other_organization_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO users(
+                  id, organization_id, email, normalized_email, display_name,
+                  password_hash, status, authorization_version, created_at, updated_at
+                ) VALUES (
+                  :user, :org, 'other-updater@test', 'other-updater@test', 'Other updater',
+                  'x', 'active', 1, now(), now()
+                )
+                """
+            ),
+            {"org": other_organization_id, "user": other_updater_id},
+        )
+    with pytest.raises(Exception, match="fk_retention_policies_updated_by"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE retention_policies
+                    SET version = 3, updated_by = :user
+                    WHERE organization_id = :org
+                    """
+                ),
+                {"org": organization_id, "user": other_updater_id},
+            )
+    engine.dispose()
+
+
+def test_0016_round_trips_every_normalized_resource_type() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    _alembic(url, "downgrade", "base")
+    _alembic(url, "upgrade", "0015_reports_exports")
+    organization_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    resources = [
+        ("candidate.created", "candidate", "candidate_id"),
+        ("application.created", "application", "application_id"),
+        ("job.created", "job", "job_id"),
+        ("resume.previewed", "resume", "resume_id"),
+        ("screening.run_created", "screening_run", "run_id"),
+        ("screening.item_accepted", "screening_item", "item_id"),
+        ("interview.created", "interview", "interview_id"),
+        ("talent_pool.created", "talent_pool", "pool_id"),
+        ("talent_pool.member_added", "talent_pool_membership", "membership_id"),
+        ("report_export.created", "report_export", "export_id"),
+        ("llm.config_updated", "llm_config", "config_id"),
+    ]
+    rows = [
+        {
+            "audit_id": uuid.uuid4(),
+            "resource_id": uuid.uuid4(),
+            "event_type": event,
+            "resource_type": resource_type,
+            "legacy_key": legacy_key,
+        }
+        for event, resource_type, legacy_key in resources
+    ]
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO organizations(id, slug, name, status, created_at, updated_at)
+                VALUES (:org, 'resource-roundtrip', 'Resource roundtrip', 'active', now(), now())
+                """
+            ),
+            {"org": organization_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO users(
+                  id, organization_id, email, normalized_email, display_name,
+                  password_hash, status, authorization_version, created_at, updated_at
+                ) VALUES (
+                  :user, :org, 'roundtrip@test', 'roundtrip@test', 'Roundtrip',
+                  'x', 'active', 1, now(), now()
+                )
+                """
+            ),
+            {"org": organization_id, "user": user_id},
+        )
+        for row in rows:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO audit_logs(
+                      id, organization_id, actor_user_id, event_type, outcome,
+                      trace_id, metadata_json, created_at
+                    ) VALUES (
+                      :audit_id, :org, :user, :event_type, 'success', 'trace-roundtrip',
+                      jsonb_build_object(
+                        CAST(:legacy_key AS text), CAST(:resource_id AS text)
+                      ), now()
+                    )
+                    """
+                ),
+                {**row, "org": organization_id, "user": user_id},
+            )
+
+    _alembic(url, "upgrade", "0016_governance_audit_retention")
+    with engine.connect() as connection:
+        normalized = connection.execute(
+            text(
+                """
+                SELECT id, resource_type, resource_id, metadata_json
+                FROM audit_logs WHERE organization_id = :org
+                """
+            ),
+            {"org": organization_id},
+        ).all()
+    by_id = {row.id: row for row in normalized}
+    for expected in rows:
+        actual = by_id[expected["audit_id"]]
+        assert (actual.resource_type, actual.resource_id) == (
+            expected["resource_type"],
+            expected["resource_id"],
+        )
+        assert expected["legacy_key"] not in actual.metadata_json
+
+    _alembic(url, "downgrade", "0015_reports_exports")
+    with engine.connect() as connection:
+        legacy_rows = connection.execute(
+            text("SELECT id, metadata_json FROM audit_logs WHERE organization_id = :org"),
+            {"org": organization_id},
+        ).all()
+    by_id = {row.id: row.metadata_json for row in legacy_rows}
+    for expected in rows:
+        assert by_id[expected["audit_id"]] == {
+            expected["legacy_key"]: str(expected["resource_id"])
+        }
+    engine.dispose()
+
+
+def test_bootstrap_creates_matching_default_policy_at_head() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    _alembic(url, "downgrade", "base")
+    _alembic(url, "upgrade", "head")
+
+    user_id = bootstrap_system_admin(
+        IdentityStore(url),
+        "bootstrap-policy",
+        "Bootstrap policy",
+        "bootstrap-policy@test",
+        "Bootstrap policy admin",
+        "correct horse battery staple",
+    )
+    with engine.connect() as connection:
+        policy = connection.execute(
+            text(
+                """
+                SELECT p.version, p.updated_by, o.retention_policy_id = p.id
+                FROM users u
+                JOIN organizations o ON o.id = u.organization_id
+                JOIN retention_policies p ON p.organization_id = o.id
+                WHERE u.id = :user
+                """
+            ),
+            {"user": user_id},
+        ).one()
+    assert policy == (1, None, True)
     engine.dispose()
