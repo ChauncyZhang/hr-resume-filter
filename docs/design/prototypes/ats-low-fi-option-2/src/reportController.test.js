@@ -7,6 +7,7 @@ import { createReportController, normalizeReportData } from "./reportController.
 test("report normalization maps server stages and rates without fixture-derived metrics", () => {
   const report = normalizeReportData({
     funnel: {
+      can_export: true,
       total_applications: 4,
       stages: [
         { stage: "new", current_count: 2, average_time_in_stage_seconds: 86400 },
@@ -29,6 +30,7 @@ test("report normalization maps server stages and rates without fixture-derived 
   });
 
   assert.equal(report.totalApplications, 4);
+  assert.equal(report.canExport, true);
   assert.deepEqual(report.stages.map((item) => [item.stage, item.currentCount, item.averageDays]), [
     ["新简历", 2, 1],
     ["面试中", 1, 1.5],
@@ -39,6 +41,14 @@ test("report normalization maps server stages and rates without fixture-derived 
   assert.equal(report.quality.parseSuccessRate, 80);
   assert.equal(report.quality.rulePassRate, 62.5);
   assert.equal(report.quality.llmSuccessRate, 75);
+});
+
+
+test("report normalization only enables export for an explicit server capability", () => {
+  assert.equal(normalizeReportData({ funnel: { can_export: true } }).canExport, true);
+  assert.equal(normalizeReportData({ funnel: { can_export: false } }).canExport, false);
+  assert.equal(normalizeReportData({ funnel: { can_export: "true" } }).canExport, false);
+  assert.equal(normalizeReportData({ funnel: {} }).canExport, false);
 });
 
 
@@ -81,17 +91,33 @@ test("export controller creates, checks, and downloads through a one-time ticket
   };
   const controller = createReportController({ client, idSource: () => "export-idempotency" });
 
-  const created = await controller.createExport({ jobId: "job-1" });
+  const signal = new AbortController().signal;
+  const created = await controller.createExport({ jobId: "job-1" }, { signal, idempotencyKey: "retained-export-key" });
   const ready = await controller.getExport(created.id);
   const file = await controller.downloadExport(ready.id);
 
   assert.equal(created.status, "queued");
   assert.equal(ready.rowCount, 7);
   assert.equal(file.filename, "report.csv");
-  assert.equal(calls[0].options.idempotencyKey, "export-idempotency");
+  assert.equal(calls[0].options.idempotencyKey, "retained-export-key");
+  assert.equal(calls[0].options.signal, signal);
   assert.deepEqual(calls[0].options.body, { job_id: "job-1", from: null, to: null });
   assert.equal(calls[2].options.method, "POST");
   assert.deepEqual(calls[3].options.body, { token: "opaque-download-token" });
+});
+
+
+test("export controller keeps a generated idempotency key as a safe direct-call default", async () => {
+  const calls = [];
+  const client = { async request(path, options) {
+    calls.push({ path, options });
+    return { data: { id: "export-default", status: "queued" } };
+  } };
+  const controller = createReportController({ client, idSource: () => "generated-export-key" });
+
+  await controller.createExport();
+
+  assert.equal(calls[0].options.idempotencyKey, "generated-export-key");
 });
 
 
@@ -120,4 +146,154 @@ test("export controller supplies safe defaults and polls until the export succee
   assert.deepEqual(delays, [25]);
   assert.equal(ready.status, "succeeded");
   assert.equal(ready.format, "csv");
+});
+
+
+test("export polling passes the signal into each delay", async () => {
+  const client = { async request() {
+    return { data: { id: "export-signal", status: "processing" } };
+  } };
+  const controller = createReportController({ client });
+  const abortController = new AbortController();
+  const signals = [];
+
+  await assert.rejects(
+    controller.waitForExport("export-signal", {
+      signal: abortController.signal,
+      delay: async (_milliseconds, { signal } = {}) => {
+        signals.push(signal);
+        abortController.abort();
+      },
+      maxAttempts: 2,
+    }),
+    { name: "AbortError" },
+  );
+  assert.deepEqual(signals, [abortController.signal]);
+});
+
+
+test("default export polling delay rejects promptly when aborted", async () => {
+  const client = { async request() {
+    return { data: { id: "export-abort", status: "processing" } };
+  } };
+  const controller = createReportController({ client });
+  const abortController = new AbortController();
+  const pending = controller.waitForExport("export-abort", {
+    signal: abortController.signal,
+    intervalMs: 1000,
+    maxAttempts: 2,
+  });
+  setTimeout(() => abortController.abort(), 5);
+
+  const result = await Promise.race([
+    pending.then(() => "resolved", (error) => error?.name),
+    new Promise((resolve) => setTimeout(() => resolve("too-slow"), 100)),
+  ]);
+
+  assert.equal(result, "AbortError");
+});
+
+
+test("report workspace operation support suppresses stale work and retains ambiguous export keys", async () => {
+  const support = await import("./reportWorkspaceState.js").catch(() => ({}));
+  assert.equal(typeof support.createLatestOperation, "function");
+  assert.equal(typeof support.createExportIntent, "function");
+
+  const operations = support.createLatestOperation();
+  const first = operations.start();
+  const second = operations.start();
+  assert.equal(first.signal.aborted, true);
+  assert.equal(first.isCurrent(), false);
+  assert.equal(second.isCurrent(), true);
+  operations.cancel();
+  assert.equal(second.signal.aborted, true);
+  assert.equal(second.isCurrent(), false);
+
+  const keys = ["intent-1", "intent-2"];
+  const intent = support.createExportIntent(() => keys.shift());
+  assert.equal(intent.key(), "intent-1");
+  assert.equal(intent.key(), "intent-1");
+  intent.succeed();
+  assert.equal(intent.key(), "intent-2");
+  intent.reset();
+  assert.equal(intent.peek(), null);
+});
+
+
+test("a deferred report response cannot become current after a newer query starts", async () => {
+  const support = await import("./reportWorkspaceState.js");
+  const operations = support.createLatestOperation();
+  const accepted = [];
+  let resolveFirst;
+  const firstResponse = new Promise((resolve) => { resolveFirst = resolve; });
+  const first = operations.start();
+  const firstCompletion = firstResponse.then((value) => {
+    if (first.isCurrent()) accepted.push(value);
+  });
+
+  const second = operations.start();
+  if (second.isCurrent()) accepted.push("scope-b");
+  resolveFirst("scope-a");
+  await firstCompletion;
+
+  assert.deepEqual(accepted, ["scope-b"]);
+});
+
+
+test("an ambiguous export creation retry reuses the same explicit key", async () => {
+  const support = await import("./reportWorkspaceState.js");
+  const sentKeys = [];
+  let attempt = 0;
+  const client = { async request(_path, options) {
+    sentKeys.push(options.idempotencyKey);
+    attempt += 1;
+    if (attempt === 1) throw new Error("connection lost after commit");
+    return { data: { id: "export-replayed", status: "queued" } };
+  } };
+  const controller = createReportController({ client });
+  const intent = support.createExportIntent(() => "stable-intent-key");
+
+  await assert.rejects(controller.createExport({}, { idempotencyKey: intent.key() }));
+  const replayed = await controller.createExport({}, { idempotencyKey: intent.key() });
+  intent.succeed();
+
+  assert.equal(replayed.id, "export-replayed");
+  assert.deepEqual(sentKeys, ["stable-intent-key", "stable-intent-key"]);
+  assert.equal(intent.peek(), null);
+});
+
+
+test("export polling is sequential and preserves failed and timeout terminals", async () => {
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
+  let requests = 0;
+  const client = { async request() {
+    activeRequests += 1;
+    maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+    requests += 1;
+    await Promise.resolve();
+    activeRequests -= 1;
+    return { data: { id: "export-terminal", status: requests === 2 ? "failed" : "processing" } };
+  } };
+  const controller = createReportController({ client });
+
+  const failed = await controller.waitForExport("export-terminal", { delay: async () => {}, maxAttempts: 3 });
+  assert.equal(failed.status, "failed");
+  assert.equal(maxActiveRequests, 1);
+
+  const pendingClient = { async request() {
+    return { data: { id: "export-timeout", status: "processing" } };
+  } };
+  const pendingController = createReportController({ client: pendingClient });
+  await assert.rejects(
+    pendingController.waitForExport("export-timeout", { delay: async () => {}, maxAttempts: 2 }),
+    (error) => error?.code === "export_timeout",
+  );
+});
+
+
+test("report workspace load states never retain previous-scope metrics", async () => {
+  const support = await import("./reportWorkspaceState.js").catch(() => ({}));
+  assert.deepEqual(support.loadingReportState?.(), { status: "loading", data: null, error: "" });
+  assert.deepEqual(support.failedReportState?.(), { status: "error", data: null, error: "报表加载失败，请检查网络后重试。" });
 });

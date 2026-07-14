@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowRight, BarChart3, CalendarRange, CheckCircle2, ChevronDown, Clock3, Download, FileCheck2, LockKeyhole, MessageSquareText, RefreshCw, UsersRound } from "lucide-react";
 import { canPerformAction } from "./roleCapabilities.js";
+import { createExportIntent, createLatestOperation, failedReportState, loadingReportState } from "./reportWorkspaceState.js";
 
 function NoPermission({ onNotify }) {
   return <section className="ux07-permission"><LockKeyhole size={34} /><h2>暂无报表查看权限</h2><p>当前账号不能读取招聘聚合数据或导出候选人记录。</p><button className="button primary" type="button" onClick={() => onNotify("请联系招聘管理员开通报表权限")}>联系管理员</button></section>;
@@ -41,47 +42,77 @@ export function ReportWorkspace({ positions = [], currentRole, onDrillDown, onNo
   const [requestVersion, setRequestVersion] = useState(0);
   const [state, setState] = useState({ status: "loading", data: null, error: "" });
   const [exportState, setExportState] = useState({ status: "idle", record: null, error: "" });
+  const loadOperationRef = useRef(null);
+  const exportOperationRef = useRef(null);
+  const downloadOperationRef = useRef(null);
+  const exportIntentRef = useRef(null);
+  if (!loadOperationRef.current) loadOperationRef.current = createLatestOperation();
+  if (!exportOperationRef.current) exportOperationRef.current = createLatestOperation();
+  if (!downloadOperationRef.current) downloadOperationRef.current = createLatestOperation();
+  if (!exportIntentRef.current) exportIntentRef.current = createExportIntent();
   const canView = canPerformAction(currentRole, "查看报表");
-  const canExport = currentRole === "招聘管理员" || currentRole === "HR 招聘专员" || currentRole === "HR";
   const selectedPosition = positions.find((item) => item.id === filters.jobId) || null;
   const query = useMemo(() => ({ jobId: filters.jobId, ...rangeForPeriod(filters.period) }), [filters]);
 
   useEffect(() => {
     if (!controller || !canView) return undefined;
-    const abortController = new AbortController();
-    setState((current) => ({ status: "loading", data: current.data, error: "" }));
-    void controller.load(query, { signal: abortController.signal }).then(
-      (data) => setState({ status: "ready", data, error: "" }),
-      (error) => { if (error?.name !== "AbortError") setState((current) => ({ status: "error", data: current.data, error: "报表加载失败，请检查网络后重试。" })); },
+    const operation = loadOperationRef.current.start();
+    setState(loadingReportState());
+    void controller.load(query, { signal: operation.signal }).then(
+      (data) => { if (operation.isCurrent()) setState({ status: "ready", data, error: "" }); },
+      (error) => { if (operation.isCurrent() && error?.name !== "AbortError") setState(failedReportState()); },
     );
-    return () => abortController.abort();
+    return () => loadOperationRef.current.cancel();
   }, [canView, controller, query, requestVersion]);
 
-  useEffect(() => { setExportState({ status: "idle", record: null, error: "" }); }, [query]);
+  useEffect(() => {
+    exportOperationRef.current.cancel();
+    downloadOperationRef.current.cancel();
+    exportIntentRef.current.reset();
+    setExportState({ status: "idle", record: null, error: "" });
+  }, [query]);
+
+  useEffect(() => () => {
+    loadOperationRef.current.cancel();
+    exportOperationRef.current.cancel();
+    downloadOperationRef.current.cancel();
+    exportIntentRef.current.reset();
+  }, []);
 
   async function createExport() {
+    const operation = exportOperationRef.current.start();
+    downloadOperationRef.current.cancel();
     setExportState({ status: "creating", record: null, error: "" });
     try {
-      const created = await controller.createExport(query);
+      const created = await controller.createExport(query, { signal: operation.signal, idempotencyKey: exportIntentRef.current.key() });
+      if (!operation.isCurrent()) return;
       if (!created) throw new Error("export missing");
+      exportIntentRef.current.succeed();
       setExportState({ status: "processing", record: created, error: "" });
-      const completed = await controller.waitForExport(created.id);
+      const completed = await controller.waitForExport(created.id, { signal: operation.signal });
+      if (!operation.isCurrent()) return;
       if (!completed || completed.status !== "succeeded") throw new Error("export failed");
       setExportState({ status: "ready", record: completed, error: "" });
       onNotify("报表导出已生成");
     } catch (error) {
+      if (!operation.isCurrent() || error?.name === "AbortError") return;
       setExportState({ status: "error", record: null, error: error?.code === "export_timeout" ? "导出仍在处理中，请稍后重试。" : "导出生成失败，请稍后重试。" });
     }
   }
 
   async function downloadExport() {
     if (!exportState.record) return;
+    const operation = downloadOperationRef.current.start();
+    const exportId = exportState.record.id;
     setExportState((current) => ({ ...current, status: "downloading", error: "" }));
     try {
-      saveBlob(await controller.downloadExport(exportState.record.id));
+      const file = await controller.downloadExport(exportId, { signal: operation.signal });
+      if (!operation.isCurrent()) return;
+      saveBlob(file);
       setExportState((current) => ({ ...current, status: "ready" }));
       onNotify("报表下载已开始");
-    } catch {
+    } catch (error) {
+      if (!operation.isCurrent() || error?.name === "AbortError") return;
       setExportState((current) => ({ ...current, status: "ready", error: "下载票据已失效，请重新下载。" }));
     }
   }
@@ -93,7 +124,7 @@ export function ReportWorkspace({ positions = [], currentRole, onDrillDown, onNo
   const maxStageCount = Math.max(1, ...(data?.stages || []).map((item) => item.currentCount));
 
   return <div className="report-page">
-    <div className="report-heading"><div><h2>基础招聘报表</h2><p>所有指标均按当前账号的服务端授权范围计算。</p></div>{canExport && data && <ExportAction state={exportState} onCreate={() => void createExport()} onDownload={() => void downloadExport()} />}</div>
+    <div className="report-heading"><div><h2>基础招聘报表</h2><p>所有指标均按当前账号的服务端授权范围计算。</p></div>{data?.canExport && <ExportAction state={exportState} onCreate={() => void createExport()} onDownload={() => void downloadExport()} />}</div>
     <section className="report-filter-panel"><div className="report-filters"><label><CalendarRange size={16} /><select aria-label="时间范围" value={filters.period} onChange={(event) => setFilters((current) => ({ ...current, period: event.target.value }))}><option>近 7 天</option><option>近 30 天</option><option>本季度</option></select><ChevronDown size={14} /></label><label><select aria-label="报表职位" value={filters.jobId} onChange={(event) => setFilters((current) => ({ ...current, jobId: event.target.value }))}><option value="">全部有权限职位</option>{positions.filter((item) => item.id && item.name).map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label><button className="button secondary" type="button" onClick={() => setRequestVersion((value) => value + 1)}><RefreshCw size={15} />刷新</button></div></section>
 
     {exportState.error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{exportState.error}</div>}

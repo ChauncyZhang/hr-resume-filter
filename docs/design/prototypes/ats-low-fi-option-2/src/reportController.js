@@ -58,6 +58,7 @@ function normalizeExport(value) {
 export function normalizeReportData({ funnel, quality } = {}) {
   const interview = funnel?.interviews || {};
   return {
+    canExport: funnel?.can_export === true,
     totalApplications: Math.max(0, Math.trunc(safeNumber(funnel?.total_applications))),
     stages: safeArray(funnel?.stages).map((item) => ({
       stage: STAGE_TO_UI[item?.stage] || "其他阶段",
@@ -97,7 +98,7 @@ export function createReportController({ client = apiClient, idSource = () => gl
       return normalizeReportData({ funnel: funnel?.data, quality: quality?.data });
     },
 
-    async createExport(filters = {}, { signal } = {}) {
+    async createExport(filters = {}, { signal, idempotencyKey = idSource() } = {}) {
       const payload = await client.request("/api/v1/exports", {
         method: "POST",
         body: {
@@ -105,7 +106,7 @@ export function createReportController({ client = apiClient, idSource = () => gl
           from: safeString(filters.from) || null,
           to: safeString(filters.to) || null,
         },
-        idempotencyKey: idSource(),
+        idempotencyKey,
         signal,
       });
       return normalizeExport(payload?.data);
@@ -118,12 +119,12 @@ export function createReportController({ client = apiClient, idSource = () => gl
       return normalizeExport(payload?.data);
     },
 
-    async waitForExport(exportId, { signal, delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)), intervalMs = 750, maxAttempts = 120 } = {}) {
+    async waitForExport(exportId, { signal, delay = abortableDelay, intervalMs = 750, maxAttempts = 120 } = {}) {
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const record = await this.getExport(exportId, { signal });
         if (!record || record.status === "succeeded" || record.status === "failed") return record;
-        await delay(intervalMs);
+        await delay(intervalMs, { signal });
       }
       const error = new Error("export timed out");
       error.code = "export_timeout";
@@ -139,6 +140,22 @@ export function createReportController({ client = apiClient, idSource = () => gl
       return client.download("/api/v1/export-download-tickets/consume", { method: "POST", body: { token }, signal });
     },
   };
+}
+
+export function abortableDelay(milliseconds, { signal } = {}) {
+  if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    function onAbort() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export const reportController = createReportController();
