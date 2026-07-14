@@ -8,13 +8,17 @@ from sqlalchemy import func, select
 
 from server.app.core.settings import Settings
 from server.app.governance import deletion_service
-from server.app.governance.deletion_models import DeletionRequest, LegalHold
-from server.app.identity.models import AuditLog, Organization, User, UserRole
+from server.app.governance.deletion_service import build_private_manifest, canonical_manifest_hash
+from server.app.governance.deletion_models import DeletionArtifact, DeletionRequest, LegalHold
+from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole
+from server.app.identity.policy import Principal
+from server.app.identity.security import PasswordService
+from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.main import create_app
 from server.app.queue.models import BackgroundJob
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, UnsafePayload
 from server.app.queue.repository import TERMINAL_CALLBACK_TYPES
-from server.app.recruiting.models import Candidate, CandidateContact, IdempotencyRecord
+from server.app.recruiting.models import Application, Candidate, CandidateContact, FileObject, IdempotencyRecord, Resume
 from server.tests.test_recruiting_api import login, seed_user
 
 
@@ -90,6 +94,20 @@ def assert_problem(response, status, code):
     assert not SENSITIVE.search(response.json()["detail"])
 
 
+def assert_private_values_absent(value, private_values):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert_private_values_absent(key, private_values)
+            assert_private_values_absent(item, private_values)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            assert_private_values_absent(item, private_values)
+        return
+    rendered = str(value)
+    assert all(private not in rendered for private in private_values)
+
+
 def test_openapi_and_queue_contract_are_exact(tmp_path) -> None:
     app = make_app(tmp_path)
     with TestClient(app) as client:
@@ -155,20 +173,99 @@ def test_request_authorization_is_non_enumerating_for_every_role(
 def test_request_is_replay_safe_conflict_safe_and_public_projection_is_recursive_safe(tmp_path) -> None:
     app = make_app(tmp_path)
     recruiter_id = seed_user(app, "recruiter", "requester@deletion.test")
+    seed_user(app, "system_admin", "redaction-system@deletion.test")
     candidate_id = candidate_for(app, recruiter_id)
     with app.state.identity_store.sync_session() as db:
         candidate = db.get(Candidate, candidate_id)
+        contact = CandidateContact(
+            organization_id=candidate.organization_id,
+            candidate_id=candidate.id,
+            kind="email",
+            ciphertext=b"UNIQUE_PRIVATE_CONTACT_CIPHERTEXT",
+            lookup_hash="a" * 64,
+            masked_value="unique-private-contact@example.test",
+        )
+        db.add(contact)
+        file = FileObject(organization_id=candidate.organization_id, storage_key="private/unique-storage-locator", original_filename="unique-private-filename.pdf", mime_type="application/pdf", size_bytes=7, sha256="e" * 64, uploaded_by=recruiter_id)
+        db.add(file); db.flush()
+        resume = Resume(organization_id=candidate.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1, parsed_text="UNIQUE_PRIVATE_RESUME_TEXT")
+        db.add(resume); db.flush()
+        job = Job(
+            organization_id=candidate.organization_id,
+            title="UNIQUE_PRIVATE_JOB_TITLE",
+            owner_id=recruiter_id,
+            status="open",
+        )
+        db.add(job); db.flush()
         db.add(
-            CandidateContact(
+            JobCollaborator(
                 organization_id=candidate.organization_id,
-                candidate_id=candidate.id,
-                kind="email",
-                ciphertext=b"secret",
-                lookup_hash="a" * 64,
-                masked_value="s***@example.test",
+                job_id=job.id,
+                user_id=recruiter_id,
+                access_role="job_recruiter",
             )
         )
+        application = Application(
+            organization_id=candidate.organization_id,
+            candidate_id=candidate.id,
+            job_id=job.id,
+            resume_id=resume.id,
+            owner_id=recruiter_id,
+            stage="rejected",
+            human_conclusion="UNIQUE_PRIVATE_APPLICATION_TEXT",
+        )
+        db.add(application); db.flush()
+        interview = Interview(
+            organization_id=candidate.organization_id,
+            application_id=application.id,
+            round_name="UNIQUE_PRIVATE_ROUND_NAME",
+            method="video",
+            timezone="UTC",
+            starts_at=FixedClock().current_time(),
+            ends_at=FixedClock().current_time() + timedelta(hours=1),
+            location="UNIQUE_PRIVATE_INTERVIEW_LOCATION",
+            meeting_url="https://unique-private-meeting.example.test/secret",
+            status="feedback_completed",
+            owner_id=recruiter_id,
+            created_by=recruiter_id,
+            calendar_organizer={"credential": "UNIQUE_PRIVATE_CREDENTIAL"},
+        )
+        db.add(interview); db.flush()
+        participant = InterviewParticipant(
+            organization_id=candidate.organization_id,
+            interview_id=interview.id,
+            user_id=recruiter_id,
+            task_status="completed",
+        )
+        db.add(participant); db.flush()
+        feedback = InterviewFeedback(
+            organization_id=candidate.organization_id,
+            interview_id=interview.id,
+            author_id=recruiter_id,
+            status="submitted",
+            ratings={"private_dimension": "UNIQUE_PRIVATE_RATING"},
+            strengths="UNIQUE_PRIVATE_FEEDBACK_STRENGTH",
+            risks="UNIQUE_PRIVATE_FEEDBACK_RISK",
+            notes="UNIQUE_PRIVATE_FEEDBACK_NOTE",
+            conclusion="recommend",
+            submitted_at=FixedClock().current_time(),
+        )
+        db.add(feedback)
         db.commit()
+        private_values = [
+            str(candidate.id), str(contact.id), str(file.id), str(resume.id),
+            str(application.id), str(interview.id), str(participant.id), str(feedback.id),
+            "Never expose this candidate", "Private title",
+            "UNIQUE_PRIVATE_CONTACT_CIPHERTEXT", "a" * 64,
+            "unique-private-contact@example.test", "private/unique-storage-locator",
+            "unique-private-filename.pdf", "UNIQUE_PRIVATE_RESUME_TEXT",
+            "UNIQUE_PRIVATE_JOB_TITLE", "UNIQUE_PRIVATE_APPLICATION_TEXT",
+            "UNIQUE_PRIVATE_ROUND_NAME", "UNIQUE_PRIVATE_INTERVIEW_LOCATION",
+            "https://unique-private-meeting.example.test/secret",
+            "UNIQUE_PRIVATE_CREDENTIAL", "UNIQUE_PRIVATE_RATING",
+            "UNIQUE_PRIVATE_FEEDBACK_STRENGTH", "UNIQUE_PRIVATE_FEEDBACK_RISK",
+            "UNIQUE_PRIVATE_FEEDBACK_NOTE",
+        ]
 
     with TestClient(app) as client:
         headers = login(client, "requester@deletion.test")
@@ -185,6 +282,12 @@ def test_request_is_replay_safe_conflict_safe_and_public_projection_is_recursive
         replay = request_deletion(client, headers, candidate_id)
         conflict = request_deletion(client, headers, candidate_id, reason="administrator_request")
         second = request_deletion(client, headers, candidate_id, key="request-2")
+        with app.state.identity_store.sync_session() as db:
+            for event in db.scalars(select(AuditLog).where(AuditLog.category == "governance")):
+                event.created_at = FixedClock().current_time() - timedelta(seconds=1)
+            db.commit()
+        system = login(client, "redaction-system@deletion.test")
+        audit_response = client.get("/api/v1/audit-logs", headers=system)
 
     assert first.status_code == replay.status_code == 201
     assert first.json() == replay.json()
@@ -202,6 +305,29 @@ def test_request_is_replay_safe_conflict_safe_and_public_projection_is_recursive
     }
     assert data["impact"]["counts"]["contacts"] == 1
     assert not SENSITIVE.search(str(first.json()))
+    for surface in (
+        first.json(), replay.json(), conflict.json(), second.json(), audit_response.json()
+    ):
+        assert_private_values_absent(surface, private_values)
+    assert audit_response.status_code == 200
+    assert any(item["event_type"] == "governance.deletion_requested" for item in audit_response.json()["data"])
+    with app.state.identity_store.sync_session() as db:
+        assert db.scalar(select(func.count()).select_from(DeletionArtifact)) == 0
+
+
+def test_create_idempotency_key_is_bound_to_candidate(tmp_path) -> None:
+    app = make_app(tmp_path)
+    recruiter_id = seed_user(app, "recruiter", "bound@deletion.test")
+    first_id = candidate_for(app, recruiter_id)
+    second_id = candidate_for(app, recruiter_id)
+    with TestClient(app) as client:
+        headers = login(client, "bound@deletion.test")
+        first = request_deletion(client, headers, first_id, "shared-key")
+        second = request_deletion(client, headers, second_id, "shared-key")
+    assert first.status_code == 201
+    assert_problem(second, 409, "idempotency_conflict")
+    with app.state.identity_store.sync_session() as db:
+        assert db.scalar(select(func.count()).select_from(DeletionRequest)) == 1
 
 
 def test_list_read_cursor_and_requester_scope(tmp_path) -> None:
@@ -210,10 +336,12 @@ def test_list_read_cursor_and_requester_scope(tmp_path) -> None:
     other_id = seed_user(app, "recruiter", "other@deletion.test")
     admin_id = seed_user(app, "system_admin", "system@deletion.test")
     candidate_id = candidate_for(app, requester_id)
+    requester_candidate_2 = candidate_for(app, requester_id)
     other_candidate_id = candidate_for(app, other_id)
     with TestClient(app) as client:
         requester = login(client, "reader@deletion.test")
         first = request_deletion(client, requester, candidate_id)
+        request_deletion(client, requester, requester_candidate_2, key="reader-second")
         other = login(client, "other@deletion.test")
         second = request_deletion(client, other, other_candidate_id, key="other-request")
         system = login(client, "system@deletion.test")
@@ -250,6 +378,19 @@ def test_list_read_cursor_and_requester_scope(tmp_path) -> None:
         denied = client.get(f"/api/v1/deletion-requests/{second.json()['data']['id']}", headers=requester)
         assert own.status_code == 200
         assert_problem(denied, 404, "resource_not_found")
+        requester_page = client.get("/api/v1/deletion-requests?limit=1", headers=requester)
+        requester_cursor = requester_page.json()["meta"]["next_cursor"]
+        assert requester_cursor
+        other = login(client, "other@deletion.test")
+        assert_problem(
+            client.get(
+                "/api/v1/deletion-requests",
+                params={"limit": 1, "cursor": requester_cursor},
+                headers=other,
+            ),
+            422,
+            "validation_failed",
+        )
 
 
 def test_approval_requires_current_preconditions_and_enqueues_once(tmp_path) -> None:
@@ -335,6 +476,35 @@ def test_stale_manifest_refreshes_without_enqueue_and_increments_version(tmp_pat
         row = db.get(DeletionRequest, UUID(request_id))
         assert row.status == "requested" and row.version == 2
         assert db.scalar(select(func.count()).select_from(BackgroundJob)) == 0
+
+
+def test_removed_resume_stale_refresh_deletes_only_unstarted_artifacts(tmp_path) -> None:
+    app = make_app(tmp_path)
+    requester_id = seed_user(app, "recruiter", "artifact-requester@deletion.test")
+    seed_user(app, "system_admin", "artifact-approver@deletion.test")
+    candidate_id = candidate_for(app, requester_id)
+    with app.state.identity_store.sync_session() as db:
+        candidate = db.get(Candidate, candidate_id)
+        file = FileObject(organization_id=candidate.organization_id, storage_key="private/obsolete-resume", original_filename="private-name.pdf", mime_type="application/pdf", size_bytes=4, sha256="f" * 64, uploaded_by=requester_id)
+        db.add(file); db.flush()
+        resume = Resume(organization_id=candidate.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1, parsed_text="private resume value")
+        db.add(resume); db.commit()
+    with TestClient(app) as client:
+        requester = login(client, "artifact-requester@deletion.test")
+        created = request_deletion(client, requester, candidate_id, "artifact-request")
+        request_id = UUID(created.json()["data"]["id"])
+        with app.state.identity_store.sync_session() as db:
+            row = db.get(DeletionRequest, request_id)
+            resume = db.scalar(select(Resume).where(Resume.candidate_id == candidate_id))
+            db.delete(resume)
+            db.add(DeletionArtifact(organization_id=row.organization_id, request_id=row.id, kind="resume_object", storage_key="private/obsolete-resume", status="pending", attempts=0))
+            db.get(Candidate, candidate_id).version += 1
+            db.commit()
+        approver = login(client, "artifact-approver@deletion.test")
+        refreshed = approve(client, approver, str(request_id), 1, "artifact-refresh")
+    assert_problem(refreshed, 409, "stale_manifest")
+    with app.state.identity_store.sync_session() as db:
+        assert db.scalar(select(func.count()).select_from(DeletionArtifact)) == 0
 
 
 def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path) -> None:
@@ -423,6 +593,11 @@ def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path
     assert_problem(conflict, 409, "idempotency_conflict")
     with app.state.identity_store.sync_session() as db:
         assert db.get(LegalHold, UUID(hold_id)).released_at is not None
+        events = list(db.scalars(select(AuditLog).where(AuditLog.category == "governance")))
+        assert any(e.event_type == "governance.legal_hold_placed" and e.outcome == "success" and e.metadata_json == {} for e in events)
+        assert any(e.event_type == "governance.legal_hold_released" and e.outcome == "success" and e.metadata_json == {"hold_version": 2} for e in events)
+        assert any(e.event_type == "governance.legal_hold_released" and e.outcome == "failure" and e.metadata_json == {"safe_error_code": "precondition_required"} for e in events)
+        assert any(e.event_type == "governance.legal_hold_released" and e.outcome == "failure" and e.metadata_json == {"safe_error_code": "resource_version_conflict"} for e in events)
 
 
 def test_audit_metadata_is_safe_and_expired_idempotency_can_be_reused(tmp_path) -> None:
@@ -566,3 +741,106 @@ def test_audit_and_queue_failures_roll_back_request_job_and_idempotency(
                 IdempotencyRecord.operation == "governance.deletion_request.approve"
             )
         ) == 0
+
+
+def test_authenticated_route_rejections_are_audited_and_audit_failure_is_503(
+    tmp_path, monkeypatch
+) -> None:
+    app = make_app(tmp_path)
+    requester_id = seed_user(app, "recruiter", "route-audit@deletion.test")
+    candidate_id = candidate_for(app, requester_id)
+    with TestClient(app) as client:
+        headers = login(client, "route-audit@deletion.test")
+        invalid = client.post(
+            f"/api/v1/candidates/{candidate_id}/deletion-requests",
+            json={"reason_code": "retention_expired"},
+            headers=headers,
+        )
+        assert_problem(invalid, 422, "validation_failed")
+    with app.state.identity_store.sync_session() as db:
+        event = db.scalar(
+            select(AuditLog).where(AuditLog.event_type == "governance.request_rejected")
+        )
+        assert event.outcome == "failure"
+        assert event.metadata_json == {"safe_error_code": "validation_failed"}
+
+    monkeypatch.setattr(deletion_service, "append_audit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError()))
+    with TestClient(app) as client:
+        headers = login(client, "route-audit@deletion.test")
+        unavailable = client.post(
+            f"/api/v1/candidates/{candidate_id}/deletion-requests",
+            json={"reason_code": "candidate_request"},
+            headers=headers,
+        )
+    assert_problem(unavailable, 503, "audit_unavailable")
+
+
+def test_authenticated_list_denial_is_audited(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    requester_id = seed_user(app, "recruiter", "inactive-list@deletion.test")
+    with app.state.identity_store.sync_session() as db:
+        user = db.get(User, requester_id)
+        organization_id = user.organization_id
+    with TestClient(app) as client:
+        headers = login(client, "inactive-list@deletion.test")
+        monkeypatch.setattr(
+            app.state.identity_service,
+            "principal",
+            lambda token: Principal(
+                user_id=requester_id,
+                organization_id=organization_id,
+                roles=frozenset({"recruiter"}),
+                active=False,
+            ),
+        )
+        denied = client.get("/api/v1/deletion-requests", headers=headers)
+    assert_problem(denied, 404, "resource_not_found")
+    with app.state.identity_store.sync_session() as db:
+        events = list(
+            db.scalars(
+                select(AuditLog).where(
+                    AuditLog.event_type == "governance.deletion_requests_listed"
+                )
+            )
+        )
+        assert [(event.outcome, event.metadata_json) for event in events] == [
+            ("denied", {"safe_error_code": "resource_not_found"})
+        ]
+
+
+def test_all_b2a_endpoints_are_non_enumerating_for_known_cross_tenant_ids(tmp_path) -> None:
+    app = make_app(tmp_path)
+    local_users = {}
+    for role in ("recruiter", "recruiting_admin", "system_admin", "hiring_manager", "interviewer"):
+        local_users[role] = seed_user(app, role, f"matrix-{role}@deletion.test")
+    with app.state.identity_store.sync_session() as db:
+        other_org = Organization(slug="other-matrix", name="Other", status="active")
+        other_user = User(organization=other_org, email="other@matrix.test", normalized_email="other@matrix.test", display_name="Other private", password_hash=PasswordService().hash("correct horse"))
+        other_user.roles.append(UserRole(role="recruiting_admin")); db.add(other_user); db.flush()
+        candidate = Candidate(organization_id=other_org.id, display_name="Cross tenant private", owner_id=other_user.id)
+        db.add(candidate); db.flush()
+        manifest, policy = build_private_manifest(db, candidate, now=FixedClock().current_time())
+        deletion = DeletionRequest(organization_id=other_org.id, candidate_id=candidate.id, reason_code="administrator_request", requested_by=other_user.id, impact_manifest=manifest, manifest_hash=canonical_manifest_hash(manifest), policy_version=policy.version, candidate_version=candidate.version)
+        hold = LegalHold(organization_id=other_org.id, candidate_id=candidate.id, reason="Cross tenant hold secret", placed_by=other_user.id)
+        db.add_all([deletion, hold]); db.commit()
+        candidate_id, request_id, hold_id = candidate.id, deletion.id, hold.id
+    with app.state.identity_store.sync_session() as db:
+        before = (db.scalar(select(func.count()).select_from(DeletionRequest)), db.scalar(select(func.count()).select_from(LegalHold)), db.scalar(select(func.count()).select_from(BackgroundJob)))
+    with TestClient(app) as client:
+        for role in local_users:
+            headers = login(client, f"matrix-{role}@deletion.test")
+            responses = [
+                request_deletion(client, headers, candidate_id, f"matrix-create-{role}"),
+                client.get("/api/v1/deletion-requests", headers=headers),
+                client.get(f"/api/v1/deletion-requests/{request_id}", headers=headers),
+                client.post(f"/api/v1/deletion-requests/{request_id}/transitions", json={"target_status":"approved"}, headers={**headers,"If-Match":'"1"',"Idempotency-Key":f"matrix-approve-{role}"}),
+                client.post(f"/api/v1/candidates/{candidate_id}/legal-holds", json={"reason":"Local attempt"}, headers={**headers,"Idempotency-Key":f"matrix-hold-{role}"}),
+                client.post(f"/api/v1/legal-holds/{hold_id}/releases", json={"reason":"Local attempt"}, headers={**headers,"If-Match":'"1"',"Idempotency-Key":f"matrix-release-{role}"}),
+                client.get(f"/api/v1/candidates/{candidate_id}/governance-status", headers=headers),
+            ]
+            assert responses[0].status_code == 404
+            assert str(request_id) not in responses[1].text
+            assert all(response.status_code == 404 for response in responses[2:])
+    with app.state.identity_store.sync_session() as db:
+        after = (db.scalar(select(func.count()).select_from(DeletionRequest)), db.scalar(select(func.count()).select_from(LegalHold)), db.scalar(select(func.count()).select_from(BackgroundJob)))
+        assert after == before

@@ -205,6 +205,21 @@ def lock_deletion_request_context(
     return (candidate, request) if request is not None else None
 
 
+def lock_approval_legal_holds(db, row: DeletionRequest) -> None:
+    list(
+        db.scalars(
+            select(LegalHold)
+            .where(
+                LegalHold.organization_id == row.organization_id,
+                LegalHold.candidate_id == row.candidate_id,
+                LegalHold.released_at.is_(None),
+            )
+            .order_by(LegalHold.id)
+            .with_for_update()
+        )
+    )
+
+
 def lock_legal_hold_context(db, organization_id, hold_id) -> tuple[Candidate, LegalHold] | None:
     candidate_id = db.scalar(
         select(LegalHold.candidate_id).where(
@@ -457,32 +472,23 @@ def safe_hold_projection(row: LegalHold, *, include_reason: bool) -> dict[str, A
     }
 
 
-def _sync_artifacts(db, row: DeletionRequest) -> None:
-    existing = {
-        (artifact.kind, artifact.storage_key)
-        for artifact in db.scalars(
-            select(DeletionArtifact).where(
+def _clear_unstarted_artifacts_for_refresh(db, row: DeletionRequest) -> None:
+    artifacts = list(
+        db.scalars(
+            select(DeletionArtifact)
+            .where(
                 DeletionArtifact.organization_id == row.organization_id,
                 DeletionArtifact.request_id == row.id,
             )
+            .with_for_update()
         )
-    }
-    for object_key, kind in (
-        ("resume_objects", "resume_object"),
-        ("temporary_exports", "report_export_object"),
-    ):
-        for item in row.impact_manifest["objects"][object_key]:
-            marker = (kind, item["storage_key"])
-            if marker not in existing:
-                db.add(
-                    DeletionArtifact(
-                        organization_id=row.organization_id,
-                        request_id=row.id,
-                        kind=kind,
-                        storage_key=item["storage_key"],
-                    )
-                )
-                existing.add(marker)
+    )
+    if any(artifact.status != "pending" or artifact.attempts != 0 for artifact in artifacts):
+        raise DeletionDomainError("artifact_checkpoint_conflict")
+    for artifact in artifacts:
+        db.delete(artifact)
+    if artifacts:
+        db.flush()
 
 
 def create_deletion_request_locked(
@@ -529,7 +535,6 @@ def create_deletion_request_locked(
     )
     db.add(row)
     db.flush()
-    _sync_artifacts(db, row)
     append_audit(
         db,
         actor=principal,
@@ -574,7 +579,6 @@ def _replace_manifest(db, row: DeletionRequest, candidate: Candidate, now: datet
     row.manifest_hash = canonical_manifest_hash(manifest)
     row.candidate_version = candidate.version
     row.policy_version = policy.version
-    _sync_artifacts(db, row)
 
 
 def approve_deletion_request_locked(
@@ -601,13 +605,13 @@ def approve_deletion_request_locked(
         candidate.version != row.candidate_version
         or not hmac.compare_digest(row.manifest_hash, current_hash)
     ):
+        _clear_unstarted_artifacts_for_refresh(db, row)
         row.impact_manifest = current_manifest
         row.manifest_hash = current_hash
         row.candidate_version = candidate.version
         row.policy_version = current_manifest["policy_version"]
         row.version += 1
         row.safe_error_code = "stale_manifest"
-        _sync_artifacts(db, row)
         append_audit(
             db,
             actor=principal,
@@ -637,6 +641,7 @@ def approve_deletion_request_locked(
         expected_manifest_hash=current_hash,
     )
     if retrying_failed:
+        _clear_unstarted_artifacts_for_refresh(db, row)
         row.impact_manifest = current_manifest
         row.manifest_hash = current_hash
         row.candidate_version = candidate.version
@@ -647,7 +652,6 @@ def approve_deletion_request_locked(
     row.approved_at = aware(now)
     row.safe_error_code = None
     row.version += 1
-    _sync_artifacts(db, row)
     QueueRepository(db).enqueue(
         row.organization_id,
         "governance.delete_candidate",

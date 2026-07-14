@@ -120,3 +120,69 @@ untouched and unstaged.
   outside B2A.
 - Queue execution, storage deletion, redaction, recovery, and tombstone filtering
   intentionally remain unimplemented for B2B/B3.
+
+## B2A re-review fixes
+
+The earlier report is corrected as follows: B2A never materializes
+`deletion_artifacts`. Artifact locator/checkpoint creation belongs to B2B. A B2A
+stale-manifest refresh only removes request-owned artifacts that are still
+`pending` with zero attempts, and fails closed if any artifact has started or
+been checkpointed.
+
+- Bound deletion-create idempotency fingerprints to `candidate_id`; sequential
+  and simultaneous same-key/different-candidate tests now produce exactly one
+  201 and one `idempotency_conflict`, never a cross-candidate replay.
+- Removed eager artifact materialization from request creation and approval.
+  Removed-resume stale refresh coverage proves obsolete unstarted artifacts are
+  deleted and no artifact is recreated.
+- Added authenticated route-validation and precondition auditing, exact
+  event/outcome/safe-code assertions, generic `governance.request_rejected`, and
+  fail-closed 503 `audit_unavailable` behavior when required rejection/read audit
+  persistence fails. Unauthenticated validation does not audit body values or IDs.
+- Approval now locks active legal-hold rows before idempotency admission, keeping
+  Candidate -> request/hold -> queue/idempotency ordering.
+- Added a real two-tenant matrix across all seven B2A endpoints and all relevant
+  roles, asserting known foreign IDs remain non-enumerating and mutation-free.
+- Added bounded barriers and joins to every B2A threaded PostgreSQL test; the
+  approve-vs-hold race rejects exceptions/500s and accepts only serialized end
+  states with no executable delete job under an active hold.
+- Seeded unique candidate, contact, resume, file/storage, application, interview,
+  URL, credential, and feedback values and recursively checked every nested
+  success, problem, and audit response value for their absence.
+- Requester cursors now bind `principal.user_id`; another same-tenant requester
+  cannot reuse the token. Requester list rows use the same current candidate-read
+  predicate as individual reads, without hardcoded requester role labels.
+
+### Re-review RED evidence
+
+- `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py -q -x`
+  - RED: `1 failed, 8 passed`; `test_create_idempotency_key_is_bound_to_candidate`
+    received 201 for the second candidate instead of 409
+    `idempotency_conflict`, proving the false cross-candidate replay.
+- `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py::test_authenticated_list_denial_is_audited -q`
+  - RED: `1 failed`; the authenticated inactive-principal list denial returned
+    404 with no `governance.deletion_requests_listed` audit row.
+
+### Re-review GREEN evidence
+
+- Focused API gate:
+  `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py -q -x`
+  - `21 passed in 26.92s`.
+- PostgreSQL barriers:
+  `docker run --rm -e POSTGRES_SMOKE_URL=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_postgres.py -q -x`
+  - `5 passed in 26.85s`.
+- Final focused API/PostgreSQL/queue/audit/OpenAPI gate:
+  `docker run --rm -e POSTGRES_SMOKE_URL=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py server/tests/test_governance_deletion_postgres.py server/tests/test_governance_api.py server/tests/test_governance_audit.py server/tests/test_queue.py server/tests/test_queue_postgres.py server/tests/test_queue_review.py -q`
+  - `96 passed in 102.52s`.
+- Final full backend PostgreSQL suite:
+  `docker run --rm -e POSTGRES_SMOKE_URL=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests -q`
+  - `642 passed, 5 skipped in 939.99s`.
+- Python 3.12 compile over changed governance/queue modules and B2A tests:
+  passed.
+- `docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet`:
+  passed.
+- Scoped and staged `git diff --check`: passed.
+
+The five skips remain the optional external ClamAV/MinIO tests. No B2B Worker,
+storage, redaction, recovery, tombstone-filtering, frontend, migration, or deploy
+behavior was added.

@@ -124,7 +124,8 @@ def test_two_request_creators_serialize_to_one_open_request(postgres_app) -> Non
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
     for client in clients:
         client.close()
 
@@ -132,6 +133,29 @@ def test_two_request_creators_serialize_to_one_open_request(postgres_app) -> Non
     assert next(response for response in responses if response.status_code == 409).json()["code"] == "deletion_request_open"
     with Session(engine) as db:
         assert db.scalar(select(func.count()).select_from(DeletionRequest)) == 1
+
+
+def test_same_key_different_candidates_never_replays_cross_candidate(postgres_app) -> None:
+    app, engine, first_id = postgres_app
+    with Session(engine) as db:
+        owner = db.scalar(select(User).where(User.email == "recruiter@deletion-pg.test"))
+        second = Candidate(organization_id=owner.organization_id, display_name="Second", owner_id=owner.id)
+        db.add(second); db.commit(); second_id = second.id
+    clients = [TestClient(app), TestClient(app)]
+    headers = [login(client, "recruiter@deletion-pg.test") for client in clients]
+    barrier = threading.Barrier(2); responses = []
+    def create(index, candidate_id):
+        barrier.wait(timeout=10)
+        responses.append(create_request(clients[index], headers[index], candidate_id, "same-resource-key"))
+    threads = [threading.Thread(target=create, args=(0, first_id)), threading.Thread(target=create, args=(1, second_id))]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
+    assert sorted(response.status_code for response in responses) == [201, 409]
+    assert next(r for r in responses if r.status_code == 409).json()["code"] == "idempotency_conflict"
+    with Session(engine) as db:
+        assert db.scalar(select(func.count()).select_from(DeletionRequest)) == 1
+    for client in clients: client.close()
 
 
 def test_two_approvers_enqueue_exactly_one_job_and_stale_version_cannot_mutate(postgres_app) -> None:
@@ -163,7 +187,8 @@ def test_two_approvers_enqueue_exactly_one_job_and_stale_version_cannot_mutate(p
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
     for client in clients:
         client.close()
 
@@ -214,10 +239,13 @@ def test_approval_and_hold_placement_serialize_without_executable_job(postgres_a
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=10)
+    assert not any(thread.is_alive() for thread in threads)
     approve_client.close()
     hold_client.close()
 
+    assert len(responses) == 2
+    assert all(response.status_code < 500 for response in responses)
     assert any(response.status_code == 201 for response in responses)
     with Session(engine) as db:
         request = db.get(DeletionRequest, UUID(request_id))

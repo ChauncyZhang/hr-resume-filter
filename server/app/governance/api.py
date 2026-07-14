@@ -35,6 +35,7 @@ from server.app.governance.deletion_service import (
     lock_candidate,
     lock_candidate_deletion_requests,
     lock_candidate_governance_rows,
+    lock_approval_legal_holds,
     lock_deletion_request_context,
     lock_legal_hold_context,
     place_legal_hold_locked,
@@ -94,7 +95,16 @@ class GovernanceRoute(APIRoute):
             try:
                 return await original(request)
             except RequestValidationError:
-                return _safe_problem(request, 422, "validation_failed")
+                principal = _principal(request)
+                if isinstance(principal, JSONResponse):
+                    return principal
+                return _rejection_response(
+                    request,
+                    principal,
+                    "governance.request_rejected",
+                    422,
+                    "validation_failed",
+                )
             except Exception as error:
                 logging.getLogger(__name__).exception(
                     "governance_request_failed",
@@ -470,7 +480,7 @@ def _audit_rejection(
     *,
     resource_type: str | None = None,
     resource_id=None,
-) -> None:
+) -> bool:
     try:
         with request.app.state.identity_store.sync_session() as audit_db:
             append_failure_audit(
@@ -483,16 +493,32 @@ def _audit_rejection(
                 resource_id=resource_id,
             )
             audit_db.commit()
+        return True
     except Exception:
         logging.getLogger(__name__).exception(
             "governance_audit_rejection_failed",
             extra={"context": {"trace_id": request.state.trace_id}},
         )
+        return False
+
+
+def _rejection_response(request, principal, event_type: str, status: int, code: str):
+    if not _audit_rejection(request, principal, event_type, code):
+        return _safe_problem(request, 503, "audit_unavailable")
+    return _safe_problem(request, status, code)
+
+
+def _validated_rejection(request, principal, event_type: str, response: JSONResponse):
+    body = json.loads(response.body)
+    return _rejection_response(
+        request, principal, event_type, response.status_code, body["code"]
+    )
 
 
 def _denied_with_audit(request: Request, principal, event_type: str) -> JSONResponse:
-    _audit_rejection(request, principal, event_type, "resource_not_found")
-    return _denied(request)
+    return _rejection_response(
+        request, principal, event_type, 404, "resource_not_found"
+    )
 
 
 def _domain_status(code: str) -> int:
@@ -501,6 +527,20 @@ def _domain_status(code: str) -> int:
     if code in {"validation_failed"}:
         return 422
     return 409
+
+
+def _audit_read_success(db, principal, event_type: str, trace_id: str) -> None:
+    from server.app.governance.audit import append_audit
+
+    append_audit(
+        db,
+        actor=principal,
+        category="governance",
+        event_type=event_type,
+        outcome="success",
+        trace_id=trace_id,
+        metadata={},
+    )
 
 
 @router.post(
@@ -524,7 +564,9 @@ def create_deletion_request(
             )
         key = _idempotency_key(request, idempotency_key)
         if isinstance(key, JSONResponse):
-            return key
+            return _validated_rejection(
+                request, principal, "governance.deletion_requested", key
+            )
         candidate = lock_candidate(db, principal.organization_id, candidate_id)
         if candidate is None:
             return _denied_with_audit(
@@ -533,7 +575,7 @@ def create_deletion_request(
         lock_candidate_deletion_requests(
             db, principal.organization_id, candidate_id
         )
-        fingerprint = payload.model_dump()
+        fingerprint = {"candidate_id": str(candidate_id), **payload.model_dump()}
         try:
             previous = load_idempotency_after_lock(
                 db,
@@ -559,12 +601,13 @@ def create_deletion_request(
             status = 201
         except IdempotencyConflict:
             db.rollback()
-            _audit_rejection(
+            if not _audit_rejection(
                 request,
                 principal,
                 "governance.deletion_requested",
                 "idempotency_conflict",
-            )
+            ):
+                return _safe_problem(request, 503, "audit_unavailable")
             return _safe_problem(request, 409, "idempotency_conflict")
         except DeletionDomainError as error:
             append_failure_audit(
@@ -607,17 +650,19 @@ def list_deletion_requests(
     if isinstance(principal, JSONResponse):
         return principal
     if status is not None and status not in DELETION_STATUSES:
-        return _safe_problem(request, 422, "validation_failed")
+        return _rejection_response(
+            request, principal, "governance.request_rejected", 422, "validation_failed"
+        )
     system_admin = can_approve_deletion(principal)
     if not system_admin and not principal.active:
-        return _denied(request)
+        return _denied_with_audit(
+            request, principal, "governance.deletion_requests_listed"
+        )
     with request.app.state.identity_store.sync_session() as db:
         query = select(DeletionRequest).where(
             DeletionRequest.organization_id == principal.organization_id
         )
         if not system_admin:
-            if not principal.roles & {"recruiter", "recruiting_admin"}:
-                return _denied(request)
             query = (
                 select(DeletionRequest)
                 .join(
@@ -646,6 +691,7 @@ def list_deletion_requests(
                     "kind": "deletion_request_cursor",
                     "organization_id": str(principal.organization_id),
                     "authorization": "system" if system_admin else "requester",
+                    "requester_id": None if system_admin else str(principal.user_id),
                     "status": status,
                 }
                 if any(decoded.get(key) != value for key, value in expected.items()):
@@ -653,7 +699,13 @@ def list_deletion_requests(
                 created_at = datetime.fromisoformat(decoded["created_at"])
                 cursor_id = UUID(decoded["id"])
             except (InvalidGovernanceToken, KeyError, TypeError, ValueError):
-                return _safe_problem(request, 422, "validation_failed")
+                return _rejection_response(
+                    request,
+                    principal,
+                    "governance.request_rejected",
+                    422,
+                    "validation_failed",
+                )
             query = query.where(
                 or_(
                     DeletionRequest.created_at < created_at,
@@ -678,12 +730,21 @@ def list_deletion_requests(
                     "kind": "deletion_request_cursor",
                     "organization_id": str(principal.organization_id),
                     "authorization": "system" if system_admin else "requester",
+                    "requester_id": None if system_admin else str(principal.user_id),
                     "status": status,
                     "created_at": aware_deletion(last.created_at).isoformat(),
                     "id": str(last.id),
                 }
             )
             rows = rows[:limit]
+        try:
+            _audit_read_success(
+                db, principal, "governance.deletion_requests_listed", request.state.trace_id
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            return _safe_problem(request, 503, "audit_unavailable")
         body = _serialized(
             DeletionRequestCollection,
             {
@@ -715,10 +776,20 @@ def get_deletion_request(request_id: UUID, request: Request):
             )
         )
         if row is None or not _can_read_deletion_request(db, principal, row):
-            return _denied(request)
+            return _denied_with_audit(
+                request, principal, "governance.deletion_request_read"
+            )
         body = _serialized(
             DeletionRequestResource, {"data": safe_request_projection(row)}
         )
+        try:
+            _audit_read_success(
+                db, principal, "governance.deletion_request_read", request.state.trace_id
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            return _safe_problem(request, 503, "audit_unavailable")
     return _response(body, etag=row.version)
 
 
@@ -742,10 +813,14 @@ def transition_deletion_request(
         )
     expected = _expected_version(request, if_match)
     if isinstance(expected, JSONResponse):
-        return expected
+        return _validated_rejection(
+            request, principal, "governance.deletion_approved", expected
+        )
     key = _idempotency_key(request, idempotency_key)
     if isinstance(key, JSONResponse):
-        return key
+        return _validated_rejection(
+            request, principal, "governance.deletion_approved", key
+        )
     operation = "governance.deletion_request.approve"
     fingerprint = {
         "request_id": str(request_id),
@@ -761,6 +836,7 @@ def transition_deletion_request(
                 request, principal, "governance.deletion_approved"
             )
         candidate, row = context
+        lock_approval_legal_holds(db, row)
         try:
             previous = load_idempotency_after_lock(
                 db,
@@ -796,12 +872,13 @@ def transition_deletion_request(
                 }
         except IdempotencyConflict:
             db.rollback()
-            _audit_rejection(
+            if not _audit_rejection(
                 request,
                 principal,
                 "governance.deletion_approved",
                 "idempotency_conflict",
-            )
+            ):
+                return _safe_problem(request, 503, "audit_unavailable")
             return _safe_problem(request, 409, "idempotency_conflict")
         except DeletionDomainError as error:
             append_failure_audit(
@@ -856,7 +933,9 @@ def place_legal_hold(
             )
         key = _idempotency_key(request, idempotency_key)
         if isinstance(key, JSONResponse):
-            return key
+            return _validated_rejection(
+                request, principal, "governance.legal_hold_placed", key
+            )
         candidate = lock_candidate(db, principal.organization_id, candidate_id)
         if candidate is None:
             return _denied_with_audit(
@@ -893,12 +972,13 @@ def place_legal_hold(
             status = 201
         except IdempotencyConflict:
             db.rollback()
-            _audit_rejection(
+            if not _audit_rejection(
                 request,
                 principal,
                 "governance.legal_hold_placed",
                 "idempotency_conflict",
-            )
+            ):
+                return _safe_problem(request, 503, "audit_unavailable")
             return _safe_problem(request, 409, "idempotency_conflict")
         except DeletionDomainError as error:
             append_failure_audit(
@@ -941,10 +1021,14 @@ def release_legal_hold(
         return principal
     expected = _expected_version(request, if_match)
     if isinstance(expected, JSONResponse):
-        return expected
+        return _validated_rejection(
+            request, principal, "governance.legal_hold_released", expected
+        )
     key = _idempotency_key(request, idempotency_key)
     if isinstance(key, JSONResponse):
-        return key
+        return _validated_rejection(
+            request, principal, "governance.legal_hold_released", key
+        )
     operation = "governance.legal_hold.release"
     fingerprint = {
         "hold_id": str(hold_id),
@@ -997,12 +1081,13 @@ def release_legal_hold(
             status = 200
         except IdempotencyConflict:
             db.rollback()
-            _audit_rejection(
+            if not _audit_rejection(
                 request,
                 principal,
                 "governance.legal_hold_released",
                 "idempotency_conflict",
-            )
+            ):
+                return _safe_problem(request, 503, "audit_unavailable")
             return _safe_problem(request, 409, "idempotency_conflict")
         except DeletionDomainError as error:
             append_failure_audit(
@@ -1042,7 +1127,9 @@ def get_candidate_governance_status(candidate_id: UUID, request: Request):
         return principal
     with request.app.state.identity_store.sync_session() as db:
         if not can_read_candidate_governance(db, principal, candidate_id):
-            return _denied(request)
+            return _denied_with_audit(
+                request, principal, "governance.candidate_status_read"
+            )
         deletion = db.scalar(
             select(DeletionRequest)
             .where(
@@ -1069,4 +1156,12 @@ def get_candidate_governance_status(candidate_id: UUID, request: Request):
         body = GovernanceStatusResource.model_validate({"data": data}).model_dump(
             mode="json", exclude_none=True
         )
+        try:
+            _audit_read_success(
+                db, principal, "governance.candidate_status_read", request.state.trace_id
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            return _safe_problem(request, 503, "audit_unavailable")
     return _response(body)

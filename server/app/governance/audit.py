@@ -65,6 +65,10 @@ EVENT_METADATA_ALLOWLIST: dict[str, dict[str, MetadataField]] = {
         "hold_version": _INT,
         "safe_error_code": _CODE,
     },
+    "governance.request_rejected": {"safe_error_code": _CODE},
+    "governance.deletion_requests_listed": {"safe_error_code": _CODE},
+    "governance.deletion_request_read": {"safe_error_code": _CODE},
+    "governance.candidate_status_read": {"safe_error_code": _CODE},
 }
 
 _ALLOWED_CATEGORIES = frozenset({"system", "recruiting", "governance"})
