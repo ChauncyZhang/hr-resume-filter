@@ -15,10 +15,17 @@ Implemented the Task A governance frontend slice against the backend governance 
 
 ### GREEN
 
-- Focused controller/role tests: 27/27 passed.
-- Full frontend suite: 244/244 passed.
+- Focused controller/role tests: 32/32 passed after independent frontend review fixes.
+- Full frontend suite: 249/249 passed.
 - Vite production build completed successfully.
 - `git diff --check` exited 0. It emitted only the pre-existing CRLF warning for prohibited user file `app/sample/candidates.csv`; that file was not touched or staged.
+
+### Independent frontend review RED/GREEN
+
+- Mutation-denied RED retained the previously loaded policy and draft after preview returned `resource_not_found`. GREEN clears policy, draft, preview token, dirty state, and save intent for preview and PATCH denial; further mutations are frozen.
+- Forced-reload RED left the old policy/draft usable while GET was pending. GREEN clears the stale editor state on loading, rejects quick save/confirm calls without aborting the authoritative GET, and creates a new intent only after the new version arrives.
+- Preview-projection RED accepted negative, fractional, string, or missing counts and malformed/expired timestamps. GREEN requires a non-negative safe integer, matching version, explicit shortening, a valid future RFC3339 expiry, and a token before exposing confirmation.
+- Dialog-focus RED had no focus manager. GREEN behavior tests verify safe initial focus, Tab and Shift+Tab trapping, busy Escape suppression, normal Escape close, disabled-control exclusion, and trigger focus restoration.
 
 ## Files
 
@@ -49,7 +56,8 @@ Modified:
 
 - Normalization retains only the documented audit and retention projection. Unknown fields, raw metadata, candidate/contact data, IP values, and server error detail are discarded.
 - The UI renders `network_ref` as “网络标识” and never renders raw metadata.
-- Loading/status/error regions use status or alert semantics; form fields have visible labels; dialogs keep the existing accessible SET-04 dialog pattern; destructive confirmation controls are disabled while saving.
+- Loading/status/error regions use status or alert semantics; form fields have visible labels; destructive confirmation controls are disabled while saving.
+- Governance dialogs initially focus the safe cancel action, trap keyboard focus, close on Escape only when not busy, and restore focus to the invoking control.
 - Existing mobile table/card and drawer behavior is preserved. Added governance filters stack at the existing mobile breakpoint, and long safe resource references wrap within their containers.
 - Audit rows and preview tokens remain in memory only. Preview tokens are excluded from public controller state and cleared by draft changes and cleanup.
 
@@ -63,7 +71,7 @@ Modified:
 ## Checks run
 
 - `node --test src/governanceSettings.test.js src/roleCapabilities.test.js`
-- `npm.cmd test` — 244 passed, 0 failed
+- `npm.cmd test` — 249 passed, 0 failed
 - `npm.cmd run build` — success; existing bundle-size warning remains
 - `git diff --check` — exit 0
 - Local Vite preview opened in the browser; login page rendered with no console warnings/errors.

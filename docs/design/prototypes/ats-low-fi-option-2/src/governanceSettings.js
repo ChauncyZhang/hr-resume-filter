@@ -35,6 +35,7 @@ const AUDIT_FILTERS = [
   ["resourceId", "resource_id"],
   ["outcome", "outcome"],
 ];
+const RFC3339_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 let fallbackKeySequence = 0;
 
@@ -175,6 +176,27 @@ function normalizedAuditRows(values) {
   return (Array.isArray(values) ? values : []).map(normalizeAuditRecord).filter(Boolean);
 }
 
+function normalizeRetentionPreview(value, { expectedVersion, now }) {
+  const affectedCandidateCount = value?.affected_candidate_count;
+  const expiresAt = safeString(value?.expires_at);
+  const expiresAtMs = RFC3339_TIMESTAMP.test(expiresAt) ? Date.parse(expiresAt) : Number.NaN;
+  const nowMs = now().getTime();
+  if (!Number.isSafeInteger(affectedCandidateCount)
+    || affectedCandidateCount < 0
+    || !Number.isSafeInteger(value?.current_version)
+    || value.current_version !== expectedVersion
+    || value?.shortening !== true
+    || !Number.isFinite(expiresAtMs)
+    || !Number.isFinite(nowMs)
+    || expiresAtMs <= nowMs) return null;
+  const impactToken = safeString(value?.impact_token);
+  if (!impactToken) return null;
+  return {
+    impactToken,
+    preview: { affectedCandidateCount, expiresAt },
+  };
+}
+
 export function releaseGovernanceSettingsSubscription(controller, unsubscribe) {
   unsubscribe();
   controller.releaseRequests();
@@ -184,6 +206,7 @@ export function createGovernanceSettingsController({
   client = apiClient,
   createIdempotencyKey = createUniqueIdempotencyKey,
   createAbortController = () => new AbortController(),
+  now = () => new Date(),
 } = {}) {
   let disposed = false;
   let auditGeneration = 0;
@@ -241,6 +264,20 @@ export function createGovernanceSettingsController({
 
   function clearPreview() {
     previewToken = "";
+  }
+
+  function publishRetentionDenied(error) {
+    clearPreview();
+    saveIntent = null;
+    publish("retention", {
+      status: "denied",
+      policy: null,
+      draft: null,
+      dirty: false,
+      preview: null,
+      error: getGovernanceErrorMessage(error),
+      message: "",
+    });
   }
 
   async function loadAudit(filters = {}) {
@@ -314,7 +351,15 @@ export function createGovernanceSettingsController({
     const { generation, request } = startRetentionRequest();
     clearPreview();
     saveIntent = null;
-    publish("retention", { status: "loading", preview: null, error: "", message: "" });
+    publish("retention", {
+      status: "loading",
+      policy: null,
+      draft: null,
+      dirty: false,
+      preview: null,
+      error: "",
+      message: "",
+    });
     try {
       const response = await client.request("/api/v1/settings/retention-policy", { signal: request.signal });
       if (!isCurrentRetention(generation)) return false;
@@ -332,8 +377,12 @@ export function createGovernanceSettingsController({
       return true;
     } catch (error) {
       if (isAbortError(error) || !isCurrentRetention(generation)) return false;
+      if (isDenied(error)) {
+        publishRetentionDenied(error);
+        return false;
+      }
       publish("retention", {
-        status: isDenied(error) ? "denied" : "error",
+        status: "error",
         policy: null,
         draft: null,
         dirty: false,
@@ -377,22 +426,26 @@ export function createGovernanceSettingsController({
         signal: request.signal,
       });
       if (!isCurrentRetention(generation)) return false;
-      const token = safeString(response?.data?.impact_token);
-      if (!token) throw new Error("invalid retention preview");
-      previewToken = token;
+      const normalized = normalizeRetentionPreview(response?.data, {
+        expectedVersion: state.retention.policy.version,
+        now,
+      });
+      if (!normalized) throw new Error("invalid retention preview");
+      previewToken = normalized.impactToken;
       publish("retention", {
         status: "ready",
-        preview: {
-          affectedCandidateCount: Math.max(0, safeInteger(response?.data?.affected_candidate_count)),
-          expiresAt: safeString(response?.data?.expires_at),
-        },
+        preview: normalized.preview,
         error: "",
       });
       return false;
     } catch (error) {
       if (isAbortError(error) || !isCurrentRetention(generation)) return false;
+      if (isDenied(error)) {
+        publishRetentionDenied(error);
+        return false;
+      }
       publish("retention", {
-        status: isDenied(error) ? "denied" : "error",
+        status: "error",
         preview: null,
         error: getGovernanceErrorMessage(error),
       });
@@ -439,6 +492,10 @@ export function createGovernanceSettingsController({
       return true;
     } catch (error) {
       if (isAbortError(error) || !isCurrentRetention(generation)) return false;
+      if (isDenied(error)) {
+        publishRetentionDenied(error);
+        return false;
+      }
       if (error?.code === "resource_version_conflict") {
         clearPreview();
         saveIntent = null;
@@ -448,7 +505,7 @@ export function createGovernanceSettingsController({
       if (!isAmbiguousFailure(error)) saveIntent = null;
       if (PREVIEW_FAILURE_CODES.has(error?.code)) clearPreview();
       publish("retention", {
-        status: isDenied(error) ? "denied" : "error",
+        status: "error",
         preview: PREVIEW_FAILURE_CODES.has(error?.code) ? null : state.retention.preview,
         error: getGovernanceErrorMessage(error),
       });
@@ -458,7 +515,7 @@ export function createGovernanceSettingsController({
 
   async function saveRetention() {
     const { policy, draft } = state.retention;
-    if (!policy || !validDraft(draft) || state.retention.status === "saving" || state.retention.status === "previewing") {
+    if (!policy || !validDraft(draft) || ["loading", "saving", "previewing"].includes(state.retention.status)) {
       if (draft && !validDraft(draft)) publish("retention", { status: "error", error: ERROR_MESSAGES.validation_failed });
       return false;
     }
@@ -470,7 +527,7 @@ export function createGovernanceSettingsController({
   }
 
   async function confirmRetentionSave() {
-    if (state.retention.status === "saving" || !previewToken || !state.retention.preview || !state.retention.policy || !validDraft(state.retention.draft)) return false;
+    if (["loading", "saving", "previewing"].includes(state.retention.status) || !previewToken || !state.retention.preview || !state.retention.policy || !validDraft(state.retention.draft)) return false;
     return patchRetention(previewToken);
   }
 

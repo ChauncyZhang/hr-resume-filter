@@ -24,6 +24,7 @@ const policy = {
   updated_by: { id: "user-1", display_name: "系统管理员", email: "private@example.com" },
   raw_metadata: { secret: true },
 };
+const previewNow = () => new Date("2026-07-14T02:00:00Z");
 
 function requireFunction(value, name) {
   assert.equal(typeof value, "function", `${name} should be implemented`);
@@ -127,7 +128,7 @@ test("audit reload clears old scope immediately and exposes loading then empty",
   const client = createClient((_path, _options, count) => count === 1
     ? { data: [{ id: "audit-1", actor: { display_name: "周明" } }], meta: { next_cursor: null, limit: 50 } }
     : second.promise);
-  const controller = createGovernanceSettingsController({ client });
+  const controller = createGovernanceSettingsController({ client, now: previewNow });
   await controller.loadAudit({ outcome: "success" });
   assert.equal(controller.getState().audit.status, "ready");
   assert.equal(controller.getState().audit.rows.length, 1);
@@ -205,6 +206,42 @@ test("audit and retention latest-operation generations do not abort each other",
   assert.equal(controller.getState().audit.status, "empty");
 });
 
+test("forced retention reload freezes stale draft and quick save cannot abort GET or start a mutation", async () => {
+  requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
+  const forcedGet = deferred();
+  const latest = { ...policy, version: 8, terminal_days: 900 };
+  const client = createClient((path, _options, count) => {
+    if (count === 1) return { data: policy };
+    if (count === 2) return forcedGet.promise;
+    if (path.endsWith("/previews")) return { data: { current_version: 8, shortening: true, affected_candidate_count: 2, impact_token: "new-version-token", expires_at: "2026-07-14T04:00:00Z" } };
+    throw new Error("unexpected request");
+  });
+  const controller = createGovernanceSettingsController({ client, now: previewNow });
+  await controller.loadRetention();
+  controller.updateRetentionDraft({ terminalDays: 365 });
+
+  const reloading = controller.loadRetention();
+  const forcedGetSignal = client.calls[1].options.signal;
+  assert.equal(controller.getState().retention.status, "loading");
+  assert.equal(controller.getState().retention.policy, null);
+  assert.equal(controller.getState().retention.draft, null);
+
+  assert.equal(await controller.saveRetention(), false);
+  assert.equal(await controller.confirmRetentionSave(), false);
+  assert.equal(forcedGetSignal.aborted, false);
+  assert.equal(client.calls.length, 2);
+
+  forcedGet.resolve({ data: latest });
+  await reloading;
+  controller.updateRetentionDraft({ terminalDays: 500 });
+  await controller.saveRetention();
+
+  assert.equal(client.calls.length, 3);
+  assert.equal(client.calls[2].path, "/api/v1/settings/retention-policy/previews");
+  assert.deepEqual(client.calls[2].options.body, { terminal_days: 500, talent_pool_days: 1095, backup_window_days: 90 });
+  assert.equal(controller.getState().retention.preview.affectedCandidateCount, 2);
+});
+
 test("unchanged or increased retention saves directly with quoted If-Match and exact body", async () => {
   requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
   const client = createClient((path, options) => {
@@ -237,7 +274,7 @@ test("shortening requires a server preview and explicit confirmation before PATC
     if (options.method === "PATCH") return { data: { ...policy, version: 8, terminal_days: 365 } };
     return { data: policy };
   });
-  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => "shorten-key" });
+  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => "shorten-key", now: previewNow });
   await controller.loadRetention();
   controller.updateRetentionDraft({ terminalDays: 365 });
   const prepared = await controller.saveRetention();
@@ -261,7 +298,7 @@ test("draft change after preview invalidates the token and confirmation gate", a
   const client = createClient((path) => path.endsWith("/previews")
     ? { data: { current_version: 7, shortening: true, affected_candidate_count: 4, impact_token: "token", expires_at: "2026-07-14T02:10:00Z" } }
     : { data: policy });
-  const controller = createGovernanceSettingsController({ client });
+  const controller = createGovernanceSettingsController({ client, now: previewNow });
   await controller.loadRetention();
   controller.updateRetentionDraft({ terminalDays: 365 });
   await controller.saveRetention();
@@ -270,6 +307,71 @@ test("draft change after preview invalidates the token and confirmation gate", a
   assert.equal(controller.getState().retention.preview, null);
   assert.equal(await controller.confirmRetentionSave(), false);
   assert.equal(client.calls.some((call) => call.options.method === "PATCH"), false);
+});
+
+test("malformed preview projections fail safely without exposing a confirmation", async () => {
+  requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
+  const valid = {
+    current_version: 7,
+    shortening: true,
+    affected_candidate_count: 2,
+    impact_token: "preview-token",
+    expires_at: "2026-07-14T02:10:00Z",
+  };
+  const malformed = [
+    { ...valid, affected_candidate_count: -1 },
+    { ...valid, affected_candidate_count: 1.5 },
+    { ...valid, affected_candidate_count: "2" },
+    { ...valid, affected_candidate_count: undefined },
+    { ...valid, expires_at: "not-a-date" },
+    { ...valid, expires_at: "2026-07-14 02:10:00" },
+    { ...valid, expires_at: "2026-07-14T02:00:00Z" },
+  ];
+
+  for (const projection of malformed) {
+    const client = createClient((path) => path.endsWith("/previews") ? { data: projection } : { data: policy });
+    const controller = createGovernanceSettingsController({ client, now: previewNow });
+    await controller.loadRetention();
+    controller.updateRetentionDraft({ terminalDays: 365 });
+
+    await controller.saveRetention();
+
+    assert.equal(controller.getState().retention.status, "error");
+    assert.equal(controller.getState().retention.preview, null);
+    assert.equal(await controller.confirmRetentionSave(), false);
+    assert.equal(client.calls.some((call) => call.options.method === "PATCH"), false);
+  }
+});
+
+test("mutation-denied preview and PATCH clear stale policy, draft, preview, and save capability", async () => {
+  requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
+  for (const mutation of ["preview", "patch"]) {
+    const client = createClient((path, options) => {
+      if (path.endsWith("/previews") || options.method === "PATCH") {
+        throw new ApiError({ status: 404, code: "resource_not_found", detail: "private authorization scope" });
+      }
+      return { data: policy };
+    });
+    const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => `${mutation}-key` });
+    await controller.loadRetention();
+    controller.updateRetentionDraft({ terminalDays: mutation === "preview" ? 365 : 800 });
+
+    await controller.saveRetention();
+
+    assert.deepEqual(controller.getState().retention, {
+      status: "denied",
+      policy: null,
+      draft: null,
+      dirty: false,
+      preview: null,
+      error: "当前账号无权访问此治理设置。",
+      message: "",
+    }, mutation);
+    const callCount = client.calls.length;
+    assert.equal(await controller.saveRetention(), false);
+    assert.equal(await controller.confirmRetentionSave(), false);
+    assert.equal(client.calls.length, callCount, `${mutation} denied must freeze mutations`);
+  }
 });
 
 test("stale or expired preview failure clears confirmation and requires a fresh preview", async () => {
@@ -283,7 +385,7 @@ test("stale or expired preview failure clears confirmation and requires a fresh 
     if (options.method === "PATCH") throw new ApiError({ status: 409, code: "retention_preview_stale", detail: "candidate private data" });
     return { data: policy };
   });
-  const controller = createGovernanceSettingsController({ client });
+  const controller = createGovernanceSettingsController({ client, now: previewNow });
   await controller.loadRetention();
   controller.updateRetentionDraft({ terminalDays: 365 });
   await controller.saveRetention();
@@ -360,6 +462,43 @@ test("version conflict reloads the current policy and asks the user to review", 
   assert.equal(controller.getState().retention.message.includes("private"), false);
 });
 
+test("version-conflict reload remains authoritative until a fresh-version save intent is created", async () => {
+  requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
+  const forcedGet = deferred();
+  const keys = ["old-version-key", "new-version-key"];
+  const latest = { ...policy, version: 8, terminal_days: 900 };
+  let patchAttempt = 0;
+  const client = createClient((_path, options, count) => {
+    if (options.method === "PATCH") {
+      patchAttempt += 1;
+      if (patchAttempt === 1) throw new ApiError({ status: 409, code: "resource_version_conflict" });
+      return { data: { ...latest, version: 9, terminal_days: options.body.terminal_days } };
+    }
+    if (count === 1) return { data: policy };
+    return forcedGet.promise;
+  });
+  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => keys.shift() });
+  await controller.loadRetention();
+  controller.updateRetentionDraft({ terminalDays: 800 });
+
+  const conflictedSave = controller.saveRetention();
+  await new Promise((resolve) => setImmediate(resolve));
+  const forcedGetSignal = client.calls[2].options.signal;
+  assert.equal(controller.getState().retention.status, "loading");
+  assert.equal(await controller.saveRetention(), false);
+  assert.equal(forcedGetSignal.aborted, false);
+  assert.equal(client.calls.length, 3);
+
+  forcedGet.resolve({ data: latest });
+  assert.equal(await conflictedSave, false);
+  controller.updateRetentionDraft({ terminalDays: 1000 });
+  assert.equal(await controller.saveRetention(), true);
+
+  const patches = client.calls.filter((call) => call.options.method === "PATCH");
+  assert.deepEqual(patches.map((call) => call.options.idempotencyKey), ["old-version-key", "new-version-key"]);
+  assert.equal(patches[1].options.ifMatch, '"8"');
+});
+
 test("Strict Mode release aborts requests and clears preview without permanently disposing the controller", async () => {
   requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
   requireFunction(releaseGovernanceSettingsSubscription, "releaseGovernanceSettingsSubscription");
@@ -399,6 +538,70 @@ test("dispose aborts in-flight operations and suppresses late state updates", as
   assert.equal(notifications, 1);
 });
 
+test("dialog focus manager sets safe initial focus, traps Tab, gates Escape while busy, and restores focus", async () => {
+  const { createServer } = await import("vite");
+  const vite = await createServer({ root: process.cwd(), logLevel: "silent", server: { middlewareMode: true }, appType: "custom" });
+  try {
+    const { createDialogFocusManager } = await vite.ssrLoadModule("/src/SettingsViews.jsx");
+    assert.equal(typeof createDialogFocusManager, "function");
+
+    const focused = [];
+    const documentRef = { activeElement: null };
+    function control(name, { disabled = false } = {}) {
+      return {
+        name,
+        disabled,
+        isConnected: true,
+        getAttribute: () => null,
+        focus() { documentRef.activeElement = this; focused.push(name); },
+      };
+    }
+    const close = control("close");
+    const cancel = control("cancel");
+    const confirm = control("confirm");
+    const disabled = control("disabled", { disabled: true });
+    const trigger = control("trigger");
+    const controls = [close, cancel, confirm, disabled];
+    let busy = false;
+    let closes = 0;
+    const dialog = {
+      querySelector(selector) { return selector === "[data-dialog-initial-focus]" ? cancel : null; },
+      querySelectorAll() { return controls; },
+      contains(value) { return controls.includes(value); },
+    };
+    const manager = createDialogFocusManager({
+      dialog,
+      restoreTarget: trigger,
+      documentRef,
+      isBusy: () => busy,
+      onClose: () => { closes += 1; },
+    });
+
+    manager.focusInitial();
+    assert.equal(documentRef.activeElement, cancel);
+    documentRef.activeElement = confirm;
+    let prevented = 0;
+    manager.handleKeyDown({ key: "Tab", shiftKey: false, preventDefault: () => { prevented += 1; } });
+    assert.equal(documentRef.activeElement, close);
+    documentRef.activeElement = close;
+    manager.handleKeyDown({ key: "Tab", shiftKey: true, preventDefault: () => { prevented += 1; } });
+    assert.equal(documentRef.activeElement, confirm);
+    assert.equal(focused.includes("disabled"), false);
+
+    busy = true;
+    manager.handleKeyDown({ key: "Escape", preventDefault: () => { prevented += 1; } });
+    assert.equal(closes, 0);
+    busy = false;
+    manager.handleKeyDown({ key: "Escape", preventDefault: () => { prevented += 1; } });
+    assert.equal(closes, 1);
+    manager.restoreFocus();
+    assert.equal(documentRef.activeElement, trigger);
+    assert.equal(prevented, 4);
+  } finally {
+    await vite.close();
+  }
+});
+
 test("Settings UI uses the real governance controller and safe SET-04 projection", () => {
   const source = readFileSync(new URL("./SettingsViews.jsx", import.meta.url), "utf8");
 
@@ -410,6 +613,11 @@ test("Settings UI uses the real governance controller and safe SET-04 projection
   assert.match(source, /网络标识/);
   assert.match(source, /confirmDisabled/);
   assert.match(source, /<AuditSettings key=\{currentRole\}/);
+  assert.match(source, /createDialogFocusManager/);
+  assert.match(source, /data-dialog-initial-focus/);
+  assert.match(source, /onKeyDown=\{handleDialogKeyDown\}/);
+  assert.match(source, /retention\.status !== "denied" && retention\.policy && retention\.draft/);
+  assert.match(source, /retention\.status === "loading" \|\| retention\.status === "saving" \|\| retention\.status === "previewing"/);
   assert.doesNotMatch(source, /const auditRows/);
   assert.doesNotMatch(source, /来源 IP/);
   assert.doesNotMatch(source, /raw_metadata|error\.detail/);
