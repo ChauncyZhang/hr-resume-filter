@@ -36,6 +36,7 @@ class FunnelData(StrictModel):
     total_applications: int
     stages: list[StageMetric]
     interviews: InterviewMetrics
+    can_export: bool
 
 
 class FunnelResource(StrictModel):

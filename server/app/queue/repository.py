@@ -9,13 +9,13 @@ from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, PayloadPolicyReg
 from server.app.queue.service import normalize_safe_code, retry_delay
 
 class LeaseRejected(RuntimeError): pass
-SCREENING_TERMINAL_TYPES={"screening.parse_item","screening.score_item","screening.llm_score_item"}
+TERMINAL_CALLBACK_TYPES={"screening.parse_item","screening.score_item","screening.llm_score_item","reports.export"}
 LEASE_REAP_BATCH_SIZE = 100
 
 class QueueRepository:
     def __init__(self, session: Session, *, jitter: Callable[[int], int] = lambda _: 0, policies: PayloadPolicyRegistry = DEFAULT_PAYLOAD_POLICIES, terminal_callbacks: Mapping[str,Callable] | None = None) -> None:
         self.session,self.jitter,self.policies=session,jitter,policies; self.terminal_callbacks=dict(terminal_callbacks or {})
-        if not set(self.terminal_callbacks)<=SCREENING_TERMINAL_TYPES: raise ValueError("terminal callback type is not allowlisted")
+        if not set(self.terminal_callbacks)<=TERMINAL_CALLBACK_TYPES: raise ValueError("terminal callback type is not allowlisted")
     def database_now(self) -> datetime:
         value=self.session.scalar(select(text("CURRENT_TIMESTAMP")))
         return datetime.fromisoformat(value) if isinstance(value,str) else value

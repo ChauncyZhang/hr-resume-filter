@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from server.app.core.settings import Settings
-from server.app.identity.models import AuditLog, Job, JobCollaborator, User
+from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole
 from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.main import create_app
 from server.app.queue.models import BackgroundJob
@@ -42,6 +42,7 @@ class FixedClock:
 @dataclass
 class FakeExportStorage:
     objects: dict[str, bytes] = field(default_factory=dict)
+    read_count: int = 0
 
     def write(self, storage_key: str, content: bytes, content_type: str) -> None:
         assert storage_key.startswith("exports/")
@@ -49,6 +50,7 @@ class FakeExportStorage:
         self.objects[storage_key] = content
 
     def open_download(self, storage_key: str, max_bytes: int):
+        self.read_count += 1
         content = self.objects[storage_key]
         assert len(content) <= max_bytes
         return BytesIO(content)
@@ -351,6 +353,7 @@ def test_authorized_funnel_counts_applications_and_stage_time_without_denied_job
     assert response.json() == {
         "data": {
             "total_applications": 2,
+            "can_export": True,
             "stages": [
                 {"stage": "new", "current_count": 1, "average_time_in_stage_seconds": 21600.0},
                 {"stage": "review", "current_count": 1, "average_time_in_stage_seconds": 28800.0},
@@ -419,8 +422,36 @@ def test_hiring_manager_reads_only_granted_reports_and_cannot_export(tmp_path) -
             headers={"Idempotency-Key": "manager-export", **headers},
         )
     assert allowed.status_code == 200
+    assert allowed.json()["data"]["can_export"] is False
     assert denied.status_code == export.status_code == 404
     assert denied.json()["code"] == export.json()["code"] == "resource_not_found"
+
+
+def test_mixed_recruiter_manager_role_cannot_export_a_manager_only_job(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = _seed_job_facts(app)
+    with app.state.identity_store.sync_session() as db:
+        user = db.get(User, seed["user_id"])
+        user.roles.append(UserRole(role="hiring_manager"))
+        grants = db.scalars(select(JobCollaborator).where(JobCollaborator.user_id == user.id)).all()
+        for grant in grants:
+            grant.access_role = "job_manager"
+        db.commit()
+
+    with TestClient(app) as client:
+        headers = login(client, "recruiter@reports.test")
+        report = client.get(
+            f"/api/v1/reports/recruiting-funnel?job_id={seed['allowed_job_id']}", headers=headers
+        )
+        export = client.post(
+            "/api/v1/exports",
+            json={"job_id": str(seed["allowed_job_id"])},
+            headers={"Idempotency-Key": "manager-only-export", **headers},
+        )
+
+    assert report.status_code == 200
+    assert report.json()["data"]["can_export"] is False
+    assert export.status_code == 404
 
 
 @pytest.mark.parametrize("prefix", ["=", "+", "-", "@", "\t", "\r"])
@@ -480,6 +511,7 @@ def test_export_is_persistent_audited_idempotent_and_downloaded_through_one_time
     assert "Denied candidate" not in download.text
     assert "private resume text" not in download.text
     assert replay_download.status_code == 404
+    assert app.state.export_storage.read_count == 1
     with app.state.identity_store.sync_session() as db:
         audits = db.scalars(select(AuditLog).where(AuditLog.event_type.like("report_export.%"))).all()
         assert [audit.event_type for audit in audits] == ["report_export.created", "report_export.downloaded"]
@@ -487,6 +519,77 @@ def test_export_is_persistent_audited_idempotent_and_downloaded_through_one_time
         for audit in audits:
             rendered = str(audit.metadata_json).casefold()
             assert not any(value in rendered for value in forbidden)
+
+
+def test_expired_export_ticket_is_rejected_before_private_storage_read(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = _seed_job_facts(app)
+    with TestClient(app) as client:
+        headers = {"Idempotency-Key": "reports-expired-ticket", **login(client, "recruiter@reports.test")}
+        created = client.post(
+            "/api/v1/exports", json={"job_id": str(seed["allowed_job_id"])}, headers=headers
+        )
+        export_id = UUID(created.json()["data"]["id"])
+        reports_models = importlib.import_module("server.app.reports.models")
+        reports_service = importlib.import_module("server.app.reports.service")
+        with app.state.identity_store.sync_session() as db:
+            export = db.get(reports_models.ExportRecord, export_id)
+            reports_service.generate_export(db, export.id, app.state.export_storage)
+            db.commit()
+        issued = client.post(f"/api/v1/exports/{export_id}/download-tickets", headers=headers)
+        token = issued.json()["data"]["token"]
+        with app.state.identity_store.sync_session() as db:
+            ticket = db.scalar(select(reports_models.ExportDownloadTicket))
+            ticket.expires_at = NOW - timedelta(seconds=1)
+            db.commit()
+
+        denied = client.post(
+            "/api/v1/export-download-tickets/consume", json={"token": token}, headers=headers
+        )
+
+    assert denied.status_code == 404
+    assert app.state.export_storage.read_count == 0
+
+
+def test_export_generation_rejects_row_limit_before_storage_write(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    seed = _seed_job_facts(app)
+    reports_models = importlib.import_module("server.app.reports.models")
+    reports_service = importlib.import_module("server.app.reports.service")
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/exports",
+            json={"job_id": str(seed["allowed_job_id"])},
+            headers={"Idempotency-Key": "reports-row-limit", **login(client, "recruiter@reports.test")},
+        )
+    export_id = UUID(response.json()["data"]["id"])
+    monkeypatch.setattr(reports_service, "MAX_EXPORT_ROWS", 1)
+
+    with app.state.identity_store.sync_session() as db:
+        with pytest.raises(reports_service.ExportLimitExceeded):
+            reports_service.generate_export(db, export_id, app.state.export_storage)
+
+    assert app.state.export_storage.objects == {}
+
+
+def test_export_generation_rejects_byte_limit_before_storage_write(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    seed = _seed_job_facts(app)
+    reports_service = importlib.import_module("server.app.reports.service")
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/exports",
+            json={"job_id": str(seed["allowed_job_id"])},
+            headers={"Idempotency-Key": "reports-byte-limit", **login(client, "recruiter@reports.test")},
+        )
+    export_id = UUID(response.json()["data"]["id"])
+    monkeypatch.setattr(reports_service, "MAX_EXPORT_BYTES", 16)
+
+    with app.state.identity_store.sync_session() as db:
+        with pytest.raises(reports_service.ExportLimitExceeded):
+            reports_service.generate_export(db, export_id, app.state.export_storage)
+
+    assert app.state.export_storage.objects == {}
 
 
 @pytest.mark.parametrize("role", ["interviewer", "system_admin"])

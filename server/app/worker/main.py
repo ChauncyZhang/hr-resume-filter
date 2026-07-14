@@ -15,7 +15,7 @@ from server.app.queue.payloads import IDENTIFIER_PATTERN, OpaqueIdField, Payload
 from server.app.queue.service import PermanentJobError, RetryableJobError, normalize_safe_code
 from server.app.recruiting.storage import StorageReadFailed
 from server.app.reports.models import ExportRecord
-from server.app.reports.service import generate_export
+from server.app.reports.service import ExportLimitExceeded, generate_export
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,8 @@ class ReportExportJobHandler:
 
         try:
             await asyncio.to_thread(self._generate, organization_id, export_id)
+        except ExportLimitExceeded:
+            raise PermanentJobError("report_export_too_large") from None
         except StorageReadFailed:
             raise RetryableJobError("report_export_storage_unavailable") from None
         except (OperationalError, DisconnectionError, SqlAlchemyTimeoutError):
@@ -85,6 +87,13 @@ def build_screening_handlers(settings,storage_client,bucket):
     llm_pipeline=LlmScreeningPipeline(sessions,OpenAiCompatibleGateway(allowlist),ApiKeyCipher(llm_key.encode()))
     report_export=ReportExportJobHandler(sessions,MinioExportStorage(storage_client,bucket))
     return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"reports.export":report_export}
+
+
+def build_terminal_callbacks():
+    from server.app.reports.terminal import report_terminal_callbacks
+    from server.app.screening.terminal import screening_terminal_callbacks
+
+    return {**screening_terminal_callbacks(), **report_terminal_callbacks()}
 
 
 class Worker:
@@ -216,8 +225,7 @@ async def _run() -> None:
     from server.app.core.storage import ObjectStorageProbe, create_storage_client
     from server.app.db.session import DatabaseProbe, create_engine
     from server.app.queue.runtime import DatabaseQueueGateway
-    from server.app.screening.terminal import screening_terminal_callbacks
-    settings = Settings.from_environment(); gateway = DatabaseQueueGateway(settings.database_url,terminal_callbacks=screening_terminal_callbacks()); storage_client=create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds)
+    settings = Settings.from_environment(); gateway = DatabaseQueueGateway(settings.database_url,terminal_callbacks=build_terminal_callbacks()); storage_client=create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds)
     handlers=build_screening_handlers(settings,storage_client,settings.object_storage_bucket)
     worker = Worker(DatabaseProbe(create_engine(settings.database_url)), ObjectStorageProbe(storage_client, settings.object_storage_bucket), interval_seconds=settings.worker_poll_interval_seconds, readiness_timeout_seconds=settings.readiness_timeout_seconds, worker_id=settings.worker_id, lease_seconds=settings.worker_lease_seconds, shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds, cancel_timeout_seconds=settings.worker_cancel_timeout_seconds, heartbeat_seconds=settings.worker_heartbeat_seconds, queue=gateway, handlers=handlers, outbox_handlers={})
     loop = asyncio.get_running_loop()

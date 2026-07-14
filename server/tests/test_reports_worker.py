@@ -8,12 +8,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
 from server.app.identity.models import User, UserStatus
+from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.reports.models import ExportRecord
 from server.app.worker import main as worker_main
 from server.app.worker.main import build_screening_handlers
 from server.tests.test_recruiting_api import login
-from server.tests.test_reports_api import _seed_job_facts, make_app
+from server.tests.test_reports_api import NOW, _seed_job_facts, make_app
 
 
 @dataclass
@@ -121,6 +122,46 @@ def test_report_handler_maps_storage_failure_to_retryable_safe_failure(tmp_path)
     assert raised.value.safe_code == "report_export_storage_unavailable"
     with app.state.identity_store.sync_session() as db:
         assert db.get(ExportRecord, export_id).status == "queued"
+
+
+def test_report_handler_maps_export_limits_to_permanent_safe_failure(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    seed = _seed_job_facts(app)
+    export_id = _create_export(app, seed)
+    handler = build_screening_handlers(app.state.settings, FakeMinio(), "reports")["reports.export"]
+
+    def reject_large_export(*_args, **_kwargs):
+        from server.app.reports.service import ExportLimitExceeded
+
+        raise ExportLimitExceeded("bounded")
+
+    monkeypatch.setattr(worker_main, "generate_export", reject_large_export)
+    with pytest.raises(PermanentJobError) as raised:
+        asyncio.run(handler(_job(seed["organization_id"], export_id)))
+    assert raised.value.safe_code == "report_export_too_large"
+
+
+def test_report_terminal_callback_marks_the_export_failed(tmp_path) -> None:
+    from server.app.reports.terminal import report_terminal_callbacks
+
+    app = make_app(tmp_path)
+    seed = _seed_job_facts(app)
+    export_id = _create_export(app, seed)
+    callbacks = report_terminal_callbacks()
+    assert set(callbacks) == {"reports.export"}
+    assert "reports.export" in worker_main.build_terminal_callbacks()
+
+    with app.state.identity_store.sync_session() as db:
+        export = db.get(ExportRecord, export_id)
+        job = db.get(BackgroundJob, export.background_job_id)
+        callbacks["reports.export"](db, job, "report_export_too_large", NOW)
+        db.commit()
+
+    with app.state.identity_store.sync_session() as db:
+        export = db.get(ExportRecord, export_id)
+        assert export.status == "failed"
+        assert export.safe_error_code == "report_export_too_large"
+        assert export.completed_at.replace(tzinfo=NOW.tzinfo) == NOW
 
 
 class FailingSessions:

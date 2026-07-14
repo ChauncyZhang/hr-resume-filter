@@ -11,6 +11,7 @@ from server.app.identity.models import AuditLog
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.recruiting.http import content_disposition
+from server.app.recruiting.authorization import RecruitingAction
 from server.app.recruiting.service import IdempotencyConflict, persisted_idempotent
 from server.app.recruiting.storage import StorageObjectTooLarge, StorageReadFailed
 from server.app.reports.models import ExportDownloadTicket, ExportRecord
@@ -62,11 +63,25 @@ def _valid_range(request: Request, from_: datetime | None, to: datetime | None):
     return None
 
 
-def _scoped_jobs(db, principal: Principal, job_id: UUID | None, request: Request):
-    job_ids = authorized_job_ids(db, principal, job_id)
+def _scoped_jobs(
+    db,
+    principal: Principal,
+    job_id: UUID | None,
+    request: Request,
+    action: RecruitingAction = RecruitingAction.READ,
+):
+    job_ids = authorized_job_ids(db, principal, job_id, action)
     if job_id is not None and not job_ids:
         return _denied(request)
     return job_ids
+
+
+def _export_scoped_jobs(db, principal: Principal, job_id: UUID | None, request: Request):
+    readable = authorized_job_ids(db, principal, job_id, RecruitingAction.READ)
+    exportable = authorized_job_ids(db, principal, job_id, RecruitingAction.EXPORT)
+    if not exportable or set(readable) != set(exportable):
+        return _denied(request)
+    return exportable
 
 
 def _export_data(export: ExportRecord) -> dict:
@@ -91,7 +106,7 @@ def _load_export(db, principal: Principal, export_id: UUID) -> ExportRecord | No
     if export is None:
         return None
     requested = {UUID(item) for item in export.filters.get("job_ids", [])}
-    return export if requested <= set(authorized_job_ids(db, principal)) else None
+    return export if requested <= set(authorized_job_ids(db, principal, action=RecruitingAction.EXPORT)) else None
 
 
 @router.get("/reports/recruiting-funnel", response_model=FunnelResource)
@@ -115,6 +130,8 @@ def get_recruiting_funnel(
         data = recruiting_funnel(
             db, principal, job_ids, from_, to, request.app.state.recruiting_clock.current_time()
         )
+        exportable = authorized_job_ids(db, principal, job_id, RecruitingAction.EXPORT)
+        data["can_export"] = bool(job_ids) and set(job_ids) == set(exportable)
         response = JSONResponse({"data": data})
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -159,7 +176,7 @@ def create_export(
     if invalid := _valid_range(request, payload.from_, payload.to):
         return invalid
     with request.app.state.identity_store.sync_session() as db:
-        job_ids = _scoped_jobs(db, principal, payload.job_id, request)
+        job_ids = _export_scoped_jobs(db, principal, payload.job_id, request)
         if isinstance(job_ids, JSONResponse):
             return job_ids
         body = payload.model_dump(by_alias=True)
@@ -257,8 +274,8 @@ def download_export(payload: TicketConsume, request: Request):
             return _denied(request)
         spool = None
         try:
-            spool = request.app.state.export_storage.open_download(export.object_key, MAX_EXPORT_BYTES)
             consume_export_ticket(db, payload.token, principal, export, request.app.state.recruiting_clock)
+            spool = request.app.state.export_storage.open_download(export.object_key, MAX_EXPORT_BYTES)
         except LookupError:
             if spool is not None:
                 spool.close()

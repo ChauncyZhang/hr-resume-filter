@@ -27,6 +27,7 @@ def principal(role: str) -> Principal:
         ("recruiter", RecruitingAction.PREVIEW, True),
         ("recruiter", RecruitingAction.ISSUE_TICKET, True),
         ("recruiter", RecruitingAction.DOWNLOAD, True),
+        ("recruiter", RecruitingAction.EXPORT, True),
         ("recruiter", RecruitingAction.RECOMMEND, True),
         ("hiring_manager", RecruitingAction.READ, True),
         ("hiring_manager", RecruitingAction.COMMENT, True),
@@ -38,6 +39,7 @@ def principal(role: str) -> Principal:
         ("hiring_manager", RecruitingAction.PREVIEW, True),
         ("hiring_manager", RecruitingAction.ISSUE_TICKET, False),
         ("hiring_manager", RecruitingAction.DOWNLOAD, False),
+        ("hiring_manager", RecruitingAction.EXPORT, False),
     ] + [
         (role, action, False)
         for role in ("system_admin", "interviewer")

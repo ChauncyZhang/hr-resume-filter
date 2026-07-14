@@ -18,6 +18,7 @@ class RecruitingAction(str, Enum):
     PREVIEW = "preview"
     ISSUE_TICKET = "issue_ticket"
     DOWNLOAD = "download"
+    EXPORT = "export"
 
 
 ROLE_ACTIONS = {
@@ -28,7 +29,7 @@ ROLE_ACTIONS = {
         RecruitingAction.MANAGE_CANDIDATE, RecruitingAction.MANAGE_JOB,
         RecruitingAction.CREATE_VERSION, RecruitingAction.TRANSITION,
         RecruitingAction.PREVIEW, RecruitingAction.ISSUE_TICKET,
-        RecruitingAction.DOWNLOAD,
+        RecruitingAction.DOWNLOAD, RecruitingAction.EXPORT,
     },
     "hiring_manager": {
         RecruitingAction.READ, RecruitingAction.COMMENT,

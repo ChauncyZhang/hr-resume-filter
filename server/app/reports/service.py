@@ -13,10 +13,16 @@ from server.app.screening.models import ScreeningItem, ScreeningResult, Screenin
 from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.reports.csv_export import render_application_csv
 from server.app.reports.models import ExportDownloadTicket, ExportRecord
+from server.app.reports.storage import MAX_EXPORT_BYTES
 
 
 AUTHORIZATION = RecruitingAuthorizationService()
 PASS_RECOMMENDATIONS = {"优先沟通", "可沟通"}
+MAX_EXPORT_ROWS = 100_000
+
+
+class ExportLimitExceeded(ValueError):
+    pass
 
 
 def _aware(value: datetime) -> datetime:
@@ -27,10 +33,15 @@ def _rate(numerator: int, denominator: int) -> float:
     return round(numerator / denominator, 6) if denominator else 0.0
 
 
-def authorized_job_ids(db, principal: Principal, job_id: uuid.UUID | None = None) -> list[uuid.UUID]:
+def authorized_job_ids(
+    db,
+    principal: Principal,
+    job_id: uuid.UUID | None = None,
+    action: RecruitingAction = RecruitingAction.READ,
+) -> list[uuid.UUID]:
     query = select(Job.id).where(
         Job.organization_id == principal.organization_id,
-        AUTHORIZATION.job_predicate(principal, RecruitingAction.READ, Job),
+        AUTHORIZATION.job_predicate(principal, action, Job),
     )
     if job_id is not None:
         query = query.where(Job.id == job_id)
@@ -276,7 +287,7 @@ def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
     requested_job_ids = [uuid.UUID(item) for item in export.filters.get("job_ids", [])]
     if principal is None:
         raise PermissionError("export requester unavailable")
-    currently_authorized = authorized_job_ids(db, principal)
+    currently_authorized = authorized_job_ids(db, principal, action=RecruitingAction.EXPORT)
     allowed = set(requested_job_ids) & set(currently_authorized)
     from_ = datetime.fromisoformat(export.filters["from"]) if export.filters.get("from") else None
     to = datetime.fromisoformat(export.filters["to"]) if export.filters.get("to") else None
@@ -294,7 +305,10 @@ def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
             *_date_scope(Application.created_at, from_, to),
         )
         .order_by(Application.created_at, Application.id)
+        .limit(MAX_EXPORT_ROWS + 1)
     ).all() if allowed else []
+    if len(rows) > MAX_EXPORT_ROWS:
+        raise ExportLimitExceeded("export row limit exceeded")
     content = render_application_csv(
         [
             {
@@ -309,6 +323,8 @@ def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
             for application, candidate in rows
         ]
     )
+    if len(content) > MAX_EXPORT_BYTES:
+        raise ExportLimitExceeded("export byte limit exceeded")
     object_key = f"exports/{export.organization_id}/{export.id}.csv"
     storage.write(object_key, content, "text/csv; charset=utf-8")
     export.object_key = object_key
