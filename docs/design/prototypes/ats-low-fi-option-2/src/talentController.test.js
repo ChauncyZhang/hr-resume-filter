@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { ApiError } from "./apiClient.js";
 import {
   createTalentController,
   canAddCandidateToTalentPool,
@@ -84,13 +85,16 @@ test("create and add commands use opaque server identities and idempotency keys"
 test("server candidates require an explicitly selected exact talent pool", () => {
   const candidates = [
     { id: "local-1", serverBacked: false },
-    { id: "server-1", candidateId: "candidate-1", serverBacked: true },
+    { id: "server-1", candidateId: "candidate-1", applicationId: "application-1", serverBacked: true },
+    { id: "server-2", candidateId: "candidate-2", serverBacked: true },
   ];
   const pools = [{ id: "pool-1", name: "AI" }, { id: "pool-2", name: "Backend" }];
 
   assert.deepEqual(selectServerTalentCandidates(candidates, ["server-1"]), [candidates[1]]);
   assert.equal(canAddCandidateToTalentPool(candidates[1]), true);
   assert.equal(canAddCandidateToTalentPool(candidates[0]), false);
+  assert.equal(canAddCandidateToTalentPool(candidates[2]), false);
+  assert.deepEqual(selectServerTalentCandidates(candidates, ["server-2"]), []);
   assert.equal(selectExactTalentPool(pools, "pool-2"), pools[1]);
   assert.equal(selectExactTalentPool(pools, "missing"), null);
   assert.equal(selectExactTalentPool(pools, null), null);
@@ -135,7 +139,7 @@ test("granted visibility is rejected until grantees can be selected", async () =
 });
 
 
-test("ambiguous retries reuse one idempotency key while distinct intents receive fresh keys", async () => {
+test("unavailable ApiError retries reuse one idempotency key and body while distinct intents receive fresh keys", async () => {
   const calls = [];
   let failOnce = true;
   let sequence = 0;
@@ -146,7 +150,7 @@ test("ambiguous retries reuse one idempotency key while distinct intents receive
         calls.push({ path, options });
         if (failOnce) {
           failOnce = false;
-          throw new TypeError("connection closed after send");
+          throw new ApiError({ status: 0, kind: "unavailable", code: "service_unavailable" });
         }
         return { data: null };
       },

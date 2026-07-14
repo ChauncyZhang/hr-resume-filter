@@ -52,7 +52,9 @@ export function selectExactTalentPool(pools, poolId) {
 }
 
 export function canAddCandidateToTalentPool(candidate) {
-  return Boolean(candidate?.serverBacked && (candidate?.candidateId || candidate?.id));
+  const candidateId = safeString(candidate?.candidateId || candidate?.id).trim();
+  const sourceApplicationId = safeString(candidate?.applicationId || candidate?.application?.id).trim();
+  return Boolean(candidate?.serverBacked && candidateId && sourceApplicationId);
 }
 
 export function selectServerTalentCandidates(candidates, candidateIds) {
@@ -200,7 +202,8 @@ export function createTalentController({ client = apiClient, idSource = () => gl
       return result;
     } catch (error) {
       const status = Number(error?.status);
-      const ambiguous = !Number.isFinite(status) || status === 408 || status === 429 || status >= 500;
+      const unavailableTransport = status === 0 && error?.kind === "unavailable";
+      const ambiguous = unavailableTransport || !Number.isFinite(status) || status === 408 || status === 429 || status >= 500;
       if (!ambiguous) pendingKeys.delete(intent);
       throw error;
     }
