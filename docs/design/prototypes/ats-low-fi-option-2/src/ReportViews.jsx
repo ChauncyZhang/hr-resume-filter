@@ -87,11 +87,11 @@ export function ReportWorkspace({ positions = [], currentRole, onDrillDown, onNo
       const created = await controller.createExport(query, { signal: operation.signal, idempotencyKey: exportIntentRef.current.key() });
       if (!operation.isCurrent()) return;
       if (!created) throw new Error("export missing");
-      exportIntentRef.current.succeed();
       setExportState({ status: "processing", record: created, error: "" });
       const completed = await controller.waitForExport(created.id, { signal: operation.signal });
       if (!operation.isCurrent()) return;
       if (!completed || completed.status !== "succeeded") throw new Error("export failed");
+      exportIntentRef.current.succeed();
       setExportState({ status: "ready", record: completed, error: "" });
       onNotify("报表导出已生成");
     } catch (error) {
