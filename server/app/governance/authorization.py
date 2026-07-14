@@ -24,6 +24,40 @@ def can_edit_retention(principal: Principal) -> bool:
     return principal.active and "system_admin" in principal.roles
 
 
+def can_request_candidate_deletion(db, principal: Principal, candidate_id) -> bool:
+    if not principal.active or not principal.roles & {"recruiter", "recruiting_admin"}:
+        return False
+    return db.scalar(
+        select(Candidate.id).where(
+            Candidate.organization_id == principal.organization_id,
+            Candidate.id == candidate_id,
+            RECRUITING.candidate_predicate(principal, RecruitingAction.READ, Candidate),
+        )
+    ) is not None
+
+
+def can_read_candidate_governance(db, principal: Principal, candidate_id) -> bool:
+    return db.scalar(
+        select(Candidate.id).where(
+            Candidate.organization_id == principal.organization_id,
+            Candidate.id == candidate_id,
+            RECRUITING.candidate_predicate(principal, RecruitingAction.READ, Candidate),
+        )
+    ) is not None
+
+
+def can_manage_legal_hold(db, principal: Principal, candidate_id) -> bool:
+    return (
+        principal.active
+        and "recruiting_admin" in principal.roles
+        and can_read_candidate_governance(db, principal, candidate_id)
+    )
+
+
+def can_approve_deletion(principal: Principal) -> bool:
+    return principal.active and "system_admin" in principal.roles
+
+
 def audit_authorization_class(principal: Principal) -> str:
     capabilities = []
     if "system_admin" in principal.roles:
@@ -63,6 +97,39 @@ def can_view_recruiting_resource(db, principal: Principal, resource_type: str, r
                 LlmProviderConfig.id == resource_id,
             )
         ) is not None
+    if resource_type in {"deletion_request", "legal_hold"}:
+        from server.app.governance.deletion_models import DeletionRequest, LegalHold
+
+        model = DeletionRequest if resource_type == "deletion_request" else LegalHold
+        if "system_admin" in principal.roles:
+            return db.scalar(
+                select(model.id).where(
+                    model.organization_id == principal.organization_id,
+                    model.id == resource_id,
+                )
+            ) is not None
+        if resource_type == "deletion_request":
+            row = db.execute(
+                select(DeletionRequest.candidate_id, DeletionRequest.requested_by).where(
+                    DeletionRequest.organization_id == principal.organization_id,
+                    DeletionRequest.id == resource_id,
+                )
+            ).first()
+            if row is None or row.requested_by != principal.user_id:
+                return False
+            candidate_id = row.candidate_id
+        else:
+            if "recruiting_admin" not in principal.roles:
+                return False
+            candidate_id = db.scalar(
+                select(LegalHold.candidate_id).where(
+                    LegalHold.organization_id == principal.organization_id,
+                    LegalHold.id == resource_id,
+                )
+            )
+        if candidate_id is None:
+            return False
+        return can_read_candidate_governance(db, principal, candidate_id)
     if not (recruiting_admin or recruiter):
         return False
     job_scope = True if recruiting_admin else RECRUITING.job_predicate(

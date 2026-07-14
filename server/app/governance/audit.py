@@ -49,6 +49,22 @@ EVENT_METADATA_ALLOWLIST: dict[str, dict[str, MetadataField]] = {
     "resume.previewed": {},
     "resume.download_ticket_issued": {},
     "resume.downloaded": {},
+    "governance.deletion_requested": {
+        "request_version": _INT,
+        "safe_error_code": _CODE,
+    },
+    "governance.deletion_approved": {
+        "request_version": _INT,
+        "safe_error_code": _CODE,
+    },
+    "governance.legal_hold_placed": {
+        "request_version": _INT,
+        "safe_error_code": _CODE,
+    },
+    "governance.legal_hold_released": {
+        "hold_version": _INT,
+        "safe_error_code": _CODE,
+    },
 }
 
 _ALLOWED_CATEGORIES = frozenset({"system", "recruiting", "governance"})

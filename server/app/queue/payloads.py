@@ -107,3 +107,13 @@ DEFAULT_PAYLOAD_POLICIES = PayloadPolicyRegistry()
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.parse_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"parser_version":IdentifierField()}))
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"jd_version_id":OpaqueIdField(),"rule_version_id":OpaqueIdField(),"rule_engine_version":IdentifierField()}))
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.llm_score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"screening_result_id":OpaqueIdField(),"config_id":OpaqueIdField(),"config_version":IntegerField(1,2147483647),"prompt_version_id":OpaqueIdField()}))
+DEFAULT_PAYLOAD_POLICIES.register_job(
+    "governance.delete_candidate",
+    PayloadSchema(
+        {
+            "organization_id": OpaqueIdField(),
+            "deletion_request_id": OpaqueIdField(),
+            "request_version": IntegerField(1, 2_147_483_647),
+        }
+    ),
+)

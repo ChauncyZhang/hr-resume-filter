@@ -3,9 +3,31 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+
+from sqlalchemy import and_, func, select, text
+
+from server.app.governance.audit import append_audit
+from server.app.governance.deletion_models import DeletionArtifact, DeletionRequest, LegalHold
+from server.app.governance.models import RetentionPolicy
+from server.app.interviews.models import Interview, InterviewFeedback, InterviewFeedbackRevision
+from server.app.queue.models import BackgroundJob
+from server.app.queue.repository import QueueRepository
+from server.app.recruiting.models import (
+    Application,
+    Candidate,
+    CandidateContact,
+    FileObject,
+    IdempotencyRecord,
+    Resume,
+)
+from server.app.recruiting.service import IdempotencyConflict, RecruitingService
+from server.app.reports.models import ExportRecord
+from server.app.screening.models import ScreeningItem, ScreeningResult
+from server.app.talent.models import TalentPoolMembership
 
 
 class DeletionDomainError(ValueError):
@@ -36,6 +58,751 @@ _IMPACT_COUNT_KEYS = (
     "temporary_exports",
 )
 _MAX_IMPACT_COUNT = 2_147_483_647
+
+
+@dataclass(frozen=True)
+class ApprovalResult:
+    request: DeletionRequest
+    enqueued: bool
+
+
+def aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def idempotency_fingerprint(body: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def load_idempotency_after_lock(
+    db,
+    *,
+    organization_id,
+    user_id,
+    operation: str,
+    key: str,
+    body: dict[str, Any],
+) -> IdempotencyRecord | None:
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            text("select pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {
+                "lock_key": (
+                    f"{organization_id}:{user_id}:{operation}:{key}"
+                )
+            },
+        )
+    record = db.scalar(
+        select(IdempotencyRecord)
+        .where(
+            IdempotencyRecord.organization_id == organization_id,
+            IdempotencyRecord.user_id == user_id,
+            IdempotencyRecord.operation == operation,
+            IdempotencyRecord.idempotency_key == key,
+        )
+        .with_for_update()
+    )
+    if record is not None and aware(record.expires_at) <= datetime.now(timezone.utc):
+        db.delete(record)
+        db.flush()
+        record = None
+    if record is not None and record.request_hash != idempotency_fingerprint(body):
+        raise IdempotencyConflict
+    return record
+
+
+def store_idempotency_after_lock(
+    db,
+    *,
+    organization_id,
+    user_id,
+    operation: str,
+    key: str,
+    body: dict[str, Any],
+    status_code: int,
+    response_json: dict[str, Any],
+) -> IdempotencyRecord:
+    record = IdempotencyRecord(
+        organization_id=organization_id,
+        user_id=user_id,
+        operation=operation,
+        idempotency_key=key,
+        request_hash=idempotency_fingerprint(body),
+        status_code=status_code,
+        response_json=response_json,
+    )
+    db.add(record)
+    db.flush()
+    return record
+
+
+def lock_candidate(db, organization_id, candidate_id) -> Candidate | None:
+    return db.scalar(
+        select(Candidate)
+        .where(
+            Candidate.organization_id == organization_id,
+            Candidate.id == candidate_id,
+        )
+        .with_for_update()
+    )
+
+
+def lock_candidate_deletion_requests(db, organization_id, candidate_id) -> list[DeletionRequest]:
+    return list(
+        db.scalars(
+            select(DeletionRequest)
+            .where(
+                DeletionRequest.organization_id == organization_id,
+                DeletionRequest.candidate_id == candidate_id,
+            )
+            .order_by(DeletionRequest.id)
+            .with_for_update()
+        )
+    )
+
+
+def lock_candidate_governance_rows(db, organization_id, candidate_id) -> None:
+    lock_candidate_deletion_requests(db, organization_id, candidate_id)
+    list(
+        db.scalars(
+            select(LegalHold)
+            .where(
+                LegalHold.organization_id == organization_id,
+                LegalHold.candidate_id == candidate_id,
+            )
+            .order_by(LegalHold.id)
+            .with_for_update()
+        )
+    )
+
+
+def lock_deletion_request_context(
+    db, organization_id, request_id
+) -> tuple[Candidate, DeletionRequest] | None:
+    candidate_id = db.scalar(
+        select(DeletionRequest.candidate_id).where(
+            DeletionRequest.organization_id == organization_id,
+            DeletionRequest.id == request_id,
+        )
+    )
+    if candidate_id is None:
+        return None
+    candidate = lock_candidate(db, organization_id, candidate_id)
+    if candidate is None:
+        return None
+    request = db.scalar(
+        select(DeletionRequest)
+        .where(
+            DeletionRequest.organization_id == organization_id,
+            DeletionRequest.id == request_id,
+        )
+        .with_for_update()
+    )
+    return (candidate, request) if request is not None else None
+
+
+def lock_legal_hold_context(db, organization_id, hold_id) -> tuple[Candidate, LegalHold] | None:
+    candidate_id = db.scalar(
+        select(LegalHold.candidate_id).where(
+            LegalHold.organization_id == organization_id,
+            LegalHold.id == hold_id,
+        )
+    )
+    if candidate_id is None:
+        return None
+    candidate = lock_candidate(db, organization_id, candidate_id)
+    if candidate is None:
+        return None
+    hold = db.scalar(
+        select(LegalHold)
+        .where(
+            LegalHold.organization_id == organization_id,
+            LegalHold.id == hold_id,
+        )
+        .with_for_update()
+    )
+    return (candidate, hold) if hold is not None else None
+
+
+def _sorted_ids(db, statement) -> list[str]:
+    return sorted((str(value) for value in db.scalars(statement)), key=str)
+
+
+def build_private_manifest(
+    db, candidate: Candidate, *, now: datetime
+) -> tuple[dict[str, Any], RetentionPolicy]:
+    organization_id = candidate.organization_id
+    candidate_id = candidate.id
+    contacts = _sorted_ids(
+        db,
+        select(CandidateContact.id).where(
+            CandidateContact.organization_id == organization_id,
+            CandidateContact.candidate_id == candidate_id,
+        ),
+    )
+    resumes = list(
+        db.execute(
+            select(Resume.id, FileObject.id, FileObject.storage_key)
+            .join(
+                FileObject,
+                and_(
+                    FileObject.organization_id == Resume.organization_id,
+                    FileObject.id == Resume.file_object_id,
+                ),
+            )
+            .where(
+                Resume.organization_id == organization_id,
+                Resume.candidate_id == candidate_id,
+            )
+        )
+    )
+    applications = _sorted_ids(
+        db,
+        select(Application.id).where(
+            Application.organization_id == organization_id,
+            Application.candidate_id == candidate_id,
+        ),
+    )
+    screening_items = _sorted_ids(
+        db,
+        select(ScreeningItem.id).where(
+            ScreeningItem.organization_id == organization_id,
+            ScreeningItem.candidate_id == candidate_id,
+        ),
+    )
+    screening_results = _sorted_ids(
+        db,
+        select(ScreeningResult.id)
+        .join(
+            ScreeningItem,
+            and_(
+                ScreeningItem.organization_id == ScreeningResult.organization_id,
+                ScreeningItem.id == ScreeningResult.item_id,
+            ),
+        )
+        .where(
+            ScreeningItem.organization_id == organization_id,
+            ScreeningItem.candidate_id == candidate_id,
+        ),
+    )
+    interviews = _sorted_ids(
+        db,
+        select(Interview.id)
+        .join(
+            Application,
+            and_(
+                Application.organization_id == Interview.organization_id,
+                Application.id == Interview.application_id,
+            ),
+        )
+        .where(
+            Application.organization_id == organization_id,
+            Application.candidate_id == candidate_id,
+        ),
+    )
+    feedback = _sorted_ids(
+        db,
+        select(InterviewFeedback.id)
+        .join(
+            Interview,
+            and_(
+                Interview.organization_id == InterviewFeedback.organization_id,
+                Interview.id == InterviewFeedback.interview_id,
+            ),
+        )
+        .join(
+            Application,
+            and_(
+                Application.organization_id == Interview.organization_id,
+                Application.id == Interview.application_id,
+            ),
+        )
+        .where(
+            Application.organization_id == organization_id,
+            Application.candidate_id == candidate_id,
+        ),
+    )
+    feedback_revisions = _sorted_ids(
+        db,
+        select(InterviewFeedbackRevision.id)
+        .join(
+            InterviewFeedback,
+            and_(
+                InterviewFeedback.organization_id == InterviewFeedbackRevision.organization_id,
+                InterviewFeedback.id == InterviewFeedbackRevision.feedback_id,
+            ),
+        )
+        .join(
+            Interview,
+            and_(
+                Interview.organization_id == InterviewFeedback.organization_id,
+                Interview.id == InterviewFeedback.interview_id,
+            ),
+        )
+        .join(
+            Application,
+            and_(
+                Application.organization_id == Interview.organization_id,
+                Application.id == Interview.application_id,
+            ),
+        )
+        .where(
+            Application.organization_id == organization_id,
+            Application.candidate_id == candidate_id,
+        ),
+    )
+    memberships = _sorted_ids(
+        db,
+        select(TalentPoolMembership.id).where(
+            TalentPoolMembership.organization_id == organization_id,
+            TalentPoolMembership.candidate_id == candidate_id,
+        ),
+    )
+    resume_objects = sorted(
+        (
+            {"row_id": str(file_id), "storage_key": storage_key}
+            for _, file_id, storage_key in resumes
+        ),
+        key=lambda item: (item["storage_key"], item["row_id"]),
+    )
+    temporary_exports = sorted(
+        (
+            {"row_id": str(row_id), "storage_key": storage_key}
+            for row_id, storage_key in db.execute(
+                select(ExportRecord.id, ExportRecord.object_key).where(
+                    ExportRecord.organization_id == organization_id,
+                    ExportRecord.object_key.is_not(None),
+                )
+            )
+        ),
+        key=lambda item: (item["storage_key"], item["row_id"]),
+    )
+    policy = db.scalar(
+        select(RetentionPolicy).where(RetentionPolicy.organization_id == organization_id)
+    )
+    if policy is None:
+        raise DeletionDomainError("retention_policy_unavailable")
+    manifest = {
+        "schema_version": 1,
+        "candidate_id": str(candidate_id),
+        "candidate_version": candidate.version,
+        "policy_version": policy.version,
+        "backup_window_ends_at": _utc_isoformat(
+            aware(now) + timedelta(days=policy.backup_window_days)
+        ),
+        "row_ids": {
+            "contacts": contacts,
+            "resumes": sorted(str(row_id) for row_id, _, _ in resumes),
+            "applications": applications,
+            "screening_items": screening_items,
+            "screening_results": screening_results,
+            "interviews": interviews,
+            "feedback": feedback,
+            "feedback_revisions": feedback_revisions,
+            "talent_memberships": memberships,
+        },
+        "objects": {
+            "resume_objects": resume_objects,
+            "temporary_exports": temporary_exports,
+        },
+        "counts": {
+            "contacts": len(contacts),
+            "resumes": len(resumes),
+            "applications": len(applications),
+            "screening_records": len(screening_items) + len(screening_results),
+            "interviews": len(interviews),
+            "feedback_records": len(feedback) + len(feedback_revisions),
+            "talent_memberships": len(memberships),
+            "resume_objects": len(resume_objects),
+            "temporary_exports": len(temporary_exports),
+        },
+    }
+    return manifest, policy
+
+
+def safe_request_projection(row: DeletionRequest) -> dict[str, Any]:
+    backup_window_ends_at = datetime.fromisoformat(
+        row.impact_manifest["backup_window_ends_at"].replace("Z", "+00:00")
+    )
+    return {
+        "id": row.id,
+        "status": row.status,
+        "version": row.version,
+        "reason_code": row.reason_code,
+        "requested_at": aware(row.requested_at),
+        "approved_at": aware(row.approved_at) if row.approved_at else None,
+        "safe_error_code": row.safe_error_code,
+        "impact": impact_manifest_projection(
+            row.impact_manifest,
+            request_id=row.id,
+            candidate_version=row.candidate_version,
+            policy_version=row.policy_version,
+            backup_window_ends_at=backup_window_ends_at,
+        ),
+    }
+
+
+def safe_hold_projection(row: LegalHold, *, include_reason: bool) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "status": "active" if row.released_at is None else "released",
+        "reason": row.reason if include_reason else None,
+        "placed_at": aware(row.placed_at),
+        "released_at": aware(row.released_at) if row.released_at else None,
+        "version": row.version,
+    }
+
+
+def _sync_artifacts(db, row: DeletionRequest) -> None:
+    existing = {
+        (artifact.kind, artifact.storage_key)
+        for artifact in db.scalars(
+            select(DeletionArtifact).where(
+                DeletionArtifact.organization_id == row.organization_id,
+                DeletionArtifact.request_id == row.id,
+            )
+        )
+    }
+    for object_key, kind in (
+        ("resume_objects", "resume_object"),
+        ("temporary_exports", "report_export_object"),
+    ):
+        for item in row.impact_manifest["objects"][object_key]:
+            marker = (kind, item["storage_key"])
+            if marker not in existing:
+                db.add(
+                    DeletionArtifact(
+                        organization_id=row.organization_id,
+                        request_id=row.id,
+                        kind=kind,
+                        storage_key=item["storage_key"],
+                    )
+                )
+                existing.add(marker)
+
+
+def create_deletion_request_locked(
+    db,
+    *,
+    candidate: Candidate,
+    principal,
+    reason_code: str,
+    now: datetime,
+    trace_id: str | None,
+) -> DeletionRequest:
+    existing = db.scalar(
+        select(DeletionRequest)
+        .where(
+            DeletionRequest.organization_id == candidate.organization_id,
+            DeletionRequest.candidate_id == candidate.id,
+            DeletionRequest.status != "completed",
+        )
+        .with_for_update()
+    )
+    if existing is not None:
+        raise DeletionDomainError("deletion_request_open")
+    completed = db.scalar(
+        select(func.count())
+        .select_from(DeletionRequest)
+        .where(
+            DeletionRequest.organization_id == candidate.organization_id,
+            DeletionRequest.candidate_id == candidate.id,
+            DeletionRequest.status == "completed",
+        )
+    )
+    validate_new_request(has_completed_request=bool(completed))
+    manifest, policy = build_private_manifest(db, candidate, now=now)
+    row = DeletionRequest(
+        organization_id=candidate.organization_id,
+        candidate_id=candidate.id,
+        reason_code=reason_code,
+        requested_by=principal.user_id,
+        requested_at=aware(now),
+        impact_manifest=manifest,
+        manifest_hash=canonical_manifest_hash(manifest),
+        policy_version=policy.version,
+        candidate_version=candidate.version,
+    )
+    db.add(row)
+    db.flush()
+    _sync_artifacts(db, row)
+    append_audit(
+        db,
+        actor=principal,
+        category="governance",
+        event_type="governance.deletion_requested",
+        outcome="success",
+        trace_id=trace_id,
+        resource_type="deletion_request",
+        resource_id=row.id,
+        metadata={"request_version": row.version},
+    )
+    return row
+
+
+def _has_active_application(db, row: DeletionRequest) -> bool:
+    return db.scalar(
+        select(func.count())
+        .select_from(Application)
+        .where(
+            Application.organization_id == row.organization_id,
+            Application.candidate_id == row.candidate_id,
+            Application.stage.not_in(RecruitingService.TERMINAL),
+        )
+    ) > 0
+
+
+def _active_hold(db, row: DeletionRequest) -> LegalHold | None:
+    return db.scalar(
+        select(LegalHold)
+        .where(
+            LegalHold.organization_id == row.organization_id,
+            LegalHold.candidate_id == row.candidate_id,
+            LegalHold.released_at.is_(None),
+        )
+        .with_for_update()
+    )
+
+
+def _replace_manifest(db, row: DeletionRequest, candidate: Candidate, now: datetime) -> None:
+    manifest, policy = build_private_manifest(db, candidate, now=now)
+    row.impact_manifest = manifest
+    row.manifest_hash = canonical_manifest_hash(manifest)
+    row.candidate_version = candidate.version
+    row.policy_version = policy.version
+    _sync_artifacts(db, row)
+
+
+def approve_deletion_request_locked(
+    db,
+    *,
+    candidate: Candidate,
+    row: DeletionRequest,
+    principal,
+    expected_version: int,
+    now: datetime,
+    trace_id: str | None,
+) -> ApprovalResult:
+    if row.version != expected_version:
+        raise DeletionDomainError("resource_version_conflict")
+    if row.status not in {"requested", "failed"}:
+        raise DeletionDomainError("invalid_deletion_state_transition")
+    has_active_application = _has_active_application(db, row)
+    hold = _active_hold(db, row)
+    current_manifest, _ = build_private_manifest(
+        db, candidate, now=aware(row.requested_at)
+    )
+    current_hash = canonical_manifest_hash(current_manifest)
+    if row.status == "requested" and (
+        candidate.version != row.candidate_version
+        or not hmac.compare_digest(row.manifest_hash, current_hash)
+    ):
+        row.impact_manifest = current_manifest
+        row.manifest_hash = current_hash
+        row.candidate_version = candidate.version
+        row.policy_version = current_manifest["policy_version"]
+        row.version += 1
+        row.safe_error_code = "stale_manifest"
+        _sync_artifacts(db, row)
+        append_audit(
+            db,
+            actor=principal,
+            category="governance",
+            event_type="governance.deletion_approved",
+            outcome="failure",
+            trace_id=trace_id,
+            resource_type="deletion_request",
+            resource_id=row.id,
+            metadata={"request_version": row.version, "safe_error_code": "stale_manifest"},
+        )
+        db.flush()
+        return ApprovalResult(row, False)
+    retrying_failed = row.status == "failed"
+    validate_approval(
+        requester_id=row.requested_by,
+        approver_id=principal.user_id,
+        has_active_application=has_active_application,
+        has_active_hold=hold is not None,
+        candidate_version=candidate.version,
+        expected_candidate_version=(
+            candidate.version if retrying_failed else row.candidate_version
+        ),
+        request_version=row.version,
+        expected_request_version=expected_version,
+        manifest_hash=current_hash if retrying_failed else row.manifest_hash,
+        expected_manifest_hash=current_hash,
+    )
+    if retrying_failed:
+        row.impact_manifest = current_manifest
+        row.manifest_hash = current_hash
+        row.candidate_version = candidate.version
+        row.policy_version = current_manifest["policy_version"]
+    advance_deletion_status(row.status, "approved")
+    row.status = "approved"
+    row.approved_by = principal.user_id
+    row.approved_at = aware(now)
+    row.safe_error_code = None
+    row.version += 1
+    _sync_artifacts(db, row)
+    QueueRepository(db).enqueue(
+        row.organization_id,
+        "governance.delete_candidate",
+        {
+            "organization_id": str(row.organization_id),
+            "deletion_request_id": str(row.id),
+            "request_version": row.version,
+        },
+        dedupe_key=f"candidate-delete:{row.id}:{row.version}",
+        trace_id=trace_id,
+        max_attempts=3,
+    )
+    append_audit(
+        db,
+        actor=principal,
+        category="governance",
+        event_type="governance.deletion_approved",
+        outcome="success",
+        trace_id=trace_id,
+        resource_type="deletion_request",
+        resource_id=row.id,
+        metadata={"request_version": row.version},
+    )
+    db.flush()
+    return ApprovalResult(row, True)
+
+
+def place_legal_hold_locked(
+    db,
+    *,
+    candidate: Candidate,
+    principal,
+    reason: str,
+    now: datetime,
+    trace_id: str | None,
+) -> LegalHold:
+    request = db.scalar(
+        select(DeletionRequest)
+        .where(
+            DeletionRequest.organization_id == candidate.organization_id,
+            DeletionRequest.candidate_id == candidate.id,
+            DeletionRequest.status != "completed",
+        )
+        .with_for_update()
+    )
+    current_hold = db.scalar(
+        select(LegalHold)
+        .where(
+            LegalHold.organization_id == candidate.organization_id,
+            LegalHold.candidate_id == candidate.id,
+            LegalHold.released_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if current_hold is not None:
+        raise DeletionDomainError("legal_hold_active")
+    request_version = None
+    if request is not None:
+        new_status, safe_error = hold_placement_outcome(request.status)
+        if new_status != request.status:
+            request.status = new_status
+            request.safe_error_code = safe_error
+            request.version += 1
+            request_version = request.version
+            job = db.scalar(
+                select(BackgroundJob)
+                .where(
+                    BackgroundJob.organization_id == request.organization_id,
+                    BackgroundJob.type == "governance.delete_candidate",
+                    BackgroundJob.dedupe_key
+                    == f"candidate-delete:{request.id}:{request.version - 1}",
+                    BackgroundJob.status.in_(("queued", "running")),
+                )
+                .with_for_update()
+            )
+            if job is not None:
+                QueueRepository(db).cancel(request.organization_id, job.id)
+    hold = LegalHold(
+        organization_id=candidate.organization_id,
+        candidate_id=candidate.id,
+        reason=reason,
+        placed_by=principal.user_id,
+        placed_at=aware(now),
+    )
+    db.add(hold)
+    db.flush()
+    metadata = {"request_version": request_version} if request_version is not None else {}
+    append_audit(
+        db,
+        actor=principal,
+        category="governance",
+        event_type="governance.legal_hold_placed",
+        outcome="success",
+        trace_id=trace_id,
+        resource_type="legal_hold",
+        resource_id=hold.id,
+        metadata=metadata,
+    )
+    return hold
+
+
+def release_legal_hold_locked(
+    db,
+    *,
+    hold: LegalHold,
+    principal,
+    reason: str,
+    expected_version: int,
+    now: datetime,
+    trace_id: str | None,
+) -> LegalHold:
+    if hold.version != expected_version:
+        raise DeletionDomainError("resource_version_conflict")
+    if hold.released_at is not None:
+        raise DeletionDomainError("legal_hold_already_released")
+    hold.released_by = principal.user_id
+    hold.released_at = aware(now)
+    hold.released_reason = reason
+    hold.version += 1
+    append_audit(
+        db,
+        actor=principal,
+        category="governance",
+        event_type="governance.legal_hold_released",
+        outcome="success",
+        trace_id=trace_id,
+        resource_type="legal_hold",
+        resource_id=hold.id,
+        metadata={"hold_version": hold.version},
+    )
+    db.flush()
+    return hold
+
+
+def append_failure_audit(
+    db,
+    *,
+    principal,
+    event_type: str,
+    trace_id: str | None,
+    safe_error_code: str,
+    resource_type: str | None = None,
+    resource_id=None,
+) -> None:
+    append_audit(
+        db,
+        actor=principal,
+        category="governance",
+        event_type=event_type,
+        outcome="denied" if safe_error_code == "resource_not_found" else "failure",
+        trace_id=trace_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        metadata={"safe_error_code": safe_error_code},
+    )
 
 
 def advance_deletion_status(current: str, target: str) -> str:
