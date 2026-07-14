@@ -966,11 +966,12 @@ def timeline(candidate_id: UUID, request: Request):
             "candidate.note_added": "Candidate note added",
             "application.created": "Application created",
             "application.updated": "Application updated",
+            "application.reactivated": "Application reactivated from talent pool",
         }
         rows = sorted([*global_events, *stage_events], key=lambda row: (row.created_at, row.id), reverse=True)
         def summary(row):
             if row.event_type != "application.stage_changed":
-                return summaries[row.event_type]
+                return summaries.get(row.event_type, "Candidate activity recorded")
             source = row.payload.get("from_stage")
             target = row.payload.get("to_stage")
             text = f"Application stage changed from {source} to {target}" if source and target else "Application stage changed"

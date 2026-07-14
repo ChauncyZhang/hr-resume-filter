@@ -22,6 +22,7 @@ from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.service import SystemClock, SystemTokens
 from server.app.recruiting.storage import MinioResumeStorage
 from server.app.recruiting.http import derive_cursor_key
+from server.app.talent.api import router as talent_router
 from server.app.reports.api import router as reports_router
 
 
@@ -113,6 +114,7 @@ def create_app(
     app.include_router(llm_router)
     from server.app.interviews.api import router as interview_router
     app.include_router(interview_router)
+    app.include_router(talent_router)
     app.include_router(reports_router)
 
     @app.exception_handler(RequestValidationError)

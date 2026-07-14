@@ -25,7 +25,7 @@ import { JobsWorkspace } from "./JobViews.jsx";
 import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
 import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
 import { InterviewsWorkspace } from "./InterviewViews.jsx";
-import { initialTalentMemberships, initialTalentPools, TalentPoolWorkspace } from "./TalentPoolViews.jsx";
+import { TalentPoolWorkspace } from "./TalentPoolViews.jsx";
 import { ReportWorkspace } from "./ReportViews.jsx";
 import { SettingsWorkspace } from "./SettingsViews.jsx";
 import { canPerformAction, getAllowedNavItems, getDefaultNavItem } from "./roleCapabilities.js";
@@ -37,6 +37,7 @@ import { candidateController as defaultCandidateController } from "./candidateCo
 import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
 import { deriveCandidateInterviews, interviewController as defaultInterviewController, selectSchedulableCandidates } from "./interviewController.js";
+import { talentController as defaultTalentController } from "./talentController.js";
 import {
   appendJobPage,
   createInitialJobWorkspaceState,
@@ -134,7 +135,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController, interviewController = defaultInterviewController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController, interviewController = defaultInterviewController, talentController = defaultTalentController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -149,10 +150,10 @@ export function App({ controller = sessionController, screeningController = defa
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} interviewController={interviewController} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} interviewController={interviewController} talentController={talentController} />;
 }
 
-function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController, interviewController }) {
+function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController, interviewController, talentController }) {
   const currentRole = session.role || "未知角色";
   const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
@@ -188,8 +189,8 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [scheduleCandidateId, setScheduleCandidateId] = useState(null);
   const [interviewOrigin, setInterviewOrigin] = useState(null);
   const [talentMode, setTalentMode] = useState("list");
-  const [talentPools, setTalentPools] = useState(initialTalentPools);
-  const [talentMemberships, setTalentMemberships] = useState(initialTalentMemberships);
+  const [talentPools, setTalentPools] = useState([]);
+  const [talentMemberships, setTalentMemberships] = useState([]);
   const [selectedPoolId, setSelectedPoolId] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
@@ -588,14 +589,20 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setInterviewOrigin(null);
   }
 
-  function addCandidatesToTalentPool(candidateIds, poolId = "POOL-FOLLOW") {
-    const pool = talentPools.find((item) => item.id === poolId) || talentPools[0];
-    const before = talentMemberships.length;
-    const next = addTalentMemberships(workflowState(), { candidateIds, poolId: pool.id, actor: roleIdentity.name });
-    const additions = next.memberships.length - before;
-    if (!additions) { notify(`候选人已在“${pool.name}”中`); return; }
-    applyWorkflowState(next);
-    notify(`已将 ${additions} 位候选人加入“${pool.name}”`);
+  async function addCandidatesToTalentPool(candidateIds, poolId = null) {
+    try {
+      const page = await talentController.listPools({ limit: 100 });
+      const pool = page.records.find((item) => item.id === poolId) || page.records[0];
+      if (!pool) { notify("请先创建一个人才库"); return; }
+      const selected = candidateIds.map((id) => candidateRecords.find((item) => item.id === id || item.candidateId === id)).filter((item) => item?.serverBacked);
+      let additions = 0;
+      for (const candidate of selected) {
+        try { await talentController.addMembership(pool.id, candidate, session.user?.id); additions += 1; } catch (error) { if (error?.code !== "talent_pool_membership_exists") throw error; }
+      }
+      notify(additions ? `已将 ${additions} 位候选人加入“${pool.name}”` : `候选人已在“${pool.name}”中`);
+    } catch {
+      notify("加入人才库失败，请检查权限和网络后重试");
+    }
   }
 
   function reactivateTalent(candidateId, position, poolId, resumeVersion) {
@@ -777,7 +784,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidateWithInterviews} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidateWithInterviews} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={backFromCandidateDetail} detailBackLabel={candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin?.activeNav === "人才库" ? "返回人才库" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} initialFilters={candidatePreset} actorName={roleIdentity.name} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
@@ -785,7 +792,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "人才库" && (
-          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={setSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} onNotify={notify} />
+          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={setSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} onNotify={notify} controller={talentController} actorId={session.user?.id} />
         )}
 
         {!screeningTask && activeNav === "报表" && (
