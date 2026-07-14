@@ -33,6 +33,7 @@ from server.app.governance.service import (
     policy_projection,
     preview_retention,
     resource_projection,
+    safe_network_ref,
     update_retention_policy,
 )
 from server.app.identity.api import problem, session_token
@@ -189,7 +190,13 @@ def list_audit_logs(
             )
         rows = db.execute(
             select(AuditLog, User.display_name)
-            .outerjoin(User, User.id == AuditLog.actor_user_id)
+            .outerjoin(
+                User,
+                and_(
+                    User.id == AuditLog.actor_user_id,
+                    User.organization_id == AuditLog.organization_id,
+                ),
+            )
             .where(*conditions)
             .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
             .limit(limit + 1)
@@ -222,7 +229,7 @@ def list_audit_logs(
                     db, principal, row.resource_type, row.resource_id
                 ),
                 "outcome": row.outcome,
-                "network_ref": row.ip_hash[:12] if row.ip_hash else None,
+                "network_ref": safe_network_ref(row.ip_hash),
                 "trace_id": row.trace_id,
                 "summary": audit_summary(row.event_type, row.metadata_json),
             }

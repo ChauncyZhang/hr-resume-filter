@@ -15,7 +15,13 @@ from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, Resume
-from server.app.recruiting.service import ActiveApplicationExists, IdempotencyConflict, persisted_idempotent
+from server.app.recruiting.service import (
+    ActiveApplicationExists,
+    IdempotencyConflict,
+    clear_candidate_retention_due,
+    lock_candidate_retention_state,
+    persisted_idempotent,
+)
 from server.app.talent.models import TalentPool, TalentPoolGrant, TalentPoolMembership
 from server.app.talent.schemas import (
     DataCollection,
@@ -653,7 +659,9 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
         target_job = db.scalar(select(Job).where(Job.organization_id == principal.organization_id, Job.id == payload.job_id, Job.status == "open", AUTH.job_predicate(principal, RecruitingAction.TRANSITION, Job)))
         if source is None or source.stage not in TERMINAL_APPLICATION_STAGES or target_job is None:
             return _denied(request)
-        candidate = db.scalar(select(Candidate).where(Candidate.organization_id == principal.organization_id, Candidate.id == membership.candidate_id).with_for_update())
+        candidate = lock_candidate_retention_state(
+            db, principal.organization_id, membership.candidate_id
+        )
         if candidate is None:
             return _denied(request)
         resume_id = payload.resume_id or source.resume_id
@@ -677,6 +685,9 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
             )
             db.add(application)
             db.flush()
+            clear_candidate_retention_due(
+                db, principal.organization_id, candidate.id
+            )
             event_payload = {"source_application_id": str(source.id), "membership_id": str(membership.id), "pool_id": str(membership.pool_id)}
             db.add_all([
                 ApplicationStageEvent(organization_id=principal.organization_id, application_id=application.id, actor_user_id=principal.user_id, event_type="application.reactivated", payload=event_payload),

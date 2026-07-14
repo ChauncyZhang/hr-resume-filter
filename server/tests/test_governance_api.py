@@ -6,7 +6,10 @@ from sqlalchemy import select
 
 from server.app.core.settings import Settings
 from server.app.governance.models import RetentionPolicy
+from server.app.governance import api as governance_api
+from server.app.governance import service as governance_service
 from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole
+from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.main import create_app
 from server.app.recruiting.models import (
     Application,
@@ -246,6 +249,48 @@ def test_audit_role_union_tenant_isolation_redaction_and_safe_projection(tmp_pat
     assert by_id[str(hidden["audit_id"])]["resource"] is None
 
 
+def test_real_candidate_writer_is_recruiting_visible_for_role_union_only(tmp_path) -> None:
+    app = make_app(tmp_path)
+    recruiter_id = seed_user(app, "recruiter", "producer@governance.test")
+    seed_user(app, "recruiting_admin", "producer-admin@governance.test")
+    seed_user(app, "system_admin", "producer-system@governance.test")
+    seed_user(app, "hiring_manager", "producer-manager@governance.test")
+    seed_user(app, "interviewer", "producer-interviewer@governance.test")
+    with TestClient(app) as client:
+        recruiter_headers = login(client, "producer@governance.test")
+        created = client.post(
+            "/api/v1/candidates",
+            json={"display_name": "Real producer", "contacts": []},
+            headers=recruiter_headers,
+        )
+        assert created.status_code == 201
+        recruiter_headers = login(client, "producer@governance.test")
+        recruiter_rows = client.get(
+            "/api/v1/audit-logs?event_type=candidate.created", headers=recruiter_headers
+        )
+        admin_headers = login(client, "producer-admin@governance.test")
+        admin_rows = client.get(
+            "/api/v1/audit-logs?event_type=candidate.created", headers=admin_headers
+        )
+        system_headers = login(client, "producer-system@governance.test")
+        system_rows = client.get(
+            "/api/v1/audit-logs?event_type=candidate.created", headers=system_headers
+        )
+        for email in ("producer-manager@governance.test", "producer-interviewer@governance.test"):
+            denied_headers = login(client, email)
+            denied = client.get("/api/v1/audit-logs", headers=denied_headers)
+            assert denied.status_code == 404
+
+    assert [item["event_type"] for item in recruiter_rows.json()["data"]] == ["candidate.created"]
+    assert [item["event_type"] for item in admin_rows.json()["data"]] == ["candidate.created"]
+    assert system_rows.json()["data"] == []
+    add_role(app, recruiter_id, "system_admin")
+    with TestClient(app) as client:
+        dual_headers = login(client, "producer@governance.test")
+        dual = client.get("/api/v1/audit-logs", headers=dual_headers)
+    assert {item["category"] for item in dual.json()["data"]} >= {"system", "recruiting"}
+
+
 def test_audit_filters_range_cursor_binding_and_equal_timestamp_pagination(tmp_path) -> None:
     app = make_app(tmp_path)
     admin_id = seed_user(app, "recruiting_admin", "admin@governance.test")
@@ -422,6 +467,42 @@ def test_retention_due_active_null_and_terminal_latest_fact(tmp_path) -> None:
         active_application.stage = "review"
         terminal = db.get(Candidate, terminal_id)
         terminal.updated_at = NOW - timedelta(days=20)
+        source_updated_at = terminal.updated_at
+        terminal_application = db.scalar(select(Application).where(Application.candidate_id == terminal_id))
+        interview = Interview(
+            organization_id=terminal.organization_id,
+            application_id=terminal_application.id,
+            round_name="Final",
+            method="video",
+            timezone="UTC",
+            starts_at=NOW - timedelta(days=4),
+            ends_at=NOW - timedelta(days=4, hours=-1),
+            owner_id=admin_id,
+            created_by=admin_id,
+            status="feedback_completed",
+            updated_at=NOW - timedelta(days=3),
+        )
+        db.add(interview)
+        db.flush()
+        db.add(
+            InterviewParticipant(
+                organization_id=terminal.organization_id,
+                interview_id=interview.id,
+                user_id=admin_id,
+            )
+        )
+        db.flush()
+        db.add(
+            InterviewFeedback(
+                organization_id=terminal.organization_id,
+                interview_id=interview.id,
+                author_id=admin_id,
+                status="amended",
+                ratings={},
+                submitted_at=NOW - timedelta(days=10),
+                updated_at=NOW - timedelta(days=2),
+            )
+        )
         db.add(
             CandidateEvent(
                 organization_id=terminal.organization_id,
@@ -443,8 +524,10 @@ def test_retention_due_active_null_and_terminal_latest_fact(tmp_path) -> None:
     assert response.status_code == 200
     with app.state.identity_store.sync_session() as db:
         assert db.get(Candidate, active_id).retention_due_at is None
-        due = db.get(Candidate, terminal_id).retention_due_at
-        assert due.replace(tzinfo=due.tzinfo or timezone.utc) == NOW - timedelta(days=5) + timedelta(days=400)
+        terminal = db.get(Candidate, terminal_id)
+        due = terminal.retention_due_at
+        assert terminal.updated_at.replace(tzinfo=terminal.updated_at.tzinfo or timezone.utc) == source_updated_at
+        assert due.replace(tzinfo=due.tzinfo or timezone.utc) == NOW - timedelta(days=2) + timedelta(days=400)
 
 
 def test_talent_maximum_wins_and_explicit_membership_date_is_unchanged(tmp_path) -> None:
@@ -488,3 +571,96 @@ def test_talent_maximum_wins_and_explicit_membership_date_is_unchanged(tmp_path)
         due = db.get(Candidate, candidate_id).retention_due_at
         assert stored_until.replace(tzinfo=stored_until.tzinfo or timezone.utc) == explicit_until
         assert due.replace(tzinfo=due.tzinfo or timezone.utc) == explicit_until
+
+
+def test_active_application_overrides_talent_membership_due_date(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "system_admin", "active-talent@governance.test")
+    candidate_id = seed_recruiting_audit(app, admin_id)["candidate_id"]
+    with app.state.identity_store.sync_session() as db:
+        application = db.scalar(select(Application).where(Application.candidate_id == candidate_id))
+        application.stage = "review"
+        admin = db.get(User, admin_id)
+        pool = TalentPool(
+            organization_id=admin.organization_id,
+            name="Active candidate pool",
+            purpose="Retention test",
+            owner_id=admin.id,
+        )
+        db.add(pool)
+        db.flush()
+        db.add(
+            TalentPoolMembership(
+                organization_id=admin.organization_id,
+                pool_id=pool.id,
+                candidate_id=candidate_id,
+                owner_id=admin.id,
+                suitable_roles=[],
+                tags=[],
+                reason="Keep",
+                retention_until=NOW + timedelta(days=1000),
+            )
+        )
+        db.commit()
+    with TestClient(app) as client:
+        headers = login(client, "active-talent@governance.test")
+        response = client.patch(
+            "/api/v1/settings/retention-policy",
+            json=policy_payload(terminal_days=400),
+            headers={**headers, "If-Match": '"1"', "Idempotency-Key": "active-talent"},
+        )
+    assert response.status_code == 200
+    with app.state.identity_store.sync_session() as db:
+        assert db.get(Candidate, candidate_id).retention_due_at is None
+
+
+def test_governance_redirect_and_unexpected_error_are_no_store(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    seed_user(app, "system_admin", "errors@governance.test")
+    with TestClient(app, follow_redirects=False) as client:
+        headers = login(client, "errors@governance.test")
+        redirect = client.get("/api/v1/audit-logs/", headers=headers)
+    assert redirect.status_code in {307, 308}
+    assert redirect.headers["Cache-Control"] == "no-store"
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("private SQL and credential detail")
+
+    monkeypatch.setattr(governance_api, "policy_projection", explode)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = login(client, "errors@governance.test")
+        failed = client.get("/api/v1/settings/retention-policy", headers=headers)
+    assert failed.status_code == 500
+    assert failed.headers["Cache-Control"] == "no-store"
+    assert "private SQL" not in failed.text
+
+
+def test_retention_failure_rolls_back_policy_due_date_idempotency_and_audit(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "system_admin", "rollback@governance.test")
+    candidate_id = seed_recruiting_audit(app, admin_id)["candidate_id"]
+    with app.state.identity_store.sync_session() as db:
+        candidate = db.get(Candidate, candidate_id)
+        candidate.retention_due_at = NOW + timedelta(days=365)
+        db.commit()
+        original_due = candidate.retention_due_at
+
+    def fail_audit(*_args, **_kwargs):
+        raise RuntimeError("audit storage failed")
+
+    monkeypatch.setattr(governance_service, "append_audit", fail_audit)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = login(client, "rollback@governance.test")
+        response = client.patch(
+            "/api/v1/settings/retention-policy",
+            json=policy_payload(terminal_days=400),
+            headers={**headers, "If-Match": '"1"', "Idempotency-Key": "rollback"},
+        )
+    assert response.status_code == 500
+    assert response.headers["Cache-Control"] == "no-store"
+    with app.state.identity_store.sync_session() as db:
+        assert db.scalar(select(RetentionPolicy.version)) == 1
+        rolled_back_due = db.get(Candidate, candidate_id).retention_due_at
+        assert rolled_back_due.replace(tzinfo=timezone.utc) == original_due
+        assert db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == "rollback")) is None
+        assert db.scalar(select(AuditLog).where(AuditLog.event_type == "retention_policy.updated")) is None

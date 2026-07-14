@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
@@ -17,6 +18,7 @@ from server.app.identity.models import Job, User
 from server.app.identity.policy import Principal
 from server.app.interviews.models import Interview, InterviewFeedback
 from server.app.recruiting.models import Application, Candidate, CandidateEvent
+from server.app.recruiting.service import lock_candidates_for_retention
 from server.app.talent.models import TalentPoolMembership
 
 
@@ -108,6 +110,12 @@ def audit_summary(event_type: str, metadata: Any) -> str:
     return base
 
 
+def safe_network_ref(ip_hash: str | None) -> str | None:
+    if ip_hash is None or not re.fullmatch(r"[0-9a-f]{64}", ip_hash):
+        return None
+    return ip_hash[:12]
+
+
 def resource_projection(db, principal: Principal, resource_type: str | None, resource_id: UUID | None):
     if resource_type is None or resource_id is None:
         return None
@@ -191,7 +199,7 @@ def candidate_due_dates(db, organization_id: UUID, terminal_days: int) -> dict[U
     )
     feedback_facts = dict(
         db.execute(
-            select(Application.candidate_id, func.max(InterviewFeedback.submitted_at))
+            select(Application.candidate_id, func.max(InterviewFeedback.updated_at))
             .join(
                 Interview,
                 and_(
@@ -239,7 +247,7 @@ def candidate_due_dates(db, organization_id: UUID, terminal_days: int) -> dict[U
             )
             terminal_due = latest + timedelta(days=terminal_days) if latest else None
         talent_due = talent_facts.get(candidate.id)
-        due[candidate.id] = _maximum([terminal_due, talent_due])
+        due[candidate.id] = None if active_count else _maximum([terminal_due, talent_due])
     return due
 
 
@@ -327,11 +335,12 @@ def _verify_preview(
 def _recalculate_due_dates(db, organization_id: UUID, due: dict[UUID, datetime | None]) -> None:
     if not due:
         return
-    expression = case(due, value=Candidate.id, else_=Candidate.retention_due_at)
+    table = Candidate.__table__
+    expression = case(due, value=table.c.id, else_=table.c.retention_due_at)
     db.execute(
-        update(Candidate)
-        .where(Candidate.organization_id == organization_id)
-        .values(retention_due_at=expression)
+        table.update()
+        .where(table.c.organization_id == organization_id)
+        .values(retention_due_at=expression, updated_at=table.c.updated_at)
     )
 
 
@@ -352,6 +361,7 @@ def update_retention_policy(
     )
     if policy.version != expected_version:
         raise ResourceVersionConflict
+    lock_candidates_for_retention(db, principal.organization_id)
     shortening = any(values[name] < getattr(policy, name) for name in values)
     affected, due = affected_candidate_ids(db, principal.organization_id, values["terminal_days"])
     if shortening:

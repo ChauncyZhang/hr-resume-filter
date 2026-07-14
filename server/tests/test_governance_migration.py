@@ -505,3 +505,54 @@ def test_bootstrap_creates_matching_default_policy_at_head() -> None:
         ).one()
     assert policy == (1, None, True)
     engine.dispose()
+
+
+def test_post_0016_audit_category_repair_preserves_append_only_trigger() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    _alembic(url, "downgrade", "base")
+    _alembic(url, "upgrade", "0016_governance_audit_retention")
+    organization_id = uuid.uuid4()
+    recruiting_id = uuid.uuid4()
+    system_id = uuid.uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO organizations(id, slug, name, status, created_at, updated_at)
+                VALUES (:org, 'category-repair', 'Category repair', 'active', now(), now())
+                """
+            ),
+            {"org": organization_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO audit_logs(
+                  id, organization_id, category, event_type, outcome, metadata_json, created_at
+                ) VALUES
+                  (:recruiting, :org, 'system', 'candidate.created', 'success', '{}', now()),
+                  (:system, :org, 'system', 'authentication.login', 'success', '{}', now())
+                """
+            ),
+            {"org": organization_id, "recruiting": recruiting_id, "system": system_id},
+        )
+
+    _alembic(url, "upgrade", "head")
+    with engine.connect() as connection:
+        categories = dict(
+            connection.execute(
+                text("SELECT id, category FROM audit_logs WHERE organization_id = :org"),
+                {"org": organization_id},
+            ).all()
+        )
+    assert categories == {recruiting_id: "recruiting", system_id: "system"}
+    with pytest.raises(Exception, match="append-only"):
+        with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE audit_logs SET outcome = 'failure' WHERE id = :id"),
+                {"id": recruiting_id},
+            )
+    _alembic(url, "downgrade", "0016_governance_audit_retention")
+    _alembic(url, "upgrade", "head")
+    engine.dispose()

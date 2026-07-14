@@ -34,6 +34,10 @@ TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 logger = logging.getLogger(__name__)
 
 
+def _is_governance_path(path: str) -> bool:
+    return path == "/api/v1/audit-logs" or path.startswith("/api/v1/audit-logs/") or path == "/api/v1/settings/retention-policy" or path.startswith("/api/v1/settings/retention-policy/")
+
+
 def _new_trace_id() -> str:
     return secrets.token_hex(16)
 
@@ -132,11 +136,7 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):
         response = problem(request, 422, "validation_failed", "The request is invalid.")
-        if request.url.path in {
-            "/api/v1/audit-logs",
-            "/api/v1/settings/retention-policy",
-            "/api/v1/settings/retention-policy/previews",
-        }:
+        if _is_governance_path(request.url.path):
             response.headers["Cache-Control"] = "no-store"
         return response
     app.add_middleware(
@@ -173,11 +173,7 @@ def create_app(
                     response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
         if response is None:
             response = await call_next(request)
-        if request.url.path in {
-            "/api/v1/audit-logs",
-            "/api/v1/settings/retention-policy",
-            "/api/v1/settings/retention-policy/previews",
-        }:
+        if _is_governance_path(request.url.path):
             response.headers["Cache-Control"] = "no-store"
         response.headers["X-Trace-ID"] = trace_id
         logger.info(
@@ -191,6 +187,29 @@ def create_app(
                 }
             },
         )
+        return response
+
+    @app.middleware("http")
+    async def governance_no_store(request: Request, call_next):  # type: ignore[no-untyped-def]
+        if not _is_governance_path(request.url.path):
+            return await call_next(request)
+        try:
+            response = await call_next(request)
+        except Exception as error:
+            trace_id = getattr(request.state, "trace_id", _new_trace_id())
+            logger.exception(
+                "governance_request_failed",
+                extra={"context": {"trace_id": trace_id, "error_type": type(error).__name__}},
+            )
+            request.state.trace_id = trace_id
+            response = problem(
+                request,
+                500,
+                "internal_error",
+                "The request could not be completed.",
+            )
+            response.headers["X-Trace-ID"] = trace_id
+        response.headers["Cache-Control"] = "no-store"
         return response
 
     @app.get("/health/live")

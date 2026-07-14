@@ -63,6 +63,25 @@ _SENSITIVE_KEY_PATTERN = re.compile(
 )
 
 
+def category_for_event(event_type: str) -> str:
+    if event_type.startswith(("retention_policy.", "governance.")):
+        return "governance"
+    if event_type.startswith(
+        (
+            "candidate.",
+            "application.",
+            "job.",
+            "resume.",
+            "screening.",
+            "interview.",
+            "talent_pool.",
+            "report_export.",
+        )
+    ):
+        return "recruiting"
+    return "system"
+
+
 def _validate_metadata(event_type: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
     fields = EVENT_METADATA_ALLOWLIST.get(event_type)
     if fields is None:
@@ -106,6 +125,8 @@ def append_audit(
     ip_hash: str | None = None,
     metadata: Mapping[str, Any] = {},
 ) -> AuditLog:
+    if category != category_for_event(event_type):
+        raise AuditValidationError("category does not match event_type")
     if category not in _ALLOWED_CATEGORIES:
         raise AuditValidationError(f"invalid audit category: {category!r}")
     if outcome not in _ALLOWED_OUTCOMES:

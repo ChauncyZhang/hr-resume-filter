@@ -134,21 +134,121 @@ Full PostgreSQL-enabled backend result:
 
 ```text
 python -m pytest server/tests -q
-1 failed, 550 passed, 4 skipped in 818.74s
+551 passed, 4 skipped
 ```
 
-The single failure is existing and outside this task's ownership:
-`server/tests/test_postgres_security.py::test_audit_logs_reject_update_and_delete`
-performs a raw INSERT into the committed `0016` partitioned `audit_logs` table without
-the required non-null `category`, so PostgreSQL raises `NotNullViolation` before that
-test reaches its append-only UPDATE/DELETE assertions. This slice did not change the
-migration, table constraint, or failing test. The focused governance migration rerun
-started afterward was interrupted before producing a result; the full run had already
-executed the migration suite and reported only the direct-insert failure above.
+The audit insert contract was corrected in follow-up commit `721a88b`; its targeted
+PostgreSQL audit check passed (`1 passed`). The final-range full gate then passed with
+the result above. This corrects the superseded intermediate failed result that was
+previously recorded here.
 
-## Remaining concern
+## Review fix wave (2026-07-14)
 
-The full backend gate is not completely green because the pre-existing PostgreSQL
-security test's raw INSERT has not been updated for the committed `0016` audit contract.
-Fixing that test is outside the brief-owned files and was intentionally not folded into
-this commit.
+All seven Important findings in `phase5-governance-api-review.md` were addressed without
+implementing deletion/legal-hold Task B or consuming revision `0017`:
+
+- Added one authoritative event-to-category mapping. The ORM `before_insert` boundary
+  applies it to every active direct `AuditLog` producer, while `append_audit` rejects an
+  explicitly inconsistent category. Real recruiting-producer and dual-role tests prove
+  the intended recruiting/system/governance role union.
+- Added `0016a_audit_category_repair`, ordered directly after `0016`. It temporarily
+  drops the append-only trigger, repairs only mismatched category values with the same
+  mapping, and restores the trigger in the same migration transaction. Its downgrade
+  intentionally retains the authoritative repaired data; Task B can still use `0017`.
+- Made any active application override talent membership and produce a null due date.
+- Changed submitted feedback retention facts to use `InterviewFeedback.updated_at`, so
+  amendments extend retention from the submitted fact's latest version.
+- Recalculation and active-application clearing use table-level updates that explicitly
+  preserve `Candidate.updated_at`.
+- Added a shared candidate-row lock boundary. Retention PATCH locks all tenant candidates
+  in deterministic ID order before reading facts; manual, screening, and talent-pool
+  application creation lock the same candidate before creating an active application and
+  clear its due date in the same transaction. The PostgreSQL barrier test proves the
+  concurrent operations serialize to a committed active application with null due date;
+  it does not retry or accept a stale result.
+- Added governance-path-family no-store middleware. Redirects, validation/auth failures,
+  successful responses, and safely converted unexpected errors all receive
+  `Cache-Control: no-store`.
+- Also completed the review's non-blocking hardening: actor display-name joins are
+  tenant-qualified and malformed/non-lowercase/non-SHA-256 `ip_hash` values expose no
+  network prefix. Cursor and preview HMAC domain separation remains unchanged.
+
+Atomicity coverage injects an audit failure after policy and due-date changes and proves
+rollback of policy version, due date, idempotency record, and update audit. Existing
+governance tests continue to cover direct-ID non-enumeration and cursor tenant/filter/role
+rebinding. PostgreSQL coverage also proves concurrent replacement of one expired
+idempotency key executes the replacement action exactly once.
+
+### Review-wave TDD evidence
+
+Expected RED before production fixes:
+
+```text
+python -m pytest server/tests/test_governance_api.py -q
+5 failed, 7 passed in 17.62s
+
+POSTGRES_SMOKE_URL=... python -m pytest server/tests/test_governance_postgres.py -q
+1 failed, 2 passed in 19.45s
+
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_migration.py::test_post_0016_audit_category_repair_preserves_append_only_trigger -q
+1 failed in 12.22s
+```
+
+The RED failures demonstrated the exact reviewed defects: system-classified recruiting
+producer, changed candidate timestamp, active-plus-talent non-null due, redirect/internal
+responses without no-store, stale concurrent retention result, and unrepaired post-0016
+category data.
+
+Final focused GREEN in the Python 3.12 test image:
+
+```text
+python -m pytest server/tests/test_governance_api.py server/tests/test_governance_models.py -q
+14 passed in 24.57s
+```
+
+Final PostgreSQL 16.9 governance/concurrency/migration GREEN:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py server/tests/test_governance_migration.py -q
+10 passed in 110.58s
+```
+
+The first affected run exposed an unintended service validation change in two legacy
+fixtures (`146 passed, 2 failed`). Removing only that new validation preserved the shared
+lock for real candidates; the exact regressions then passed (`2 passed in 1.26s`). Final
+affected GREEN:
+
+```text
+python -m pytest \
+  server/tests/test_recruiting.py server/tests/test_recruiting_api.py \
+  server/tests/test_screening_api.py server/tests/test_screening_pipeline.py \
+  server/tests/test_talent_api.py server/tests/test_interview_api.py \
+  server/tests/test_reports_api.py server/tests/test_llm_api.py -q
+148 passed in 247.38s
+```
+
+Compilation and patch hygiene:
+
+```text
+python -m compileall -q server
+exit 0
+
+git diff --check
+exit 0
+```
+
+Final PostgreSQL-enabled backend gate:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest server/tests -q
+558 passed, 4 skipped in 885.80s
+```
+
+### Remaining concerns
+
+- No known failing test or open Critical/Important review finding remains.
+- The category repair intentionally performs controlled updates while its append-only
+  trigger is absent inside one transactional migration. Deployments should apply it as a
+  normal exclusive schema migration before any future `0017` Task B migration.

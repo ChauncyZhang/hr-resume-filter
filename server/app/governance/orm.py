@@ -5,8 +5,9 @@ from typing import Any
 
 from sqlalchemy import Connection, event, insert, select
 
+from server.app.governance.audit import category_for_event
 from server.app.governance.models import RetentionPolicy
-from server.app.identity.models import Organization, utcnow
+from server.app.identity.models import AuditLog, Organization, utcnow
 
 
 _registered = False
@@ -44,10 +45,15 @@ def _seed_default_policy(_: Any, connection: Connection, organization: Organizat
     )
 
 
+def _categorize_audit(_: Any, __: Connection, audit: AuditLog) -> None:
+    audit.category = category_for_event(audit.event_type)
+
+
 def register_governance_orm() -> None:
     global _registered
     if _registered:
         return
     event.listen(Organization, "before_insert", _ensure_policy_pointer)
     event.listen(Organization, "after_insert", _seed_default_policy)
+    event.listen(AuditLog, "before_insert", _categorize_audit)
     _registered = True

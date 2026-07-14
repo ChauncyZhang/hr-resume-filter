@@ -264,12 +264,7 @@ def patch_application_record(db, organization_id, application_id, changes, *, ex
 def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):
     from server.app.recruiting.models import Application, Candidate, Resume
 
-    db.scalar(
-        select(Candidate.id).where(
-            Candidate.organization_id == organization_id,
-            Candidate.id == candidate_id,
-        ).with_for_update()
-    )
+    lock_candidate_retention_state(db, organization_id, candidate_id)
     resume = db.scalar(select(Resume).where(Resume.organization_id == organization_id, Resume.id == resume_id))
     if resume is None or resume.candidate_id != candidate_id:
         raise InvalidAggregateRelationship
@@ -279,7 +274,48 @@ def create_application_record(db, *, organization_id, candidate_id, job_id, resu
     application = Application(organization_id=organization_id, candidate_id=candidate_id, job_id=job_id, resume_id=resume_id, owner_id=owner_id, source=source, stage="new", source_application_id=related[0].id if related else None)
     db.add(application)
     db.flush()
+    clear_candidate_retention_due(db, organization_id, candidate_id)
     return application
+
+
+def lock_candidate_retention_state(db, organization_id, candidate_id):
+    from server.app.recruiting.models import Candidate
+
+    return db.scalar(
+        select(Candidate).where(
+            Candidate.organization_id == organization_id,
+            Candidate.id == candidate_id,
+        ).with_for_update()
+    )
+
+
+def lock_candidates_for_retention(db, organization_id):
+    from server.app.recruiting.models import Candidate
+
+    return list(
+        db.scalars(
+            select(Candidate.id).where(
+                Candidate.organization_id == organization_id
+            ).order_by(Candidate.id).with_for_update()
+        )
+    )
+
+
+def clear_candidate_retention_due(db, organization_id, candidate_id) -> None:
+    from server.app.recruiting.models import Candidate
+
+    table = Candidate.__table__
+    db.execute(
+        table.update()
+        .where(
+            table.c.organization_id == organization_id,
+            table.c.id == candidate_id,
+        )
+        .values(
+            retention_due_at=None,
+            updated_at=table.c.updated_at,
+        )
+    )
 
 
 def issue_download_ticket_record(db, organization_id, user_id, resume_id, clock, tokens):
