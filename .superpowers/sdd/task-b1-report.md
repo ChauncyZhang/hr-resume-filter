@@ -2,13 +2,15 @@
 
 ## Status
 
-DONE_WITH_CONCERNS
+DONE
 
 ## Commits
 
 - `52df461` — `feat(governance): add deletion foundation`
-- Report: committed separately after this report was written.
+- `b10e37b` — `docs(governance): report task B1 verification`
 - `0228262` — `fix(governance): harden deletion foundation`
+- `623ec8c` — `docs(governance): record task B1 review fixes`
+- `ea543a4` — `test(governance): stabilize audit clock fixture`
 
 ## Files changed
 
@@ -18,6 +20,7 @@ DONE_WITH_CONCERNS
 - `server/tests/test_governance_deletion_models.py`
 - `server/tests/test_governance_deletion_migration.py`
 - `server/tests/test_deploy_database_identity.py`
+- `server/tests/test_governance_api.py`
 - `server/app/governance/__init__.py`
 - `server/app/recruiting/models.py`
 - `deploy/compose.yaml`
@@ -121,6 +124,9 @@ An initial host-Python attempt was an environment error because the default Pyth
   - The run recorded one failure by 11% and was stopped after remaining CPU-bound progress stalled at 81% beyond 25 minutes.
   - Diagnostic rerun: `docker run --rm -e POSTGRES_SMOKE_URL=... -e APP_DB_TEST_USER=ux09_app -e APP_DB_TEST_PASSWORD=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests -x -vv`
   - `1 failed, 10 passed, 1 skipped in 25.38s`: pre-existing `server/tests/test_governance_api.py::test_real_candidate_writer_is_recruiting_visible_for_role_union_only` expected `candidate.created` but received an empty recruiter audit list. The same test failed alone (`1 failed in 9.84s`) and no Task B1 review-fix file changes that API path.
+  - Root cause: that test fixed the governance query clock at `2026-07-14T12:00:00Z` while real audit writers used wall-clock time. Runs after that fixed instant excluded newly written audit rows as future data.
+  - Stabilization gate after normalizing only that test's produced audit timestamps to its fixed clock: `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_api.py -q` — `13 passed in 27.86s`.
+  - Final clean rerun against a fresh PostgreSQL 16.9 database with distinct migration-owner and application identities: `docker run --rm --name ux09-b1-final-suite -e POSTGRES_SMOKE_URL=... -e APP_DB_TEST_USER=ux09_app -e APP_DB_TEST_PASSWORD=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests -q` — `617 passed, 4 skipped in 1374.14s`.
 - Compile, Compose, shell, and diff checks:
   - `docker build --target test -t ux09-server-test -f server/Dockerfile .` — passed.
   - `docker run --rm ... ux09-server-test python -m compileall -q <changed Python files>` — passed.
@@ -128,9 +134,9 @@ An initial host-Python attempt was an environment error because the default Pyth
   - `docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet` — passed.
   - Scoped `git diff --check` and staged `git diff --cached --check` — passed.
 
-## Review-fix behavior and remaining concern
+## Review-fix behavior and residual boundary
 
 - API/worker Compose URLs now use a dedicated LOGIN app role. PostgreSQL bootstrap/migrations retain the owner role; Alembic creates no roles or passwords. The idempotent operator script reconciles least-privilege table/sequence grants, excludes audit UPDATE/DELETE and function grants, and rejects shared owner/app credentials.
 - Downgrade takes deterministic `ACCESS EXCLUSIVE` locks on `audit_logs`, `candidates`, and all four Task B tables before checking evidence. The coordinated writer test proves downgrade waits, observes the committed evidence, refuses, and leaves all additive objects intact.
 - Tests now generate the full 25-edge state matrix and dynamically discover/assert all eight required composite tenant FK families. Manifest counts require exact bounded integers, and manifest hashes require exactly 64 lowercase hexadecimal characters in ORM and PostgreSQL constraints.
-- Remaining concern: the unrelated governance audit visibility test prevents a clean full-backend claim. All Task B1 focused PostgreSQL, pure, Compose, compile, shell, and diff gates pass.
+- Independent re-review approved Task B1 specification compliance with no Critical or Important findings. The final full backend suite is clean; the four skips remain the explicitly optional ClamAV/MinIO smoke integrations. The privileged redaction body remains deliberately fail-closed and belongs to B2.
