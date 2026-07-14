@@ -9,8 +9,10 @@ DONE
 - `d85cdaa` - `feat(governance): add deletion request admission APIs`
 - `7280bc3` - `docs(sdd): record Task B2A evidence`
 - `b0cb9ca` - `fix(governance): close B2A review findings`
-- The final re-review report update is committed separately after recording the
-  immutable fix hash above.
+- `6b8f8aa` - `docs(sdd): finalize B2A re-review evidence`
+- `b31f7a3` - `test(governance): bound B2A concurrency races`
+- The final Minor-review report update is committed separately after recording
+  the immutable test-fix hash above.
 
 ## Files changed
 
