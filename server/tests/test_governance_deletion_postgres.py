@@ -22,6 +22,8 @@ pytestmark = pytest.mark.skipif(
     not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured"
 )
 ORIGIN = "https://hr.example.test"
+BARRIER_TIMEOUT_SECONDS = 10
+THREAD_JOIN_TIMEOUT_SECONDS = 30
 
 
 class Probe:
@@ -109,23 +111,45 @@ def create_request(client, headers, candidate_id, key):
     )
 
 
+def run_concurrently(*workers) -> None:
+    barrier = threading.Barrier(len(workers))
+    worker_errors = []
+    error_lock = threading.Lock()
+
+    def guarded(worker) -> None:
+        try:
+            barrier.wait(timeout=BARRIER_TIMEOUT_SECONDS)
+            worker()
+        except BaseException as error:
+            with error_lock:
+                worker_errors.append(error)
+
+    threads = [
+        threading.Thread(target=guarded, args=(worker,), daemon=True)
+        for worker in workers
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+
+    alive = [thread.name for thread in threads if thread.is_alive()]
+    if alive:
+        barrier.abort()
+    assert not alive, f"concurrent workers remained alive: {alive}"
+    assert not worker_errors, f"concurrent worker failures: {worker_errors!r}"
+
+
 def test_two_request_creators_serialize_to_one_open_request(postgres_app) -> None:
     app, engine, candidate_id = postgres_app
     clients = [TestClient(app), TestClient(app)]
     headers = [login(client, "recruiter@deletion-pg.test") for client in clients]
-    barrier = threading.Barrier(2)
     responses = []
 
     def create(index):
-        barrier.wait()
         responses.append(create_request(clients[index], headers[index], candidate_id, f"request-{index}"))
 
-    threads = [threading.Thread(target=create, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
-    assert not any(thread.is_alive() for thread in threads)
+    run_concurrently(*(lambda index=index: create(index) for index in range(2)))
     for client in clients:
         client.close()
 
@@ -143,14 +167,15 @@ def test_same_key_different_candidates_never_replays_cross_candidate(postgres_ap
         db.add(second); db.commit(); second_id = second.id
     clients = [TestClient(app), TestClient(app)]
     headers = [login(client, "recruiter@deletion-pg.test") for client in clients]
-    barrier = threading.Barrier(2); responses = []
+    responses = []
+
     def create(index, candidate_id):
-        barrier.wait(timeout=10)
         responses.append(create_request(clients[index], headers[index], candidate_id, "same-resource-key"))
-    threads = [threading.Thread(target=create, args=(0, first_id)), threading.Thread(target=create, args=(1, second_id))]
-    for thread in threads: thread.start()
-    for thread in threads: thread.join(timeout=10)
-    assert not any(thread.is_alive() for thread in threads)
+
+    run_concurrently(
+        lambda: create(0, first_id),
+        lambda: create(1, second_id),
+    )
     assert sorted(response.status_code for response in responses) == [201, 409]
     assert next(r for r in responses if r.status_code == 409).json()["code"] == "idempotency_conflict"
     with Session(engine) as db:
@@ -166,11 +191,9 @@ def test_two_approvers_enqueue_exactly_one_job_and_stale_version_cannot_mutate(p
     request_id = created.json()["data"]["id"]
     clients = [TestClient(app), TestClient(app)]
     headers = [login(client, "system@deletion-pg.test") for client in clients]
-    barrier = threading.Barrier(2)
     responses = []
 
     def approve(index):
-        barrier.wait()
         responses.append(
             clients[index].post(
                 f"/api/v1/deletion-requests/{request_id}/transitions",
@@ -183,12 +206,7 @@ def test_two_approvers_enqueue_exactly_one_job_and_stale_version_cannot_mutate(p
             )
         )
 
-    threads = [threading.Thread(target=approve, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
-    assert not any(thread.is_alive() for thread in threads)
+    run_concurrently(*(lambda index=index: approve(index) for index in range(2)))
     for client in clients:
         client.close()
 
@@ -212,54 +230,71 @@ def test_approval_and_hold_placement_serialize_without_executable_job(postgres_a
     approve_client, hold_client = TestClient(app), TestClient(app)
     approve_headers = login(approve_client, "system@deletion-pg.test")
     hold_headers = login(hold_client, "recruiting-admin@deletion-pg.test")
-    barrier = threading.Barrier(2)
-    responses = []
+    responses = {}
 
     def approve():
-        barrier.wait()
-        responses.append(
-            approve_client.post(
-                f"/api/v1/deletion-requests/{request_id}/transitions",
-                json={"target_status": "approved"},
-                headers={**approve_headers, "If-Match": '"1"', "Idempotency-Key": "race-approve"},
-            )
+        responses["approval"] = approve_client.post(
+            f"/api/v1/deletion-requests/{request_id}/transitions",
+            json={"target_status": "approved"},
+            headers={**approve_headers, "If-Match": '"1"', "Idempotency-Key": "race-approve"},
         )
 
     def hold():
-        barrier.wait()
-        responses.append(
-            hold_client.post(
-                f"/api/v1/candidates/{candidate_id}/legal-holds",
-                json={"reason": "Concurrent legal hold"},
-                headers={**hold_headers, "Idempotency-Key": "race-hold"},
-            )
+        responses["hold"] = hold_client.post(
+            f"/api/v1/candidates/{candidate_id}/legal-holds",
+            json={"reason": "Concurrent legal hold"},
+            headers={**hold_headers, "Idempotency-Key": "race-hold"},
         )
 
-    threads = [threading.Thread(target=approve), threading.Thread(target=hold)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
-    assert not any(thread.is_alive() for thread in threads)
+    run_concurrently(approve, hold)
     approve_client.close()
     hold_client.close()
 
-    assert len(responses) == 2
-    assert all(response.status_code < 500 for response in responses)
-    assert any(response.status_code == 201 for response in responses)
+    assert set(responses) == {"approval", "hold"}
+    approval_response = responses["approval"]
+    hold_response = responses["hold"]
+    assert hold_response.status_code == 201
+    assert hold_response.headers["ETag"] == '"1"'
+    assert hold_response.json()["data"]["status"] == "active"
+    assert hold_response.json()["data"]["version"] == 1
+    assert hold_response.json()["data"]["reason"] == "Concurrent legal hold"
+
     with Session(engine) as db:
         request = db.get(DeletionRequest, UUID(request_id))
-        assert db.scalar(
-            select(func.count()).select_from(LegalHold).where(LegalHold.released_at.is_(None))
-        ) == 1
-        assert request.status in {"requested", "failed"}
-        active_jobs = db.scalar(
-            select(func.count()).select_from(BackgroundJob).where(
-                BackgroundJob.type == "governance.delete_candidate",
-                BackgroundJob.status.in_(("queued", "running")),
+        active_holds = list(
+            db.scalars(select(LegalHold).where(LegalHold.released_at.is_(None)))
+        )
+        jobs = list(
+            db.scalars(
+                select(BackgroundJob).where(
+                    BackgroundJob.type == "governance.delete_candidate"
+                )
             )
         )
-        assert active_jobs == 0
+        assert len(active_holds) == 1
+        assert not any(job.status in {"queued", "running"} for job in jobs)
+
+        if approval_response.status_code == 409:
+            assert approval_response.json()["code"] == "legal_hold_active"
+            assert request.status == "requested"
+            assert request.version == 1
+            assert request.safe_error_code is None
+            assert jobs == []
+        elif approval_response.status_code == 200:
+            assert approval_response.json()["data"]["status"] == "approved"
+            assert approval_response.json()["data"]["version"] == 2
+            assert request.status == "failed"
+            assert request.version == 3
+            assert request.safe_error_code == "legal_hold_active"
+            assert len(jobs) == 1
+            assert jobs[0].dedupe_key == f"candidate-delete:{request_id}:2"
+            assert jobs[0].status == "cancelled"
+        else:
+            pytest.fail(
+                "approve-vs-hold produced an illegal response serialization: "
+                f"approval={approval_response.status_code} "
+                f"body={approval_response.json()!r}"
+            )
 
 
 def test_failed_retry_refreshes_manifest_and_uses_new_version_once(postgres_app) -> None:

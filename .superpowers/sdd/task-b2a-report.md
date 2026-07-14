@@ -189,3 +189,42 @@ been checkpointed.
 The five skips remain the optional external ClamAV/MinIO tests. No B2B Worker,
 storage, redaction, recovery, tombstone-filtering, frontend, migration, or deploy
 behavior was added.
+
+## Final B2A Minor review fixes
+
+Only `server/tests/test_governance_deletion_postgres.py` and this report changed;
+no production code or protected user file was modified.
+
+- Replaced the four duplicated threaded test setups with one bounded concurrency
+  helper. Its only `Barrier.wait` has a 10-second timeout, every daemon worker has
+  a 30-second join timeout, broken barriers and worker exceptions are captured,
+  and the test fails explicitly if an exception occurs or a worker remains alive.
+- Strengthened approve-vs-hold to accept only these two complete serializations:
+  hold 201 followed by approval 409 `legal_hold_active`, leaving the request at
+  requested/version 1 with no job; or approval 200 followed by hold 201, leaving
+  the request failed/version 3 with `legal_hold_active` and exactly one version-2
+  delete job in `cancelled`. Both require one active hold and no queued/running job.
+
+### Final Minor RED/review evidence
+
+- `rg -n "Barrier|\\.wait\\(|Thread\\(|\\.join\\(" server/tests/test_governance_deletion_postgres.py`
+  - Review RED: four calls used bare `barrier.wait()` and the race test accepted
+    broad status/state sets (`status < 500`, any 201, and requested-or-failed)
+    instead of the two legal serializations. This was a test-strength defect, so
+    the pre-change runtime suite remained green despite the finding.
+
+### Final Minor GREEN evidence
+
+- Affected PostgreSQL file:
+  `docker run --rm -e POSTGRES_SMOKE_URL=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_postgres.py -q -x`
+  - `5 passed in 28.72s`.
+- Focused B2A API/PostgreSQL/audit/queue/OpenAPI gate:
+  `docker run --rm -e POSTGRES_SMOKE_URL=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py server/tests/test_governance_deletion_postgres.py server/tests/test_governance_api.py server/tests/test_governance_audit.py server/tests/test_queue.py server/tests/test_queue_postgres.py server/tests/test_queue_review.py -q`
+  - `96 passed in 126.12s`.
+- Python 3.12 compile of the changed PostgreSQL test: passed.
+- Static bounded-wait audit found no bare `.wait()` call and confirmed the
+  timeout, bounded join, live-worker assertion, and worker-error assertion.
+- Scoped `git diff --check`: passed.
+
+No full backend rerun was required for this test-only assertion hardening; the
+requested affected-file and focused B2A gates both passed against PostgreSQL.
