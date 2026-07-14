@@ -337,7 +337,7 @@ def test_audit_logs_reject_update_and_delete(pg_store) -> None:
     _, organization_id = seed_pg_user(pg_store)
     with pg_store.engine.begin() as connection:
         audit_id = uuid4()
-        connection.execute(text("insert into audit_logs(id,organization_id,event_type,outcome,metadata_json,created_at) values (:id,:org,'test','success','{}',now())"), {"id": audit_id, "org": organization_id})
+        connection.execute(text("insert into audit_logs(id,organization_id,category,event_type,outcome,metadata_json,created_at) values (:id,:org,'system','test','success','{}',now())"), {"id": audit_id, "org": organization_id})
     for statement in ("update audit_logs set outcome='changed' where id=:id", "delete from audit_logs where id=:id"):
         with pytest.raises(OperationalError):
             with pg_store.engine.begin() as connection:
