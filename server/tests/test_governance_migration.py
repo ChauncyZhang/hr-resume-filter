@@ -193,6 +193,11 @@ def test_0016_backfills_populated_0015_and_preserves_audit_on_downgrade() -> Non
 
     with pytest.raises(Exception, match="append-only"):
         with engine.begin() as connection:
+            connection.execute(
+                text("UPDATE audit_logs SET outcome = 'failure' WHERE id = :audit"), ids
+            )
+    with pytest.raises(Exception, match="append-only"):
+        with engine.begin() as connection:
             connection.execute(text("DELETE FROM audit_logs WHERE id = :audit"), ids)
 
     _alembic(url, "upgrade", "head")
@@ -302,6 +307,55 @@ def test_0016_seeds_zero_user_organization_with_system_actor_policy() -> None:
                     """
                 ),
                 {"org": organization_id, "user": other_updater_id},
+            )
+    engine.dispose()
+
+
+def test_0016_rejects_cross_tenant_organization_policy_pointer() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    _alembic(url, "downgrade", "base")
+    _alembic(url, "upgrade", "head")
+    first_organization_id = uuid.uuid4()
+    second_organization_id = uuid.uuid4()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO organizations(id, slug, name, status, created_at, updated_at)
+                VALUES
+                  (:first, 'first-tenant', 'First tenant', 'active', now(), now()),
+                  (:second, 'second-tenant', 'Second tenant', 'active', now(), now())
+                """
+            ),
+            {"first": first_organization_id, "second": second_organization_id},
+        )
+        second_policy_id = connection.scalar(
+            text(
+                """
+                SELECT retention_policy_id
+                FROM organizations
+                WHERE id = :organization_id
+                """
+            ),
+            {"organization_id": second_organization_id},
+        )
+
+    with pytest.raises(Exception, match="fk_organizations_retention_policy"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE organizations
+                    SET retention_policy_id = :policy_id
+                    WHERE id = :organization_id
+                    """
+                ),
+                {
+                    "organization_id": first_organization_id,
+                    "policy_id": second_policy_id,
+                },
             )
     engine.dispose()
 

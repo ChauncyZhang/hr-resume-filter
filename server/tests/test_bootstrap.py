@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from server.app.governance.models import RetentionPolicy
 from server.app.identity.bootstrap import bootstrap_system_admin
@@ -35,3 +36,16 @@ def test_orm_schema_creation_rejects_non_sqlite_dialects() -> None:
     store.engine.dialect.name = "postgresql"
     with pytest.raises(RuntimeError, match="Alembic"):
         store.create_schema()
+
+
+def test_sqlite_rejects_cross_tenant_retention_policy_pointer(identity_app) -> None:
+    app, _, _ = identity_app
+    with app.state.identity_store.sync_session() as session:
+        first = Organization(slug="first", name="First")
+        second = Organization(slug="second", name="Second")
+        session.add_all([first, second])
+        session.commit()
+
+        first.retention_policy_id = second.retention_policy_id
+        with pytest.raises(IntegrityError):
+            session.commit()
