@@ -35,6 +35,7 @@ _IMPACT_COUNT_KEYS = (
     "resume_objects",
     "temporary_exports",
 )
+_MAX_IMPACT_COUNT = 2_147_483_647
 
 
 def advance_deletion_status(current: str, target: str) -> str:
@@ -103,16 +104,11 @@ def impact_manifest_projection(
     if not isinstance(private_counts, dict):
         private_counts = {}
     counts: dict[str, int] = {}
-    try:
-        for key in _IMPACT_COUNT_KEYS:
-            value = private_counts.get(key, 0)
-            if isinstance(value, bool):
-                raise ValueError
-            counts[key] = int(value)
-            if counts[key] < 0:
-                raise ValueError
-    except (TypeError, ValueError, OverflowError):
-        raise DeletionDomainError("invalid_impact_manifest") from None
+    for key in _IMPACT_COUNT_KEYS:
+        value = private_counts.get(key, 0)
+        if type(value) is not int or not 0 <= value <= _MAX_IMPACT_COUNT:
+            raise DeletionDomainError("invalid_impact_manifest")
+        counts[key] = value
     return {
         "schema_version": 1,
         "candidate_ref": str(request_id),

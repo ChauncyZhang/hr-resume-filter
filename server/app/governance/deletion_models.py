@@ -24,6 +24,16 @@ from server.app.queue import models as queue_models  # noqa: F401
 
 
 _PRIVATE_JSON = JSON().with_variant(postgresql.JSONB(), "postgresql")
+_MANIFEST_HASH_REMAINDER = "manifest_hash"
+for _hex_character in "0123456789abcdef":
+    _MANIFEST_HASH_REMAINDER = (
+        f"replace({_MANIFEST_HASH_REMAINDER}, '{_hex_character}', '')"
+    )
+_MANIFEST_HASH_CHECK = (
+    "length(manifest_hash) = 64 AND "
+    "manifest_hash = lower(manifest_hash) AND "
+    f"length({_MANIFEST_HASH_REMAINDER}) = 0"
+)
 
 
 class DeletionRequest(Base):
@@ -51,7 +61,7 @@ class DeletionRequest(Base):
         ),
         CheckConstraint("requested_by IS NOT NULL OR reason_code = 'retention_expired'"),
         CheckConstraint("manifest_schema_version = 1"),
-        CheckConstraint("length(manifest_hash) = 64"),
+        CheckConstraint(_MANIFEST_HASH_CHECK),
         CheckConstraint("policy_version >= 1"),
         CheckConstraint("candidate_version >= 1"),
         CheckConstraint("recovery_generation >= 0"),

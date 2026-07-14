@@ -82,6 +82,12 @@ def test_deletion_models_register_tenant_scoped_schema_contract() -> None:
         "attempts >= 0",
         "length(reason) <= 1000",
     } <= checks
+    assert any(
+        "length(manifest_hash) = 64" in check
+        and "lower(manifest_hash)" in check
+        and all(f"'{character}'" in check for character in "0123456789abcdef")
+        for check in checks
+    )
 
     indexes = {index.name: index for table in (request, hold) for index in table.indexes}
     assert isinstance(indexes["uq_deletion_requests_open_candidate"], Index)
@@ -106,20 +112,27 @@ def test_exact_deletion_state_edges_are_allowed(current: str, target: str) -> No
     assert advance_deletion_status(current, target) == target
 
 
-@pytest.mark.parametrize(
-    ("current", "target"),
-    [
-        ("requested", "executing"),
-        ("requested", "failed"),
-        ("approved", "completed"),
-        ("failed", "executing"),
-        ("completed", "approved"),
-        ("completed", "failed"),
-    ],
-)
-def test_all_other_deletion_state_edges_are_rejected(current: str, target: str) -> None:
-    with pytest.raises(DeletionDomainError, match="^invalid_deletion_state_transition$"):
-        advance_deletion_status(current, target)
+def test_complete_known_deletion_state_transition_matrix() -> None:
+    states = ("requested", "approved", "executing", "completed", "failed")
+    allowed = {
+        ("requested", "approved"),
+        ("approved", "executing"),
+        ("executing", "completed"),
+        ("executing", "failed"),
+        ("failed", "approved"),
+        ("completed", "completed"),
+    }
+
+    for current in states:
+        for target in states:
+            if (current, target) in allowed:
+                assert advance_deletion_status(current, target) == target
+            else:
+                with pytest.raises(
+                    DeletionDomainError,
+                    match="^invalid_deletion_state_transition$",
+                ):
+                    advance_deletion_status(current, target)
 
 
 @pytest.mark.parametrize(
@@ -263,10 +276,16 @@ def test_impact_manifest_projection_is_fixed_and_private() -> None:
         assert private_value not in rendered
 
 
-def test_impact_projection_rejects_invalid_counts_without_disclosing_values() -> None:
+@pytest.mark.parametrize(
+    "invalid_count",
+    [True, 1.5, "1", None, -1, 2_147_483_648],
+)
+def test_impact_projection_rejects_invalid_counts_without_disclosing_values(
+    invalid_count: object,
+) -> None:
     with pytest.raises(DeletionDomainError) as raised:
         impact_manifest_projection(
-            {"counts": {"contacts": "private-count"}},
+            {"counts": {"contacts": invalid_count}},
             request_id=uuid.uuid4(),
             candidate_version=1,
             policy_version=1,
@@ -275,7 +294,18 @@ def test_impact_projection_rejects_invalid_counts_without_disclosing_values() ->
 
     assert raised.value.code == "invalid_impact_manifest"
     assert str(raised.value) == "invalid_impact_manifest"
-    assert "private-count" not in str(raised.value)
+
+
+def test_impact_projection_accepts_maximum_manifest_count() -> None:
+    projection = impact_manifest_projection(
+        {"counts": {"contacts": 2_147_483_647}},
+        request_id=uuid.uuid4(),
+        candidate_version=1,
+        policy_version=1,
+        backup_window_ends_at=datetime.now(timezone.utc),
+    )
+
+    assert projection["counts"]["contacts"] == 2_147_483_647
 
 
 def test_canonical_manifest_hash_is_deterministic_and_does_not_return_manifest() -> None:

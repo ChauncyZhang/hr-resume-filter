@@ -10,6 +10,9 @@ CMD ["uvicorn", "server.app.main:create_app", "--factory", "--host", "0.0.0.0", 
 
 FROM runtime AS test
 USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
 COPY server/requirements-dev.txt /opt/ux09/server/requirements-dev.txt
 COPY deploy/nginx/default.conf /opt/ux09/deploy/nginx/default.conf
 RUN pip install --no-cache-dir -r server/requirements-dev.txt

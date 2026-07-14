@@ -16,13 +16,30 @@ When a local Python 3.12 interpreter is available, installing
 
 ## Migrations
 
-From the repository root, with `DATABASE_URL` set to an async PostgreSQL URL:
+From the repository root, set `DATABASE_URL` to the async PostgreSQL URL for the
+bootstrap/migration owner (`POSTGRES_USER`), not the runtime application role:
 
 ```powershell
 python -m alembic -c server/alembic.ini upgrade head
 ```
 
 The Phase 0 revision is intentionally empty; domain tables arrive in later tasks.
+
+Alembic never creates roles or stores database passwords. PostgreSQL bootstrap owns the
+schema, while API and worker processes connect as the separate `APP_DB_USER`. On a fresh
+Compose volume, `deploy/postgres/provision-app-role.sh` creates that login with
+`NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` and establishes default
+table/sequence privileges. After every migration on an existing volume, rerun the safe,
+idempotent grant reconciliation before restarting API/worker processes:
+
+```powershell
+docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T postgres `
+  sh /docker-entrypoint-initdb.d/10-provision-app-role.sh
+```
+
+The application role receives DML on current non-audit tables, append-only access to audit
+tables, and no function grants. Sensitive redaction remains owner-only. Keep
+`POSTGRES_PASSWORD` and `APP_DB_PASSWORD` distinct and rotate them independently.
 
 ## Compose
 
@@ -58,7 +75,8 @@ network deadline provides the finite bound required for worker process shutdown.
 
 ## Production requirements
 
-Set `APP_ENVIRONMENT=production`, a non-placeholder PostgreSQL password, distinct MinIO
+Set `APP_ENVIRONMENT=production`, distinct non-placeholder PostgreSQL owner and application
+passwords, distinct MinIO
 access and secret keys, and explicit HTTPS CORS origins. Startup rejects placeholders and
 wildcard CORS. Buckets are private and must be provisioned separately; the application never
 enables anonymous/public access. Rotate secrets through the deployment environment, not Git.

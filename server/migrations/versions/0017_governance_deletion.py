@@ -81,7 +81,7 @@ def upgrade() -> None:
             name="ck_deletion_requests_manifest_schema_version",
         ),
         sa.CheckConstraint(
-            "char_length(manifest_hash) = 64",
+            "manifest_hash ~ '^[0-9a-f]{64}$'",
             name="ck_deletion_requests_manifest_hash",
         ),
         sa.CheckConstraint("policy_version >= 1", name="ck_deletion_requests_policy_version"),
@@ -253,6 +253,20 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     connection = op.get_bind()
+    connection.execute(
+        sa.text(
+            """
+            LOCK TABLE
+              audit_logs,
+              candidates,
+              deletion_artifacts,
+              deletion_recovery_runs,
+              deletion_requests,
+              legal_holds
+            IN ACCESS EXCLUSIVE MODE
+            """
+        )
+    )
     evidence_exists = connection.scalar(
         sa.text(
             """
