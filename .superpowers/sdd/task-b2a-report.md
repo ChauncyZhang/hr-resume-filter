@@ -7,7 +7,10 @@ DONE
 ## Commits
 
 - `d85cdaa` - `feat(governance): add deletion request admission APIs`
-- The report is committed separately immediately after this file is written.
+- `7280bc3` - `docs(sdd): record Task B2A evidence`
+- `b0cb9ca` - `fix(governance): close B2A review findings`
+- The final re-review report update is committed separately after recording the
+  immutable fix hash above.
 
 ## Files changed
 
