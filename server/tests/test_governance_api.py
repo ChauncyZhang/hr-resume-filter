@@ -286,6 +286,16 @@ def test_real_candidate_writer_is_recruiting_visible_for_role_union_only(tmp_pat
             headers=recruiter_headers,
         )
         assert created.status_code == 201
+        with app.state.identity_store.sync_session() as db:
+            produced_audit = db.scalar(
+                select(AuditLog).where(
+                    AuditLog.actor_user_id == recruiter_id,
+                    AuditLog.event_type == "candidate.created",
+                )
+            )
+            assert produced_audit is not None
+            produced_audit.created_at = NOW
+            db.commit()
         recruiter_headers = login(client, "producer@governance.test")
         recruiter_rows = client.get(
             "/api/v1/audit-logs?event_type=candidate.created", headers=recruiter_headers
@@ -309,6 +319,14 @@ def test_real_candidate_writer_is_recruiting_visible_for_role_union_only(tmp_pat
     add_role(app, recruiter_id, "system_admin")
     with TestClient(app) as client:
         dual_headers = login(client, "producer@governance.test")
+        with app.state.identity_store.sync_session() as db:
+            produced_audits = db.scalars(
+                select(AuditLog).where(AuditLog.actor_user_id == recruiter_id)
+            ).all()
+            assert produced_audits
+            for produced_audit in produced_audits:
+                produced_audit.created_at = NOW
+            db.commit()
         dual = client.get("/api/v1/audit-logs", headers=dual_headers)
     assert {item["category"] for item in dual.json()["data"]} >= {"system", "recruiting"}
 
