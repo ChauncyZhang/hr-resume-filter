@@ -2,6 +2,8 @@ const RECRUITING_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "人
 const INTERVIEWER_NAV_ITEMS = ["工作台", "面试"];
 const HIRING_MANAGER_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "报表"];
 const ALL_SETTINGS_SECTIONS = ["组织与权限", "流程与评价模板", "AI 设置", "审计与数据治理"];
+const GOVERNANCE_VIEW_ROLES = new Set(["系统管理员", "system_admin", "招聘管理员", "recruiting_admin", "HR 招聘专员", "HR"]);
+const GOVERNANCE_EDIT_ROLES = new Set(["系统管理员", "system_admin"]);
 
 const RECRUITING_ACTIONS = [
   "导入简历",
@@ -89,7 +91,19 @@ export function canEditOrganizationSettings(role) {
 }
 
 export function canEditAuditSettings(role) {
-  return role === "系统管理员";
+  return canEditRetentionSettings(role);
+}
+
+export function canViewAuditSettings(role) {
+  return GOVERNANCE_VIEW_ROLES.has(role);
+}
+
+export function canViewRetentionSettings(role) {
+  return GOVERNANCE_VIEW_ROLES.has(role);
+}
+
+export function canEditRetentionSettings(role) {
+  return GOVERNANCE_EDIT_ROLES.has(role);
 }
 
 export function getRoleIdentity(role) {

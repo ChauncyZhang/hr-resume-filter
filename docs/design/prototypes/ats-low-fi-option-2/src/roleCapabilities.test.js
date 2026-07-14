@@ -5,7 +5,10 @@ import {
   canEditAiSettings,
   canEditAuditSettings,
   canEditOrganizationSettings,
+  canEditRetentionSettings,
   canPerformAction,
+  canViewAuditSettings,
+  canViewRetentionSettings,
   getAllowedNavItems,
   getAllowedSettingsSections,
   getDefaultNavItem,
@@ -95,4 +98,26 @@ test("未知角色、导航和操作默认拒绝", () => {
   assert.deepEqual(getAllowedSettingsSections("未知角色"), []);
   assert.equal(canEditOrganizationSettings("未知角色"), false);
   assert.equal(canEditAuditSettings("未知角色"), false);
+});
+
+test("治理设置显式区分审计查看和保留策略编辑权限", () => {
+  const matrix = [
+    ["系统管理员", true, true, true],
+    ["system_admin", true, true, true],
+    ["招聘管理员", true, true, false],
+    ["recruiting_admin", true, true, false],
+    ["HR 招聘专员", true, true, false],
+    ["HR", true, true, false],
+    ["用人经理", false, false, false],
+    ["hiring_manager", false, false, false],
+    ["面试官", false, false, false],
+    ["interviewer", false, false, false],
+    ["未知角色", false, false, false],
+  ];
+
+  for (const [role, auditView, retentionView, retentionEdit] of matrix) {
+    assert.equal(canViewAuditSettings(role), auditView, `${role} audit view`);
+    assert.equal(canViewRetentionSettings(role), retentionView, `${role} retention view`);
+    assert.equal(canEditRetentionSettings(role), retentionEdit, `${role} retention edit`);
+  }
 });

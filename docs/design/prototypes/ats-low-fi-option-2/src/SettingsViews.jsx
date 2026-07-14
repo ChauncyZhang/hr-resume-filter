@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Bot, CheckCircle2, ChevronDown, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
-import { getRoleCapabilities, isPermissionExpansion } from "./ux07Domain.js";
-import { canEditAiSettings, canEditAuditSettings, canEditOrganizationSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
+import { isPermissionExpansion } from "./ux07Domain.js";
+import { canEditAiSettings, canEditOrganizationSettings, canEditRetentionSettings, canViewAuditSettings, canViewRetentionSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
 import { createLlmSettingsController, getTestDisabledReason, releaseLlmSettingsSubscription } from "./llmSettings.js";
+import { createGovernanceSettingsController, releaseGovernanceSettingsSubscription } from "./governanceSettings.js";
 
 const settingsSections = [
   ["组织与权限", Users],
@@ -17,20 +18,13 @@ const seedUsers = [
   { id: "U-004", name: "刘思远", email: "liu***@company.com", department: "产品部", role: "HR", status: "停用", scopes: ["产品经理"] },
 ];
 
-const auditRows = [
-  { id: "AUD-1072", time: "今天 11:24", actor: "张小北", action: "下载简历", object: "李嘉明 · 当前简历", result: "成功", ip: "10.***.18.24", trace: "tr_8c21f7", change: "下载人才库候选人当前简历" },
-  { id: "AUD-1071", time: "今天 10:58", actor: "陈雨", action: "状态变化", object: "陈浩 · Java 后端工程师", result: "成功", ip: "10.***.21.16", trace: "tr_67d12a", change: "待安排 → 面试中" },
-  { id: "AUD-1070", time: "今天 10:32", actor: "张小北", action: "配置变更", object: "LLM 设置", result: "成功", ip: "10.***.18.24", trace: "tr_51aa93", change: "模型范围新增 AI 工程师" },
-  { id: "AUD-1069", time: "昨天 17:46", actor: "系统", action: "登录", object: "王磊", result: "失败", ip: "103.***.44.8", trace: "tr_03bc18", change: "登录凭据校验失败" },
-];
-
 function RoleSwitch({ value, onChange }) {
   if (!onChange || value !== "招聘管理员") return null;
   return <div className="role-switch" aria-label="当前角色">{["招聘管理员", "HR", "面试官"].map((role) => <button type="button" key={role} className={value === role ? "active" : ""} onClick={() => onChange(role)}>{role}</button>)}</div>;
 }
 
-function DangerDialog({ title, description, impact, confirmText, onCancel, onConfirm }) {
-  return <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label={title}><header><div><h3>{title}</h3><p>{description}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={onCancel}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>{impact}</span></div><footer><button className="button secondary" type="button" onClick={onCancel}>取消</button><button className="button danger" type="button" onClick={onConfirm}>{confirmText}</button></footer></section></div>;
+function DangerDialog({ title, description, impact, confirmText, confirmDisabled = false, onCancel, onConfirm }) {
+  return <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label={title}><header><div><h3>{title}</h3><p>{description}</p></div><button className="icon-button" type="button" aria-label="关闭" disabled={confirmDisabled} onClick={onCancel}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>{impact}</span></div><footer><button className="button secondary" type="button" disabled={confirmDisabled} onClick={onCancel}>取消</button><button className="button danger" type="button" disabled={confirmDisabled} onClick={onConfirm}>{confirmText}</button></footer></section></div>;
 }
 
 function PermissionNotice({ children }) {
@@ -120,18 +114,82 @@ function AiSettings({ role, onNotify, onDirtyChange }) {
   return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>控制候选人文本是否发送到后端允许的模型服务。</p></div></div>{error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{error}</div>}{message && <div className="llm-settings-message" role="status">{message}</div>}<section className="ai-governance"><ShieldCheck size={20} /><div><strong>数据外发控制</strong><p>Provider 地址由后端部署白名单管理；前端仅选择已允许的 Provider 与模型。</p></div><label className="llm-enabled-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => controller.updateDraft({ enabled: event.target.checked })} />启用</label></section><div className="settings-form llm-settings-form"><label>Provider<select value={draft.provider_id} onChange={(event) => { const provider_id = event.target.value; controller.updateDraft({ provider_id, model: config.available_providers?.[provider_id]?.[0] || "" }); }}><option value="">请选择 Provider</option>{providers.map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select></label><label>模型<select value={draft.model} disabled={!draft.provider_id || models.length === 0} onChange={(event) => controller.updateDraft({ model: event.target.value })}><option value="">请选择模型</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><div className="llm-key-field"><span className="llm-field-label">API Key</span><div className="masked-key"><KeyRound size={16} aria-hidden="true" /><span>{config.key_configured ? "已安全配置" : "尚未配置"}</span><button type="button" onClick={() => replacingKey ? controller.cancelKeyReplacement() : controller.startKeyReplacement()}>{replacingKey ? "取消替换" : config.key_configured ? "替换" : "添加"}</button></div>{replacingKey && <label className="llm-replacement-key">新的 API Key<input type="password" autoComplete="new-password" value={replacementKey} onChange={(event) => controller.setReplacementKey(event.target.value)} placeholder="保存后不会再次显示" /></label>}{saveMissingKey && <small className="llm-field-hint">启用模型前必须添加并保存 API Key。</small>}</div><div className="llm-scope-summary"><strong>允许使用的岗位</strong><p>{scopeIds.length === 0 ? "全部岗位（空列表表示不限制岗位）" : `已限制为 ${scopeIds.length} 个岗位`}</p>{scopeIds.length > 0 && <code>{scopeIds.join("、")}</code>}<small>岗位选择器尚未开放；保存时会原样保留当前岗位 ID。</small></div></div><section className={`llm-test-result ${lastTestSucceeded ? "success" : lastTestFailed ? "error" : "idle"}`} aria-live="polite"><div>{lastTestSucceeded ? <CheckCircle2 size={20} /> : lastTestFailed ? <AlertTriangle size={20} /> : <Bot size={20} />}<span><strong>{status === "testing" ? "正在测试已保存的配置" : lastTestSucceeded ? "最近一次连接成功" : lastTestFailed ? "最近一次连接失败" : "尚未测试已保存的配置"}</strong><small>{lastTestSucceeded ? `耗时 ${config.last_test_latency_ms ?? "—"} ms · ${formatTestTime(config.last_tested_at)}` : lastTestFailed ? `安全错误码：${config.last_test_error_code || "未知"} · ${formatTestTime(config.last_tested_at)}` : "测试只使用服务器中最后保存的 Provider、模型和 API Key。"}</small>{testDisabledReason && <small className="llm-test-explanation">{testDisabledReason}</small>}</span></div><button className="button secondary" type="button" disabled={Boolean(testDisabledReason)} onClick={testConnection}>{status === "testing" && <RefreshCw size={15} />}测试连接</button></section><div className="settings-sticky-actions"><span>{status === "saving" ? "正在保存…" : dirty ? "有尚未保存的修改" : "当前配置已保存"}</span>{dirty && <button className="button secondary" type="button" disabled={status === "saving" || status === "testing"} onClick={() => controller.discardDraft()}>取消修改</button>}<button className="button primary" type="button" disabled={saveDisabled} onClick={save}>{status === "saving" ? "保存中…" : "保存设置"}</button></div></div>;
 }
 
+function formatAuditTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function auditResourceLabel(resource) {
+  if (!resource) return "授权范围外资源";
+  return resource.label ? `${resource.label} · ${resource.type} · ${resource.id}` : `${resource.type} · ${resource.id}`;
+}
+
+function auditOutcomeLabel(outcome) {
+  if (outcome === "success") return "成功";
+  if (outcome === "denied") return "已拒绝";
+  if (outcome === "failure") return "失败";
+  return "未知";
+}
+
+function auditFilterDate(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+}
+
+function GovernanceState({ title, message, onRetry, denied = false }) {
+  return <div className={`governance-state${denied ? " denied" : ""}`} role={denied ? undefined : "alert"}>{denied ? <LockKeyhole size={22} /> : <AlertTriangle size={22} />}<div><strong>{title}</strong><p>{message}</p></div>{onRetry && <button className="button secondary" type="button" onClick={onRetry}>重试</button>}</div>;
+}
+
 function AuditSettings({ role, onNotify }) {
-  const editable = canEditAuditSettings(role);
-  const capabilities = getRoleCapabilities(role);
-  const [action, setAction] = useState("全部操作");
+  const canViewAudit = canViewAuditSettings(role);
+  const canViewRetention = canViewRetentionSettings(role);
+  const editable = canEditRetentionSettings(role);
+  const controller = useMemo(() => createGovernanceSettingsController(), [role]);
+  const [viewState, setViewState] = useState(() => controller.getState());
+  const [filters, setFilters] = useState({ from: "", to: "", eventType: "", outcome: "" });
   const [selected, setSelected] = useState(null);
-  const [retention, setRetention] = useState(730);
-  const [draftRetention, setDraftRetention] = useState(730);
-  const [risk, setRisk] = useState(false);
-  if (!capabilities.auditView && role !== "系统管理员") return <section className="settings-denied"><LockKeyhole size={31} /><h3>无审计与治理权限</h3><p>面试官不能查看系统访问记录或候选人保留策略。</p></section>;
-  const rows = auditRows.filter((item) => action === "全部操作" || item.action === action);
-  function saveRetention() { if (draftRetention < retention) { setRisk(true); return; } setRetention(draftRetention); onNotify("数据保留策略已保存"); }
-  return <div className="settings-section"><div className="settings-section-heading"><div><h2>审计与数据治理</h2><p>查询关键操作并管理候选人数据保留周期。</p></div></div>{!editable && <PermissionNotice>HR 仅可查看授权对象的审计记录，不能修改保留策略。</PermissionNotice>}<div className="audit-toolbar"><label><select value={action} onChange={(event) => setAction(event.target.value)}><option>全部操作</option><option>登录</option><option>下载简历</option><option>状态变化</option><option>配置变更</option></select><ChevronDown size={14} /></label><span>近 30 天 · {rows.length} 条示例记录</span></div><div className="settings-table audit-table"><div className="settings-table-head"><span>时间</span><span>操作者</span><span>操作</span><span>对象</span><span>结果</span><span /></div>{rows.map((row) => <button type="button" className="settings-table-row" key={row.id} onClick={() => setSelected(row)}><span>{row.time}</span><span>{row.actor}</span><span>{row.action}</span><span>{row.object}</span><span className={row.result === "成功" ? "status-ok" : "status-danger"}>{row.result}</span><span>详情</span></button>)}</div><section className="retention-policy"><header><Database size={21} /><div><h3>数据保留策略</h3><p>缩短周期可能触发不可逆的数据清理。</p></div></header><div><label>候选人档案保留<select disabled={!editable} value={draftRetention} onChange={(event) => setDraftRetention(Number(event.target.value))}><option value="365">365 天</option><option value="540">540 天</option><option value="730">730 天</option><option value="1095">1095 天</option></select></label><label>审计日志保留<input disabled value="1095 天" /></label><label>备份保留<input disabled value="90 天" /></label>{editable && <button className="button primary" type="button" onClick={saveRetention}>保存保留策略</button>}</div></section>{selected && <aside className="settings-drawer" aria-label="审计详情"><header><div><h2>审计详情</h2><p>{selected.id} · {selected.result}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setSelected(null)}><X size={20} /></button></header><div className="settings-drawer-body"><dl><div><dt>时间</dt><dd>{selected.time}</dd></div><div><dt>操作者</dt><dd>{selected.actor}</dd></div><div><dt>操作</dt><dd>{selected.action}</dd></div><div><dt>对象</dt><dd>{selected.object}</dd></div><div><dt>来源 IP</dt><dd>{selected.ip}</dd></div><div><dt>Trace ID</dt><dd>{selected.trace}</dd></div><div><dt>变更摘要</dt><dd>{selected.change}</dd></div></dl></div><footer><button className="button primary" type="button" onClick={() => setSelected(null)}>完成</button></footer></aside>}{risk && <DangerDialog title="确认缩短候选人保留期限" description={`保留周期将从 ${retention} 天缩短为 ${draftRetention} 天。`} impact="预计 18 位候选人将在下一次清理任务中进入删除队列；删除后只能从仍在保留期内的备份恢复。" confirmText="确认缩短期限" onCancel={() => setRisk(false)} onConfirm={() => { setRetention(draftRetention); setRisk(false); onNotify("保留策略已缩短并记录审计"); }} />}</div>;
+
+  useEffect(() => {
+    const unsubscribe = controller.subscribe(setViewState);
+    if (canViewAudit) controller.loadAudit();
+    if (canViewRetention) controller.loadRetention();
+    return () => releaseGovernanceSettingsSubscription(controller, unsubscribe);
+  }, [canViewAudit, canViewRetention, controller]);
+
+  if (!canViewAudit || !canViewRetention) return <section className="settings-denied"><LockKeyhole size={31} /><h3>无审计与治理权限</h3><p>当前角色不能查看系统访问记录或候选人保留策略。</p></section>;
+
+  const { audit, retention } = viewState;
+  const selectedStillVisible = selected && audit.rows.some((row) => row.id === selected.id);
+  const activeSelected = selectedStillVisible ? selected : null;
+  const retentionBusy = retention.status === "saving" || retention.status === "previewing";
+
+  function applyFilters(event) {
+    event.preventDefault();
+    setSelected(null);
+    controller.loadAudit({
+      from: auditFilterDate(filters.from),
+      to: auditFilterDate(filters.to),
+      eventType: filters.eventType.trim(),
+      outcome: filters.outcome,
+    });
+  }
+
+  function changeRetention(key, value) {
+    controller.updateRetentionDraft({ [key]: Number(value) });
+  }
+
+  async function saveRetention() {
+    if (await controller.saveRetention()) onNotify("数据保留策略已保存");
+  }
+
+  async function confirmRetention() {
+    if (await controller.confirmRetentionSave()) onNotify("数据保留策略已保存并记录审计");
+  }
+
+  return <div className="settings-section governance-settings"><div className="settings-section-heading"><div><h2>审计与数据治理</h2><p>查询服务端授权的关键操作并管理候选人数据保留周期。</p></div></div>{!editable && <PermissionNotice>当前为只读模式；审计范围由服务端授权，保留策略仅系统管理员可修改。</PermissionNotice>}<form className="audit-toolbar governance-filters" onSubmit={applyFilters}><label>开始时间<input type="datetime-local" value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} /></label><label>结束时间<input type="datetime-local" value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} /></label><label>事件类型<input value={filters.eventType} onChange={(event) => setFilters({ ...filters, eventType: event.target.value })} placeholder="如 candidate.created" /></label><label>结果<select value={filters.outcome} onChange={(event) => setFilters({ ...filters, outcome: event.target.value })}><option value="">全部结果</option><option value="success">成功</option><option value="denied">已拒绝</option><option value="failure">失败</option></select></label><button className="button secondary" type="submit">查询</button><span>{audit.rows.length} 条已加载记录</span></form>{audit.status === "loading" && <div className="governance-loading" role="status"><RefreshCw size={18} />正在加载授权审计记录…</div>}{audit.status === "denied" && <GovernanceState denied title="无审计记录权限" message="服务端未授权当前账号查看审计记录。" />}{audit.status === "error" && <GovernanceState title="审计记录加载失败" message={audit.error} onRetry={() => controller.loadAudit(audit.filters)} />}{audit.status === "empty" && <div className="governance-empty" role="status"><FileClock size={22} /><strong>没有符合条件的审计记录</strong><span>请调整筛选条件后重试。</span></div>}{audit.rows.length > 0 && <><div className="settings-table audit-table"><div className="settings-table-head"><span>时间</span><span>操作者</span><span>事件</span><span>资源</span><span>结果</span><span /></div>{audit.rows.map((row) => <button type="button" className="settings-table-row" key={row.id} onClick={() => setSelected(row)}><span>{formatAuditTime(row.createdAt)}</span><span>{row.actor.displayName || "已删除用户"}</span><span>{row.summary || row.eventType || "—"}</span><span>{auditResourceLabel(row.resource)}</span><span className={row.outcome === "success" ? "status-ok" : "status-danger"}>{auditOutcomeLabel(row.outcome)}</span><span>详情</span></button>)}</div><div className="audit-pagination" aria-live="polite">{audit.error && <span role="alert">{audit.error}</span>}{audit.nextCursor && <button className="button secondary" type="button" disabled={audit.loadingMore} onClick={() => controller.loadMoreAudit()}>{audit.loadingMore ? "加载中…" : "加载更多"}</button>}</div></>}
+  <section className="retention-policy"><header><Database size={21} /><div><h3>数据保留策略</h3><p>缩短任一周期必须先预览服务端影响并显式确认。</p></div></header>{retention.status === "loading" && !retention.policy && <div className="governance-loading" role="status"><RefreshCw size={18} />正在加载保留策略…</div>}{retention.status === "denied" && <GovernanceState denied title="无保留策略权限" message="服务端未授权当前账号查看保留策略。" />}{retention.status === "error" && !retention.policy && <GovernanceState title="保留策略加载失败" message={retention.error} onRetry={() => controller.loadRetention()} />}{retention.policy && retention.draft && <>{retention.error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{retention.error}</div>}{retention.message && <div className="llm-settings-message" role="status">{retention.message}</div>}<div><label>终态候选人保留天数<input type="number" min="30" max="3650" disabled={!editable || retentionBusy} value={retention.draft.terminalDays} onChange={(event) => changeRetention("terminalDays", event.target.value)} /></label><label>人才库保留天数<input type="number" min="30" max="3650" disabled={!editable || retentionBusy} value={retention.draft.talentPoolDays} onChange={(event) => changeRetention("talentPoolDays", event.target.value)} /></label><label>备份窗口天数<input type="number" min="30" max="3650" disabled={!editable || retentionBusy} value={retention.draft.backupWindowDays} onChange={(event) => changeRetention("backupWindowDays", event.target.value)} /></label>{editable && <button className="button primary" type="button" disabled={!retention.dirty || retentionBusy} onClick={saveRetention}>{retention.status === "previewing" ? "正在预览…" : retention.status === "saving" ? "保存中…" : "保存保留策略"}</button>}</div><small className="retention-version">当前版本 {retention.policy.version} · 最近更新 {formatAuditTime(retention.policy.updatedAt)}</small></>}</section>{activeSelected && <aside className="settings-drawer" aria-label="审计详情"><header><div><h2>审计详情</h2><p>{activeSelected.id} · {auditOutcomeLabel(activeSelected.outcome)}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setSelected(null)}><X size={20} /></button></header><div className="settings-drawer-body"><dl><div><dt>时间</dt><dd>{formatAuditTime(activeSelected.createdAt)}</dd></div><div><dt>操作者</dt><dd>{activeSelected.actor.displayName || "已删除用户"}</dd></div><div><dt>事件摘要</dt><dd>{activeSelected.summary || activeSelected.eventType || "—"}</dd></div><div><dt>资源</dt><dd>{auditResourceLabel(activeSelected.resource)}</dd></div><div><dt>结果</dt><dd>{auditOutcomeLabel(activeSelected.outcome)}</dd></div><div><dt>网络标识</dt><dd>{activeSelected.networkRef || "—"}</dd></div><div><dt>Trace ID</dt><dd>{activeSelected.traceId || "—"}</dd></div></dl></div><footer><button className="button primary" type="button" onClick={() => setSelected(null)}>完成</button></footer></aside>}{retention.preview && <DangerDialog title="确认缩短数据保留周期" description={`服务端影响预览有效期至 ${formatAuditTime(retention.preview.expiresAt)}。`} impact={`预计 ${retention.preview.affectedCandidateCount} 位候选人受到影响。请核对后明确确认。`} confirmText={retention.status === "saving" ? "保存中…" : "确认缩短期限"} confirmDisabled={retention.status === "saving"} onCancel={() => controller.cancelRetentionPreview()} onConfirm={confirmRetention} />}</div>;
 }
 
 export function SettingsWorkspace({ currentRole, onRoleChange, onNotify }) {
@@ -141,7 +199,7 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify }) {
   const allowedSettingsSections = getAllowedSettingsSections(currentRole);
   const visibleSettingsSections = settingsSections.filter(([label]) => allowedSettingsSections.includes(label));
   const activeSection = allowedSettingsSections.includes(section) ? section : allowedSettingsSections[0];
-  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} onDirtyChange={setAiDirty} /> : activeSection === "审计与数据治理" ? <AuditSettings role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
+  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} onDirtyChange={setAiDirty} /> : activeSection === "审计与数据治理" ? <AuditSettings key={currentRole} role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
   function openSection(nextSection) {
     if (activeSection === "AI 设置" && aiDirty && nextSection !== activeSection) {
       setPendingSection(nextSection);
