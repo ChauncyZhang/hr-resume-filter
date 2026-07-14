@@ -38,6 +38,7 @@ import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
 import { deriveCandidateInterviews, interviewController as defaultInterviewController, selectSchedulableCandidates } from "./interviewController.js";
 import { talentController as defaultTalentController } from "./talentController.js";
+import { reportController as defaultReportController } from "./reportController.js";
 import {
   appendJobPage,
   createInitialJobWorkspaceState,
@@ -135,7 +136,7 @@ function Modal({ title, children, onClose, footer }) {
   );
 }
 
-export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController, interviewController = defaultInterviewController, talentController = defaultTalentController }) {
+export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController, interviewController = defaultInterviewController, talentController = defaultTalentController, reportController = defaultReportController }) {
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
 
   useEffect(() => {
@@ -150,10 +151,10 @@ export function App({ controller = sessionController, screeningController = defa
     const identity = getSessionIdentity(session.user, null);
     return <AccessDeniedView displayName={identity.name} error={session.error} loggingOut={session.loggingOut} onLogout={() => controller.logout()} />;
   }
-  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} interviewController={interviewController} talentController={talentController} />;
+  return <AuthenticatedApp session={session} onLogout={() => controller.logout()} screeningController={screeningController} candidateController={candidateController} jobController={jobController} workbenchController={workbenchController} interviewController={interviewController} talentController={talentController} reportController={reportController} />;
 }
 
-function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController, interviewController, talentController }) {
+function AuthenticatedApp({ session, onLogout, screeningController, candidateController, jobController, workbenchController, interviewController, talentController, reportController }) {
   const currentRole = session.role || "未知角色";
   const recentTaskStorageKey = getRecentScreeningTaskStorageKey(session.user);
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
@@ -796,7 +797,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "报表" && (
-          <ReportWorkspace candidates={candidateRecords} positions={positionRecords} screeningSummary={screeningSummary} currentRole={currentRole} onDrillDown={drillDownReport} onNotify={notify} />
+          <ReportWorkspace positions={positionRecords} currentRole={currentRole} onDrillDown={drillDownReport} onNotify={notify} controller={reportController} />
         )}
 
         {!screeningTask && activeNav === "设置" && (
