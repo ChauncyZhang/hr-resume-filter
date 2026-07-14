@@ -24,6 +24,7 @@ class Candidate(Record, Base):
     owner_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     version: Mapped[int] = mapped_column(Integer, default=1)
     retention_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     __table_args__ = (UniqueConstraint("organization_id", "id"), ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]))
 
