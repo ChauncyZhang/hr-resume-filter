@@ -22,6 +22,7 @@ from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.service import SystemClock, SystemTokens
 from server.app.recruiting.storage import MinioResumeStorage
 from server.app.recruiting.http import derive_cursor_key
+from server.app.reports.api import router as reports_router
 
 
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -42,6 +43,7 @@ def create_app(
     initialize_identity_schema: bool = False,
     resume_storage=None,
     quarantine_storage=None,
+    export_storage=None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
 
@@ -61,6 +63,9 @@ def create_app(
             )
         storage_probe = storage_probe or ObjectStorageProbe(storage_client, settings.object_storage_bucket)
         resume_storage = resume_storage or MinioResumeStorage(storage_client, settings.object_storage_bucket)
+        if export_storage is None:
+            from server.app.reports.storage import MinioExportStorage
+            export_storage = MinioExportStorage(storage_client, settings.object_storage_bucket)
         if quarantine_storage is None:
             from server.app.screening.storage import QuarantineStorage
             quarantine_storage = QuarantineStorage(storage_client, settings.object_storage_bucket)
@@ -91,6 +96,7 @@ def create_app(
     )
     app.state.resume_storage = resume_storage
     app.state.quarantine_storage = quarantine_storage
+    app.state.export_storage = export_storage
     from server.app.llm.gateway import OpenAiCompatibleGateway
     from server.app.llm.policy import ProviderAllowlist
     from server.app.llm.security import ApiKeyCipher
@@ -107,6 +113,7 @@ def create_app(
     app.include_router(llm_router)
     from server.app.interviews.api import router as interview_router
     app.include_router(interview_router)
+    app.include_router(reports_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):
