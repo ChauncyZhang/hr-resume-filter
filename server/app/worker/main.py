@@ -2,15 +2,68 @@ import asyncio
 import logging
 import os
 import signal
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
+
+from sqlalchemy import select
+from sqlalchemy.exc import DisconnectionError, OperationalError, StatementError, TimeoutError as SqlAlchemyTimeoutError
 
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
+from server.app.queue.payloads import IDENTIFIER_PATTERN, OpaqueIdField, PayloadSchema, TYPE_PATTERN, UnsafePayload
 from server.app.queue.service import PermanentJobError, RetryableJobError, normalize_safe_code
-from server.app.queue.payloads import IDENTIFIER_PATTERN, TYPE_PATTERN
+from server.app.recruiting.storage import StorageReadFailed
+from server.app.reports.models import ExportRecord
+from server.app.reports.service import generate_export
 
 logger = logging.getLogger(__name__)
+
+
+REPORT_EXPORT_PAYLOAD = PayloadSchema(
+    {"organization_id": OpaqueIdField(), "export_id": OpaqueIdField()}
+)
+
+
+def _sync_database_url(database_url: str) -> str:
+    return database_url.replace("+asyncpg", "+psycopg").replace("+aiosqlite", "")
+
+
+class ReportExportJobHandler:
+    def __init__(self, sessions, storage) -> None:
+        self._sessions = sessions
+        self._storage = storage
+
+    async def __call__(self, job: object) -> None:
+        try:
+            payload = REPORT_EXPORT_PAYLOAD.validate(job.payload)
+            organization_id = uuid.UUID(payload["organization_id"])
+            export_id = uuid.UUID(payload["export_id"])
+            if uuid.UUID(str(job.organization_id)) != organization_id:
+                raise UnsafePayload("job tenant does not match payload")
+        except (AttributeError, TypeError, ValueError, UnsafePayload):
+            raise PermanentJobError("report_export_payload_invalid") from None
+
+        try:
+            await asyncio.to_thread(self._generate, organization_id, export_id)
+        except StorageReadFailed:
+            raise RetryableJobError("report_export_storage_unavailable") from None
+        except (OperationalError, DisconnectionError, SqlAlchemyTimeoutError):
+            raise RetryableJobError("report_export_database_unavailable") from None
+        except (LookupError, PermissionError, ValueError, StatementError):
+            raise PermanentJobError("report_export_unavailable") from None
+
+    def _generate(self, organization_id: uuid.UUID, export_id: uuid.UUID) -> None:
+        with self._sessions.begin() as database:
+            export = database.scalar(
+                select(ExportRecord).where(
+                    ExportRecord.organization_id == organization_id,
+                    ExportRecord.id == export_id,
+                )
+            )
+            if export is None:
+                raise LookupError("export unavailable")
+            generate_export(database, export.id, self._storage)
 
 def build_screening_handlers(settings,storage_client,bucket):
     from sqlalchemy import create_engine
@@ -22,14 +75,16 @@ def build_screening_handlers(settings,storage_client,bucket):
     from server.app.llm.gateway import OpenAiCompatibleGateway
     from server.app.llm.policy import ProviderAllowlist
     from server.app.llm.security import ApiKeyCipher
-    sessions=sessionmaker(create_engine(settings.database_url.replace("+asyncpg","+psycopg")),expire_on_commit=False)
+    from server.app.reports.storage import MinioExportStorage
+    sessions=sessionmaker(create_engine(_sync_database_url(settings.database_url)),expire_on_commit=False)
     scanner=ClamAvScanner(settings.clamav_host,settings.clamav_port,connect_timeout=settings.clamav_connect_timeout_seconds,read_timeout=settings.clamav_read_timeout_seconds,total_timeout=settings.clamav_total_timeout_seconds)
     pipeline=ScreeningPipeline(sessions,PipelineStorage(storage_client,bucket),scanner,settings)
     llm_key=settings.llm_config_encryption_key.get_secret_value()
     if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
     allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
     llm_pipeline=LlmScreeningPipeline(sessions,OpenAiCompatibleGateway(allowlist),ApiKeyCipher(llm_key.encode()))
-    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item}
+    report_export=ReportExportJobHandler(sessions,MinioExportStorage(storage_client,bucket))
+    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"reports.export":report_export}
 
 
 class Worker:
