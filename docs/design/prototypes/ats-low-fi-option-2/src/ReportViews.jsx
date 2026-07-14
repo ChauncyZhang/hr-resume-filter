@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, ArrowRight, BarChart3, CalendarRange, CheckCircle2, ChevronDown, Clock3, Download, FileCheck2, LockKeyhole, MessageSquareText, RefreshCw, UsersRound } from "lucide-react";
 import { canPerformAction } from "./roleCapabilities.js";
-import { createExportIntent, createLatestOperation, failedReportState, loadingReportState } from "./reportWorkspaceState.js";
+import { createExportIntent, createLatestOperation, failedReportState, isTerminalExportFailure, loadingReportState } from "./reportWorkspaceState.js";
 
 function NoPermission({ onNotify }) {
   return <section className="ux07-permission"><LockKeyhole size={34} /><h2>暂无报表查看权限</h2><p>当前账号不能读取招聘聚合数据或导出候选人记录。</p><button className="button primary" type="button" onClick={() => onNotify("请联系招聘管理员开通报表权限")}>联系管理员</button></section>;
@@ -90,6 +90,7 @@ export function ReportWorkspace({ positions = [], currentRole, onDrillDown, onNo
       setExportState({ status: "processing", record: created, error: "" });
       const completed = await controller.waitForExport(created.id, { signal: operation.signal });
       if (!operation.isCurrent()) return;
+      if (isTerminalExportFailure(completed)) exportIntentRef.current.reset();
       if (!completed || completed.status !== "succeeded") throw new Error("export failed");
       exportIntentRef.current.succeed();
       setExportState({ status: "ready", record: completed, error: "" });

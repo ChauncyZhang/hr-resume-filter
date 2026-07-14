@@ -46,3 +46,7 @@ export function loadingReportState() {
 export function failedReportState() {
   return { status: "error", data: null, error: "报表加载失败，请检查网络后重试。" };
 }
+
+export function isTerminalExportFailure(record) {
+  return record?.status === "failed";
+}

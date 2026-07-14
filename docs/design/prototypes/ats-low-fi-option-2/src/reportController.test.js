@@ -297,3 +297,16 @@ test("report workspace load states never retain previous-scope metrics", async (
   assert.deepEqual(support.loadingReportState?.(), { status: "loading", data: null, error: "" });
   assert.deepEqual(support.failedReportState?.(), { status: "error", data: null, error: "报表加载失败，请检查网络后重试。" });
 });
+
+
+test("only a confirmed terminal export failure starts a fresh export intent", async () => {
+  const support = await import("./reportWorkspaceState.js");
+  const intent = support.createExportIntent(() => "replacement-key");
+  intent.key();
+
+  assert.equal(support.isTerminalExportFailure({ status: "queued" }), false);
+  assert.equal(support.isTerminalExportFailure(null), false);
+  assert.equal(support.isTerminalExportFailure({ status: "failed" }), true);
+  if (support.isTerminalExportFailure({ status: "failed" })) intent.reset();
+  assert.equal(intent.peek(), null);
+});
