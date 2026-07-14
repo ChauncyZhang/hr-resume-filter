@@ -491,3 +491,112 @@ exit 0
 - No test is currently failing. The one asyncpg connection timeout was reproduced only
   as an infrastructure transient and passed both exact and full-combination reruns on a
   fresh PostgreSQL container.
+
+## Final independent review lock-order fix (2026-07-14)
+
+The final review's remaining Important identified a multi-candidate ordering gap in
+screening bulk actions. Although each transition used the shared Candidate-first service,
+the transaction reached transitions in `ScreeningItem.id` order. That allowed bulk to
+hold a higher Candidate UUID while retention PATCH held a lower Candidate UUID and each
+waited for the other's row.
+
+The scoped fix changes only screening bulk ordering:
+
+- Before taking retention business-fact locks, bulk performs a tenant- and run-scoped
+  read of every requested `ScreeningItem -> Application -> Candidate` relationship.
+- It locks the distinct target Candidates in ascending UUID order, matching retention
+  PATCH's global `Candidate.id` order.
+- It then locks the run/items and locks Applications in `(candidate_id, application_id)`
+  order. Locked rows are checked against the pre-read relationships before any mutation,
+  closing the TOCTOU window.
+- Every actual transition still calls `transition_application_record`, retaining its
+  candidate/application revalidation, expected-version check, domain transition rules,
+  timeline event, audit event, and immediate retention recalculation.
+
+A production search found no other writer that acquires multiple Candidate retention
+locks in one transaction. Retention PATCH already orders all Candidates by UUID; other
+retention fact writers operate on one Candidate per transaction. No unrelated path was
+changed.
+
+### Final-review TDD and verification evidence
+
+The first test execution returned 404 because the governance fixture's system
+administrator lacked the real screening `recruiting_admin` role; the fixture was corrected
+before evaluating lock behavior. The valid RED then deterministically produced the
+reviewed failure:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py::test_screening_bulk_and_retention_patch_lock_candidates_in_global_order -q
+1 failed in 14.21s
+```
+
+PostgreSQL reported `DeadlockDetected`: retention PATCH held the lower Candidate and
+waited for the higher Candidate, while bulk held the higher Candidate and waited for the
+lower Candidate. PATCH returned 500 and its transaction rolled back.
+
+Targeted GREEN after Candidate UUID prelocking:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py::test_screening_bulk_and_retention_patch_lock_candidates_in_global_order -q
+1 passed in 10.75s
+```
+
+The barrier uses reversed ScreeningItem/Candidate UUID order plus explicit
+`lock_timeout`/`statement_timeout`. GREEN requires both PATCH and bulk to return 200, both
+applications to transition through the real service with version 2 and two audit events,
+and both stored due dates to equal the final 400-day fact calculation.
+
+Focused GREEN:
+
+```text
+python -m pytest server/tests/test_screening_actions.py server/tests/test_screening_api.py -q
+19 passed in 47.60s
+```
+
+PostgreSQL governance migration/concurrency GREEN:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py server/tests/test_governance_migration.py -q
+18 passed in 154.76s
+```
+
+Affected GREEN:
+
+```text
+python -m pytest server/tests/test_recruiting.py server/tests/test_recruiting_api.py \
+  server/tests/test_screening_api.py server/tests/test_screening_pipeline.py \
+  server/tests/test_screening_actions.py server/tests/test_talent_api.py \
+  server/tests/test_interview_api.py server/tests/test_llm_api.py -q
+138 passed in 206.48s
+```
+
+Final PostgreSQL-enabled backend gate:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest server/tests -q
+567 passed, 4 skipped in 952.22s
+```
+
+Compilation and patch hygiene:
+
+```text
+python -m compileall -q server
+exit 0
+
+git diff --check -- server/app/screening/actions.py \
+  server/tests/test_governance_postgres.py \
+  .superpowers/sdd/phase5-governance-api-report.md
+exit 0
+```
+
+### Final-review files changed and concern
+
+- `server/app/screening/actions.py`
+- `server/tests/test_governance_postgres.py`
+- `.superpowers/sdd/phase5-governance-api-report.md`
+
+The specified final-review Important has implementation and full-gate evidence. This
+report does not claim a later independent post-fix review result that has not occurred.

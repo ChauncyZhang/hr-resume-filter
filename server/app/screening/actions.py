@@ -1,5 +1,6 @@
 import uuid
-from sqlalchemy import select
+from sqlalchemy import and_, select
+from server.app.governance.retention import lock_candidate_retention_facts
 from server.app.identity.models import AuditLog
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
@@ -74,12 +75,21 @@ def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None)
     db.flush(); return item,run,job
 
 def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
+    requested={item.item_id:item.expected_application_version for item in payload.items}
+    relationships=list(db.execute(select(ScreeningItem.id,ScreeningItem.application_id,Application.candidate_id).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested))))
+    if len(relationships)!=len(requested): raise ScreeningBulkConflict
+    expected_relationships={item_id:(application_id,candidate_id) for item_id,application_id,candidate_id in relationships}
+    candidate_ids=sorted({candidate_id for _,candidate_id in expected_relationships.values()})
+    if any(lock_candidate_retention_facts(db,organization_id,candidate_id) is None for candidate_id in candidate_ids): raise ScreeningBulkConflict
     run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==run_id).with_for_update())
-    requested={item.item_id:item.expected_application_version for item in payload.items}; rows=list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested)).order_by(ScreeningItem.id).with_for_update()))
+    rows=list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested)).order_by(ScreeningItem.id).with_for_update()))
     if run is None or len(rows)!=len(requested): raise ScreeningBulkConflict
+    if any(expected_relationships.get(item.id)!=(item.application_id,item.candidate_id) for item in rows): raise ScreeningBulkConflict
     if any(item.status!="scored" or item.application_id is None or not db.scalar(select(ScreeningResult.id).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id)) for item in rows): raise ScreeningBulkConflict
-    applications=list(db.scalars(select(Application).where(Application.organization_id==organization_id,Application.id.in_([item.application_id for item in rows])).order_by(Application.id)))
+    applications=list(db.scalars(select(Application).where(Application.organization_id==organization_id,Application.id.in_([item.application_id for item in rows])).order_by(Application.candidate_id,Application.id).with_for_update()))
     if len(applications)!=len(rows): raise ScreeningBulkConflict
+    application_candidates={application.id:application.candidate_id for application in applications}
+    if any(application_candidates.get(application_id)!=candidate_id for application_id,candidate_id in expected_relationships.values()): raise ScreeningBulkConflict
     by_id={application.id:application for application in applications}; decisions=[]
     for item in rows:
         application=by_id[item.application_id]; expected=requested[item.id]; target="review" if payload.command=="advance_to_review" else "rejected"

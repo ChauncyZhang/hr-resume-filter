@@ -3,7 +3,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,7 +21,15 @@ from server.app.identity.bootstrap import bootstrap_system_admin
 from server.app.interviews import api as interviews_api
 from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.main import create_app
-from server.app.recruiting.models import Application, Candidate, FileObject, IdempotencyRecord, Resume
+from server.app.recruiting.models import (
+    Application,
+    Candidate,
+    FileObject,
+    IdempotencyRecord,
+    JobJdVersion,
+    Resume,
+    ScreeningRuleVersion,
+)
 from server.app.recruiting import service as recruiting_service
 from server.app.recruiting.service import (
     ResourceVersionConflict,
@@ -30,6 +38,9 @@ from server.app.recruiting.service import (
     persisted_idempotent,
     transition_application_record,
 )
+from server.app.screening import actions as screening_actions
+from server.app.screening import api as screening_api
+from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.talent import api as talent_api
 from server.app.talent.models import TalentPool, TalentPoolMembership
 
@@ -642,6 +653,254 @@ def test_application_transition_and_patch_use_candidate_first_without_deadlock(
             db, ids["organization_id"], 365
         )[ids["candidate_id"]]
         assert candidate.retention_due_at is expected is None
+
+
+def test_screening_bulk_and_retention_patch_lock_candidates_in_global_order(
+    postgres_app, monkeypatch
+) -> None:
+    app, engine = postgres_app
+    low_candidate_id = UUID(int=10)
+    high_candidate_id = UUID(int=20)
+    first_item_id = UUID(int=100)
+    second_item_id = UUID(int=200)
+    with Session(engine) as db:
+        user = db.scalar(select(User).where(User.email == "governance-pg@test"))
+        db.add(UserRole(user_id=user.id, role="recruiting_admin"))
+        job = Job(
+            organization_id=user.organization_id,
+            title="Ordered bulk",
+            owner_id=user.id,
+            status="open",
+        )
+        db.add(job)
+        db.flush()
+        jd = JobJdVersion(
+            organization_id=user.organization_id,
+            job_id=job.id,
+            version_number=1,
+            content={"text": "Python"},
+            created_by=user.id,
+        )
+        rule = ScreeningRuleVersion(
+            organization_id=user.organization_id,
+            job_id=job.id,
+            version_number=1,
+            content={},
+            created_by=user.id,
+        )
+        db.add_all([jd, rule])
+        db.flush()
+        run = ScreeningRun(
+            organization_id=user.organization_id,
+            job_id=job.id,
+            jd_version_id=jd.id,
+            rule_version_id=rule.id,
+            source="upload",
+            status="completed",
+            total_count=2,
+            processed_count=2,
+            succeeded_count=2,
+            failed_count=0,
+            created_by=user.id,
+        )
+        db.add(run)
+        db.flush()
+        application_ids = {}
+        for index, (candidate_id, item_id) in enumerate(
+            ((high_candidate_id, first_item_id), (low_candidate_id, second_item_id)),
+            start=1,
+        ):
+            candidate = Candidate(
+                id=candidate_id,
+                organization_id=user.organization_id,
+                display_name=f"Ordered candidate {index}",
+                owner_id=user.id,
+            )
+            stored_file = FileObject(
+                organization_id=user.organization_id,
+                storage_key=f"private/ordered-{index}",
+                original_filename=f"ordered-{index}.pdf",
+                mime_type="application/pdf",
+                size_bytes=1,
+                sha256=str(index) * 64,
+                uploaded_by=user.id,
+            )
+            db.add_all([candidate, stored_file])
+            db.flush()
+            resume = Resume(
+                organization_id=user.organization_id,
+                candidate_id=candidate.id,
+                file_object_id=stored_file.id,
+                version_number=1,
+            )
+            db.add(resume)
+            db.flush()
+            application = Application(
+                organization_id=user.organization_id,
+                candidate_id=candidate.id,
+                job_id=job.id,
+                resume_id=resume.id,
+                owner_id=user.id,
+                stage="new",
+                source="screening",
+            )
+            db.add(application)
+            db.flush()
+            item = ScreeningItem(
+                id=item_id,
+                organization_id=user.organization_id,
+                run_id=run.id,
+                file_object_id=stored_file.id,
+                candidate_id=candidate.id,
+                resume_id=resume.id,
+                application_id=application.id,
+                status="scored",
+                attempts=1,
+            )
+            db.add(item)
+            db.flush()
+            db.add(
+                ScreeningResult(
+                    organization_id=user.organization_id,
+                    item_id=item.id,
+                    application_id=application.id,
+                    resume_id=resume.id,
+                    rule_engine_version="rule-v1",
+                    rule_score=80,
+                    recommendation="可沟通",
+                    required_hits=["Python"],
+                    required_missing=[],
+                    bonus_hits=[],
+                    estimated_years=0,
+                    risks=[],
+                    questions=[],
+                )
+            )
+            application_ids[candidate.id] = application.id
+        db.commit()
+        organization_id = user.organization_id
+        run_id = run.id
+
+    patch_has_low_candidate = threading.Event()
+    release_patch = threading.Event()
+    bulk_about_to_lock_low_candidate = threading.Event()
+    responses = {}
+    original_lock_all = governance_service.lock_all_candidate_retention_facts
+    original_transition = screening_actions.transition_application_record
+    original_apply_bulk = screening_api.apply_bulk_action
+
+    def ordered_patch_lock(db, locked_organization_id):
+        if locked_organization_id != organization_id:
+            return original_lock_all(db, locked_organization_id)
+        db.execute(text("SET LOCAL lock_timeout = '3s'"))
+        db.execute(text("SET LOCAL statement_timeout = '8s'"))
+        locked = []
+        for candidate_id in (low_candidate_id, high_candidate_id):
+            locked.append(
+                db.scalar(
+                    select(Candidate.id)
+                    .where(
+                        Candidate.organization_id == organization_id,
+                        Candidate.id == candidate_id,
+                    )
+                    .with_for_update()
+                )
+            )
+            if candidate_id == low_candidate_id:
+                patch_has_low_candidate.set()
+                assert release_patch.wait(10)
+        return locked
+
+    def observed_transition(db, locked_organization_id, application_id, *args, **kwargs):
+        if application_id == application_ids[low_candidate_id]:
+            bulk_about_to_lock_low_candidate.set()
+        return original_transition(
+            db, locked_organization_id, application_id, *args, **kwargs
+        )
+
+    def timed_apply_bulk(db, *args, **kwargs):
+        db.execute(text("SET LOCAL lock_timeout = '3s'"))
+        db.execute(text("SET LOCAL statement_timeout = '8s'"))
+        return original_apply_bulk(db, *args, **kwargs)
+
+    monkeypatch.setattr(
+        governance_service, "lock_all_candidate_retention_facts", ordered_patch_lock
+    )
+    monkeypatch.setattr(
+        screening_actions, "transition_application_record", observed_transition
+    )
+    monkeypatch.setattr(screening_api, "apply_bulk_action", timed_apply_bulk)
+
+    patch_client = TestClient(app)
+    bulk_client = TestClient(app)
+    patch_headers = _login(patch_client)
+    bulk_headers = _login(bulk_client)
+
+    def patch_policy():
+        responses["patch"] = patch_client.patch(
+            "/api/v1/settings/retention-policy",
+            json={
+                "terminal_days": 400,
+                "talent_pool_days": 730,
+                "backup_window_days": 90,
+            },
+            headers={
+                **patch_headers,
+                "If-Match": '"1"',
+                "Idempotency-Key": "ordered-bulk-retention",
+            },
+        )
+
+    def bulk_reject():
+        responses["bulk"] = bulk_client.post(
+            f"/api/v1/screening-runs/{run_id}/bulk-actions",
+            json={
+                "command": "reject",
+                "reason_code": "not_selected",
+                "items": [
+                    {
+                        "item_id": str(first_item_id),
+                        "expected_application_version": 1,
+                    },
+                    {
+                        "item_id": str(second_item_id),
+                        "expected_application_version": 1,
+                    },
+                ],
+            },
+            headers={**bulk_headers, "Idempotency-Key": "ordered-bulk-reject"},
+        )
+
+    patch_thread = threading.Thread(target=patch_policy)
+    bulk_thread = threading.Thread(target=bulk_reject)
+    patch_thread.start()
+    assert patch_has_low_candidate.wait(10)
+    bulk_thread.start()
+    bulk_about_to_lock_low_candidate.wait(1)
+    release_patch.set()
+    patch_thread.join(12)
+    bulk_thread.join(12)
+    patch_client.close()
+    bulk_client.close()
+
+    assert not patch_thread.is_alive() and not bulk_thread.is_alive()
+    assert responses["patch"].status_code == 200
+    assert responses["bulk"].status_code == 200
+    with Session(engine) as db:
+        expected = candidate_due_dates(
+            db, organization_id, 400, {low_candidate_id, high_candidate_id}
+        )
+        for candidate_id in (low_candidate_id, high_candidate_id):
+            candidate = db.get(Candidate, candidate_id)
+            application = db.get(Application, application_ids[candidate_id])
+            assert application.stage == "rejected"
+            assert application.version == 2
+            assert aware(candidate.retention_due_at) == aware(expected[candidate_id])
+        assert db.scalar(
+            select(func.count()).select_from(AuditLog).where(
+                AuditLog.event_type == "application.stage_changed"
+            )
+        ) == 2
 
 
 @pytest.mark.parametrize("writer_kind", ["feedback", "talent"])
