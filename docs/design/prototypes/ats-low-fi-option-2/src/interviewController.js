@@ -58,10 +58,24 @@ function quotedVersion(version) {
   return `"${version}"`;
 }
 
-function dateParts(value) {
+function dateParts(value, timezone) {
   const raw = safeString(value);
-  const matched = raw.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
-  return matched ? { date: matched[1], time: matched[2] } : { date: "", time: "" };
+  const instant = new Date(raw);
+  if (!raw || Number.isNaN(instant.getTime())) return { date: "", time: "" };
+  try {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+      timeZone: safeString(timezone, "Asia/Shanghai"),
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(instant).map((part) => [part.type, part.value]));
+    return { date: `${parts.year}-${parts.month}-${parts.day}`, time: `${parts.hour}:${parts.minute}` };
+  } catch {
+    return { date: raw.slice(0, 10), time: raw.slice(11, 16) };
+  }
 }
 
 function displayDate(date) {
@@ -95,7 +109,8 @@ export function normalizeInterview(value) {
   const id = safeString(value?.id);
   if (!id) return null;
   const participants = safeArray(value?.participants).map(normalizeParticipant).filter(Boolean);
-  const { date, time } = dateParts(value?.starts_at);
+  const timezone = safeString(value?.timezone, "Asia/Shanghai");
+  const { date, time } = dateParts(value?.starts_at, timezone);
   const candidateTitle = safeString(value?.candidate?.current_title);
   return {
     id,
@@ -112,7 +127,7 @@ export function normalizeInterview(value) {
     time,
     duration: durationMinutes(value?.starts_at, value?.ends_at),
     method: API_TO_UI_METHOD[value?.method] || "面试",
-    timezone: safeString(value?.timezone, "Asia/Shanghai"),
+    timezone,
     interviewerIds: participants.map((item) => item.id),
     interviewers: participants.map((item) => item.name),
     participants,
@@ -142,6 +157,18 @@ export function deriveCandidateInterviews(candidateId, records) {
       result: record.feedback?.conclusion || record.feedbackStatus || record.status,
       feedback: record.feedback?.strengths || "暂无已提交反馈",
     }));
+}
+
+export function selectSchedulableCandidates(records) {
+  const applicationIds = new Set();
+  return safeArray(records).filter((record) => {
+    const applicationId = safeString(record?.applicationId);
+    if (record?.serverBacked !== true || record?.stage !== "待安排" || !applicationId || applicationIds.has(applicationId)) {
+      return false;
+    }
+    applicationIds.add(applicationId);
+    return true;
+  });
 }
 
 function timezoneOffset(timezone) {
@@ -219,6 +246,10 @@ function normalizeFeedback(value) {
     notes: safeString(value?.notes),
     version: Number.isInteger(value?.version) ? value.version : 0,
     submittedAt: safeString(value?.submitted_at),
+    author: value?.author ? {
+      id: safeString(value.author.id),
+      name: safeString(value.author.display_name, "未命名面试官"),
+    } : null,
   };
 }
 
@@ -248,6 +279,41 @@ function normalizeTask(value) {
   };
 }
 
+function normalizeParticipantOption(value) {
+  const id = safeString(value?.id);
+  const name = safeString(value?.display_name);
+  if (!id || !name) return null;
+  return { id, name, roles: safeArray(value?.roles).filter((role) => typeof role === "string") };
+}
+
+function normalizeMaterials(value) {
+  const focus = value?.interview_focus || value?.screening || {};
+  return {
+    interviewId: safeString(value?.interview_id),
+    candidate: {
+      id: safeString(value?.candidate?.id),
+      name: safeString(value?.candidate?.display_name, "未命名候选人"),
+      currentTitle: safeString(value?.candidate?.current_title, "当前职称未填写"),
+    },
+    job: { id: safeString(value?.job?.id), title: safeString(value?.job?.title, "职位未记录") },
+    jd: value?.jd ? {
+      id: safeString(value.jd.id),
+      version: Number.isInteger(value.jd.version_number) ? value.jd.version_number : null,
+      description: safeString(value.jd.description),
+    } : null,
+    resume: value?.resume ? {
+      id: safeString(value.resume.id),
+      version: Number.isInteger(value.resume.version_number) ? value.resume.version_number : null,
+      previewText: safeString(value.resume.preview_text),
+    } : null,
+    interviewFocus: {
+      requiredMissing: safeArray(focus.required_missing).filter((item) => typeof item === "string"),
+      risks: safeArray(focus.risks).filter((item) => typeof item === "string"),
+      suggestedQuestions: safeArray(focus.suggested_questions || focus.questions).filter((item) => typeof item === "string"),
+    },
+  };
+}
+
 export function createInterviewController({ client = apiClient, idempotencyKey = () => crypto.randomUUID() } = {}) {
   async function list(filters = {}, { signal } = {}) {
     const params = new URLSearchParams();
@@ -255,9 +321,15 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
     if (safeString(filters.to)) params.set("to", filters.to);
     if (safeString(filters.interviewerId)) params.set("interviewer_id", filters.interviewerId);
     if (safeString(filters.status)) params.set("status", filters.status);
+    if (safeString(filters.cursor)) params.set("cursor", filters.cursor);
+    if (Number.isInteger(filters.limit) && filters.limit > 0) params.set("limit", String(filters.limit));
     const response = await client.request(`/api/v1/interviews${params.size ? `?${params}` : ""}`, signalOption(signal));
     const records = safeArray(response?.data).map(normalizeInterview).filter(Boolean);
-    return { records, count: Number.isInteger(response?.meta?.count) ? response.meta.count : records.length };
+    return {
+      records,
+      count: Number.isInteger(response?.meta?.count) ? response.meta.count : records.length,
+      nextCursor: safeString(response?.meta?.next_cursor) || null,
+    };
   }
 
   async function get(interviewId, { signal } = {}) {
@@ -282,8 +354,16 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
   }
 
   async function checkConflicts(interviewId, form, { signal } = {}) {
-    const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
-    const response = await client.request(`/api/v1/interviews/${id}/conflicts`, { method: "POST", body: conflictBody(form), ...signalOption(signal) });
+    const id = safeString(interviewId).trim();
+    const body = conflictBody(form);
+    const path = id
+      ? `/api/v1/interviews/${id}/conflicts`
+      : "/api/v1/interview-conflicts";
+    const response = await client.request(path, {
+      method: "POST",
+      body: id ? body : { application_id: requireId(form?.applicationId, "APPLICATION_ID_REQUIRED"), ...body },
+      ...signalOption(signal),
+    });
     return { hard: safeArray(response?.data?.hard), soft: safeArray(response?.data?.soft) };
   }
 
@@ -338,7 +418,25 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
     return safeArray(response?.data).map(normalizeTask).filter((item) => item.interviewId);
   }
 
-  return { list, get, save, checkConflicts, transition, downloadCalendar, getMyFeedback, saveMyFeedback, submitMyFeedback, amendFeedback, listMyTasks };
+  async function listParticipantOptions(applicationId, { signal } = {}) {
+    const id = requireId(applicationId, "APPLICATION_ID_REQUIRED");
+    const response = await client.request(`/api/v1/applications/${id}/interview-participant-options`, signalOption(signal));
+    return safeArray(response?.data).map(normalizeParticipantOption).filter(Boolean);
+  }
+
+  async function listFeedbacks(interviewId, { signal } = {}) {
+    const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
+    const response = await client.request(`/api/v1/interviews/${id}/feedbacks`, signalOption(signal));
+    return safeArray(response?.data).map(normalizeFeedback).filter((feedback) => feedback.id);
+  }
+
+  async function getMaterials(interviewId, { signal } = {}) {
+    const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
+    const response = await client.request(`/api/v1/interviews/${id}/materials`, signalOption(signal));
+    return normalizeMaterials(response?.data);
+  }
+
+  return { list, get, save, checkConflicts, transition, downloadCalendar, getMyFeedback, saveMyFeedback, submitMyFeedback, amendFeedback, listMyTasks, listParticipantOptions, listFeedbacks, getMaterials };
 }
 
 export const interviewController = createInterviewController();

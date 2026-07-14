@@ -5,7 +5,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from server.app.core.settings import Settings
-from server.app.identity.models import Job, JobCollaborator, User, UserRole
+from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole, UserStatus
+from server.app.identity.security import PasswordService
 from server.app.interviews.models import (
     Interview,
     InterviewEvent,
@@ -14,8 +15,10 @@ from server.app.interviews.models import (
     InterviewParticipant,
 )
 from server.app.main import create_app
-from server.app.recruiting.models import Application, Candidate, FileObject, Resume
-from server.tests.test_recruiting_api import login, seed_user
+from server.app.recruiting.models import Application, Candidate, FileObject, JobJdVersion, Resume
+from server.app.recruiting.storage import MAX_PREVIEW_BYTES
+from server.app.screening.models import ScreeningResult
+from server.tests.test_recruiting_api import login, seed_screening_results, seed_user
 
 
 class Probe:
@@ -44,17 +47,85 @@ def test_interview_openapi_registers_the_phase_4_contract(tmp_path) -> None:
         schema = client.get("/openapi.json").json()
 
     expected = {
+        "/api/v1/applications/{application_id}/interview-participant-options": {"get"},
+        "/api/v1/interview-conflicts": {"post"},
         "/api/v1/interviews": {"get", "post"},
         "/api/v1/interviews/{interview_id}": {"get", "patch"},
         "/api/v1/interviews/{interview_id}/conflicts": {"post"},
         "/api/v1/interviews/{interview_id}/transitions": {"post"},
         "/api/v1/interviews/{interview_id}/calendar-file": {"get"},
+        "/api/v1/interviews/{interview_id}/feedbacks": {"get"},
+        "/api/v1/interviews/{interview_id}/materials": {"get"},
         "/api/v1/interviews/{interview_id}/my-feedback": {"get", "put"},
         "/api/v1/interviews/{interview_id}/my-feedback/submit": {"post"},
         "/api/v1/interview-feedback/{feedback_id}/amendments": {"post"},
         "/api/v1/me/tasks": {"get"},
     }
     assert {path: set(schema["paths"].get(path, {})) for path in expected} == expected
+
+
+def test_interview_participant_options_return_only_active_tenant_users_with_eligible_roles(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    system_user_id = seed_user(app, "system_admin", "system-only@example.test")
+    with app.state.identity_store.sync_session() as database:
+        admin = database.get(User, seed["admin_id"])
+        admin.roles.append(UserRole(role="system_admin"))
+        database.get(User, seed["other_interviewer_id"]).status = UserStatus.DISABLED
+        other_organization = Organization(slug="other", name="Other", status="active")
+        other_user = User(
+            organization=other_organization,
+            email="other-interviewer@example.test",
+            normalized_email="other-interviewer@example.test",
+            display_name="Other interviewer",
+            password_hash="not-used",
+        )
+        other_user.roles.append(UserRole(role="interviewer"))
+        database.add(other_user)
+        database.commit()
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/applications/{seed['application_id']}/interview-participant-options",
+            headers=login(client, "interview-admin@example.test"),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {
+        "data": [
+            {
+                "id": str(seed["interviewer_id"]),
+                "display_name": "interviewer",
+                "roles": ["interviewer"],
+            },
+            {
+                "id": str(seed["admin_id"]),
+                "display_name": "recruiting_admin",
+                "roles": ["recruiting_admin"],
+            },
+        ],
+        "meta": {"count": 2},
+    }
+    assert str(system_user_id) not in response.text
+    assert "email" not in response.text
+    assert "other-interviewer@example.test" not in response.text
+
+
+def test_interview_participant_options_require_authentication_and_scheduling_scope(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    path = f"/api/v1/applications/{seed['application_id']}/interview-participant-options"
+
+    with TestClient(app) as client:
+        unauthenticated = client.get(path)
+        interviewer_headers = login(client, "assigned@example.test")
+        unauthorized = client.get(path, headers=interviewer_headers)
+
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json()["code"] == "authentication_required"
+    assert unauthorized.status_code == 404
+    assert unauthorized.json()["code"] == "resource_not_found"
 
 
 def seed_application(app):
@@ -155,6 +226,373 @@ def create_interview(client, seed, *, key="create-interview", payload=None):
     return response, headers
 
 
+def seed_feedback_summary(app):
+    seed = seed_application(app)
+    recruiter_id = seed_user(app, "recruiter", "application-owner@example.test")
+    unrelated_recruiter_id = seed_user(app, "recruiter", "unrelated-recruiter@example.test")
+    manager_id = seed_user(app, "hiring_manager", "job-manager@example.test")
+    unassigned_interviewer_id = seed_user(app, "interviewer", "unassigned-summary@example.test")
+    system_admin_id = seed_user(app, "system_admin", "summary-system@example.test")
+    payload = interview_payload(seed)
+    payload["participants"].append(
+        {
+            "user_id": str(seed["other_interviewer_id"]),
+            "role": "interviewer",
+            "required_feedback": True,
+        }
+    )
+    with TestClient(app) as client:
+        created, _ = create_interview(client, seed, key="feedback-summary-create", payload=payload)
+    interview_id = UUID(created.json()["data"]["id"])
+    submitted_at = datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        application = database.get(Application, seed["application_id"])
+        application.owner_id = recruiter_id
+        submitted_author = database.get(User, seed["interviewer_id"])
+        submitted_author.display_name = "Submitted Author"
+        database.get(User, seed["other_interviewer_id"]).display_name = "Draft Author"
+        database.add(
+            JobCollaborator(
+                organization_id=application.organization_id,
+                job_id=seed["job_id"],
+                user_id=manager_id,
+                access_role="job_manager",
+            )
+        )
+        submitted = InterviewFeedback(
+            organization_id=application.organization_id,
+            interview_id=interview_id,
+            author_id=seed["interviewer_id"],
+            status="submitted",
+            ratings=feedback_payload()["ratings"],
+            strengths="Strong evidence",
+            risks="Scaling depth",
+            conclusion="recommend",
+            notes="Proceed",
+            version=2,
+            submitted_at=submitted_at,
+        )
+        draft = InterviewFeedback(
+            organization_id=application.organization_id,
+            interview_id=interview_id,
+            author_id=seed["other_interviewer_id"],
+            status="draft",
+            ratings={"professional_ability": 1},
+            strengths="SECRET DRAFT",
+            version=1,
+        )
+        cross_organization = Organization(slug="feedback-other", name="Feedback Other", status="active")
+        cross_tenant_user = User(
+            organization=cross_organization,
+            email="cross-tenant@example.test",
+            normalized_email="cross-tenant@example.test",
+            display_name="Cross tenant",
+            password_hash=PasswordService().hash("cross tenant password"),
+        )
+        cross_tenant_user.roles.append(UserRole(role="recruiting_admin"))
+        database.add_all([submitted, draft, cross_tenant_user])
+        database.commit()
+        return {
+            **seed,
+            "interview_id": interview_id,
+            "submitted_feedback_id": submitted.id,
+            "submitted_at": submitted_at,
+            "recruiter_id": recruiter_id,
+            "unrelated_recruiter_id": unrelated_recruiter_id,
+            "manager_id": manager_id,
+            "unassigned_interviewer_id": unassigned_interviewer_id,
+            "system_admin_id": system_admin_id,
+        }
+
+
+def test_interview_feedbacks_return_submitted_results_without_drafts_or_contacts(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_feedback_summary(app)
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/interviews/{seed['interview_id']}/feedbacks",
+            headers=login(client, "interview-admin@example.test"),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {
+        "data": [
+            {
+                "id": str(seed["submitted_feedback_id"]),
+                "interview_id": str(seed["interview_id"]),
+                "author": {
+                    "id": str(seed["interviewer_id"]),
+                    "display_name": "Submitted Author",
+                },
+                "status": "submitted",
+                "ratings": feedback_payload()["ratings"],
+                "strengths": "Strong evidence",
+                "risks": "Scaling depth",
+                "conclusion": "recommend",
+                "notes": "Proceed",
+                "submitted_at": seed["submitted_at"].isoformat(),
+                "version": 2,
+            }
+        ],
+        "meta": {"count": 1},
+    }
+    assert "SECRET DRAFT" not in response.text
+    assert "email" not in response.text
+
+
+def test_interview_feedbacks_enforce_summary_read_permission_matrix(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_feedback_summary(app)
+    path = f"/api/v1/interviews/{seed['interview_id']}/feedbacks"
+
+    with TestClient(app) as client:
+        for email in (
+            "interview-admin@example.test",
+            "application-owner@example.test",
+            "job-manager@example.test",
+            "assigned@example.test",
+            "unassigned@example.test",
+        ):
+            assert client.get(path, headers=login(client, email)).status_code == 200
+
+        for email in (
+            "unrelated-recruiter@example.test",
+            "unassigned-summary@example.test",
+            "summary-system@example.test",
+        ):
+            denied = client.get(path, headers=login(client, email))
+            assert denied.status_code == 404
+            assert denied.json()["code"] == "resource_not_found"
+
+        cross_login = client.post(
+            "/api/v1/auth/login",
+            json={
+                "organization_slug": "feedback-other",
+                "email": "cross-tenant@example.test",
+                "password": "cross tenant password",
+            },
+            headers={"Origin": "https://hr.example.test"},
+        )
+        assert cross_login.status_code == 200
+        cross_tenant = client.get(
+            path,
+            headers={
+                "Origin": "https://hr.example.test",
+                "X-CSRF-Token": cross_login.headers["X-CSRF-Token"],
+            },
+        )
+        assert cross_tenant.status_code == 404
+        assert cross_tenant.json()["code"] == "resource_not_found"
+
+
+def seed_interview_materials(app):
+    seed = seed_application(app)
+    with TestClient(app) as client:
+        created, _ = create_interview(client, seed, key="materials-create")
+    interview_id = UUID(created.json()["data"]["id"])
+    older_at = datetime(2026, 7, 19, 8, 0, tzinfo=timezone.utc)
+    latest_at = datetime(2026, 7, 19, 9, 0, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        application = database.get(Application, seed["application_id"])
+        resume = database.get(Resume, application.resume_id)
+        resume.parsed_text = (
+            "姓名：李嘉明\n"
+            "邮箱 candidate@example.test\n"
+            "电话 +86 138 0013 8000\n"
+            "地址：上海市敏感地址\n"
+            "Python FastAPI Kubernetes"
+        )
+        seed_screening_results(
+            database,
+            application,
+            resume.file_object_id,
+            seed["admin_id"],
+            [
+                ("rules-v1", 60, "可沟通", older_at),
+                ("rules-v2", 80, "优先沟通", latest_at),
+            ],
+        )
+        database.flush()
+        latest_result = database.scalar(
+            select(ScreeningResult)
+            .where(
+                ScreeningResult.organization_id == application.organization_id,
+                ScreeningResult.application_id == application.id,
+            )
+            .order_by(ScreeningResult.created_at.desc(), ScreeningResult.id.desc())
+        )
+        latest_result.required_missing = ["System design"]
+        latest_result.risks = ["Contact candidate@example.test"]
+        latest_result.questions = ["How would 李嘉明 scale FastAPI?"]
+        database.add(
+            JobJdVersion(
+                organization_id=application.organization_id,
+                job_id=application.job_id,
+                version_number=2,
+                content={"description": "Latest AI Engineer description"},
+                created_by=seed["admin_id"],
+            )
+        )
+        database.commit()
+        return {
+            **seed,
+            "interview_id": interview_id,
+            "resume_id": resume.id,
+            "latest_result_id": latest_result.id,
+        }
+
+
+def test_interview_materials_allow_assigned_interviewer_and_return_redacted_minimal_projection(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_interview_materials(app)
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/interviews/{seed['interview_id']}/materials",
+            headers=login(client, "assigned@example.test"),
+        )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json() == {
+        "data": {
+            "interview_id": str(seed["interview_id"]),
+            "candidate": {
+                "id": str(seed["candidate_id"]),
+                "display_name": "李嘉明",
+                "current_title": "AI 算法工程师",
+                "location": None,
+            },
+            "job": {"id": str(seed["job_id"]), "title": "AI Engineer"},
+            "jd": {
+                "version_number": 2,
+                "description": "Latest AI Engineer description",
+            },
+            "resume": {
+                "id": str(seed["resume_id"]),
+                "preview_text": (
+                    "姓名：[REDACTED]\n"
+                    "邮箱 [REDACTED_EMAIL]\n"
+                    "电话 [REDACTED_PHONE]\n"
+                    "地址：[REDACTED]\n"
+                    "Python FastAPI Kubernetes"
+                ),
+            },
+            "screening": {
+                "id": str(seed["latest_result_id"]),
+                "required_missing": ["System design"],
+                "risks": ["Contact [REDACTED_EMAIL]"],
+                "questions": ["How would [REDACTED_NAME] scale FastAPI?"],
+            },
+        }
+    }
+    for forbidden in (
+        "candidate@example.test",
+        "138 0013 8000",
+        "上海市敏感地址",
+        "original_filename",
+        "storage_key",
+        "file_object_id",
+        "contacts",
+        "notes",
+        "download",
+    ):
+        assert forbidden not in response.text
+
+    with app.state.identity_store.sync_session() as database:
+        audit = database.scalar(
+            select(AuditLog).where(
+                AuditLog.event_type == "interview.materials_viewed",
+                AuditLog.actor_user_id == seed["interviewer_id"],
+            )
+        )
+        assert audit is not None
+        assert audit.outcome == "success"
+        assert audit.metadata_json == {"interview_id": str(seed["interview_id"])}
+
+
+def test_interview_materials_enforce_job_or_active_assignment_scope(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_interview_materials(app)
+    path = f"/api/v1/interviews/{seed['interview_id']}/materials"
+    with app.state.identity_store.sync_session() as database:
+        other_organization = Organization(slug="materials-other", name="Materials Other", status="active")
+        other_admin = User(
+            organization=other_organization,
+            email="materials-other@example.test",
+            normalized_email="materials-other@example.test",
+            display_name="Materials Other Admin",
+            password_hash=PasswordService().hash("materials other password"),
+        )
+        other_admin.roles.append(UserRole(role="recruiting_admin"))
+        database.add(other_admin)
+        database.commit()
+
+    with TestClient(app) as client:
+        assert client.get(path, headers=login(client, "interview-admin@example.test")).status_code == 200
+
+        unrelated = client.get(path, headers=login(client, "unassigned@example.test"))
+        assert unrelated.status_code == 404
+        assert unrelated.json()["code"] == "resource_not_found"
+
+        cross_login = client.post(
+            "/api/v1/auth/login",
+            json={
+                "organization_slug": "materials-other",
+                "email": "materials-other@example.test",
+                "password": "materials other password",
+            },
+            headers={"Origin": "https://hr.example.test"},
+        )
+        cross_tenant = client.get(
+            path,
+            headers={
+                "Origin": "https://hr.example.test",
+                "X-CSRF-Token": cross_login.headers["X-CSRF-Token"],
+            },
+        )
+        assert cross_tenant.status_code == 404
+        assert cross_tenant.json()["code"] == "resource_not_found"
+
+    with app.state.identity_store.sync_session() as database:
+        participant = database.scalar(
+            select(InterviewParticipant).where(
+                InterviewParticipant.interview_id == seed["interview_id"],
+                InterviewParticipant.user_id == seed["interviewer_id"],
+            )
+        )
+        participant.task_status = "cancelled"
+        database.commit()
+
+    with TestClient(app) as client:
+        cancelled = client.get(path, headers=login(client, "assigned@example.test"))
+        assert cancelled.status_code == 404
+        assert cancelled.json()["code"] == "resource_not_found"
+
+
+def test_interview_materials_reject_oversized_resume_preview_without_audit(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_interview_materials(app)
+    with app.state.identity_store.sync_session() as database:
+        database.get(Resume, seed["resume_id"]).parsed_text = "x" * (MAX_PREVIEW_BYTES + 1)
+        database.commit()
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/interviews/{seed['interview_id']}/materials",
+            headers=login(client, "assigned@example.test"),
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "preview_too_large"
+    with app.state.identity_store.sync_session() as database:
+        assert database.scalar(
+            select(AuditLog).where(AuditLog.event_type == "interview.materials_viewed")
+        ) is None
+
+
 def test_create_interview_is_idempotent_checks_conflicts_and_scopes_interviewer_reads(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
@@ -228,7 +666,10 @@ def test_revoked_recruiting_role_removes_historical_assignment_access(tmp_path) 
             json=feedback_payload(),
             headers={**headers, "If-Match": '"0"'},
         ).status_code == 404
-        assert client.get("/api/v1/interviews", headers=headers).json() == {"data": [], "meta": {"count": 0}}
+        assert client.get("/api/v1/interviews", headers=headers).json() == {
+            "data": [],
+            "meta": {"limit": 50, "next_cursor": None},
+        }
         assert client.get("/api/v1/me/tasks", headers=headers).json() == {"data": [], "meta": {"count": 0}}
 
 
@@ -257,6 +698,155 @@ def test_create_rejects_same_candidate_overlap_with_different_interviewer(tmp_pa
 
     assert response.status_code == 409
     assert response.json()["code"] == "schedule_hard_conflict"
+
+
+def test_new_interview_conflicts_report_hard_candidate_overlap(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        existing, headers = create_interview(
+            client,
+            seed,
+            key="preflight-hard-existing",
+            payload=interview_payload(seed, starts_at=start),
+        )
+        response = client.post(
+            "/api/v1/interview-conflicts",
+            json={
+                "application_id": str(seed["application_id"]),
+                "starts_at": start.isoformat(),
+                "ends_at": (start + timedelta(minutes=45)).isoformat(),
+                "participant_ids": [str(seed["other_interviewer_id"])],
+                "buffer_minutes": 15,
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"hard": [existing.json()["data"]["id"]], "soft": []}}
+
+
+def test_new_interview_conflicts_report_soft_adjacent_participant_booking(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        existing, headers = create_interview(
+            client,
+            seed,
+            key="preflight-soft-existing",
+            payload=interview_payload(seed, starts_at=start),
+        )
+        adjacent_start = start + timedelta(minutes=55)
+        response = client.post(
+            "/api/v1/interview-conflicts",
+            json={
+                "application_id": str(seed["application_id"]),
+                "starts_at": adjacent_start.isoformat(),
+                "ends_at": (adjacent_start + timedelta(minutes=45)).isoformat(),
+                "participant_ids": [str(seed["interviewer_id"])],
+                "buffer_minutes": 15,
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"hard": [], "soft": [existing.json()["data"]["id"]]}}
+
+
+def test_new_interview_conflicts_return_empty_when_schedule_is_available(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        _, headers = create_interview(
+            client,
+            seed,
+            key="preflight-clear-existing",
+            payload=interview_payload(seed, starts_at=start),
+        )
+        available_start = start + timedelta(hours=4)
+        response = client.post(
+            "/api/v1/interview-conflicts",
+            json={
+                "application_id": str(seed["application_id"]),
+                "starts_at": available_start.isoformat(),
+                "ends_at": (available_start + timedelta(minutes=45)).isoformat(),
+                "participant_ids": [str(seed["interviewer_id"])],
+                "buffer_minutes": 15,
+            },
+            headers=headers,
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"hard": [], "soft": []}}
+
+
+def test_new_interview_conflicts_require_application_scope_and_tenant_participants(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    payload = {
+        "application_id": str(seed["application_id"]),
+        "starts_at": datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc).isoformat(),
+        "ends_at": datetime(2026, 7, 20, 8, 45, tzinfo=timezone.utc).isoformat(),
+        "participant_ids": [str(seed["interviewer_id"])],
+        "buffer_minutes": 15,
+    }
+    with app.state.identity_store.sync_session() as database:
+        other_organization = Organization(slug="conflict-other", name="Conflict Other", status="active")
+        other_admin = User(
+            organization=other_organization,
+            email="conflict-other@example.test",
+            normalized_email="conflict-other@example.test",
+            display_name="Conflict Other Admin",
+            password_hash=PasswordService().hash("conflict other password"),
+        )
+        other_admin.roles.append(UserRole(role="recruiting_admin"))
+        database.add(other_admin)
+        database.commit()
+        other_admin_id = other_admin.id
+
+    with TestClient(app) as client:
+        anonymous = client.post("/api/v1/interview-conflicts", json=payload)
+        assert anonymous.status_code == 403
+        assert anonymous.json()["code"] == "csrf_validation_failed"
+
+        unauthorized = client.post(
+            "/api/v1/interview-conflicts",
+            json=payload,
+            headers=login(client, "assigned@example.test"),
+        )
+        assert unauthorized.status_code == 404
+        assert unauthorized.json()["code"] == "resource_not_found"
+
+        cross_login = client.post(
+            "/api/v1/auth/login",
+            json={
+                "organization_slug": "conflict-other",
+                "email": "conflict-other@example.test",
+                "password": "conflict other password",
+            },
+            headers={"Origin": "https://hr.example.test"},
+        )
+        cross_tenant = client.post(
+            "/api/v1/interview-conflicts",
+            json=payload,
+            headers={
+                "Origin": "https://hr.example.test",
+                "X-CSRF-Token": cross_login.headers["X-CSRF-Token"],
+            },
+        )
+        assert cross_tenant.status_code == 404
+        assert cross_tenant.json()["code"] == "resource_not_found"
+
+        foreign_participant = client.post(
+            "/api/v1/interview-conflicts",
+            json={**payload, "participant_ids": [str(other_admin_id)]},
+            headers=login(client, "interview-admin@example.test"),
+        )
+        assert foreign_participant.status_code == 404
+        assert foreign_participant.json()["code"] == "resource_not_found"
 
 
 def test_reschedule_rejects_same_candidate_overlap_with_different_interviewer(tmp_path) -> None:
@@ -652,6 +1242,135 @@ def test_submitted_feedback_amendment_requires_its_author_reason_and_version(tmp
         assert revision.new_payload["notes"] == "补充核实了线上吞吐数据"
 
 
+def test_interview_list_uses_stable_signed_cursor_pagination(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    starts_at = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        application = database.get(Application, seed["application_id"])
+        interviews = [
+            Interview(
+                organization_id=application.organization_id,
+                application_id=application.id,
+                round_name=f"Round {index}",
+                method="video",
+                timezone="Asia/Shanghai",
+                starts_at=starts_at if index < 2 else starts_at + timedelta(hours=1),
+                ends_at=(starts_at if index < 2 else starts_at + timedelta(hours=1)) + timedelta(minutes=45),
+                meeting_url="https://meeting.example.test/room",
+                owner_id=seed["admin_id"],
+                created_by=seed["admin_id"],
+                status="scheduled",
+            )
+            for index in range(3)
+        ]
+        database.add_all(interviews)
+        database.commit()
+        expected_ids = [str(item.id) for item in sorted(interviews, key=lambda item: (item.starts_at, item.id))]
+
+    with TestClient(app) as client:
+        headers = login(client, "interview-admin@example.test")
+        first = client.get("/api/v1/interviews", params={"limit": 2}, headers=headers)
+        second = client.get(
+            "/api/v1/interviews",
+            params={"limit": 2, "cursor": first.json()["meta"]["next_cursor"]},
+            headers=headers,
+        )
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["meta"]["limit"] == second.json()["meta"]["limit"] == 2
+    assert first.json()["meta"]["next_cursor"] is not None
+    assert second.json()["meta"]["next_cursor"] is None
+    assert [item["id"] for item in first.json()["data"] + second.json()["data"]] == expected_ids
+
+
+def test_interview_list_rejects_invalid_cross_filter_and_cross_tenant_cursors(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    other_organization = Organization(slug="cursor-other", name="Cursor Other", status="active")
+    other_admin = User(
+        organization=other_organization,
+        email="cursor-other@example.test",
+        normalized_email="cursor-other@example.test",
+        display_name="Cursor Other Admin",
+        password_hash=PasswordService().hash("cursor other password"),
+    )
+    other_admin.roles.append(UserRole(role="recruiting_admin"))
+    with app.state.identity_store.sync_session() as database:
+        database.add(other_admin)
+        database.commit()
+
+    with TestClient(app) as client:
+        _, headers = create_interview(client, seed, key="cursor-binding-first")
+        create_interview(
+            client,
+            seed,
+            key="cursor-binding-second",
+            payload=interview_payload(seed, starts_at=datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)),
+        )
+        first = client.get(
+            "/api/v1/interviews",
+            params={"status": "scheduled", "limit": 1},
+            headers=headers,
+        )
+        token = first.json()["meta"]["next_cursor"]
+        tampered_token = ("A" if token[0] != "A" else "B") + token[1:]
+        invalid = client.get("/api/v1/interviews", params={"cursor": tampered_token}, headers=headers)
+        mismatch = client.get(
+            "/api/v1/interviews",
+            params={"status": "confirmed", "cursor": token},
+            headers=headers,
+        )
+        too_small = client.get("/api/v1/interviews", params={"limit": 0}, headers=headers)
+        too_large = client.get("/api/v1/interviews", params={"limit": 101}, headers=headers)
+
+        other_login = client.post(
+            "/api/v1/auth/login",
+            json={
+                "organization_slug": "cursor-other",
+                "email": "cursor-other@example.test",
+                "password": "cursor other password",
+            },
+            headers={"Origin": "https://hr.example.test"},
+        )
+        cross_tenant = client.get(
+            "/api/v1/interviews",
+            params={"status": "scheduled", "cursor": token},
+            headers={
+                "Origin": "https://hr.example.test",
+                "X-CSRF-Token": other_login.headers["X-CSRF-Token"],
+            },
+        )
+
+    assert first.status_code == 200
+    assert token is not None
+    for response in (invalid, mismatch, cross_tenant, too_small, too_large):
+        assert response.status_code == 422
+        assert response.json()["code"] == "validation_failed"
+
+
+def test_calendar_download_commits_safe_audit_before_returning_file(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    with TestClient(app) as client:
+        created, headers = create_interview(client, seed, key="calendar-download-audit")
+        interview_id = created.json()["data"]["id"]
+        response = client.get(f"/api/v1/interviews/{interview_id}/calendar-file", headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["content-type"].startswith("text/calendar")
+    with app.state.identity_store.sync_session() as database:
+        audit = database.scalar(
+            select(AuditLog).where(AuditLog.event_type == "interview.calendar_downloaded")
+        )
+        assert audit is not None
+        assert audit.organization_id == database.get(User, seed["admin_id"]).organization_id
+        assert audit.actor_user_id == seed["admin_id"]
+        assert audit.outcome == "success"
+        assert audit.metadata_json == {"interview_id": interview_id}
+
+
 def test_interview_list_conflicts_and_my_tasks_share_assignment_scope(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
@@ -688,17 +1407,17 @@ def test_interview_list_conflicts_and_my_tasks_share_assignment_scope(tmp_path) 
 
         admin_list = client.get("/api/v1/interviews", headers=admin_headers)
         assert admin_list.status_code == 200
-        assert admin_list.json()["meta"]["count"] == 2
+        assert admin_list.json()["meta"] == {"limit": 50, "next_cursor": None}
 
         assigned_headers = login(client, "assigned@example.test")
         assigned_list = client.get("/api/v1/interviews", headers=assigned_headers)
         assert assigned_list.status_code == 200
-        assert assigned_list.json()["meta"]["count"] == 2
+        assert assigned_list.json()["meta"] == {"limit": 50, "next_cursor": None}
 
         outsider_headers = login(client, "unassigned@example.test")
         outsider_list = client.get("/api/v1/interviews", headers=outsider_headers)
         assert outsider_list.status_code == 200
-        assert outsider_list.json() == {"data": [], "meta": {"count": 0}}
+        assert outsider_list.json() == {"data": [], "meta": {"limit": 50, "next_cursor": None}}
 
         admin_headers = login(client, "interview-admin@example.test")
         assert client.post(

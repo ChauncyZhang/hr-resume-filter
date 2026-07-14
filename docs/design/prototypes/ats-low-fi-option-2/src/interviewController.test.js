@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createInterviewController, deriveCandidateInterviews } from "./interviewController.js";
+import { createInterviewController, deriveCandidateInterviews, selectSchedulableCandidates } from "./interviewController.js";
 
 const INTERVIEW_ID = "11111111-1111-4111-8111-111111111111";
 const APPLICATION_ID = "22222222-2222-4222-8222-222222222222";
@@ -18,8 +18,8 @@ function apiInterview(overrides = {}) {
     round_name: "一面",
     method: "video",
     timezone: "Asia/Shanghai",
-    starts_at: "2026-07-15T10:00:00+08:00",
-    ends_at: "2026-07-15T11:00:00+08:00",
+    starts_at: "2026-07-15T02:00:00Z",
+    ends_at: "2026-07-15T03:00:00Z",
     location: null,
     meeting_url: "https://meeting.example.com/one",
     status: "pending_feedback",
@@ -53,15 +53,15 @@ function queuedClient(responses) {
 }
 
 test("lists interviews from the server envelope and maps display fields", async () => {
-  const { client, calls } = queuedClient([{ data: [apiInterview()], meta: { count: 1 } }]);
+  const { client, calls } = queuedClient([{ data: [apiInterview()], meta: { count: 1, limit: 25, next_cursor: "CURSOR-2" } }]);
   const controller = createInterviewController({ client });
   const signal = new AbortController().signal;
 
-  const result = await controller.list({ status: "pending_feedback", interviewerId: USER_ID }, { signal });
+  const result = await controller.list({ status: "pending_feedback", interviewerId: USER_ID, limit: 25, cursor: "CURSOR-1" }, { signal });
 
   assert.deepEqual(calls, [{
     kind: "request",
-    path: `/api/v1/interviews?interviewer_id=${USER_ID}&status=pending_feedback`,
+    path: `/api/v1/interviews?interviewer_id=${USER_ID}&status=pending_feedback&cursor=CURSOR-1&limit=25`,
     options: { signal },
   }]);
   assert.equal(result.records.length, 1);
@@ -98,6 +98,7 @@ test("lists interviews from the server envelope and maps display fields", async 
     feedback: null,
   });
   assert.equal(result.count, 1);
+  assert.equal(result.nextCursor, "CURSOR-2");
 });
 
 test("gets one interview and propagates abort errors unchanged", async () => {
@@ -187,6 +188,103 @@ test("checks conflicts, transitions, downloads calendar, and lists my tasks", as
   ]);
 });
 
+test("lists authorized participant options for the selected application", async () => {
+  const { client, calls } = queuedClient([{ data: [
+    { id: USER_ID, display_name: "张小北", roles: ["interviewer"] },
+    { id: "77777777-7777-4777-8777-777777777777", display_name: "王磊", roles: ["hiring_manager"] },
+  ], meta: { count: 2 } }]);
+  const controller = createInterviewController({ client });
+  const signal = new AbortController().signal;
+
+  const options = await controller.listParticipantOptions(APPLICATION_ID, { signal });
+
+  assert.deepEqual(calls, [{
+    kind: "request",
+    path: `/api/v1/applications/${APPLICATION_ID}/interview-participant-options`,
+    options: { signal },
+  }]);
+  assert.deepEqual(options, [
+    { id: USER_ID, name: "张小北", roles: ["interviewer"] },
+    { id: "77777777-7777-4777-8777-777777777777", name: "王磊", roles: ["hiring_manager"] },
+  ]);
+});
+
+test("lists submitted feedback summaries for an authorized reviewer", async () => {
+  const { client, calls } = queuedClient([{ data: [{
+    ...apiInterview(),
+    id: FEEDBACK_ID,
+    interview_id: INTERVIEW_ID,
+    author: { id: USER_ID, display_name: "张小北" },
+    status: "submitted",
+    ratings: { professional_ability: 4, problem_solving: 3, communication: 4, role_fit: 3 },
+    strengths: "项目证据充分",
+    risks: "规模化经验待确认",
+    conclusion: "recommend",
+    notes: "建议推进",
+    submitted_at: "2026-07-15T12:00:00Z",
+    version: 2,
+  }], meta: { count: 1 } }]);
+  const controller = createInterviewController({ client });
+
+  const feedbacks = await controller.listFeedbacks(INTERVIEW_ID);
+
+  assert.deepEqual(calls, [{ kind: "request", path: `/api/v1/interviews/${INTERVIEW_ID}/feedbacks`, options: {} }]);
+  assert.equal(feedbacks.length, 1);
+  assert.deepEqual(feedbacks[0].author, { id: USER_ID, name: "张小北" });
+  assert.equal(feedbacks[0].conclusion, "推荐");
+  assert.equal(feedbacks[0].ratings.professional, "优秀");
+});
+
+test("loads only interview-scoped redacted candidate materials", async () => {
+  const { client, calls } = queuedClient([{ data: {
+    interview_id: INTERVIEW_ID,
+    candidate: { id: CANDIDATE_ID, display_name: "赵宁", current_title: "大模型应用工程师" },
+    job: { id: JOB_ID, title: "AI 工程师" },
+    jd: { id: "88888888-8888-4888-8888-888888888888", version_number: 3, description: "负责 RAG 与 Agent 交付" },
+    resume: { id: "99999999-9999-4999-8999-999999999999", version_number: 2, preview_text: "[REDACTED_NAME]\nRAG 项目经验" },
+    screening: { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", required_missing: ["Kubernetes"], risks: ["团队规模待确认"], questions: ["如何评估 RAG 质量？"] },
+  } }]);
+  const controller = createInterviewController({ client });
+
+  const materials = await controller.getMaterials(INTERVIEW_ID);
+
+  assert.deepEqual(calls, [{ kind: "request", path: `/api/v1/interviews/${INTERVIEW_ID}/materials`, options: {} }]);
+  assert.equal(materials.resume.previewText, "[REDACTED_NAME]\nRAG 项目经验");
+  assert.deepEqual(materials.interviewFocus.requiredMissing, ["Kubernetes"]);
+  assert.deepEqual(materials.interviewFocus.suggestedQuestions, ["如何评估 RAG 质量？"]);
+  assert.equal(materials.candidate.name, "赵宁");
+});
+
+test("checks a new schedule through the application-scoped conflict endpoint", async () => {
+  const { client, calls } = queuedClient([{ data: { hard: [], soft: [INTERVIEW_ID] } }]);
+  const controller = createInterviewController({ client });
+
+  const result = await controller.checkConflicts(null, {
+    applicationId: APPLICATION_ID,
+    date: "2026-07-15",
+    time: "10:00",
+    duration: 60,
+    timezone: "Asia/Shanghai",
+    participantIds: [USER_ID],
+  });
+
+  assert.deepEqual(result, { hard: [], soft: [INTERVIEW_ID] });
+  assert.deepEqual(calls, [{
+    kind: "request",
+    path: "/api/v1/interview-conflicts",
+    options: {
+      method: "POST",
+      body: {
+        application_id: APPLICATION_ID,
+        starts_at: "2026-07-15T10:00:00+08:00",
+        ends_at: "2026-07-15T11:00:00+08:00",
+        participant_ids: [USER_ID],
+        buffer_minutes: 15,
+      },
+    },
+  }]);
+});
+
 test("loads, creates, updates, submits, and amends the current user's feedback", async () => {
   const draft = { id: FEEDBACK_ID, interview_id: INTERVIEW_ID, author_id: USER_ID, status: "draft", ratings: {}, strengths: null, risks: null, conclusion: null, notes: null, version: 1, submitted_at: null };
   const submitted = { ...draft, status: "submitted", version: 3, submitted_at: "2026-07-15T12:00:00+08:00" };
@@ -250,4 +348,23 @@ test("candidate interview history is derived only from matching server records",
     result: "推荐",
     feedback: "技术基础扎实",
   }]);
+});
+
+test("schedule candidates come only from server-backed pending applications", () => {
+  const pending = {
+    id: APPLICATION_ID,
+    candidateId: CANDIDATE_ID,
+    applicationId: APPLICATION_ID,
+    serverBacked: true,
+    stage: "待安排",
+  };
+  const records = [
+    { ...pending, id: "fixture", serverBacked: false },
+    pending,
+    { ...pending, id: "interviewing", applicationId: "other", stage: "面试中" },
+    { ...pending, id: "missing-application", applicationId: "" },
+    pending,
+  ];
+
+  assert.deepEqual(selectSchedulableCandidates(records), [pending]);
 });

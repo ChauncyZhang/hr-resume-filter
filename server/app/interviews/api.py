@@ -1,3 +1,5 @@
+import hashlib
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -7,10 +9,11 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, delete, exists, func, or_, select, text
 
 from server.app.identity.api import problem, session_token
-from server.app.identity.models import AuditLog, Job, User, UserRole, UserStatus
+from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.interviews.domain import CalendarContact, build_calendar_invitation
+from server.app.llm.redaction import redact_screening_text
 from server.app.interviews.models import (
     Interview,
     InterviewEvent,
@@ -24,12 +27,14 @@ from server.app.interviews.schemas import (
     FeedbackAmendment,
     FeedbackDraft,
     InterviewCreate,
+    NewInterviewConflictInput,
     InterviewPatch,
     InterviewTransition,
     ScheduleInput,
 )
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
-from server.app.recruiting.models import Application, Candidate
+from server.app.recruiting.models import Application, Candidate, JobJdVersion, Resume
+from server.app.recruiting.storage import MAX_PREVIEW_BYTES
 from server.app.recruiting.service import (
     IdempotencyConflict,
     InvalidStateTransition,
@@ -37,6 +42,7 @@ from server.app.recruiting.service import (
     persisted_idempotent,
     transition_application_record,
 )
+from server.app.screening.models import ScreeningResult
 
 
 router = APIRouter(prefix="/api/v1")
@@ -44,6 +50,7 @@ AUTH = RecruitingAuthorizationService()
 ETAG = re.compile(r'^"(0|[1-9][0-9]*)"$')
 REQUIRED_RATINGS = {"professional_ability", "problem_solving", "communication", "role_fit"}
 INTERVIEW_ACCESS_ROLES = frozenset({"recruiting_admin", "recruiter", "hiring_manager", "interviewer"})
+INTERVIEW_PARTICIPANT_ROLES = ("recruiting_admin", "recruiter", "hiring_manager", "interviewer")
 
 
 class ScheduleConflict(Exception):
@@ -128,6 +135,93 @@ def _load_interview(db, principal: Principal, interview_id: UUID, *, manage: boo
             allowed,
         )
     )
+
+
+def _load_interview_for_feedback_summary(db, principal: Principal, interview_id: UUID):
+    if not principal.active:
+        return None
+    allowed = []
+    if "recruiting_admin" in principal.roles:
+        allowed.append(True)
+    if "recruiter" in principal.roles:
+        allowed.append(Application.owner_id == principal.user_id)
+    if "hiring_manager" in principal.roles:
+        allowed.append(
+            exists().where(
+                JobCollaborator.organization_id == Job.organization_id,
+                JobCollaborator.job_id == Job.id,
+                JobCollaborator.user_id == principal.user_id,
+                JobCollaborator.access_role == "job_manager",
+            )
+        )
+    if _has_assignment_access(principal):
+        allowed.append(
+            exists().where(
+                InterviewParticipant.organization_id == Interview.organization_id,
+                InterviewParticipant.interview_id == Interview.id,
+                InterviewParticipant.user_id == principal.user_id,
+            )
+        )
+    if not allowed:
+        return None
+    return db.scalar(
+        select(Interview)
+        .join(
+            Application,
+            and_(
+                Application.organization_id == Interview.organization_id,
+                Application.id == Interview.application_id,
+            ),
+        )
+        .join(
+            Job,
+            and_(
+                Job.organization_id == Application.organization_id,
+                Job.id == Application.job_id,
+            ),
+        )
+        .where(
+            Interview.organization_id == principal.organization_id,
+            Interview.id == interview_id,
+            or_(*allowed),
+        )
+    )
+
+
+def _load_interview_material_context(db, principal: Principal, interview_id: UUID):
+    assigned = (
+        exists().where(
+            InterviewParticipant.organization_id == Interview.organization_id,
+            InterviewParticipant.interview_id == Interview.id,
+            InterviewParticipant.user_id == principal.user_id,
+            InterviewParticipant.role == "interviewer",
+            InterviewParticipant.task_status != "cancelled",
+        )
+        if _has_assignment_access(principal)
+        else False
+    )
+    return db.execute(
+        select(Interview, Application, Job)
+        .join(
+            Application,
+            and_(
+                Application.organization_id == Interview.organization_id,
+                Application.id == Interview.application_id,
+            ),
+        )
+        .join(
+            Job,
+            and_(
+                Job.organization_id == Application.organization_id,
+                Job.id == Application.job_id,
+            ),
+        )
+        .where(
+            Interview.organization_id == principal.organization_id,
+            Interview.id == interview_id,
+            or_(AUTH.job_predicate(principal, RecruitingAction.READ, Job), assigned),
+        )
+    ).one_or_none()
 
 
 def _schedule_conflicts(
@@ -296,7 +390,7 @@ def _advance_application_if_interviews_complete(
 def _participant_role_predicate():
     return exists().where(
         UserRole.user_id == User.id,
-        UserRole.role.in_(("recruiting_admin", "recruiter", "hiring_manager", "interviewer")),
+        UserRole.role.in_(INTERVIEW_PARTICIPANT_ROLES),
     )
 
 
@@ -352,17 +446,18 @@ def _calendar_contact_snapshot(db, organization_id: UUID, organizer_id: UUID, pa
     )
 
 
-def _assigned_participant(db, principal: Principal, interview_id: UUID):
+def _assigned_participant(db, principal: Principal, interview_id: UUID, *, for_update: bool = False):
     if not _has_assignment_access(principal):
         return None
-    return db.scalar(
-        select(InterviewParticipant).where(
-            InterviewParticipant.organization_id == principal.organization_id,
-            InterviewParticipant.interview_id == interview_id,
-            InterviewParticipant.user_id == principal.user_id,
-            InterviewParticipant.role == "interviewer",
-        )
+    statement = select(InterviewParticipant).where(
+        InterviewParticipant.organization_id == principal.organization_id,
+        InterviewParticipant.interview_id == interview_id,
+        InterviewParticipant.user_id == principal.user_id,
+        InterviewParticipant.role == "interviewer",
     )
+    if for_update:
+        statement = statement.with_for_update()
+    return db.scalar(statement)
 
 
 def _feedback_data(feedback: InterviewFeedback) -> dict:
@@ -382,6 +477,22 @@ def _feedback_data(feedback: InterviewFeedback) -> dict:
     }
 
 
+def _submitted_feedback_data(feedback: InterviewFeedback, author: User) -> dict:
+    return {
+        "id": str(feedback.id),
+        "interview_id": str(feedback.interview_id),
+        "author": {"id": str(author.id), "display_name": author.display_name},
+        "status": feedback.status,
+        "ratings": feedback.ratings,
+        "strengths": feedback.strengths,
+        "risks": feedback.risks,
+        "conclusion": feedback.conclusion,
+        "notes": feedback.notes,
+        "submitted_at": _aware(feedback.submitted_at).isoformat(),
+        "version": feedback.version,
+    }
+
+
 def _feedback_document(feedback: InterviewFeedback) -> dict:
     return {
         "ratings": feedback.ratings,
@@ -394,6 +505,34 @@ def _feedback_document(feedback: InterviewFeedback) -> dict:
     }
 
 
+@router.get("/applications/{application_id}/interview-participant-options", response_model=DataCollection)
+def list_interview_participant_options(application_id: UUID, request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_application_for_management(db, principal, application_id) is None:
+            return _denied(request)
+        rows = db.execute(
+            select(User.id, User.display_name, UserRole.role)
+            .join(UserRole, UserRole.user_id == User.id)
+            .where(
+                User.organization_id == principal.organization_id,
+                User.status == UserStatus.ACTIVE,
+                UserRole.role.in_(INTERVIEW_PARTICIPANT_ROLES),
+            )
+            .order_by(User.display_name, User.id, UserRole.role)
+        ).all()
+        options = []
+        for user_id, display_name, role in rows:
+            if not options or options[-1]["id"] != str(user_id):
+                options.append({"id": str(user_id), "display_name": display_name, "roles": []})
+            options[-1]["roles"].append(role)
+        response = JSONResponse({"data": options, "meta": {"count": len(options)}})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 @router.get("/interviews", response_model=DataCollection)
 def list_interviews(
     request: Request,
@@ -401,6 +540,8 @@ def list_interviews(
     date_to: datetime | None = Query(default=None, alias="to"),
     interviewer_id: UUID | None = None,
     status: str | None = None,
+    cursor: str | None = None,
+    limit: int = Query(50, ge=1, le=100),
 ):
     principal = _principal(request)
     if isinstance(principal, JSONResponse):
@@ -414,6 +555,19 @@ def list_interviews(
         if _has_assignment_access(principal)
         else False
     )
+    cursor_scope = hashlib.sha256(
+        json.dumps(
+            {
+                "from": _aware(date_from).astimezone(timezone.utc).isoformat() if date_from else None,
+                "interviewer_id": str(interviewer_id) if interviewer_id else None,
+                "status": status,
+                "to": _aware(date_to).astimezone(timezone.utc).isoformat() if date_to else None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    cursor_sort = f"interviews:starts_at:{cursor_scope}"
     with request.app.state.identity_store.sync_session() as db:
         statement = (
             select(Interview)
@@ -438,9 +592,40 @@ def list_interviews(
                     InterviewParticipant.user_id == interviewer_id,
                 )
             )
-        interviews = db.scalars(statement.order_by(Interview.starts_at, Interview.id).distinct()).all()
+        if cursor:
+            try:
+                decoded = request.app.state.recruiting_cursor.decode(
+                    cursor,
+                    str(principal.organization_id),
+                    cursor_sort,
+                )
+                starts_at = datetime.fromisoformat(decoded["value"])
+                statement = statement.where(
+                    or_(
+                        Interview.starts_at > starts_at,
+                        and_(Interview.starts_at == starts_at, Interview.id > UUID(decoded["id"])),
+                    )
+                )
+            except Exception:
+                return problem(request, 422, "validation_failed", "The request could not be completed.")
+        interviews = db.scalars(
+            statement.order_by(Interview.starts_at, Interview.id).distinct().limit(limit + 1)
+        ).all()
+        next_cursor = None
+        if len(interviews) > limit:
+            last = interviews[limit - 1]
+            next_cursor = request.app.state.recruiting_cursor.encode(
+                str(principal.organization_id),
+                cursor_sort,
+                _aware(last.starts_at).isoformat(),
+                str(last.id),
+            )
+            interviews = interviews[:limit]
         response = JSONResponse(
-            {"data": [_interview_data(db, interview) for interview in interviews], "meta": {"count": len(interviews)}}
+            {
+                "data": [_interview_data(db, interview) for interview in interviews],
+                "meta": {"limit": limit, "next_cursor": next_cursor},
+            }
         )
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -765,6 +950,29 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             raise
 
 
+@router.post("/interview-conflicts", response_model=DataResource)
+def check_new_interview_conflicts(payload: NewInterviewConflictInput, request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    with request.app.state.identity_store.sync_session() as db:
+        application = _load_application_for_management(db, principal, payload.application_id)
+        if application is None:
+            return _denied(request)
+        if not _validate_participants(db, principal.organization_id, payload.participant_ids):
+            return _denied(request)
+        hard, soft = _schedule_conflicts(
+            db,
+            principal.organization_id,
+            payload.participant_ids,
+            application.candidate_id,
+            payload.starts_at,
+            payload.ends_at,
+            buffer_minutes=payload.buffer_minutes,
+        )
+        return {"data": {"hard": [str(value) for value in hard], "soft": [str(value) for value in soft]}}
+
+
 @router.post("/interviews/{interview_id}/conflicts", response_model=DataResource)
 def check_conflicts(interview_id: UUID, payload: ScheduleInput, request: Request):
     principal = _principal(request)
@@ -942,6 +1150,17 @@ def download_calendar(interview_id: UUID, request: Request) -> Response:
                 for contact in interview.calendar_attendees
             ),
         )
+        db.add(
+            AuditLog(
+                organization_id=principal.organization_id,
+                actor_user_id=principal.user_id,
+                event_type="interview.calendar_downloaded",
+                outcome="success",
+                trace_id=request.state.trace_id,
+                metadata_json={"interview_id": str(interview.id)},
+            )
+        )
+        db.commit()
         return Response(
             content=payload,
             media_type="text/calendar; charset=utf-8",
@@ -950,6 +1169,137 @@ def download_calendar(interview_id: UUID, request: Request) -> Response:
                 "Cache-Control": "no-store",
             },
         )
+
+
+@router.get("/interviews/{interview_id}/materials", response_model=DataResource)
+def get_interview_materials(interview_id: UUID, request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    with request.app.state.identity_store.sync_session() as db:
+        context = _load_interview_material_context(db, principal, interview_id)
+        if context is None:
+            return _denied(request)
+        interview, application, job = context
+        candidate = db.scalar(
+            select(Candidate).where(
+                Candidate.organization_id == principal.organization_id,
+                Candidate.id == application.candidate_id,
+            )
+        )
+        resume = db.scalar(
+            select(Resume).where(
+                Resume.organization_id == principal.organization_id,
+                Resume.id == application.resume_id,
+                Resume.candidate_id == application.candidate_id,
+            )
+        )
+        if candidate is None or resume is None:
+            return _denied(request)
+        preview_source = resume.parsed_text or ""
+        if len(preview_source.encode("utf-8")) > MAX_PREVIEW_BYTES:
+            return problem(request, 422, "preview_too_large", "The preview is unavailable.")
+        preview_text = redact_screening_text(preview_source, candidate_name=candidate.display_name)
+        jd = db.scalar(
+            select(JobJdVersion)
+            .where(
+                JobJdVersion.organization_id == principal.organization_id,
+                JobJdVersion.job_id == job.id,
+            )
+            .order_by(JobJdVersion.version_number.desc(), JobJdVersion.id.desc())
+        )
+        screening = db.scalar(
+            select(ScreeningResult)
+            .where(
+                ScreeningResult.organization_id == principal.organization_id,
+                ScreeningResult.application_id == application.id,
+            )
+            .order_by(ScreeningResult.created_at.desc(), ScreeningResult.id.desc())
+        )
+
+        def redacted_items(values):
+            return [
+                redact_screening_text(value, candidate_name=candidate.display_name)
+                for value in values or []
+                if isinstance(value, str)
+            ]
+
+        jd_content = jd.content if jd is not None and isinstance(jd.content, dict) else {}
+        description = jd_content.get("description", jd_content.get("text"))
+        if not isinstance(description, str):
+            description = None
+        body = {
+            "data": {
+                "interview_id": str(interview.id),
+                "candidate": {
+                    "id": str(candidate.id),
+                    "display_name": candidate.display_name,
+                    "current_title": candidate.current_title,
+                    "location": candidate.location,
+                },
+                "job": {"id": str(job.id), "title": job.title},
+                "jd": None
+                if jd is None
+                else {"version_number": jd.version_number, "description": description},
+                "resume": {"id": str(resume.id), "preview_text": preview_text},
+                "screening": None
+                if screening is None
+                else {
+                    "id": str(screening.id),
+                    "required_missing": redacted_items(screening.required_missing),
+                    "risks": redacted_items(screening.risks),
+                    "questions": redacted_items(screening.questions),
+                },
+            }
+        }
+        db.add(
+            AuditLog(
+                organization_id=principal.organization_id,
+                actor_user_id=principal.user_id,
+                event_type="interview.materials_viewed",
+                outcome="success",
+                trace_id=request.state.trace_id,
+                metadata_json={"interview_id": str(interview.id)},
+            )
+        )
+        db.commit()
+        response = JSONResponse(body)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+@router.get("/interviews/{interview_id}/feedbacks", response_model=DataCollection)
+def list_interview_feedbacks(interview_id: UUID, request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_interview_for_feedback_summary(db, principal, interview_id) is None:
+            return _denied(request)
+        rows = db.execute(
+            select(InterviewFeedback, User)
+            .join(
+                User,
+                and_(
+                    User.organization_id == InterviewFeedback.organization_id,
+                    User.id == InterviewFeedback.author_id,
+                ),
+            )
+            .where(
+                InterviewFeedback.organization_id == principal.organization_id,
+                InterviewFeedback.interview_id == interview_id,
+                InterviewFeedback.status.in_(("submitted", "amended")),
+            )
+            .order_by(InterviewFeedback.submitted_at, InterviewFeedback.id)
+        ).all()
+        response = JSONResponse(
+            {
+                "data": [_submitted_feedback_data(feedback, author) for feedback, author in rows],
+                "meta": {"count": len(rows)},
+            }
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 @router.get("/interviews/{interview_id}/my-feedback", response_model=DataResource)
@@ -988,7 +1338,7 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
             return value
     with request.app.state.identity_store.sync_session() as db:
         interview = _load_interview(db, principal, interview_id)
-        participant = _assigned_participant(db, principal, interview_id)
+        participant = _assigned_participant(db, principal, interview_id, for_update=True)
         if interview is None or participant is None:
             return _denied(request)
         if interview.status != "pending_feedback":

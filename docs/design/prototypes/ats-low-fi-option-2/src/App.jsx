@@ -36,7 +36,7 @@ import { screeningController as defaultScreeningController } from "./screeningCo
 import { candidateController as defaultCandidateController } from "./candidateController.js";
 import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
-import { deriveCandidateInterviews, interviewController as defaultInterviewController } from "./interviewController.js";
+import { deriveCandidateInterviews, interviewController as defaultInterviewController, selectSchedulableCandidates } from "./interviewController.js";
 import {
   appendJobPage,
   createInitialJobWorkspaceState,
@@ -180,9 +180,11 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const candidateLoadRef = useRef(null);
   const [candidatePreset, setCandidatePreset] = useState(null);
   const [interviewMode, setInterviewMode] = useState("list");
-  const [interviewState, setInterviewState] = useState({ status: "loading", records: [], tasks: [], error: "" });
+  const [interviewState, setInterviewState] = useState({ status: "loading", records: [], tasks: [], nextCursor: null, loadingMore: false, error: "" });
   const [selectedInterviewId, setSelectedInterviewId] = useState(null);
   const interviewLoadRef = useRef(null);
+  const [interviewCandidateRecords, setInterviewCandidateRecords] = useState([]);
+  const interviewCandidateLoadRef = useRef(null);
   const [scheduleCandidateId, setScheduleCandidateId] = useState(null);
   const [interviewOrigin, setInterviewOrigin] = useState(null);
   const [talentMode, setTalentMode] = useState("list");
@@ -208,11 +210,18 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const selectedInterview = interviewRecords.find((record) => record.id === selectedInterviewId) || null;
   const selectedCandidateWithInterviews = useMemo(() => selectedCandidate ? { ...selectedCandidate, interviews: deriveCandidateInterviews(selectedCandidate.id, interviewRecords) } : null, [interviewRecords, selectedCandidate]);
   const interviewCandidates = useMemo(() => {
-    if (!selectedCandidateWithInterviews) return candidateRecords;
-    return candidateRecords.some((candidate) => candidate.id === selectedCandidateWithInterviews.id || candidate.candidateId === selectedCandidateWithInterviews.id)
-      ? candidateRecords
-      : [selectedCandidateWithInterviews, ...candidateRecords];
-  }, [candidateRecords, selectedCandidateWithInterviews]);
+    const serverCandidates = selectSchedulableCandidates(interviewCandidateRecords);
+    const selected = selectedCandidateWithInterviews?.serverBacked
+      ? {
+          ...selectedCandidateWithInterviews,
+          applicationId: selectedCandidateWithInterviews.applicationId || selectedCandidateWithInterviews.application?.id || "",
+        }
+      : null;
+    return selectSchedulableCandidates([
+      ...(selected ? [selected] : []),
+      ...serverCandidates,
+    ]);
+  }, [interviewCandidateRecords, selectedCandidateWithInterviews]);
   const sessionMessage = getSessionMessage(session.error);
   const screeningSummary = useMemo(() => {
     if (!recentTask?.files?.length) return null;
@@ -224,28 +233,60 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     };
   }, [recentTask]);
 
-  const loadInterviews = useCallback(async () => {
+  const loadInterviews = useCallback(async ({ cursor = null, append = false } = {}) => {
     interviewLoadRef.current?.abort();
     const controller = new AbortController();
     interviewLoadRef.current = controller;
-    setInterviewState((current) => ({ ...current, status: "loading", error: "" }));
+    setInterviewState((current) => ({ ...current, status: append ? current.status : "loading", loadingMore: append, error: "" }));
     try {
       const [page, tasks] = await Promise.all([
-        interviewController.list({}, { signal: controller.signal }),
-        interviewController.listMyTasks({ signal: controller.signal }),
+        interviewController.list({ limit: 50, cursor: cursor || undefined }, { signal: controller.signal }),
+        append ? Promise.resolve(null) : interviewController.listMyTasks({ signal: controller.signal }),
       ]);
       if (interviewLoadRef.current !== controller) return null;
-      setInterviewState({ status: "ready", records: page.records, tasks, error: "" });
-      setSelectedInterviewId((current) => current && page.records.some((record) => record.id === current) ? current : null);
+      setInterviewState((current) => ({
+        status: "ready",
+        records: append ? [...current.records, ...page.records] : page.records,
+        tasks: tasks || current.tasks,
+        nextCursor: page.nextCursor,
+        loadingMore: false,
+        error: "",
+      }));
+      if (!append) setSelectedInterviewId((current) => current && page.records.some((record) => record.id === current) ? current : null);
       return page.records;
     } catch (error) {
       if (error?.name === "AbortError" || interviewLoadRef.current !== controller) return null;
-      setInterviewState((current) => ({ ...current, status: "error", error: "面试加载失败，请检查网络后重试。" }));
+      setInterviewState((current) => ({ ...current, status: append ? current.status : "error", loadingMore: false, error: "面试加载失败，请检查网络后重试。" }));
       return null;
     } finally {
       if (interviewLoadRef.current === controller) interviewLoadRef.current = null;
     }
   }, [interviewController]);
+
+  const loadInterviewCandidates = useCallback(async () => {
+    interviewCandidateLoadRef.current?.abort();
+    const controller = new AbortController();
+    interviewCandidateLoadRef.current = controller;
+    try {
+      const candidates = [];
+      let cursor = "";
+      do {
+        const page = await candidateController.listCandidates({ stage: "待安排", limit: 100, cursor: cursor || undefined }, { signal: controller.signal });
+        candidates.push(...page.records);
+        cursor = page.nextCursor || "";
+      } while (cursor);
+      if (interviewCandidateLoadRef.current !== controller) return null;
+      const records = selectSchedulableCandidates(candidates);
+      setInterviewCandidateRecords(records);
+      return records;
+    } catch (error) {
+      if (error?.name === "AbortError" || interviewCandidateLoadRef.current !== controller) return null;
+      setInterviewCandidateRecords([]);
+      return null;
+    } finally {
+      if (interviewCandidateLoadRef.current === controller) interviewCandidateLoadRef.current = null;
+    }
+  }, [candidateController]);
 
   const refreshInterviewsAfterMutation = useCallback(async (record) => {
     if (record?.id) {
@@ -256,8 +297,8 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
           : [record, ...current.records],
       }));
     }
-    await loadInterviews();
-  }, [loadInterviews]);
+    await Promise.all([loadInterviews(), loadInterviewCandidates()]);
+  }, [loadInterviewCandidates, loadInterviews]);
 
   const loadWorkbench = useCallback(async () => {
     if (currentRole === "面试官") return null;
@@ -356,11 +397,14 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
 
   useEffect(() => {
     void loadInterviews();
+    void loadInterviewCandidates();
     return () => {
       interviewLoadRef.current?.abort();
       interviewLoadRef.current = null;
+      interviewCandidateLoadRef.current?.abort();
+      interviewCandidateLoadRef.current = null;
     };
-  }, [loadInterviews]);
+  }, [loadInterviewCandidates, loadInterviews]);
 
   useEffect(() => {
     if (activeNav === "工作台" && currentRole !== "面试官") void loadWorkbench();
@@ -515,6 +559,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   }
 
   function openScheduleInterview(candidate = null, interview = null) {
+    void loadInterviewCandidates();
     setInterviewOrigin(activeNav === "面试" ? null : { activeNav, candidateMode, selectedCandidate, screeningTask });
     setScreeningTask(null);
     setActiveNav("面试");
@@ -736,7 +781,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         )}
 
         {!screeningTask && activeNav === "面试" && (
-          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterviewId={selectedInterviewId} setSelectedInterviewId={setSelectedInterviewId} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} status={interviewState.status} error={interviewState.error} onRetry={() => void loadInterviews()} candidates={interviewCandidates} onNotify={notify} onBack={backFromInterview} onRecordsChanged={refreshInterviewsAfterMutation} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} actorId={session.user?.id} controller={interviewController} />
+          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterviewId={selectedInterviewId} setSelectedInterviewId={setSelectedInterviewId} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} status={interviewState.status} error={interviewState.error} onRetry={() => void loadInterviews()} nextCursor={interviewState.nextCursor} loadingMore={interviewState.loadingMore} onLoadMore={() => void loadInterviews({ cursor: interviewState.nextCursor, append: true })} candidates={interviewCandidates} onNotify={notify} onBack={backFromInterview} onRecordsChanged={refreshInterviewsAfterMutation} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} actorId={session.user?.id} controller={interviewController} />
         )}
 
         {!screeningTask && activeNav === "人才库" && (

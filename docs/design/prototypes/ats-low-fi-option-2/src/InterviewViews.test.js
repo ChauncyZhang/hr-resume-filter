@@ -4,14 +4,17 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 
 const source = readFileSync(new URL("./InterviewViews.jsx", import.meta.url), "utf8");
+const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
 const helpersSource = source.match(/\/\* feedback-draft-helpers:start \*\/([\s\S]*?)\/\* feedback-draft-helpers:end \*\//)?.[1];
 assert.ok(helpersSource, "InterviewViews.jsx must expose the feedback draft helper block");
 const {
   clearInterviewFeedbackDraft,
+  getFeedbackSubmitError,
   getInterviewFeedbackDraftKey,
   loadInterviewFeedbackDraft,
+  resolveInterviewFeedbackDraft,
   saveInterviewFeedbackDraft,
-} = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { clearInterviewFeedbackDraft, getInterviewFeedbackDraftKey, loadInterviewFeedbackDraft, saveInterviewFeedbackDraft }; })()`);
+} = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { clearInterviewFeedbackDraft, getFeedbackSubmitError, getInterviewFeedbackDraftKey, loadInterviewFeedbackDraft, resolveInterviewFeedbackDraft, saveInterviewFeedbackDraft }; })()`);
 
 function createStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -63,4 +66,29 @@ test("clearing a submitted draft removes only that interview draft", () => {
 
   assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-001" }, storage), null);
   assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-002" }, storage).conclusion, "保留");
+});
+
+test("a versioned server draft wins over a stale local draft", () => {
+  const local = { ...form, conclusion: "保留" };
+  const server = { ...form, id: "FDB-001", version: 3, conclusion: "推荐" };
+
+  const resolved = resolveInterviewFeedbackDraft(local, server);
+
+  assert.equal(resolved.source, "server");
+  assert.equal(resolved.form.conclusion, "推荐");
+  assert.equal(resolveInterviewFeedbackDraft(local, { status: "draft", version: 0 }).source, "local");
+});
+
+test("feedback version conflicts explain that the local draft was preserved", () => {
+  assert.equal(
+    getFeedbackSubmitError({ code: "resource_version_conflict" }),
+    "服务端草稿已在其他页面或设备更新。本机内容已保留，请刷新后核对再提交。",
+  );
+  assert.equal(getFeedbackSubmitError({ code: "service_unavailable" }), "网络请求失败，表单和本机草稿均已保留。请重试提交。");
+});
+
+test("schedule workspace loads pending applications from the server without fixture fallback", () => {
+  assert.match(appSource, /candidateController\.listCandidates\(\{ stage: "待安排", limit: 100, cursor: cursor \|\| undefined \}/);
+  assert.match(appSource, /selectSchedulableCandidates\(interviewCandidateRecords\)/);
+  assert.doesNotMatch(appSource, /if \(!selectedCandidateWithInterviews\) return candidateRecords/);
 });

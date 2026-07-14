@@ -226,3 +226,47 @@ def test_postgres_concurrent_final_feedback_submissions_advance_once() -> None:
         application = database.get(Application, seed["application_id"])
         assert interview.status == "feedback_completed"
         assert application.stage == "decision"
+
+
+def test_postgres_concurrent_first_feedback_drafts_return_one_version_conflict() -> None:
+    app = postgres_app()
+    seed = seed_application(app)
+    with TestClient(app) as client:
+        created, admin_headers = create_interview(client, seed, key="concurrent-draft-create")
+        interview_id = created.json()["data"]["id"]
+        assert client.post(
+            f"/api/v1/interviews/{interview_id}/transitions",
+            json={"target": "confirmed"},
+            headers={**admin_headers, "If-Match": '"1"', "Idempotency-Key": "concurrent-draft-confirm"},
+        ).status_code == 200
+        assert client.post(
+            f"/api/v1/interviews/{interview_id}/transitions",
+            json={"target": "completed"},
+            headers={**admin_headers, "If-Match": '"2"', "Idempotency-Key": "concurrent-draft-complete"},
+        ).status_code == 200
+
+    barrier = threading.Barrier(2)
+
+    def save(conclusion):
+        with TestClient(app) as client:
+            headers = login(client, "assigned@example.test")
+            barrier.wait()
+            return client.put(
+                f"/api/v1/interviews/{interview_id}/my-feedback",
+                json=feedback_payload(conclusion),
+                headers={**headers, "If-Match": '"0"'},
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(save, ("recommend", "strong_recommend")))
+
+    assert sorted(response.status_code for response in responses) == [200, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["code"] == "resource_version_conflict"
+    with app.state.identity_store.sync_session() as database:
+        assert database.scalar(
+            select(func.count(InterviewFeedback.id)).where(
+                InterviewFeedback.interview_id == UUID(interview_id),
+                InterviewFeedback.author_id == seed["interviewer_id"],
+            )
+        ) == 1

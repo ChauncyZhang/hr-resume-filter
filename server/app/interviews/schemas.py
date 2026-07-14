@@ -36,6 +36,10 @@ class ScheduleInput(StrictModel):
         return self
 
 
+class NewInterviewConflictInput(ScheduleInput):
+    application_id: UUID
+
+
 class InterviewCreate(StrictModel):
     application_id: UUID
     round_name: str = Field(min_length=1, max_length=100)
