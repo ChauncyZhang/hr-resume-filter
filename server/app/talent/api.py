@@ -65,6 +65,10 @@ def _expected_version(request: Request, value: str | None) -> int | JSONResponse
     return int(matched.group(1))
 
 
+def _is_active_application_conflict(error: IntegrityError) -> bool:
+    return getattr(getattr(error.orig, "diag", None), "constraint_name", None) == "uq_applications_active"
+
+
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
@@ -196,11 +200,71 @@ def _pool_data(db, pool: TalentPool, *, include_grants: bool = False) -> dict:
     return body
 
 
-def _membership_data(db, membership: TalentPoolMembership) -> dict:
+def _authorized_application(db, principal: Principal, application_id: UUID, candidate_id: UUID):
+    return db.scalar(
+        select(Application)
+        .join(
+            Job,
+            and_(
+                Job.organization_id == Application.organization_id,
+                Job.id == Application.job_id,
+            ),
+        )
+        .where(
+            Application.organization_id == principal.organization_id,
+            Application.id == application_id,
+            Application.candidate_id == candidate_id,
+            AUTH.job_predicate(principal, RecruitingAction.READ, Job),
+        )
+    )
+
+
+def _authorized_resume(db, principal: Principal, resume_id: UUID, candidate_id: UUID):
+    visible_application = exists().where(
+        Application.organization_id == Resume.organization_id,
+        Application.resume_id == Resume.id,
+        exists().where(
+            Job.organization_id == Application.organization_id,
+            Job.id == Application.job_id,
+            AUTH.job_predicate(principal, RecruitingAction.DOWNLOAD, Job),
+        ),
+    )
+    return db.scalar(
+        select(Resume).where(
+            Resume.organization_id == principal.organization_id,
+            Resume.id == resume_id,
+            Resume.candidate_id == candidate_id,
+            visible_application,
+        )
+    )
+
+
+def _membership_data(db, principal: Principal, membership: TalentPoolMembership) -> dict:
     candidate = db.get(Candidate, membership.candidate_id)
     owner = db.get(User, membership.owner_id)
-    source = db.get(Application, membership.source_application_id) if membership.source_application_id else None
+    source = (
+        _authorized_application(
+            db,
+            principal,
+            membership.source_application_id,
+            membership.candidate_id,
+        )
+        if membership.source_application_id
+        else None
+    )
     source_job = db.get(Job, source.job_id) if source else None
+    if membership.source_application_id is None:
+        source_data = None
+    elif source is None:
+        source_data = {"id": str(membership.source_application_id), "redacted": True}
+    else:
+        source_data = {
+            "id": str(source.id),
+            "job_id": str(source.job_id),
+            "job_title": source_job.title if source_job else "Unavailable",
+            "stage": source.stage,
+            "human_conclusion": source.human_conclusion,
+        }
     return {
         "id": str(membership.id),
         "pool_id": str(membership.pool_id),
@@ -210,13 +274,7 @@ def _membership_data(db, membership: TalentPoolMembership) -> dict:
             "current_title": candidate.current_title if candidate else None,
             "location": candidate.location if candidate else None,
         },
-        "source_application": None if source is None else {
-            "id": str(source.id),
-            "job_id": str(source.job_id),
-            "job_title": source_job.title if source_job else "Unavailable",
-            "stage": source.stage,
-            "human_conclusion": source.human_conclusion,
-        },
+        "source_application": source_data,
         "owner": {"id": str(membership.owner_id), "display_name": owner.display_name if owner else "Unavailable"},
         "suitable_roles": list(membership.suitable_roles or []),
         "tags": list(membership.tags or []),
@@ -465,7 +523,7 @@ def list_talent_pool_memberships(
             last = rows[limit - 1]
             next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), cursor_sort, _aware(last.updated_at).isoformat(), str(last.id))
             rows = rows[:limit]
-        response = JSONResponse({"data": [_membership_data(db, row) for row in rows], "meta": {"limit": limit, "next_cursor": next_cursor}})
+        response = JSONResponse({"data": [_membership_data(db, principal, row) for row in rows], "meta": {"limit": limit, "next_cursor": next_cursor}})
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -487,7 +545,12 @@ def create_talent_pool_membership(pool_id: UUID, payload: MembershipCreate, requ
             return _denied(request)
         source = None
         if payload.source_application_id:
-            source = db.scalar(select(Application).where(Application.organization_id == principal.organization_id, Application.id == payload.source_application_id, Application.candidate_id == payload.candidate_id))
+            source = _authorized_application(
+                db,
+                principal,
+                payload.source_application_id,
+                payload.candidate_id,
+            )
             if source is None:
                 return _denied(request)
 
@@ -508,7 +571,7 @@ def create_talent_pool_membership(pool_id: UUID, payload: MembershipCreate, requ
             db.flush()
             db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_added", outcome="success", trace_id=request.state.trace_id, metadata_json={"pool_id": str(pool.id), "membership_id": str(membership.id), "candidate_id": str(candidate.id)}))
             db.flush()
-            return 201, {"data": _membership_data(db, membership)}
+            return 201, {"data": _membership_data(db, principal, membership)}
 
         try:
             status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "talent_pool.member_add", key, {"pool_id": pool_id, **payload.model_dump()}, action)
@@ -548,7 +611,7 @@ def patch_talent_pool_membership(membership_id: UUID, payload: MembershipPatch, 
         membership.updated_at = datetime.now(timezone.utc)
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_updated", outcome="success", trace_id=request.state.trace_id, metadata_json={"membership_id": str(membership.id), "changed_fields": sorted(payload.model_fields_set)}))
         db.commit()
-        response = JSONResponse({"data": _membership_data(db, membership)})
+        response = JSONResponse({"data": _membership_data(db, principal, membership)})
         response.headers["ETag"] = f'"{membership.version}"'
         response.headers["Cache-Control"] = "no-store"
         return response
@@ -594,7 +657,7 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
         if candidate is None:
             return _denied(request)
         resume_id = payload.resume_id or source.resume_id
-        resume = db.scalar(select(Resume).where(Resume.organization_id == principal.organization_id, Resume.id == resume_id, Resume.candidate_id == candidate.id))
+        resume = _authorized_resume(db, principal, resume_id, candidate.id)
         if resume is None:
             return _denied(request)
 
@@ -629,6 +692,11 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
         except ActiveApplicationExists:
             db.rollback()
             return problem(request, 409, "active_application_exists", "An active application already exists for this job.")
+        except IntegrityError as error:
+            db.rollback()
+            if _is_active_application_conflict(error):
+                return problem(request, 409, "active_application_exists", "An active application already exists for this job.")
+            raise
         except IdempotencyConflict:
             db.rollback()
             return problem(request, 409, "idempotency_conflict", "The idempotency key was already used.")

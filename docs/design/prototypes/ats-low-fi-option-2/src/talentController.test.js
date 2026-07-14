@@ -1,7 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { createTalentController, normalizeTalentMembership, normalizeTalentPool } from "./talentController.js";
+import {
+  createTalentController,
+  canAddCandidateToTalentPool,
+  normalizeTalentMembership,
+  normalizeTalentPool,
+  selectExactTalentPool,
+  selectServerTalentCandidates,
+} from "./talentController.js";
 
 
 test("talent pool and membership normalization keeps only the server projection", () => {
@@ -71,4 +78,87 @@ test("create and add commands use opaque server identities and idempotency keys"
   assert.equal(calls[0].options.idempotencyKey, "idem-fixed");
   assert.equal(calls[1].options.body.source_application_id, "application-1");
   assert.equal(calls[1].options.idempotencyKey, "idem-fixed");
+});
+
+
+test("server candidates require an explicitly selected exact talent pool", () => {
+  const candidates = [
+    { id: "local-1", serverBacked: false },
+    { id: "server-1", candidateId: "candidate-1", serverBacked: true },
+  ];
+  const pools = [{ id: "pool-1", name: "AI" }, { id: "pool-2", name: "Backend" }];
+
+  assert.deepEqual(selectServerTalentCandidates(candidates, ["server-1"]), [candidates[1]]);
+  assert.equal(canAddCandidateToTalentPool(candidates[1]), true);
+  assert.equal(canAddCandidateToTalentPool(candidates[0]), false);
+  assert.equal(selectExactTalentPool(pools, "pool-2"), pools[1]);
+  assert.equal(selectExactTalentPool(pools, "missing"), null);
+  assert.equal(selectExactTalentPool(pools, null), null);
+});
+
+
+test("redacted source applications do not reconstruct restricted job details", () => {
+  const membership = normalizeTalentMembership({
+    id: "member-1",
+    pool_id: "pool-1",
+    candidate: { id: "candidate-1", display_name: "Candidate" },
+    source_application: { id: "restricted-application", redacted: true },
+    owner: { id: "user-1", display_name: "HR" },
+    suitable_roles: ["AI"],
+    tags: [],
+    reason: "retain",
+    retention_until: "2028-07-14T00:00:00Z",
+    status: "active",
+    version: 1,
+  });
+
+  assert.equal(membership.sourceApplicationId, "");
+  assert.deepEqual(membership.candidate.applications, []);
+  assert.equal(membership.source, "来源申请不可见");
+  assert.equal(membership.latestConclusion, "来源申请不可见");
+  assert.doesNotMatch(JSON.stringify(membership), /restricted-application/);
+});
+
+
+test("granted visibility is rejected until grantees can be selected", async () => {
+  let requested = false;
+  const controller = createTalentController({
+    client: { async request() { requested = true; } },
+    idSource: () => "unused",
+  });
+
+  await assert.rejects(
+    controller.createPool({ name: "AI", purpose: "AI", visibility: "指定成员可见", suitableRoles: ["AI"], retentionDays: 730 }, "user-1"),
+    (error) => error.code === "talent_grants_required",
+  );
+  assert.equal(requested, false);
+});
+
+
+test("ambiguous retries reuse one idempotency key while distinct intents receive fresh keys", async () => {
+  const calls = [];
+  let failOnce = true;
+  let sequence = 0;
+  const controller = createTalentController({
+    idSource: () => `idem-${++sequence}`,
+    client: {
+      async request(path, options) {
+        calls.push({ path, options });
+        if (failOnce) {
+          failOnce = false;
+          throw new TypeError("connection closed after send");
+        }
+        return { data: null };
+      },
+    },
+  });
+  const candidate = { candidateId: "candidate-1", applicationId: "application-1", position: "AI", tags: [] };
+
+  await assert.rejects(controller.addMembership("pool-1", candidate, "user-1"));
+  await controller.addMembership("pool-1", candidate, "user-1");
+  await controller.addMembership("pool-2", candidate, "user-1");
+
+  assert.equal(calls[0].options.idempotencyKey, calls[1].options.idempotencyKey);
+  assert.equal(calls[0].options.body.retention_until, calls[1].options.body.retention_until);
+  assert.notEqual(calls[1].options.idempotencyKey, calls[2].options.idempotencyKey);
 });

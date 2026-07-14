@@ -2,20 +2,40 @@ from uuid import UUID
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from server.app.core.settings import Settings
 from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
-from server.app.recruiting.models import Application
+from server.app.recruiting.models import (
+    Application,
+    ApplicationStageEvent,
+    CandidateContact,
+    CandidateEvent,
+    FileObject,
+    IdempotencyRecord,
+    Resume,
+)
 from server.app.talent.models import TalentPoolMembership
+from server.app.talent.api import _is_active_application_conflict
 from server.tests.test_interview_api import seed_application
-from server.tests.test_recruiting_api import login
+from server.tests.test_recruiting_api import login, seed_user
 
 
 class Probe:
     async def check(self) -> None:
         pass
+
+
+class ConstraintDiagnostic:
+    def __init__(self, name):
+        self.constraint_name = name
+
+
+class ConstraintOrigin(Exception):
+    def __init__(self, name):
+        self.diag = ConstraintDiagnostic(name)
 
 
 def make_app(tmp_path):
@@ -89,6 +109,14 @@ def test_talent_openapi_registers_phase_5_pool_contract(tmp_path) -> None:
         "/api/v1/talent-pool-memberships/{membership_id}/reactivations": {"post"},
     }
     assert {path: set(paths.get(path, {})) for path in expected} == expected
+
+
+def test_only_named_active_application_constraint_is_translated() -> None:
+    active = IntegrityError("insert", {}, ConstraintOrigin("uq_applications_active"))
+    unrelated = IntegrityError("insert", {}, ConstraintOrigin("uq_talent_pool_membership_candidate"))
+
+    assert _is_active_application_conflict(active) is True
+    assert _is_active_application_conflict(unrelated) is False
 
 
 def test_pool_membership_round_trip_is_tenant_scoped_and_does_not_mutate_application(tmp_path) -> None:
@@ -205,6 +233,12 @@ def test_reactivation_creates_linked_application_preserves_history_and_rejects_a
     with TestClient(app) as client:
         headers, _, membership = create_pool_and_membership(client, seed)
         membership_id = membership.json()["data"]["id"]
+        with app.state.identity_store.sync_session() as database:
+            pii_counts = {
+                "contacts": database.query(CandidateContact).count(),
+                "files": database.query(FileObject).count(),
+                "resumes": database.query(Resume).count(),
+            }
         first = client.post(
             f"/api/v1/talent-pool-memberships/{membership_id}/reactivations",
             json={"job_id": str(target_id)},
@@ -250,6 +284,145 @@ def test_reactivation_creates_linked_application_preserves_history_and_rejects_a
         assert created.resume_id == source.resume_id
         assert created.source_application_id == source.id
         assert membership_row.status == "active"
+        assert database.query(ApplicationStageEvent).filter(
+            ApplicationStageEvent.event_type == "application.reactivated"
+        ).count() == 1
+        assert database.query(CandidateEvent).filter(
+            CandidateEvent.event_type == "candidate.reactivated"
+        ).count() == 1
+        assert database.query(AuditLog).filter(
+            AuditLog.event_type == "talent_pool.member_reactivated"
+        ).count() == 1
+        assert database.query(IdempotencyRecord).filter(
+            IdempotencyRecord.operation == "talent_pool.reactivate"
+        ).count() == 1
+        assert database.query(CandidateContact).count() == pii_counts["contacts"]
+        assert database.query(FileObject).count() == pii_counts["files"]
+        assert database.query(Resume).count() == pii_counts["resumes"]
+
+
+def test_source_application_requires_job_access_and_is_redacted_after_access_is_lost(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    recruiter_id = seed_user(app, "recruiter", "talent-scoped@example.test")
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "rejected"
+        source.version += 1
+        denied_job = Job(
+            organization_id=source.organization_id,
+            title="Restricted source",
+            owner_id=seed["admin_id"],
+            status="open",
+        )
+        target_job = Job(
+            organization_id=source.organization_id,
+            title="Authorized target",
+            owner_id=recruiter_id,
+            status="open",
+        )
+        denied_file = FileObject(
+            organization_id=source.organization_id,
+            storage_key="talent/restricted-resume.pdf",
+            original_filename="restricted.pdf",
+            mime_type="application/pdf",
+            size_bytes=10,
+            sha256="b" * 64,
+            uploaded_by=seed["admin_id"],
+        )
+        database.add_all([denied_job, target_job, denied_file])
+        database.flush()
+        denied_resume = Resume(
+            organization_id=source.organization_id,
+            candidate_id=source.candidate_id,
+            file_object_id=denied_file.id,
+            version_number=2,
+            parsed_text="restricted resume contents",
+        )
+        database.add(denied_resume)
+        database.flush()
+        denied_application = Application(
+            organization_id=source.organization_id,
+            candidate_id=source.candidate_id,
+            job_id=denied_job.id,
+            resume_id=denied_resume.id,
+            owner_id=seed["admin_id"],
+            stage="rejected",
+        )
+        source_grant = JobCollaborator(
+            organization_id=source.organization_id,
+            job_id=source.job_id,
+            user_id=recruiter_id,
+            access_role="job_recruiter",
+        )
+        target_grant = JobCollaborator(
+            organization_id=source.organization_id,
+            job_id=target_job.id,
+            user_id=recruiter_id,
+            access_role="job_owner",
+        )
+        database.add_all([denied_application, source_grant, target_grant])
+        database.commit()
+        denied_application_id = denied_application.id
+        denied_resume_id = denied_resume.id
+        target_job_id = target_job.id
+        source_resume_id = source.resume_id
+
+    with TestClient(app) as client:
+        admin_headers = login(client, "interview-admin@example.test")
+        pool = client.post(
+            "/api/v1/talent-pools",
+            json={**pool_payload(recruiter_id), "name": "Scoped talent", "visibility": "private"},
+            headers={**admin_headers, "Idempotency-Key": "scoped-talent-pool"},
+        )
+        assert pool.status_code == 201
+        pool_id = pool.json()["data"]["id"]
+        recruiter_headers = login(client, "talent-scoped@example.test")
+        denied_membership = client.post(
+            f"/api/v1/talent-pools/{pool_id}/memberships",
+            json={**membership_payload(seed), "source_application_id": str(denied_application_id), "owner_id": str(recruiter_id)},
+            headers={**recruiter_headers, "Idempotency-Key": "denied-source-membership"},
+        )
+        assert denied_membership.status_code == 404
+        membership = client.post(
+            f"/api/v1/talent-pools/{pool_id}/memberships",
+            json={**membership_payload(seed), "owner_id": str(recruiter_id)},
+            headers={**recruiter_headers, "Idempotency-Key": "allowed-source-membership"},
+        )
+        assert membership.status_code == 201
+        membership_id = membership.json()["data"]["id"]
+
+        with app.state.identity_store.sync_session() as database:
+            database.delete(database.get(JobCollaborator, source_grant.id))
+            database.commit()
+
+        listed = client.get(f"/api/v1/talent-pools/{pool_id}/memberships", headers=recruiter_headers)
+        default_resume = client.post(
+            f"/api/v1/talent-pool-memberships/{membership_id}/reactivations",
+            json={"job_id": str(target_job_id)},
+            headers={**recruiter_headers, "Idempotency-Key": "default-source-resume"},
+        )
+        override_resume = client.post(
+            f"/api/v1/talent-pool-memberships/{membership_id}/reactivations",
+            json={"job_id": str(target_job_id), "resume_id": str(denied_resume_id)},
+            headers={**recruiter_headers, "Idempotency-Key": "override-source-resume"},
+        )
+        source_preview = client.get(f"/api/v1/resumes/{source_resume_id}/preview", headers=recruiter_headers)
+        override_preview = client.get(f"/api/v1/resumes/{denied_resume_id}/preview", headers=recruiter_headers)
+
+    assert listed.status_code == 200
+    assert listed.json()["data"][0]["source_application"] == {
+        "id": str(seed["application_id"]),
+        "redacted": True,
+    }
+    assert default_resume.status_code == override_resume.status_code == 404
+    assert source_preview.status_code == override_preview.status_code == 404
+    with app.state.identity_store.sync_session() as database:
+        assert database.query(Application).filter(
+            Application.organization_id == source.organization_id,
+            Application.candidate_id == seed["candidate_id"],
+            Application.job_id == target_job_id,
+        ).count() == 0
 
 
 def test_membership_removal_audit_does_not_store_user_reason(tmp_path) -> None:

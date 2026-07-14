@@ -1,5 +1,6 @@
 import os
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,7 +9,7 @@ from server.app.identity.models import Job, JobCollaborator
 from server.app.recruiting.models import Application
 from server.tests.test_interview_api import seed_application
 from server.tests.test_interview_api_postgres import postgres_app
-from server.tests.test_recruiting_api import login
+from server.tests.test_recruiting_api import login, seed_user
 from server.tests.test_talent_api import create_pool_and_membership
 
 
@@ -71,3 +72,81 @@ def test_postgres_concurrent_reactivations_create_only_one_active_application() 
         ).all()
         assert len(active) == 1
         assert active[0].source_application_id == seed["application_id"]
+
+
+def test_postgres_reactivation_racing_ordinary_creation_returns_controlled_conflict() -> None:
+    app = postgres_app()
+    seed = seed_application(app)
+    recruiter_id = seed_user(app, "recruiter", "mixed-writer@example.test")
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "rejected"
+        source.version += 1
+        target = Job(
+            organization_id=source.organization_id,
+            title="Mixed writer RAG Engineer",
+            owner_id=recruiter_id,
+            status="open",
+        )
+        database.add(target)
+        database.flush()
+        database.add_all(
+            [JobCollaborator(
+                organization_id=source.organization_id,
+                job_id=target.id,
+                user_id=recruiter_id,
+                access_role="job_owner",
+            ), JobCollaborator(
+                organization_id=source.organization_id,
+                job_id=source.job_id,
+                user_id=recruiter_id,
+                access_role="job_recruiter",
+            )]
+        )
+        database.commit()
+        target_id = target.id
+        resume_id = source.resume_id
+
+    with TestClient(app) as client:
+        _, _, membership = create_pool_and_membership(client, seed)
+        membership_id = membership.json()["data"]["id"]
+
+    barrier = Barrier(2)
+
+    def reactivate():
+        with TestClient(app) as client:
+            headers = login(client, "interview-admin@example.test")
+            barrier.wait()
+            return client.post(
+                f"/api/v1/talent-pool-memberships/{membership_id}/reactivations",
+                json={"job_id": str(target_id)},
+                headers={**headers, "Idempotency-Key": "mixed-writer-reactivation"},
+            )
+
+    def create_ordinary():
+        with TestClient(app) as client:
+            headers = login(client, "mixed-writer@example.test")
+            barrier.wait()
+            return client.post(
+                f"/api/v1/jobs/{target_id}/applications",
+                json={"candidate_id": str(seed["candidate_id"]), "resume_id": str(resume_id)},
+                headers={**headers, "Idempotency-Key": "mixed-writer-ordinary"},
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = [pool.submit(reactivate), pool.submit(create_ordinary)]
+        responses = [future.result() for future in responses]
+
+    assert sorted(response.status_code for response in responses) == [201, 409], [
+        (response.status_code, response.json()) for response in responses
+    ]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.json()["code"] == "active_application_exists"
+    with app.state.identity_store.sync_session() as database:
+        active = database.query(Application).filter(
+            Application.organization_id == source.organization_id,
+            Application.candidate_id == seed["candidate_id"],
+            Application.job_id == target_id,
+            Application.stage.not_in(("hired", "rejected", "withdrawn")),
+        ).all()
+        assert len(active) == 1

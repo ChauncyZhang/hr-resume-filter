@@ -46,6 +46,29 @@ function requireVersion(value) {
   return value;
 }
 
+export function selectExactTalentPool(pools, poolId) {
+  const id = safeString(poolId).trim();
+  return id ? safeArray(pools).find((pool) => pool?.id === id) || null : null;
+}
+
+export function canAddCandidateToTalentPool(candidate) {
+  return Boolean(candidate?.serverBacked && (candidate?.candidateId || candidate?.id));
+}
+
+export function selectServerTalentCandidates(candidates, candidateIds) {
+  const requested = new Set(safeArray(candidateIds));
+  const selected = [];
+  const seen = new Set();
+  for (const candidate of safeArray(candidates)) {
+    const candidateId = candidate?.candidateId || candidate?.id;
+    if (!canAddCandidateToTalentPool(candidate) || seen.has(candidateId)) continue;
+    if (!requested.has(candidate.id) && !requested.has(candidate.candidateId)) continue;
+    seen.add(candidateId);
+    selected.push(candidate);
+  }
+  return selected;
+}
+
 function dateOnly(value) {
   const raw = safeString(value);
   return /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : "";
@@ -82,7 +105,8 @@ export function normalizeTalentMembership(value) {
   const id = safeString(value?.id);
   const candidateId = safeString(value?.candidate?.id);
   if (!id || !candidateId) return null;
-  const source = value?.source_application || null;
+  const redactedSource = Boolean(value?.source_application?.redacted);
+  const source = redactedSource ? null : value?.source_application || null;
   const sourceApplicationId = safeString(source?.id);
   const sourceJobId = safeString(source?.job_id);
   const sourceJobTitle = safeString(source?.job_title, "历史职位");
@@ -125,17 +149,22 @@ export function normalizeTalentMembership(value) {
     owner: safeString(value?.owner?.display_name, "未分配"),
     joinedAt: dateOnly(value?.created_at),
     reason: safeString(value?.reason),
-    source: safeString(source?.job_title, "人才库"),
+    source: redactedSource ? "来源申请不可见" : safeString(source?.job_title, "人才库"),
     nextContact: dateOnly(value?.next_contact_at),
     retentionUntil: dateOnly(value?.retention_until),
     recentInteraction: formatActivity(value?.updated_at),
-    latestConclusion: safeString(source?.human_conclusion, "暂无历史结论"),
+    latestConclusion: redactedSource ? "来源申请不可见" : safeString(source?.human_conclusion, "暂无历史结论"),
     status: STATUS_TO_UI[value?.status] || "正常",
     version: Number.isInteger(value?.version) ? value.version : null,
   };
 }
 
 function poolPayload(form, ownerId) {
+  if (form?.visibility === "指定成员可见") {
+    const error = new Error("grantee selection is required");
+    error.code = "talent_grants_required";
+    throw error;
+  }
   return {
     name: safeString(form?.name).trim(),
     purpose: safeString(form?.purpose).trim(),
@@ -160,6 +189,23 @@ function membershipPatch(updated) {
 }
 
 export function createTalentController({ client = apiClient, idSource = () => globalThis.crypto.randomUUID() } = {}) {
+  const pendingKeys = new Map();
+
+  async function mutate(intent, body, request) {
+    const operation = pendingKeys.get(intent) || { idempotencyKey: idSource(), body };
+    pendingKeys.set(intent, operation);
+    try {
+      const result = await request(operation.idempotencyKey, operation.body);
+      pendingKeys.delete(intent);
+      return result;
+    } catch (error) {
+      const status = Number(error?.status);
+      const ambiguous = !Number.isFinite(status) || status === 408 || status === 429 || status >= 500;
+      if (!ambiguous) pendingKeys.delete(intent);
+      throw error;
+    }
+  }
+
   return {
     async listPools(filters = {}, options = {}) {
       const params = new URLSearchParams();
@@ -173,12 +219,11 @@ export function createTalentController({ client = apiClient, idSource = () => gl
       };
     },
     async createPool(form, ownerId, options = {}) {
-      const payload = await client.request("/api/v1/talent-pools", {
-        method: "POST",
-        body: poolPayload(form, ownerId),
-        idempotencyKey: idSource(),
-        ...options,
-      });
+      const body = poolPayload(form, ownerId);
+      const intent = `pool:create:${JSON.stringify(body)}`;
+      const payload = await mutate(intent, body, (idempotencyKey, retainedBody) => client.request("/api/v1/talent-pools", {
+        method: "POST", body: retainedBody, idempotencyKey, ...options,
+      }));
       return normalizeTalentPool(payload?.data);
     },
     async listMemberships(poolId, filters = {}, options = {}) {
@@ -199,9 +244,7 @@ export function createTalentController({ client = apiClient, idSource = () => gl
       const sourceApplicationId = requireId(candidate?.applicationId || candidate?.application?.id, "talent_application_required");
       const retention = new Date();
       retention.setUTCFullYear(retention.getUTCFullYear() + 2);
-      const payload = await client.request(`/api/v1/talent-pools/${encodeURIComponent(id)}/memberships`, {
-        method: "POST",
-        body: {
+      const body = {
           candidate_id: candidateId,
           source_application_id: sourceApplicationId,
           owner_id: requireId(ownerId, "talent_owner_required"),
@@ -210,10 +253,11 @@ export function createTalentController({ client = apiClient, idSource = () => gl
           reason: "由招聘人员加入人才库",
           next_contact_at: null,
           retention_until: retention.toISOString(),
-        },
-        idempotencyKey: idSource(),
-        ...options,
-      });
+      };
+      const intent = `membership:add:${id}:${candidateId}:${sourceApplicationId}`;
+      const payload = await mutate(intent, body, (idempotencyKey, retainedBody) => client.request(`/api/v1/talent-pools/${encodeURIComponent(id)}/memberships`, {
+        method: "POST", body: retainedBody, idempotencyKey, ...options,
+      }));
       return normalizeTalentMembership(payload?.data);
     },
     async updateMembership(updated, options = {}) {
@@ -239,12 +283,12 @@ export function createTalentController({ client = apiClient, idSource = () => gl
     },
     async reactivate(memberId, jobId, options = {}) {
       const id = requireId(memberId, "talent_membership_required");
-      const payload = await client.request(`/api/v1/talent-pool-memberships/${encodeURIComponent(id)}/reactivations`, {
-        method: "POST",
-        body: { job_id: requireId(jobId, "talent_job_required") },
-        idempotencyKey: idSource(),
-        ...options,
-      });
+      const targetJobId = requireId(jobId, "talent_job_required");
+      const intent = `membership:reactivate:${id}:${targetJobId}`;
+      const body = { job_id: targetJobId };
+      const payload = await mutate(intent, body, (idempotencyKey, retainedBody) => client.request(`/api/v1/talent-pool-memberships/${encodeURIComponent(id)}/reactivations`, {
+        method: "POST", body: retainedBody, idempotencyKey, ...options,
+      }));
       return payload?.data ?? null;
     },
   };

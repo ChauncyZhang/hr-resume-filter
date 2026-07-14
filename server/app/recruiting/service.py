@@ -262,8 +262,14 @@ def patch_application_record(db, organization_id, application_id, changes, *, ex
 
 
 def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):
-    from server.app.recruiting.models import Application, Resume
+    from server.app.recruiting.models import Application, Candidate, Resume
 
+    db.scalar(
+        select(Candidate.id).where(
+            Candidate.organization_id == organization_id,
+            Candidate.id == candidate_id,
+        ).with_for_update()
+    )
     resume = db.scalar(select(Resume).where(Resume.organization_id == organization_id, Resume.id == resume_id))
     if resume is None or resume.candidate_id != candidate_id:
         raise InvalidAggregateRelationship

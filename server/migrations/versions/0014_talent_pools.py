@@ -138,6 +138,39 @@ def downgrade():
     op.execute("DROP FUNCTION validate_application_source()")
     op.drop_constraint("fk_applications_source_candidate", "applications", type_="foreignkey")
     op.drop_constraint("uq_applications_tenant_id_candidate", "applications", type_="unique")
+    # Revision 0013 cannot represent cross-job source links. Preserve that
+    # provenance in the application history before clearing the incompatible FK.
+    op.execute(
+        """
+        INSERT INTO application_stage_events(
+            id, organization_id, application_id, actor_user_id,
+            event_type, payload, created_at
+        )
+        SELECT
+            gen_random_uuid(), target.organization_id, target.id, target.owner_id,
+            'application.source_detached_for_downgrade',
+            jsonb_build_object(
+                'source_application_id', target.source_application_id::text,
+                'reason', 'cross_job_source_not_supported_before_0014'
+            ),
+            now()
+        FROM applications target
+        JOIN applications source
+          ON source.organization_id = target.organization_id
+         AND source.id = target.source_application_id
+        WHERE source.job_id <> target.job_id
+        """
+    )
+    op.execute(
+        """
+        UPDATE applications target
+        SET source_application_id = NULL
+        FROM applications source
+        WHERE source.organization_id = target.organization_id
+          AND source.id = target.source_application_id
+          AND source.job_id <> target.job_id
+        """
+    )
     op.create_foreign_key(
         "applications_organization_id_source_application_id_candida_fkey",
         "applications",

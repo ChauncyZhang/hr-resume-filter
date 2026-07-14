@@ -37,7 +37,11 @@ import { candidateController as defaultCandidateController } from "./candidateCo
 import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
 import { deriveCandidateInterviews, interviewController as defaultInterviewController, selectSchedulableCandidates } from "./interviewController.js";
-import { talentController as defaultTalentController } from "./talentController.js";
+import {
+  selectExactTalentPool,
+  selectServerTalentCandidates,
+  talentController as defaultTalentController,
+} from "./talentController.js";
 import { reportController as defaultReportController } from "./reportController.js";
 import {
   appendJobPage,
@@ -193,6 +197,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [talentPools, setTalentPools] = useState([]);
   const [talentMemberships, setTalentMemberships] = useState([]);
   const [selectedPoolId, setSelectedPoolId] = useState(null);
+  const [talentAddDialog, setTalentAddDialog] = useState(null);
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [screeningViewState, setScreeningViewState] = useState(null);
@@ -591,18 +596,34 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   }
 
   async function addCandidatesToTalentPool(candidateIds, poolId = null) {
+    if (!poolId) {
+      setTalentAddDialog({ candidateIds, pools: [], selectedPoolId: "", status: "loading", error: "" });
+      try {
+        const page = await talentController.listPools({ limit: 100 });
+        setTalentAddDialog({ candidateIds, pools: page.records, selectedPoolId: "", status: "ready", error: "" });
+      } catch {
+        setTalentAddDialog({ candidateIds, pools: [], selectedPoolId: "", status: "error", error: "人才库加载失败，请重试" });
+      }
+      return false;
+    }
     try {
       const page = await talentController.listPools({ limit: 100 });
-      const pool = page.records.find((item) => item.id === poolId) || page.records[0];
-      if (!pool) { notify("请先创建一个人才库"); return; }
-      const selected = candidateIds.map((id) => candidateRecords.find((item) => item.id === id || item.candidateId === id)).filter((item) => item?.serverBacked);
+      const pool = selectExactTalentPool(page.records, poolId);
+      if (!pool) { notify("目标人才库不存在或当前不可见，请重新选择"); return false; }
+      const selected = selectServerTalentCandidates(
+        [...candidateRecords, selectedCandidate].filter(Boolean),
+        candidateIds,
+      );
+      if (!selected.length) { notify("未找到可加入的人才档案"); return false; }
       let additions = 0;
       for (const candidate of selected) {
         try { await talentController.addMembership(pool.id, candidate, session.user?.id); additions += 1; } catch (error) { if (error?.code !== "talent_pool_membership_exists") throw error; }
       }
       notify(additions ? `已将 ${additions} 位候选人加入“${pool.name}”` : `候选人已在“${pool.name}”中`);
+      return true;
     } catch {
       notify("加入人才库失败，请检查权限和网络后重试");
+      return false;
     }
   }
 
@@ -812,6 +833,18 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
       </main>
 
       {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onRunCreated={persistRecentServerTask} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} onNotify={notify} actorName={roleIdentity.name} />}
+
+      {talentAddDialog && (
+        <Modal
+          title="加入人才库"
+          onClose={() => setTalentAddDialog(null)}
+          footer={<><button className="button secondary" type="button" onClick={() => setTalentAddDialog(null)}>取消</button><button className="button primary" type="button" disabled={talentAddDialog.status !== "ready" || !talentAddDialog.selectedPoolId} onClick={async () => { setTalentAddDialog((current) => ({ ...current, status: "submitting" })); const added = await addCandidatesToTalentPool(talentAddDialog.candidateIds, talentAddDialog.selectedPoolId); if (added) setTalentAddDialog(null); else setTalentAddDialog((current) => current ? ({ ...current, status: "ready" }) : current); }}>确认加入</button></>}
+        >
+          {talentAddDialog.status === "loading" && <p role="status">正在加载可用人才库...</p>}
+          {talentAddDialog.status === "error" && <p className="field-error" role="alert">{talentAddDialog.error}</p>}
+          {(talentAddDialog.status === "ready" || talentAddDialog.status === "submitting") && <label>目标人才库<select aria-label="目标人才库" value={talentAddDialog.selectedPoolId} disabled={talentAddDialog.status === "submitting"} onChange={(event) => setTalentAddDialog((current) => ({ ...current, selectedPoolId: event.target.value }))}><option value="">请选择人才库</option>{talentAddDialog.pools.map((pool) => <option key={pool.id} value={pool.id}>{pool.name}</option>)}</select></label>}
+        </Modal>
+      )}
 
       {modal === "duplicates" && (
         <Modal title="处理重复候选人" onClose={() => setModal(null)} footer={<><button className="button secondary" type="button" onClick={() => setModal(null)}>暂不处理</button><button className="button primary" type="button" onClick={() => { setModal(null); notify("2 组候选人已合并"); }}>确认合并</button></>}>
