@@ -14,7 +14,13 @@ from server.app.queue.models import BackgroundJob
 from server.app.recruiting.models import Application, Candidate, FileObject, IdempotencyRecord, Resume
 from server.app.recruiting.service import persisted_idempotent
 from server.app.reports.models import ExportRecord
-from server.app.reports.service import authorized_job_ids, create_export_record, recruiting_funnel
+from server.app.reports.service import (
+    authorized_job_ids,
+    consume_export_ticket,
+    create_export_record,
+    issue_export_ticket,
+    recruiting_funnel,
+)
 
 
 pytestmark = pytest.mark.skipif(
@@ -169,3 +175,63 @@ def test_postgres_report_scope_and_concurrent_idempotent_export_creation(reports
                 IdempotencyRecord.operation == "report_export.create"
             )
         ) == 1
+
+
+def test_postgres_concurrent_ticket_consumption_allows_one_storage_read(reports_db) -> None:
+    principal, allowed_job_id = _seed_scope(reports_db)
+    now = datetime.now(timezone.utc)
+
+    class Clock:
+        def current_time(self):
+            return now
+
+    class Tokens:
+        def new_token(self):
+            return "concurrent-report-download-token"
+
+    with Session(reports_db) as db:
+        export = create_export_record(
+            db,
+            principal,
+            [allowed_job_id],
+            None,
+            None,
+            "ticket-race-trace",
+            "ticket-race-key",
+        )
+        export.status = "succeeded"
+        export.object_key = f"exports/{principal.organization_id}/{export.id}.csv"
+        export.completed_at = now
+        raw = issue_export_ticket(db, export, principal, Clock(), Tokens())
+        db.commit()
+        export_id = export.id
+
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+    reads = 0
+    lock = threading.Lock()
+
+    def consume_once() -> None:
+        nonlocal reads
+        with Session(reports_db) as db:
+            export = db.get(ExportRecord, export_id)
+            barrier.wait()
+            try:
+                consume_export_ticket(db, raw, principal, export, Clock())
+                with lock:
+                    reads += 1
+                    outcomes.append("read")
+                db.commit()
+            except LookupError:
+                db.rollback()
+                with lock:
+                    outcomes.append("denied")
+
+    threads = [threading.Thread(target=consume_once) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert reads == 1
+    assert sorted(outcomes) == ["denied", "read"]
