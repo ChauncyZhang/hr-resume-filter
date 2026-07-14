@@ -311,6 +311,14 @@ def persisted_idempotent(db, organization_id, user_id, operation, key, body, act
         db.execute(text("select pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key})
     record = db.scalar(select(IdempotencyRecord).where(IdempotencyRecord.organization_id == organization_id, IdempotencyRecord.user_id == user_id, IdempotencyRecord.operation == operation, IdempotencyRecord.idempotency_key == key).with_for_update())
     if record:
+        expires_at = record.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            db.delete(record)
+            db.flush()
+            record = None
+    if record:
         if record.request_hash != request_hash:
             raise IdempotencyConflict
         return record.status_code, record.response_json

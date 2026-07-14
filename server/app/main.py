@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import hashlib
+import hmac
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -24,6 +26,8 @@ from server.app.recruiting.storage import MinioResumeStorage
 from server.app.recruiting.http import derive_cursor_key
 from server.app.talent.api import router as talent_router
 from server.app.reports.api import router as reports_router
+from server.app.governance.api import router as governance_router
+from server.app.governance.service import GovernanceTokenCodec
 
 
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -92,6 +96,10 @@ def create_app(
     cursor_secret = settings.contact_lookup_secret.get_secret_value()
     cursor_source = cursor_secret.encode() if cursor_secret != "change-me" else b"test-only-cursor-signing-boundary"
     app.state.recruiting_cursor = CursorCodec(derive_cursor_key(cursor_source))
+    governance_key = hmac.new(
+        cursor_source, b"ux09/governance/tokens/v1", hashlib.sha256
+    ).digest()
+    app.state.governance_tokens = GovernanceTokenCodec(governance_key)
     app.state.contact_cipher = ContactCipher(
         settings.contact_encryption_key.get_secret_value().encode(),
         settings.contact_lookup_secret.get_secret_value().encode(),
@@ -119,10 +127,18 @@ def create_app(
     app.include_router(interview_router)
     app.include_router(talent_router)
     app.include_router(reports_router)
+    app.include_router(governance_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):
-        return problem(request, 422, "validation_failed", "The request is invalid.")
+        response = problem(request, 422, "validation_failed", "The request is invalid.")
+        if request.url.path in {
+            "/api/v1/audit-logs",
+            "/api/v1/settings/retention-policy",
+            "/api/v1/settings/retention-policy/previews",
+        }:
+            response.headers["Cache-Control"] = "no-store"
+        return response
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -157,6 +173,12 @@ def create_app(
                     response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
         if response is None:
             response = await call_next(request)
+        if request.url.path in {
+            "/api/v1/audit-logs",
+            "/api/v1/settings/retention-policy",
+            "/api/v1/settings/retention-policy/previews",
+        }:
+            response.headers["Cache-Control"] = "no-store"
         response.headers["X-Trace-ID"] = trace_id
         logger.info(
             "request_complete",
