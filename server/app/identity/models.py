@@ -33,6 +33,7 @@ class Organization(Timestamped, Base):
     slug: Mapped[str] = mapped_column(String(100), unique=True)
     name: Mapped[str] = mapped_column(String(200))
     status: Mapped[str] = mapped_column(String(32), default="active")
+    retention_policy_id: Mapped[uuid.UUID] = mapped_column(Uuid, default=uuid.uuid4, nullable=False)
 
 
 class Department(Timestamped, Base):
@@ -166,8 +167,12 @@ class AuditLog(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     organization_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"))
     actor_user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    category: Mapped[str] = mapped_column(String(32), default="system", nullable=False)
     event_type: Mapped[str] = mapped_column(String(100))
     outcome: Mapped[str] = mapped_column(String(32))
+    resource_type: Mapped[str | None] = mapped_column(String(64))
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    ip_hash: Mapped[str | None] = mapped_column(String(64))
     trace_id: Mapped[str | None] = mapped_column(String(64))
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

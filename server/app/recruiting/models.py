@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, ForeignKeyConstraint, Index, Integer, LargeBinary, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
@@ -23,6 +23,7 @@ class Candidate(Record, Base):
     location: Mapped[str | None] = mapped_column(String(200))
     owner_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     version: Mapped[int] = mapped_column(Integer, default=1)
+    retention_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
     __table_args__ = (UniqueConstraint("organization_id", "id"), ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]))
 
@@ -139,4 +140,11 @@ class IdempotencyRecord(Record, Base):
     request_hash: Mapped[str] = mapped_column(String(64))
     status_code: Mapped[int] = mapped_column(Integer)
     response_json: Mapped[dict] = mapped_column(JSON)
-    __table_args__ = (UniqueConstraint("organization_id", "user_id", "operation", "idempotency_key"), ForeignKeyConstraint(["organization_id", "user_id"], ["users.organization_id", "users.id"]))
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: now() + timedelta(hours=24)
+    )
+    __table_args__ = (
+        UniqueConstraint("organization_id", "user_id", "operation", "idempotency_key"),
+        ForeignKeyConstraint(["organization_id", "user_id"], ["users.organization_id", "users.id"]),
+        Index("ix_idempotency_records_expires_at", "organization_id", "expires_at"),
+    )
