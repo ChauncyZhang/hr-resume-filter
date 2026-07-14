@@ -47,6 +47,9 @@ def create_app(
     export_storage=None,
 ) -> FastAPI:
     settings = settings or Settings.from_environment()
+    from server.app.governance.orm import register_governance_orm
+
+    register_governance_orm()
 
     if database_probe is None or storage_probe is None:
         from server.app.core.storage import ObjectStorageProbe, create_storage_client

@@ -5,13 +5,19 @@ import uuid
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
+from server.app.core.settings import Settings
 from server.app.identity.bootstrap import bootstrap_system_admin
-from server.app.identity.store import IdentityStore
+from server.app.main import create_app
 
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured"
 )
+
+
+class _Probe:
+    async def check(self) -> None:
+        pass
 
 
 def _alembic(url: str, *args: str) -> None:
@@ -314,6 +320,7 @@ def test_0016_round_trips_every_normalized_resource_type() -> None:
         ("resume.previewed", "resume", "resume_id"),
         ("screening.run_created", "screening_run", "run_id"),
         ("screening.item_accepted", "screening_item", "item_id"),
+        ("screening.item_rejected", "screening_run", "run_id"),
         ("interview.created", "interview", "interview_id"),
         ("talent_pool.created", "talent_pool", "pool_id"),
         ("talent_pool.member_added", "talent_pool_membership", "membership_id"),
@@ -412,8 +419,17 @@ def test_bootstrap_creates_matching_default_policy_at_head() -> None:
     _alembic(url, "downgrade", "base")
     _alembic(url, "upgrade", "head")
 
+    app = create_app(
+        settings=Settings(
+            environment="test",
+            database_url=url,
+            cors_origins=["https://hr.example.test"],
+        ),
+        database_probe=_Probe(),
+        storage_probe=_Probe(),
+    )
     user_id = bootstrap_system_admin(
-        IdentityStore(url),
+        app.state.identity_store,
         "bootstrap-policy",
         "Bootstrap policy",
         "bootstrap-policy@test",

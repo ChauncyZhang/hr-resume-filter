@@ -82,17 +82,17 @@ def _resource_type_sql() -> str:
 def _resource_id_sql() -> str:
     return """
         CASE
-          WHEN event_type LIKE 'candidate.%' THEN metadata_json ->> 'candidate_id'
-          WHEN event_type LIKE 'application.%' THEN metadata_json ->> 'application_id'
-          WHEN event_type LIKE 'job.%' THEN metadata_json ->> 'job_id'
-          WHEN event_type LIKE 'resume.%' THEN metadata_json ->> 'resume_id'
-          WHEN event_type LIKE 'screening.item_%' THEN metadata_json ->> 'item_id'
-          WHEN event_type LIKE 'screening.%' THEN metadata_json ->> 'run_id'
-          WHEN event_type LIKE 'interview.%' THEN metadata_json ->> 'interview_id'
-          WHEN event_type LIKE 'talent_pool.member_%' THEN metadata_json ->> 'membership_id'
-          WHEN event_type LIKE 'talent_pool.%' THEN metadata_json ->> 'pool_id'
-          WHEN event_type LIKE 'report_export.%' THEN metadata_json ->> 'export_id'
-          WHEN event_type LIKE 'llm.%' THEN metadata_json ->> 'config_id'
+          WHEN event_type LIKE 'candidate.%' AND metadata_json ? 'candidate_id' THEN metadata_json ->> 'candidate_id'
+          WHEN event_type LIKE 'application.%' AND metadata_json ? 'application_id' THEN metadata_json ->> 'application_id'
+          WHEN event_type LIKE 'job.%' AND metadata_json ? 'job_id' THEN metadata_json ->> 'job_id'
+          WHEN event_type LIKE 'resume.%' AND metadata_json ? 'resume_id' THEN metadata_json ->> 'resume_id'
+          WHEN event_type LIKE 'screening.item_%' AND metadata_json ? 'item_id' THEN metadata_json ->> 'item_id'
+          WHEN event_type LIKE 'screening.%' AND metadata_json ? 'run_id' THEN metadata_json ->> 'run_id'
+          WHEN event_type LIKE 'interview.%' AND metadata_json ? 'interview_id' THEN metadata_json ->> 'interview_id'
+          WHEN event_type LIKE 'talent_pool.member_%' AND metadata_json ? 'membership_id' THEN metadata_json ->> 'membership_id'
+          WHEN event_type LIKE 'talent_pool.%' AND metadata_json ? 'pool_id' THEN metadata_json ->> 'pool_id'
+          WHEN event_type LIKE 'report_export.%' AND metadata_json ? 'export_id' THEN metadata_json ->> 'export_id'
+          WHEN event_type LIKE 'llm.%' AND metadata_json ? 'config_id' THEN metadata_json ->> 'config_id'
           ELSE NULL
         END
     """

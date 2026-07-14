@@ -14,4 +14,8 @@ class IdentityStore:
         self.sync_session: sessionmaker[Session] = sessionmaker(self.engine, expire_on_commit=False)
 
     def create_schema(self) -> None:
+        if self.engine.dialect.name != "sqlite":
+            raise RuntimeError(
+                "ORM schema creation is SQLite-only; use Alembic for non-SQLite databases"
+            )
         Base.metadata.create_all(self.engine)

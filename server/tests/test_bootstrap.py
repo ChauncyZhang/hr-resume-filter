@@ -1,6 +1,10 @@
+import pytest
+
+from server.app.governance.models import RetentionPolicy
 from server.app.identity.bootstrap import bootstrap_system_admin
-from server.app.identity.models import AuditLog, User
+from server.app.identity.models import AuditLog, Organization, User
 from server.app.identity.security import PasswordService
+from server.app.identity.store import IdentityStore
 from server.tests.test_identity import identity_app
 
 
@@ -18,3 +22,16 @@ def test_bootstrap_is_explicit_and_rotates_selected_admin(identity_app) -> None:
             "bootstrap.admin_created",
             "bootstrap.admin_rotated",
         ]
+        organization = session.query(Organization).one()
+        policy = session.query(RetentionPolicy).one()
+        assert organization.retention_policy_id == policy.id
+        assert policy.organization_id == organization.id
+        assert policy.version == 1
+        assert policy.updated_by is None
+
+
+def test_orm_schema_creation_rejects_non_sqlite_dialects() -> None:
+    store = IdentityStore("sqlite://")
+    store.engine.dialect.name = "postgresql"
+    with pytest.raises(RuntimeError, match="Alembic"):
+        store.create_schema()
