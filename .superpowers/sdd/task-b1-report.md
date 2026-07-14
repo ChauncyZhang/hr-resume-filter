@@ -2,12 +2,13 @@
 
 ## Status
 
-DONE
+DONE_WITH_CONCERNS
 
 ## Commits
 
 - `52df461` — `feat(governance): add deletion foundation`
 - Report: committed separately after this report was written.
+- `0228262` — `fix(governance): harden deletion foundation`
 
 ## Files changed
 
@@ -16,8 +17,14 @@ DONE
 - `server/migrations/versions/0017_governance_deletion.py`
 - `server/tests/test_governance_deletion_models.py`
 - `server/tests/test_governance_deletion_migration.py`
+- `server/tests/test_deploy_database_identity.py`
 - `server/app/governance/__init__.py`
 - `server/app/recruiting/models.py`
+- `deploy/compose.yaml`
+- `deploy/.env.example`
+- `deploy/postgres/provision-app-role.sh`
+- `server/Dockerfile`
+- `server/README.md`
 - `.superpowers/sdd/task-b1-report.md`
 
 The pre-existing user modifications in `.superpowers/sdd/task-1-report.md`, `.superpowers/sdd/task-2-report.md`, and `app/sample/candidates.csv` were left unstaged and untouched.
@@ -85,3 +92,45 @@ An initial host-Python attempt was an environment error because the default Pyth
 
 - The privileged redaction function deliberately remains fail-closed until B2; no redaction or audit-trigger exception path exists in this task.
 - External ClamAV and MinIO smoke integrations were not configured, accounting for all four full-suite skips; they are unrelated to the Task B1 database/domain surface.
+
+## Review-fix RED evidence
+
+- `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_models.py server/tests/test_deploy_database_identity.py -q`
+  - RED: `6 failed, 30 passed in 6.69s`; failures proved count coercion/overflow, length-only ORM hash validation, and API/worker use of bootstrap database credentials.
+- `docker run --rm -e POSTGRES_SMOKE_URL=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_migration.py -q -k 'dynamically or lowercase_hex or downgrade_waits'`
+  - After correcting a test-only multi-statement psycopg setup error, RED was `5 failed, 2 passed, 9 deselected in 142.42s`; uppercase/non-hex hashes were accepted and downgrade never waited for an audit-table lock.
+- `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_deploy_database_identity.py -q -k shared_owner`
+  - RED: `2 failed, 3 deselected in 0.98s`; the role script reached `psql` instead of rejecting shared owner/app identities and passwords.
+
+## Review-fix GREEN and gate evidence
+
+- Pure model/domain plus Compose contract:
+  - `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_models.py server/tests/test_deploy_database_identity.py -q`
+  - `36 passed in 4.02s` before the final distinct-credential guard; the final deploy-only gate was `5 passed in 1.72s`.
+- Provision script idempotency:
+  - Copied `deploy/postgres/provision-app-role.sh` into isolated PostgreSQL 16.9 container `ux09-b1-review-pg` and ran it twice with distinct test-only owner/app credentials.
+  - Both runs exited `0`.
+- Complete focused PostgreSQL gate:
+  - `docker run --rm -e POSTGRES_SMOKE_URL=... -e APP_DB_TEST_USER=ux09_app -e APP_DB_TEST_PASSWORD=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_models.py server/tests/test_deploy_database_identity.py server/tests/test_governance_deletion_migration.py -q --durations=10`
+  - `48 passed in 298.59s`.
+- Final role/pure regression gate after the credential guard:
+  - `docker run --rm -e POSTGRES_SMOKE_URL=... -e APP_DB_TEST_USER=ux09_app -e APP_DB_TEST_PASSWORD=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_models.py server/tests/test_deploy_database_identity.py server/tests/test_governance_deletion_migration.py::test_provisioned_application_role_is_unprivileged_and_cannot_mutate_evidence -q`
+  - `39 passed in 15.53s`.
+- Full backend PostgreSQL suite:
+  - `docker run --rm -e POSTGRES_SMOKE_URL=... -e APP_DB_TEST_USER=ux09_app -e APP_DB_TEST_PASSWORD=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests -q --durations=20`
+  - The run recorded one failure by 11% and was stopped after remaining CPU-bound progress stalled at 81% beyond 25 minutes.
+  - Diagnostic rerun: `docker run --rm -e POSTGRES_SMOKE_URL=... -e APP_DB_TEST_USER=ux09_app -e APP_DB_TEST_PASSWORD=... -v "${PWD}:/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests -x -vv`
+  - `1 failed, 10 passed, 1 skipped in 25.38s`: pre-existing `server/tests/test_governance_api.py::test_real_candidate_writer_is_recruiting_visible_for_role_union_only` expected `candidate.created` but received an empty recruiter audit list. The same test failed alone (`1 failed in 9.84s`) and no Task B1 review-fix file changes that API path.
+- Compile, Compose, shell, and diff checks:
+  - `docker build --target test -t ux09-server-test -f server/Dockerfile .` — passed.
+  - `docker run --rm ... ux09-server-test python -m compileall -q <changed Python files>` — passed.
+  - `docker run --rm -v "${PWD}:/opt/ux09" -w /opt/ux09 postgres:16.9-alpine sh -n deploy/postgres/provision-app-role.sh` — passed.
+  - `docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet` — passed.
+  - Scoped `git diff --check` and staged `git diff --cached --check` — passed.
+
+## Review-fix behavior and remaining concern
+
+- API/worker Compose URLs now use a dedicated LOGIN app role. PostgreSQL bootstrap/migrations retain the owner role; Alembic creates no roles or passwords. The idempotent operator script reconciles least-privilege table/sequence grants, excludes audit UPDATE/DELETE and function grants, and rejects shared owner/app credentials.
+- Downgrade takes deterministic `ACCESS EXCLUSIVE` locks on `audit_logs`, `candidates`, and all four Task B tables before checking evidence. The coordinated writer test proves downgrade waits, observes the committed evidence, refuses, and leaves all additive objects intact.
+- Tests now generate the full 25-edge state matrix and dynamically discover/assert all eight required composite tenant FK families. Manifest counts require exact bounded integers, and manifest hashes require exactly 64 lowercase hexadecimal characters in ORM and PostgreSQL constraints.
+- Remaining concern: the unrelated governance audit visibility test prevents a clean full-backend claim. All Task B1 focused PostgreSQL, pure, Compose, compile, shell, and diff gates pass.
