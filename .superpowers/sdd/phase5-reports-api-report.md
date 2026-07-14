@@ -2,7 +2,7 @@
 
 ## Status
 
-`DONE_WITH_CONCERNS`
+`DONE`
 
 Implemented the scoped reports/export API, persistent export/audit records, safe CSV generation, private one-time download flow, and PostgreSQL migration/tests.
 
@@ -20,6 +20,9 @@ Implemented the scoped reports/export API, persistent export/audit records, safe
 - `server/tests/test_reports_api.py`: SQLite API, authorization, metric, audit, CSV, idempotency, and download tests.
 - `server/tests/test_reports_api_postgres.py`: PostgreSQL tenant/job-scope and concurrent idempotency test.
 - `server/tests/test_reports_migration.py`: PostgreSQL upgrade/downgrade/upgrade test.
+- `server/app/worker/main.py`: validated transactional `reports.export` handler and production handler-map registration.
+- `server/tests/test_reports_worker.py`: end-to-end handler-map generation and permanent/retryable safe-failure coverage.
+- `server/tests/test_screening_worker.py`: production handler allowlist updated for `reports.export`.
 
 ## API And Data Behavior
 
@@ -30,6 +33,7 @@ Implemented the scoped reports/export API, persistent export/audit records, safe
 - CSV output includes application/job/candidate opaque IDs, candidate display name, stage, source, and creation time. It excludes contacts and resume text.
 - Every cell beginning with `=`, `+`, `-`, `@`, tab, or carriage return is prefixed with a single quote.
 - Export API responses never expose object keys or permanent URLs. Audit metadata contains only export ID and job count for creation, and export ID for download.
+- The deployed worker map now consumes `reports.export`, validates opaque tenant/export IDs, generates through the private export storage adapter in a synchronous SQLAlchemy transaction, and commits the export state only after storage succeeds.
 
 ## Authorization And Security
 
@@ -55,12 +59,17 @@ Implemented the scoped reports/export API, persistent export/audit records, safe
 - `python -m compileall -q server/app server/tests server/migrations/versions` in the Python 3.12 test image -> exit 0.
 - `git diff --cached --check` before the implementation commit -> exit 0.
 - A broader combined recruiting/interview run exceeded the 120-second command limit and produced no usable result; it is not reported as passing.
+- Worker follow-up RED: `test_reports_worker.py` + `test_screening_worker.py` -> 7 failed because `reports.export` and `ReportExportJobHandler` were absent.
+- Worker follow-up focused GREEN: the same files -> 7 passed in 11.38s.
+- Worker/report compatibility gate: `test_reports_worker.py`, `test_screening_worker.py`, `test_worker.py`, and `test_reports_api.py` -> 24 passed in 20.02s.
+- Worker/report compile gate: `python -m compileall -q server/app/worker server/app/reports server/tests/test_reports_worker.py server/tests/test_screening_worker.py` -> exit 0.
 
 ## Commits
 
 - `57800a9` - `feat(server): add scoped recruiting reports and exports`
+- `69949f6` - `fix(worker): process report export jobs`
 
-## Unresolved Concerns
+## Resolved Concerns
 
-- The assigned API slice creates the durable `reports.export` job and implements/test-drives `generate_export`, but the current shared worker handler map does not yet register `reports.export`. The worker owner must register this handler before queued exports complete automatically in a deployed runtime.
-- Migration `0015_reports_exports` intentionally follows the concurrent, currently uncommitted `0014_talent_pools` migration already present in the shared worktree. Integration requires that Phase 5 talent migration to land first.
+- `reports.export` is registered alongside screening handlers in `_run`; malformed tenant/export payloads and missing/unauthorized records fail permanently with non-disclosing safe codes, while storage and transient database failures remain retryable.
+- Migration `0014_talent_pools` landed in `e1f7901`, so `0015_reports_exports` now has a committed down revision.
