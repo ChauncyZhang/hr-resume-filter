@@ -105,9 +105,6 @@ def _apply_application_transition(db, application, target, *, actor_user_id, tra
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import ApplicationStageEvent
 
-    lock_candidate_retention_facts(
-        db, application.organization_id, application.candidate_id
-    )
     source = application.stage
     RecruitingService().transition_application_state(source, target, reason_code=reason_code, reason_text=reason_text)
     application.stage = target
@@ -128,11 +125,31 @@ def _apply_application_transition(db, application, target, *, actor_user_id, tra
     return application
 
 
-def transition_application_record(db, application_id, target, *, expected_version, actor_user_id, trace_id, reason_code=None, reason_text=None):
+def transition_application_record(db, organization_id, application_id, target, *, expected_version, actor_user_id, trace_id, reason_code=None, reason_text=None):
     from server.app.recruiting.models import Application
 
-    application = db.scalar(select(Application).where(Application.id == application_id).with_for_update())
-    if application is None or application.version != expected_version:
+    candidate_id = db.scalar(
+        select(Application.candidate_id).where(
+            Application.organization_id == organization_id,
+            Application.id == application_id,
+        )
+    )
+    if candidate_id is None:
+        raise ResourceVersionConflict
+    lock_candidate_retention_facts(db, organization_id, candidate_id)
+    application = db.scalar(
+        select(Application)
+        .where(
+            Application.organization_id == organization_id,
+            Application.id == application_id,
+        )
+        .with_for_update()
+    )
+    if (
+        application is None
+        or application.candidate_id != candidate_id
+        or application.version != expected_version
+    ):
         raise ResourceVersionConflict
     return _apply_application_transition(db, application, target, actor_user_id=actor_user_id, trace_id=trace_id, reason_code=reason_code, reason_text=reason_text)
 

@@ -355,6 +355,9 @@ def _advance_application_if_interviews_complete(
     actor_user_id: UUID,
     trace_id: str,
 ) -> bool:
+    candidate_id = _lock_application_candidate_retention(
+        db, organization_id, application_id
+    )
     application = db.scalar(
         select(Application)
         .where(
@@ -363,7 +366,7 @@ def _advance_application_if_interviews_complete(
         )
         .with_for_update()
     )
-    if application is None:
+    if application is None or application.candidate_id != candidate_id:
         raise InvalidStateTransition
     active_statuses = db.scalars(
         select(Interview.status).where(
@@ -377,6 +380,7 @@ def _advance_application_if_interviews_complete(
     if application.stage == "interviewing":
         transition_application_record(
             db,
+            organization_id,
             application.id,
             "decision",
             expected_version=application.version,
@@ -663,6 +667,9 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
             return _denied(request)
         try:
             def action():
+                candidate_id = _lock_application_candidate_retention(
+                    db, principal.organization_id, application.id
+                )
                 locked_application = db.scalar(
                     select(Application)
                     .where(
@@ -671,12 +678,10 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                     )
                     .with_for_update()
                 )
-                if locked_application is None:
-                    raise InvalidStateTransition
-                locked_candidate = lock_candidate_retention_facts(
-                    db, principal.organization_id, locked_application.candidate_id
-                )
-                if locked_candidate is None:
+                if (
+                    locked_application is None
+                    or locked_application.candidate_id != candidate_id
+                ):
                     raise InvalidStateTransition
                 if not _lock_participants(db, principal.organization_id, participant_ids):
                     raise InvalidStateTransition
@@ -690,7 +695,7 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                     db,
                     principal.organization_id,
                     participant_ids,
-                    locked_candidate.id,
+                    candidate_id,
                     payload.starts_at,
                     payload.ends_at,
                 )
@@ -733,6 +738,7 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                 if locked_application.stage == "interview_pending":
                     transition_application_record(
                         db,
+                        principal.organization_id,
                         locked_application.id,
                         "interviewing",
                         expected_version=locked_application.version,
@@ -765,7 +771,7 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                 )
                 db.flush()
                 recalculate_candidate_retention(
-                    db, principal.organization_id, locked_candidate.id
+                    db, principal.organization_id, candidate_id
                 )
                 return 201, {"data": _interview_data(db, interview)}
 
@@ -824,6 +830,13 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
         interview = _load_interview(db, principal, interview_id, manage=True)
         if interview is None:
             return _denied(request)
+        application_id = interview.application_id
+        try:
+            candidate_id = _lock_application_candidate_retention(
+                db, principal.organization_id, application_id
+            )
+        except InvalidStateTransition:
+            return _denied(request)
         interview = db.scalar(
             select(Interview)
             .where(
@@ -832,6 +845,8 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             )
             .with_for_update()
         )
+        if interview is None or interview.application_id != application_id:
+            return _denied(request)
         if interview.version != expected:
             return problem(request, 409, "resource_version_conflict", "The interview changed. Refresh and retry.")
         if interview.status not in {"draft", "scheduled", "rescheduled", "confirmed"}:
@@ -850,12 +865,6 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             return problem(request, 422, "validation_failed", "meeting_url is required for video interviews.")
         if final_method == "onsite" and not final_location:
             return problem(request, 422, "validation_failed", "location is required for onsite interviews.")
-        application = db.get(Application, interview.application_id)
-        candidate = lock_candidate_retention_facts(
-            db, principal.organization_id, application.candidate_id
-        )
-        if candidate is None:
-            return _denied(request)
         participants = payload.participants
         if participants is None:
             participant_ids = list(
@@ -884,7 +893,7 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             db,
             principal.organization_id,
             participant_ids,
-            candidate.id,
+            candidate_id,
             starts_at,
             ends_at,
             exclude_interview_id=interview.id,
@@ -949,7 +958,7 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             )
             db.flush()
             recalculate_candidate_retention(
-                db, principal.organization_id, candidate.id
+                db, principal.organization_id, candidate_id
             )
             body = {"data": _interview_data(db, interview)}
             db.commit()
@@ -1029,6 +1038,10 @@ def transition_interview(
             return _denied(request)
         try:
             def action():
+                application_id = interview.application_id
+                candidate_id = _lock_application_candidate_retention(
+                    db, principal.organization_id, application_id
+                )
                 locked = db.scalar(
                     select(Interview)
                     .where(
@@ -1037,11 +1050,12 @@ def transition_interview(
                     )
                     .with_for_update()
                 )
-                if locked is None or locked.version != expected:
+                if (
+                    locked is None
+                    or locked.application_id != application_id
+                    or locked.version != expected
+                ):
                     raise ResourceVersionConflict
-                candidate_id = _lock_application_candidate_retention(
-                    db, principal.organization_id, locked.application_id
-                )
                 source = locked.status
                 target = payload.target
                 allowed = {
@@ -1413,6 +1427,10 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
             return _denied(request)
         try:
             def action():
+                application_id = interview.application_id
+                candidate_id = _lock_application_candidate_retention(
+                    db, principal.organization_id, application_id
+                )
                 locked_interview = db.scalar(
                     select(Interview)
                     .where(
@@ -1421,11 +1439,17 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                     )
                     .with_for_update()
                 )
-                if locked_interview is None or locked_interview.status != "pending_feedback":
+                if (
+                    locked_interview is None
+                    or locked_interview.application_id != application_id
+                    or locked_interview.status != "pending_feedback"
+                ):
                     raise InvalidStateTransition
-                candidate_id = _lock_application_candidate_retention(
-                    db, principal.organization_id, locked_interview.application_id
+                locked_participant = _assigned_participant(
+                    db, principal, interview_id, for_update=True
                 )
+                if locked_participant is None:
+                    raise InvalidStateTransition
                 feedback = db.scalar(
                     select(InterviewFeedback)
                     .where(
@@ -1449,7 +1473,7 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                 feedback.submitted_at = now
                 feedback.version += 1
                 feedback.updated_at = now
-                participant.task_status = "completed"
+                locked_participant.task_status = "completed"
                 db.flush()
 
                 required_ids = set(
@@ -1550,23 +1574,40 @@ def amend_feedback(feedback_id: UUID, payload: FeedbackAmendment, request: Reque
                 InterviewFeedback.id == feedback_id,
                 InterviewFeedback.author_id == principal.user_id,
             )
-            .with_for_update()
         )
         if feedback is None or _assigned_participant(db, principal, feedback.interview_id) is None:
+            return _denied(request)
+        interview_id = feedback.interview_id
+        application_id = db.scalar(
+            select(Interview.application_id).where(
+                Interview.organization_id == principal.organization_id,
+                Interview.id == interview_id,
+            )
+        )
+        if application_id is None:
+            return _denied(request)
+        candidate_id = _lock_application_candidate_retention(
+            db, principal.organization_id, application_id
+        )
+        feedback = db.scalar(
+            select(InterviewFeedback)
+            .where(
+                InterviewFeedback.organization_id == principal.organization_id,
+                InterviewFeedback.id == feedback_id,
+                InterviewFeedback.author_id == principal.user_id,
+            )
+            .with_for_update()
+        )
+        if (
+            feedback is None
+            or feedback.interview_id != interview_id
+            or _assigned_participant(db, principal, interview_id) is None
+        ):
             return _denied(request)
         if feedback.status not in {"submitted", "amended"}:
             return problem(request, 409, "invalid_state_transition", "Only submitted feedback can be amended.")
         if feedback.version != expected:
             return problem(request, 409, "resource_version_conflict", "The feedback changed. Refresh and retry.")
-        application_id = db.scalar(
-            select(Interview.application_id).where(
-                Interview.organization_id == principal.organization_id,
-                Interview.id == feedback.interview_id,
-            )
-        )
-        candidate_id = _lock_application_candidate_retention(
-            db, principal.organization_id, application_id
-        )
         previous = _feedback_document(feedback)
         changes = payload.model_dump(exclude={"reason"})
         now = datetime.now(timezone.utc)

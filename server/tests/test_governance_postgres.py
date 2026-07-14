@@ -8,19 +8,30 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from server.app.core.settings import Settings
 from server.app.governance import service as governance_service
 from server.app.governance.models import RetentionPolicy
+from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
 from server.app.governance.service import aware, candidate_due_dates
 from server.app.identity.models import AuditLog, Job, Organization, User, UserRole
 from server.app.identity.bootstrap import bootstrap_system_admin
+from server.app.interviews import api as interviews_api
 from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.main import create_app
 from server.app.recruiting.models import Application, Candidate, FileObject, IdempotencyRecord, Resume
-from server.app.recruiting.service import create_application_record, persisted_idempotent
-from server.app.talent.models import TalentPool
+from server.app.recruiting import service as recruiting_service
+from server.app.recruiting.service import (
+    ResourceVersionConflict,
+    create_application_record,
+    patch_application_record,
+    persisted_idempotent,
+    transition_application_record,
+)
+from server.app.talent import api as talent_api
+from server.app.talent.models import TalentPool, TalentPoolMembership
 
 
 pytestmark = pytest.mark.skipif(
@@ -476,4 +487,276 @@ def test_retention_patch_serializes_with_every_retention_fact_writer(
     with Session(engine) as db:
         candidate = db.get(Candidate, ids["candidate_id"])
         expected = candidate_due_dates(db, ids["organization_id"], 400)[ids["candidate_id"]]
+        assert aware(candidate.retention_due_at) == aware(expected)
+
+
+def test_single_candidate_recalculation_does_not_touch_or_wait_on_other_candidate(
+    postgres_app,
+) -> None:
+    _, engine = postgres_app
+    ids = _seed_concurrent_retention_fact_writers(engine)
+    with Session(engine) as db:
+        other = Candidate(
+            organization_id=ids["organization_id"],
+            display_name="Unrelated candidate",
+            owner_id=ids["user_id"],
+            retention_due_at=datetime.now(timezone.utc) + timedelta(days=700),
+        )
+        db.add(other)
+        db.commit()
+        other_id = other.id
+    def row_identity(candidate_id):
+        with engine.connect() as connection:
+            return connection.execute(
+                text(
+                    "SELECT retention_due_at, updated_at, version, xmin::text "
+                    "FROM candidates WHERE id = :id"
+                ),
+                {"id": candidate_id},
+            ).one()
+
+    def assert_isolated_recalculation(candidate_id, unrelated_id):
+        before = row_identity(unrelated_id)
+        blocker = Session(engine)
+        blocker.execute(text("SET LOCAL statement_timeout = '5s'"))
+        blocker.scalar(
+            select(Candidate).where(Candidate.id == unrelated_id).with_for_update()
+        )
+        completed = threading.Event()
+        errors = []
+
+        def recalculate_target():
+            try:
+                with Session(engine) as db:
+                    db.execute(text("SET LOCAL lock_timeout = '750ms'"))
+                    db.execute(text("SET LOCAL statement_timeout = '3s'"))
+                    lock_candidate_retention_facts(
+                        db, ids["organization_id"], candidate_id
+                    )
+                    recalculate_candidate_retention(
+                        db, ids["organization_id"], candidate_id
+                    )
+                    db.commit()
+            except Exception as error:
+                errors.append(error)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=recalculate_target)
+        thread.start()
+        assert completed.wait(3)
+        blocker.rollback()
+        blocker.close()
+        thread.join(3)
+
+        assert errors == []
+        assert row_identity(unrelated_id) == before
+
+    assert_isolated_recalculation(ids["candidate_id"], other_id)
+    assert_isolated_recalculation(other_id, ids["candidate_id"])
+
+
+def test_application_transition_and_patch_use_candidate_first_without_deadlock(
+    postgres_app, monkeypatch
+) -> None:
+    _, engine = postgres_app
+    ids = _seed_concurrent_retention_fact_writers(engine)
+    with Session(engine) as db:
+        application = db.get(Application, ids["application_id"])
+        application.stage = "new"
+        db.commit()
+
+    transition_before_candidate = threading.Event()
+    release_transition = threading.Event()
+    patch_done = threading.Event()
+    errors = {}
+    original_lock = recruiting_service.lock_candidate_retention_facts
+
+    def observed_lock(db, organization_id, candidate_id):
+        if threading.current_thread().name == "transition-writer":
+            transition_before_candidate.set()
+            assert release_transition.wait(5)
+        return original_lock(db, organization_id, candidate_id)
+
+    monkeypatch.setattr(
+        recruiting_service, "lock_candidate_retention_facts", observed_lock
+    )
+
+    def transition_writer():
+        try:
+            with Session(engine) as db:
+                db.execute(text("SET LOCAL lock_timeout = '2s'"))
+                db.execute(text("SET LOCAL statement_timeout = '5s'"))
+                transition_application_record(
+                    db,
+                    ids["organization_id"],
+                    ids["application_id"],
+                    "review",
+                    expected_version=1,
+                    actor_user_id=ids["user_id"],
+                    trace_id="transition-lock-order",
+                )
+                db.commit()
+        except Exception as error:
+            errors["transition"] = error
+
+    def patch_writer():
+        try:
+            with Session(engine) as db:
+                db.execute(text("SET LOCAL lock_timeout = '2s'"))
+                db.execute(text("SET LOCAL statement_timeout = '5s'"))
+                patch_application_record(
+                    db,
+                    ids["organization_id"],
+                    ids["application_id"],
+                    {"human_conclusion": "serialized"},
+                    expected_version=1,
+                    actor_user_id=ids["user_id"],
+                    trace_id="patch-lock-order",
+                )
+                db.commit()
+        except Exception as error:
+            errors["patch"] = error
+        finally:
+            patch_done.set()
+
+    transition_thread = threading.Thread(
+        target=transition_writer, name="transition-writer"
+    )
+    transition_thread.start()
+    assert transition_before_candidate.wait(5)
+    patch_thread = threading.Thread(target=patch_writer, name="patch-writer")
+    patch_thread.start()
+    patch_finished_before_release = patch_done.wait(1)
+    release_transition.set()
+    transition_thread.join(6)
+    patch_thread.join(6)
+
+    assert patch_finished_before_release
+    assert "patch" not in errors
+    assert isinstance(errors.get("transition"), ResourceVersionConflict)
+    assert not any(isinstance(error, OperationalError) for error in errors.values())
+    with Session(engine) as db:
+        candidate = db.get(Candidate, ids["candidate_id"])
+        expected = candidate_due_dates(
+            db, ids["organization_id"], 365
+        )[ids["candidate_id"]]
+        assert candidate.retention_due_at is expected is None
+
+
+@pytest.mark.parametrize("writer_kind", ["feedback", "talent"])
+def test_fact_writer_waits_for_candidate_before_locking_business_row(
+    postgres_app, writer_kind, monkeypatch
+) -> None:
+    app, engine = postgres_app
+    ids = _seed_concurrent_retention_fact_writers(engine)
+    with TestClient(app) as login_client:
+        headers = _login(login_client)
+        session_cookies = dict(login_client.cookies)
+    with Session(engine) as db:
+        membership = TalentPoolMembership(
+            organization_id=ids["organization_id"],
+            pool_id=ids["pool_id"],
+            candidate_id=ids["candidate_id"],
+            owner_id=ids["user_id"],
+            suitable_roles=["Engineer"],
+            tags=[],
+            reason="Existing fact",
+            retention_until=datetime.now(timezone.utc) + timedelta(days=800),
+        )
+        db.add(membership)
+        db.commit()
+        membership_id = membership.id
+
+    candidate_writer = Session(engine)
+    candidate_writer.execute(text("SET LOCAL lock_timeout = '2s'"))
+    candidate = candidate_writer.scalar(
+        select(Candidate)
+        .where(Candidate.id == ids["candidate_id"])
+        .with_for_update()
+    )
+    candidate.current_title = "Concurrent candidate writer"
+    candidate_writer.flush()
+    response = {}
+    done = threading.Event()
+    writer_before_candidate = threading.Event()
+    writer_module = interviews_api if writer_kind == "feedback" else talent_api
+    original_lock = writer_module.lock_candidate_retention_facts
+
+    def observed_lock(db, organization_id, candidate_id):
+        db.execute(text("SET LOCAL lock_timeout = '3s'"))
+        db.execute(text("SET LOCAL statement_timeout = '6s'"))
+        writer_before_candidate.set()
+        return original_lock(db, organization_id, candidate_id)
+
+    monkeypatch.setattr(writer_module, "lock_candidate_retention_facts", observed_lock)
+
+    def write_business_fact():
+        with TestClient(app) as client:
+            client.cookies.update(session_cookies)
+            if writer_kind == "feedback":
+                response["value"] = client.post(
+                    f"/api/v1/interview-feedback/{ids['feedback_id']}/amendments",
+                    json={
+                        "ratings": {
+                            "professional_ability": 4,
+                            "problem_solving": 4,
+                            "communication": 4,
+                            "role_fit": 4,
+                        },
+                        "strengths": "Updated",
+                        "risks": "Low",
+                        "conclusion": "recommend",
+                        "notes": "Lock order",
+                        "reason": "Concurrent evidence",
+                    },
+                    headers={**headers, "If-Match": '"1"'},
+                )
+            else:
+                response["value"] = client.patch(
+                    f"/api/v1/talent-pool-memberships/{membership_id}",
+                    json={"retention_until": (datetime.now(timezone.utc) + timedelta(days=900)).isoformat()},
+                    headers={**headers, "If-Match": '"1"'},
+                )
+        done.set()
+
+    thread = threading.Thread(target=write_business_fact, name="fact-writer")
+    thread.start()
+    reached_candidate_lock = writer_before_candidate.wait(10)
+    fact_row_was_free = False
+    try:
+        if reached_candidate_lock:
+            fact_row_was_free = True
+            try:
+                with Session(engine) as probe:
+                    probe.execute(text("SET LOCAL lock_timeout = '500ms'"))
+                    if writer_kind == "feedback":
+                        probe.scalar(
+                            select(InterviewFeedback)
+                            .where(InterviewFeedback.id == ids["feedback_id"])
+                            .with_for_update(nowait=True)
+                        )
+                    else:
+                        probe.scalar(
+                            select(TalentPoolMembership)
+                            .where(TalentPoolMembership.id == membership_id)
+                            .with_for_update(nowait=True)
+                        )
+                    probe.rollback()
+            except OperationalError:
+                fact_row_was_free = False
+    finally:
+        candidate_writer.commit()
+        candidate_writer.close()
+    thread.join(6)
+
+    assert reached_candidate_lock
+    assert fact_row_was_free
+    assert done.is_set()
+    assert response["value"].status_code == 200
+    with Session(engine) as db:
+        candidate = db.get(Candidate, ids["candidate_id"])
+        expected = candidate_due_dates(
+            db, ids["organization_id"], 365
+        )[ids["candidate_id"]]
         assert aware(candidate.retention_due_at) == aware(expected)

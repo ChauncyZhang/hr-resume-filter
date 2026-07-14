@@ -78,7 +78,7 @@ def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
     requested={item.item_id:item.expected_application_version for item in payload.items}; rows=list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested)).order_by(ScreeningItem.id).with_for_update()))
     if run is None or len(rows)!=len(requested): raise ScreeningBulkConflict
     if any(item.status!="scored" or item.application_id is None or not db.scalar(select(ScreeningResult.id).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id)) for item in rows): raise ScreeningBulkConflict
-    applications=list(db.scalars(select(Application).where(Application.organization_id==organization_id,Application.id.in_([item.application_id for item in rows])).order_by(Application.id).with_for_update()))
+    applications=list(db.scalars(select(Application).where(Application.organization_id==organization_id,Application.id.in_([item.application_id for item in rows])).order_by(Application.id)))
     if len(applications)!=len(rows): raise ScreeningBulkConflict
     by_id={application.id:application for application in applications}; decisions=[]
     for item in rows:
@@ -90,6 +90,6 @@ def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
         decisions.append((application,"applied",target))
     output=[]
     for application,result,target in decisions:
-        if result=="applied": application=transition_application_record(db,application.id,target,expected_version=application.version,actor_user_id=actor_user_id,trace_id=trace_id,reason_code=payload.reason_code,reason_text=payload.reason_text)
+        if result=="applied": application=transition_application_record(db,organization_id,application.id,target,expected_version=application.version,actor_user_id=actor_user_id,trace_id=trace_id,reason_code=payload.reason_code,reason_text=payload.reason_text)
         output.append({"id":str(application.id),"stage":application.stage,"version":application.version,"result":result})
     db.flush(); return {"command":payload.command,"applied_count":sum(item["result"]=="applied" for item in output),"already_applied_count":sum(item["result"]=="already_applied" for item in output),"applications":output}

@@ -604,15 +604,25 @@ def patch_talent_pool_membership(membership_id: UUID, payload: MembershipPatch, 
     if isinstance(expected, JSONResponse):
         return expected
     with request.app.state.identity_store.sync_session() as db:
-        membership = _load_membership(db, principal, membership_id, manage=True, for_update=True)
+        membership = _load_membership(db, principal, membership_id, manage=True)
         if membership is None:
             return _denied(request)
-        if membership.version != expected:
-            return problem(request, 409, "resource_version_conflict", "The resource changed. Reload and try again.")
+        candidate_id = membership.candidate_id
         changes = payload.model_dump(exclude_unset=True)
         if "owner_id" in changes and _active_user(db, principal.organization_id, changes["owner_id"]) is None:
             return _denied(request)
-        lock_candidate_retention_facts(db, principal.organization_id, membership.candidate_id)
+        candidate = lock_candidate_retention_facts(
+            db, principal.organization_id, candidate_id
+        )
+        if candidate is None:
+            return _denied(request)
+        membership = _load_membership(
+            db, principal, membership_id, manage=True, for_update=True
+        )
+        if membership is None or membership.candidate_id != candidate_id:
+            return _denied(request)
+        if membership.version != expected:
+            return problem(request, 409, "resource_version_conflict", "The resource changed. Reload and try again.")
         for field, value in changes.items():
             setattr(membership, field, value)
         membership.version += 1
@@ -635,13 +645,22 @@ def delete_talent_pool_membership(membership_id: UUID, payload: MembershipRemova
     if isinstance(expected, JSONResponse):
         return expected
     with request.app.state.identity_store.sync_session() as db:
-        membership = _load_membership(db, principal, membership_id, manage=True, for_update=True)
+        membership = _load_membership(db, principal, membership_id, manage=True)
         if membership is None:
+            return _denied(request)
+        candidate_id = membership.candidate_id
+        candidate = lock_candidate_retention_facts(
+            db, principal.organization_id, candidate_id
+        )
+        if candidate is None:
+            return _denied(request)
+        membership = _load_membership(
+            db, principal, membership_id, manage=True, for_update=True
+        )
+        if membership is None or membership.candidate_id != candidate_id:
             return _denied(request)
         if membership.version != expected:
             return problem(request, 409, "resource_version_conflict", "The resource changed. Reload and try again.")
-        lock_candidate_retention_facts(db, principal.organization_id, membership.candidate_id)
-        candidate_id = membership.candidate_id
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_removed", outcome="success", trace_id=request.state.trace_id, metadata_json={"membership_id": str(membership.id), "pool_id": str(membership.pool_id), "candidate_id": str(membership.candidate_id), "reason_provided": True}))
         db.delete(membership)
         db.flush()
@@ -659,17 +678,28 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
     if isinstance(key, JSONResponse):
         return key
     with request.app.state.identity_store.sync_session() as db:
-        membership = _load_membership(db, principal, membership_id, manage=True, for_update=True)
-        if membership is None or membership.status != "active" or membership.source_application_id is None:
+        membership = _load_membership(db, principal, membership_id, manage=True)
+        if membership is None:
+            return _denied(request)
+        candidate_id = membership.candidate_id
+        candidate = lock_candidate_retention_facts(
+            db, principal.organization_id, candidate_id
+        )
+        if candidate is None:
+            return _denied(request)
+        membership = _load_membership(
+            db, principal, membership_id, manage=True, for_update=True
+        )
+        if (
+            membership is None
+            or membership.candidate_id != candidate_id
+            or membership.status != "active"
+            or membership.source_application_id is None
+        ):
             return _denied(request)
         source = db.scalar(select(Application).where(Application.organization_id == principal.organization_id, Application.id == membership.source_application_id, Application.candidate_id == membership.candidate_id))
         target_job = db.scalar(select(Job).where(Job.organization_id == principal.organization_id, Job.id == payload.job_id, Job.status == "open", AUTH.job_predicate(principal, RecruitingAction.TRANSITION, Job)))
         if source is None or source.stage not in TERMINAL_APPLICATION_STAGES or target_job is None:
-            return _denied(request)
-        candidate = lock_candidate_retention_facts(
-            db, principal.organization_id, membership.candidate_id
-        )
-        if candidate is None:
             return _denied(request)
         resume_id = payload.resume_id or source.resume_id
         resume = _authorized_resume(db, principal, resume_id, candidate.id)

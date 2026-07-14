@@ -1161,7 +1161,7 @@ def transition_application(application_id: UUID, payload: Transition, request: R
         if _load_application(db, principal, application_id, RecruitingAction.TRANSITION) is None: return _denied(request)
         try:
             def action():
-                item = transition_application_record(db, application_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id, reason_code=payload.reason_code, reason_text=payload.reason_text)
+                item = transition_application_record(db, principal.organization_id, application_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id, reason_code=payload.reason_code, reason_text=payload.reason_text)
                 return 200, {"data": _application_data(item)}
             status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.transition", key, {"application_id": application_id, **payload.model_dump()}, action); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
         except Exception as error: db.rollback(); return _problem_for(request, error)

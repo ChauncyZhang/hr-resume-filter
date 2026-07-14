@@ -261,7 +261,8 @@ POSTGRES_SMOKE_URL=... python -m pytest server/tests -q
 
 ### Remaining concerns
 
-- No known failing test or open Critical/Important review finding remains.
+- This review-wave snapshot had no known failing test; later independent review findings
+  and their resolutions are recorded below.
 - The category repair intentionally performs controlled updates while its append-only
   trigger is absent inside one transactional migration. Deployments should apply it as a
   normal exclusive schema migration before any future `0017` Task B migration.
@@ -360,6 +361,133 @@ exit 0
 
 ### Final concerns
 
-- No known failing test or open Critical/Important review finding remains.
+- This second-review snapshot had no known failing test; the third independent review
+  findings and their resolutions are recorded below.
 - `0016a` retains its controlled transactional trigger drop/repair/recreate behavior and
   must be deployed before any future Task B `0017` migration.
+
+## Third independent review fix wave (2026-07-14)
+
+The two third-review Important findings were addressed without frontend or Task B
+changes:
+
+- `recalculate_due_dates` now restricts its physical `UPDATE` to the exact candidate IDs
+  present in the computed due-date mapping, in addition to the organization predicate.
+  A PostgreSQL two-candidate test recalculates each candidate independently while the
+  other row is locked and proves that the unrelated row's `retention_due_at`,
+  `updated_at`, `version`, and PostgreSQL `xmin` remain unchanged. Both directions finish
+  within explicit lock/statement timeouts, proving that unrelated candidate rows are not
+  locked and no deadlock occurs.
+- All retention-fact mutation paths were audited and normalized to Candidate first,
+  business fact second. Application transition now performs a tenant-scoped candidate-ID
+  pre-read, locks Candidate, then tenant-scoped locks and revalidates Application version
+  and candidate relationship. Interview create/update/transition, submitted-feedback
+  submit/amend, talent membership update/delete/reactivation, and application completion
+  advancement follow the same ordering and revalidate the pre-read relationship after
+  locking. Talent creation and the existing candidate/application/event writers already
+  lock Candidate before inserting facts.
+- Screening bulk action no longer pre-locks Application rows before calling the shared
+  Candidate-first transition service. Screening run/item locks remain earlier because
+  they are not candidate retention facts and no Candidate-first path subsequently locks
+  those rows.
+- PostgreSQL writer barriers set `lock_timeout` and `statement_timeout`. They prove
+  application transition versus application patch completes without deadlock and yields
+  the version-correct winner, and prove feedback amendment and talent membership patch
+  wait on Candidate before acquiring their business rows. Stored `retention_due_at` is
+  checked against the final committed fact set after every barrier.
+
+### Third-review TDD evidence
+
+Expected RED before implementation:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest server/tests/test_governance_postgres.py \
+  -k "single_candidate_recalculation or application_transition_and_patch or fact_writer_waits" -q
+4 failed, 6 deselected in 23.84s
+```
+
+The failures were specific to the review findings: single-candidate recalculation timed
+out while updating a locked unrelated candidate; application patch could not complete
+while transition paused before its Candidate lock; and both feedback amendment and talent
+patch had already locked their business row while blocked on Candidate.
+
+Final focused GREEN:
+
+```text
+python -m pytest server/tests/test_governance_api.py server/tests/test_governance_models.py \
+  server/tests/test_llm_api.py server/tests/test_recruiting.py -q
+39 passed in 22.87s
+```
+
+Final PostgreSQL migration/concurrency GREEN, including the symmetric two-candidate
+isolation check and all writer barriers:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py server/tests/test_governance_migration.py -q
+17 passed in 120.55s
+```
+
+Submission self-review replaced the feedback/talent test's fixed startup delay with a
+real event barrier at the Candidate lock call and added per-writer lock/statement
+timeouts. The finalized four new concurrency cases passed together (`4 passed, 6
+deselected in 16.97s`) before the complete 17-test result above.
+
+One earlier combined PostgreSQL run reached `16 passed` and then the final migration test
+failed while asyncpg opened a connection with `TimeoutError`; PostgreSQL had one of 100
+connections active and no test assertion had failed. The exact test passed on a fresh
+PostgreSQL 16.9 container (`1 passed in 11.19s`), followed by the clean 17-test result
+above.
+
+The first affected run exposed three legacy SQLite aggregate fixtures that intentionally
+create Application without Candidate (`150 passed, 3 failed`). Keeping the shared lock
+call while removing the newly introduced candidate-existence requirement preserved that
+fixture contract; the recruiting module then passed (`22 passed in 1.72s`). Final
+affected GREEN:
+
+```text
+python -m pytest server/tests/test_recruiting.py server/tests/test_recruiting_api.py \
+  server/tests/test_screening_api.py server/tests/test_screening_pipeline.py \
+  server/tests/test_screening_actions.py server/tests/test_talent_api.py \
+  server/tests/test_interview_api.py server/tests/test_llm_api.py -q
+138 passed in 158.97s
+```
+
+Final PostgreSQL-enabled backend gate:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest server/tests -q
+566 passed, 4 skipped in 848.21s
+```
+
+Compilation and patch hygiene:
+
+```text
+python -m compileall -q server
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Third-review files changed
+
+- `server/app/governance/retention.py`
+- `server/app/recruiting/service.py`
+- `server/app/recruiting/api.py`
+- `server/app/screening/actions.py`
+- `server/app/interviews/api.py`
+- `server/app/talent/api.py`
+- `server/tests/test_governance_postgres.py`
+- `server/tests/test_postgres_security.py`
+- `server/tests/test_recruiting.py`
+- `.superpowers/sdd/phase5-governance-api-report.md`
+
+### Third-review concerns
+
+- The specified third-review findings have implementation and test evidence, but this
+  report does not claim an independent post-fix review is clean; that conclusion belongs
+  to the next independent review.
+- No test is currently failing. The one asyncpg connection timeout was reproduced only
+  as an infrastructure transient and passed both exact and full-combination reruns on a
+  fresh PostgreSQL container.

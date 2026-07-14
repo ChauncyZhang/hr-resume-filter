@@ -385,7 +385,7 @@ def test_concurrent_stale_application_and_job_writers_only_emit_one_success(pg_s
                 barrier.wait()
                 try:
                     if kind == "application":
-                        transition_application_record(db, ids["application"], "review", expected_version=1, actor_user_id=user_id, trace_id="race")
+                        transition_application_record(db, organization_id, ids["application"], "review", expected_version=1, actor_user_id=user_id, trace_id="race")
                     else:
                         transition_job_record(db, ids["job"], "open", expected_version=1, actor_user_id=user_id, trace_id="race")
                     db.commit()

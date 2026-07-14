@@ -169,7 +169,10 @@ def recalculate_due_dates(
     expression = case(due, value=table.c.id, else_=table.c.retention_due_at)
     db.execute(
         table.update()
-        .where(table.c.organization_id == organization_id)
+        .where(
+            table.c.organization_id == organization_id,
+            table.c.id.in_(due.keys()),
+        )
         .values(retention_due_at=expression, updated_at=table.c.updated_at)
     )
 

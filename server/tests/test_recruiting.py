@@ -167,7 +167,7 @@ def test_persisted_transition_increments_version_and_writes_timeline_and_audit_a
         application = Application(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="new", source="manual")
         db.add(application)
         db.flush()
-        transition_application_record(db, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
+        transition_application_record(db, application.organization_id, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
         db.commit()
         assert application.stage == "review" and application.version == 2
         assert db.query(ApplicationStageEvent).count() == 1
@@ -188,7 +188,7 @@ def test_transition_rolls_back_aggregate_and_timeline_when_audit_insert_fails():
         event.listen(AuditLog, "before_insert", reject_audit)
         try:
             with pytest.raises(RuntimeError, match="injected audit failure"):
-                transition_application_record(db, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
+                transition_application_record(db, application.organization_id, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
             db.rollback()
         finally:
             event.remove(AuditLog, "before_insert", reject_audit)
@@ -205,10 +205,10 @@ def test_persisted_transitions_require_expected_version_and_increment_once():
         job = Job(organization_id=UUID(int=1), title="Role", owner_id=UUID(int=5), status="draft")
         db.add_all([application, job])
         db.flush()
-        transition_application_record(db, application.id, "review", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
+        transition_application_record(db, application.organization_id, application.id, "review", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
         transition_job_record(db, job.id, "open", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
         with pytest.raises(ResourceVersionConflict):
-            transition_application_record(db, application.id, "contact", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
+            transition_application_record(db, application.organization_id, application.id, "contact", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
         with pytest.raises(ResourceVersionConflict):
             transition_job_record(db, job.id, "paused", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
         assert application.version == job.version == 2
