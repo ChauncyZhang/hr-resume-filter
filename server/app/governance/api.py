@@ -79,8 +79,12 @@ def _denied(request: Request) -> JSONResponse:
     return _safe_problem(request, 404, "resource_not_found")
 
 
-def _token_codec(request: Request) -> GovernanceTokenCodec:
-    return request.app.state.governance_tokens
+def _audit_cursor_codec(request: Request) -> GovernanceTokenCodec:
+    return request.app.state.governance_audit_cursor
+
+
+def _retention_preview_codec(request: Request) -> GovernanceTokenCodec:
+    return request.app.state.governance_retention_preview
 
 
 def _current_time(request: Request) -> datetime:
@@ -169,7 +173,7 @@ def list_audit_logs(
             conditions.append(AuditLog.outcome == outcome)
         if cursor is not None:
             try:
-                decoded = _token_codec(request).decode(cursor)
+                decoded = _audit_cursor_codec(request).decode(cursor)
                 expected = {
                     "kind": "audit_cursor",
                     "organization_id": str(principal.organization_id),
@@ -204,7 +208,7 @@ def list_audit_logs(
         next_cursor = None
         if len(rows) > limit:
             last = rows[limit - 1][0]
-            next_cursor = _token_codec(request).encode(
+            next_cursor = _audit_cursor_codec(request).encode(
                 {
                     "kind": "audit_cursor",
                     "organization_id": str(principal.organization_id),
@@ -273,7 +277,7 @@ def preview_retention_policy(payload: RetentionValues, request: Request):
             db,
             principal,
             payload.model_dump(),
-            _token_codec(request),
+            _retention_preview_codec(request),
             _current_time(request),
         )
         content = _serialized(RetentionPreviewResource, {"data": preview})
@@ -322,7 +326,7 @@ def patch_retention_policy(
                                 values,
                                 payload.impact_token,
                                 expected_version,
-                                _token_codec(request),
+                                _retention_preview_codec(request),
                                 _current_time(request),
                                 request.state.trace_id,
                             )

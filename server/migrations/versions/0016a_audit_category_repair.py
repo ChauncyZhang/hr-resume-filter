@@ -17,6 +17,8 @@ CASE
     THEN 'governance'
   WHEN event_type ~ '^(candidate|application|job|resume|screening|interview|talent_pool|report_export)\\.'
     THEN 'recruiting'
+  WHEN event_type LIKE 'llm.%'
+    THEN 'system'
   ELSE 'system'
 END
 """

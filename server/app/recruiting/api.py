@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
+from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Department, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
@@ -894,6 +895,7 @@ def create_candidate(payload: CandidateCreate, request: Request):
                 db.add(CandidateContact(organization_id=principal.organization_id, candidate_id=candidate.id, kind=canonical_kind, ciphertext=protected.ciphertext, lookup_hash=protected.lookup_hash, masked_value=protected.masked_value))
             db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=candidate.id, actor_user_id=principal.user_id, event_type="candidate.created", payload={}))
             db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="candidate.created", outcome="success", trace_id=request.state.trace_id, metadata_json={"candidate_id": str(candidate.id)}))
+            db.flush(); recalculate_candidate_retention(db, principal.organization_id, candidate.id)
             db.commit(); return _resource(_candidate_data(db, candidate, principal), 201)
         except Exception as error:
             db.rollback(); return _problem_for(request, error)
@@ -1000,8 +1002,10 @@ def add_note(candidate_id: UUID, payload: NoteCreate, request: Request):
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate_application(db, principal, candidate_id, payload.application_id, RecruitingAction.COMMENT) is None: return _denied(request)
+        lock_candidate_retention_facts(db, principal.organization_id, candidate_id)
         application_id = str(payload.application_id)
         note = CandidateNote(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note", payload={"application_id": application_id, "body": payload.body}); db.add(note); db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note_added", payload={"application_id": application_id})); db.flush()
+        recalculate_candidate_retention(db, principal.organization_id, candidate_id)
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="candidate.note_added", outcome="success", trace_id=request.state.trace_id, metadata_json={"candidate_id": str(candidate_id), "application_id": application_id, "note_id": str(note.id)})); db.commit()
         return _resource({"id": str(note.id), "application_id": application_id, "body": payload.body, "author_id": str(principal.user_id), "created_at": note.created_at.isoformat()}, 201)
 
@@ -1117,7 +1121,7 @@ def create_application(job_id: UUID, payload: ApplicationCreate, request: Reques
         try:
             def action():
                 item = create_application_record(db, organization_id=principal.organization_id, candidate_id=payload.candidate_id, job_id=job_id, resume_id=payload.resume_id, owner_id=owner_id, source=payload.source)
-                db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=item.candidate_id, actor_user_id=principal.user_id, event_type="application.created", payload={"application_id": str(item.id), "job_id": str(job_id)})); db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="application.created", outcome="success", trace_id=request.state.trace_id, metadata_json={"application_id": str(item.id), "job_id": str(job_id)})); return 201, {"data": _application_data(item)}
+                db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=item.candidate_id, actor_user_id=principal.user_id, event_type="application.created", payload={"application_id": str(item.id), "job_id": str(job_id)})); db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="application.created", outcome="success", trace_id=request.state.trace_id, metadata_json={"application_id": str(item.id), "job_id": str(job_id)})); db.flush(); recalculate_candidate_retention(db, principal.organization_id, item.candidate_id); return 201, {"data": _application_data(item)}
             status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.create", key, {"job_id": job_id, **payload.model_dump()}, action); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
         except Exception as error: db.rollback(); return _problem_for(request, error)
 

@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from server.app.identity.models import AuditLog
+from server.app.identity.models import AuditLog,Organization,User,UserRole
+from server.app.identity.security import PasswordService
 from server.app.llm.models import LlmInvocation,LlmProviderConfig
 from server.app.llm.policy import ProviderAllowlist
 from server.tests.test_screening_api import app_and_seed,login
@@ -11,6 +12,11 @@ class Gateway:
 
 def test_llm_settings_role_key_preservation_and_fixed_connection_test(tmp_path):
     app,_,_=app_and_seed(tmp_path); app.state.llm_allowlist=ProviderAllowlist({"approved":{"base_url":"https://provider.example/v1","models":["model-a"]}},resolver=lambda *args,**kwargs:[(2,1,6,"",("8.8.8.8",443))]); gateway=Gateway(); app.state.llm_gateway=gateway
+    with app.state.identity_store.sync_session() as db:
+        organization=db.scalar(select(Organization)); password=PasswordService().hash("correct")
+        for role,email in (("recruiter","llm-recruiter@example.test"),("interviewer","llm-interviewer@example.test")):
+            user=User(organization_id=organization.id,email=email,normalized_email=email,display_name=role,password_hash=password); user.roles.append(UserRole(role=role)); db.add(user)
+        db.commit()
     with TestClient(app) as client:
         system=login(client,"system@example.test"); payload={"provider_id":"approved","model":"model-a","enabled":True,"api_key":"sk-private","allowed_job_ids":[]}
         saved=client.put("/api/v1/settings/llm",json=payload,headers={**system,"If-Match":'"0"',"Idempotency-Key":"save"}); assert saved.status_code==200,saved.text; assert saved.json()["data"]["key_configured"] is True and saved.json()["data"]["available_providers"]=={"approved":["model-a"]} and "api_key" not in saved.text
@@ -23,6 +29,18 @@ def test_llm_settings_role_key_preservation_and_fixed_connection_test(tmp_path):
         test_replay=client.post("/api/v1/settings/llm/test",headers={**system,"Idempotency-Key":"test"}); assert test_replay.json()==tested.json() and len(gateway.calls)==1
         client.post("/api/v1/auth/logout",headers=system); admin=login(client,"admin@example.test"); visible=client.get("/api/v1/settings/llm",headers=admin); assert visible.status_code==200 and "key_configured" not in visible.text
         client.post("/api/v1/auth/logout",headers=admin); manager=login(client,"manager@example.test"); assert client.get("/api/v1/settings/llm",headers=manager).status_code==404
+        client.post("/api/v1/auth/logout",headers=manager); system=login(client,"system@example.test"); system_audits=client.get("/api/v1/audit-logs?event_type=llm.config_updated",headers=system)
+        client.post("/api/v1/auth/logout",headers=system); admin=login(client,"admin@example.test"); recruiting_audits=client.get("/api/v1/audit-logs?event_type=llm.config_updated",headers=admin)
+        assert [row["category"] for row in system_audits.json()["data"]]==["system","system"]
+        assert recruiting_audits.json()["data"]==[]
+        for email in ("llm-recruiter@example.test","manager@example.test","llm-interviewer@example.test"):
+            client.post("/api/v1/auth/logout",headers=admin); denied_headers=login(client,email); denied=client.get("/api/v1/audit-logs?event_type=llm.config_updated",headers=denied_headers)
+            assert denied.json()["data"]==[] if email.startswith("llm-recruiter") else denied.status_code==404
+            admin=denied_headers
+        with app.state.identity_store.sync_session() as db:
+            db.add(UserRole(user_id=db.scalar(select(User.id).where(User.email=="admin@example.test")),role="system_admin")); db.commit()
+        client.post("/api/v1/auth/logout",headers=admin); dual=login(client,"admin@example.test"); dual_audits=client.get("/api/v1/audit-logs?event_type=llm.config_updated",headers=dual)
+        assert [row["category"] for row in dual_audits.json()["data"]]==["system","system"]
     with app.state.identity_store.sync_session() as db:
         config=db.scalar(select(LlmProviderConfig)); assert config.encrypted_api_key and b"sk-private" not in config.encrypted_api_key
         assert db.scalar(select(LlmInvocation)).request_field_manifest==["fixed_probe"]

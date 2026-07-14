@@ -9,17 +9,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, case, func, select, update
+from sqlalchemy import select
 
 from server.app.governance.audit import append_audit
 from server.app.governance.authorization import can_view_recruiting_resource
 from server.app.governance.models import RetentionPolicy
+from server.app.governance.retention import (
+    aware,
+    candidate_due_dates,
+    lock_all_candidate_retention_facts,
+    recalculate_due_dates,
+)
 from server.app.identity.models import Job, User
 from server.app.identity.policy import Principal
-from server.app.interviews.models import Interview, InterviewFeedback
-from server.app.recruiting.models import Application, Candidate, CandidateEvent
-from server.app.recruiting.service import lock_candidates_for_retention
-from server.app.talent.models import TalentPoolMembership
+from server.app.recruiting.models import Candidate
 
 
 class GovernanceError(Exception):
@@ -54,10 +57,6 @@ class RetentionPreviewStaleImpact(GovernanceError):
     code = "retention_preview_stale_impact"
 
 
-def aware(value: datetime) -> datetime:
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-
-
 def utc_rfc3339(value: datetime) -> str:
     return aware(value).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -84,6 +83,16 @@ class GovernanceTokenCodec:
             return decoded
         except (ValueError, TypeError, json.JSONDecodeError):
             raise InvalidGovernanceToken from None
+
+
+def derive_governance_key(root_secret: bytes, purpose: str) -> bytes:
+    if purpose not in {"audit-cursor", "retention-preview"}:
+        raise ValueError("unsupported governance key purpose")
+    return hmac.new(
+        root_secret,
+        f"ux09/governance/{purpose}/v1".encode(),
+        hashlib.sha256,
+    ).digest()
 
 
 SUMMARY_BY_EVENT = {
@@ -155,100 +164,6 @@ def policy_projection(db, policy: RetentionPolicy) -> dict[str, Any]:
             "display_name": updater.display_name if updater else "System migration",
         },
     }
-
-
-def _maximum(values: list[datetime | None]) -> datetime | None:
-    present = [aware(value) for value in values if value is not None]
-    return max(present) if present else None
-
-
-def candidate_due_dates(db, organization_id: UUID, terminal_days: int) -> dict[UUID, datetime | None]:
-    candidates = db.scalars(
-        select(Candidate).where(Candidate.organization_id == organization_id)
-    ).all()
-    applications = db.execute(
-        select(
-            Application.candidate_id,
-            func.sum(case((Application.stage.not_in(("hired", "rejected", "withdrawn")), 1), else_=0)),
-            func.max(Application.updated_at),
-        )
-        .where(Application.organization_id == organization_id)
-        .group_by(Application.candidate_id)
-    ).all()
-    app_facts = {candidate_id: (int(active_count or 0), latest) for candidate_id, active_count, latest in applications}
-    event_facts = dict(
-        db.execute(
-            select(CandidateEvent.candidate_id, func.max(CandidateEvent.created_at))
-            .where(CandidateEvent.organization_id == organization_id)
-            .group_by(CandidateEvent.candidate_id)
-        ).all()
-    )
-    interview_facts = dict(
-        db.execute(
-            select(Application.candidate_id, func.max(Interview.updated_at))
-            .join(
-                Interview,
-                and_(
-                    Interview.organization_id == Application.organization_id,
-                    Interview.application_id == Application.id,
-                ),
-            )
-            .where(Application.organization_id == organization_id)
-            .group_by(Application.candidate_id)
-        ).all()
-    )
-    feedback_facts = dict(
-        db.execute(
-            select(Application.candidate_id, func.max(InterviewFeedback.updated_at))
-            .join(
-                Interview,
-                and_(
-                    Interview.organization_id == Application.organization_id,
-                    Interview.application_id == Application.id,
-                ),
-            )
-            .join(
-                InterviewFeedback,
-                and_(
-                    InterviewFeedback.organization_id == Interview.organization_id,
-                    InterviewFeedback.interview_id == Interview.id,
-                ),
-            )
-            .where(
-                Application.organization_id == organization_id,
-                InterviewFeedback.status.in_(("submitted", "amended")),
-            )
-            .group_by(Application.candidate_id)
-        ).all()
-    )
-    talent_facts = dict(
-        db.execute(
-            select(TalentPoolMembership.candidate_id, func.max(TalentPoolMembership.retention_until))
-            .where(
-                TalentPoolMembership.organization_id == organization_id,
-                TalentPoolMembership.status == "active",
-            )
-            .group_by(TalentPoolMembership.candidate_id)
-        ).all()
-    )
-    due: dict[UUID, datetime | None] = {}
-    for candidate in candidates:
-        active_count, application_updated = app_facts.get(candidate.id, (0, None))
-        terminal_due = None
-        if active_count == 0:
-            latest = _maximum(
-                [
-                    candidate.updated_at,
-                    application_updated,
-                    event_facts.get(candidate.id),
-                    interview_facts.get(candidate.id),
-                    feedback_facts.get(candidate.id),
-                ]
-            )
-            terminal_due = latest + timedelta(days=terminal_days) if latest else None
-        talent_due = talent_facts.get(candidate.id)
-        due[candidate.id] = None if active_count else _maximum([terminal_due, talent_due])
-    return due
 
 
 def affected_candidate_ids(db, organization_id: UUID, terminal_days: int) -> tuple[list[UUID], dict[UUID, datetime | None]]:
@@ -332,18 +247,6 @@ def _verify_preview(
         raise RetentionPreviewStaleImpact
 
 
-def _recalculate_due_dates(db, organization_id: UUID, due: dict[UUID, datetime | None]) -> None:
-    if not due:
-        return
-    table = Candidate.__table__
-    expression = case(due, value=table.c.id, else_=table.c.retention_due_at)
-    db.execute(
-        table.update()
-        .where(table.c.organization_id == organization_id)
-        .values(retention_due_at=expression, updated_at=table.c.updated_at)
-    )
-
-
 def update_retention_policy(
     db,
     principal: Principal,
@@ -361,7 +264,7 @@ def update_retention_policy(
     )
     if policy.version != expected_version:
         raise ResourceVersionConflict
-    lock_candidates_for_retention(db, principal.organization_id)
+    lock_all_candidate_retention_facts(db, principal.organization_id)
     shortening = any(values[name] < getattr(policy, name) for name in values)
     affected, due = affected_candidate_ids(db, principal.organization_id, values["terminal_days"])
     if shortening:
@@ -372,7 +275,7 @@ def update_retention_policy(
     policy.version += 1
     policy.updated_by = principal.user_id
     policy.updated_at = aware(now)
-    _recalculate_due_dates(db, principal.organization_id, due)
+    recalculate_due_dates(db, principal.organization_id, due)
     append_audit(
         db,
         actor=principal,

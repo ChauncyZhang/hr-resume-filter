@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import String, and_, cast, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
+from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, User, UserStatus
 from server.app.identity.policy import Principal
@@ -18,8 +19,6 @@ from server.app.recruiting.models import Application, ApplicationStageEvent, Can
 from server.app.recruiting.service import (
     ActiveApplicationExists,
     IdempotencyConflict,
-    clear_candidate_retention_due,
-    lock_candidate_retention_state,
     persisted_idempotent,
 )
 from server.app.talent.models import TalentPool, TalentPoolGrant, TalentPoolMembership
@@ -561,6 +560,7 @@ def create_talent_pool_membership(pool_id: UUID, payload: MembershipCreate, requ
                 return _denied(request)
 
         def action():
+            lock_candidate_retention_facts(db, principal.organization_id, candidate.id)
             membership = TalentPoolMembership(
                 organization_id=principal.organization_id,
                 pool_id=pool.id,
@@ -575,6 +575,7 @@ def create_talent_pool_membership(pool_id: UUID, payload: MembershipCreate, requ
             )
             db.add(membership)
             db.flush()
+            recalculate_candidate_retention(db, principal.organization_id, candidate.id)
             db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_added", outcome="success", trace_id=request.state.trace_id, metadata_json={"pool_id": str(pool.id), "membership_id": str(membership.id), "candidate_id": str(candidate.id)}))
             db.flush()
             return 201, {"data": _membership_data(db, principal, membership)}
@@ -611,11 +612,13 @@ def patch_talent_pool_membership(membership_id: UUID, payload: MembershipPatch, 
         changes = payload.model_dump(exclude_unset=True)
         if "owner_id" in changes and _active_user(db, principal.organization_id, changes["owner_id"]) is None:
             return _denied(request)
+        lock_candidate_retention_facts(db, principal.organization_id, membership.candidate_id)
         for field, value in changes.items():
             setattr(membership, field, value)
         membership.version += 1
         membership.updated_at = datetime.now(timezone.utc)
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_updated", outcome="success", trace_id=request.state.trace_id, metadata_json={"membership_id": str(membership.id), "changed_fields": sorted(payload.model_fields_set)}))
+        recalculate_candidate_retention(db, principal.organization_id, membership.candidate_id)
         db.commit()
         response = JSONResponse({"data": _membership_data(db, principal, membership)})
         response.headers["ETag"] = f'"{membership.version}"'
@@ -637,8 +640,12 @@ def delete_talent_pool_membership(membership_id: UUID, payload: MembershipRemova
             return _denied(request)
         if membership.version != expected:
             return problem(request, 409, "resource_version_conflict", "The resource changed. Reload and try again.")
+        lock_candidate_retention_facts(db, principal.organization_id, membership.candidate_id)
+        candidate_id = membership.candidate_id
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_removed", outcome="success", trace_id=request.state.trace_id, metadata_json={"membership_id": str(membership.id), "pool_id": str(membership.pool_id), "candidate_id": str(membership.candidate_id), "reason_provided": True}))
         db.delete(membership)
+        db.flush()
+        recalculate_candidate_retention(db, principal.organization_id, candidate_id)
         db.commit()
         return Response(status_code=204)
 
@@ -659,7 +666,7 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
         target_job = db.scalar(select(Job).where(Job.organization_id == principal.organization_id, Job.id == payload.job_id, Job.status == "open", AUTH.job_predicate(principal, RecruitingAction.TRANSITION, Job)))
         if source is None or source.stage not in TERMINAL_APPLICATION_STAGES or target_job is None:
             return _denied(request)
-        candidate = lock_candidate_retention_state(
+        candidate = lock_candidate_retention_facts(
             db, principal.organization_id, membership.candidate_id
         )
         if candidate is None:
@@ -685,7 +692,7 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
             )
             db.add(application)
             db.flush()
-            clear_candidate_retention_due(
+            recalculate_candidate_retention(
                 db, principal.organization_id, candidate.id
             )
             event_payload = {"source_application_id": str(source.id), "membership_id": str(membership.id), "pool_id": str(membership.pool_id)}
@@ -695,6 +702,7 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
                 AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="talent_pool.member_reactivated", outcome="success", trace_id=request.state.trace_id, metadata_json={"membership_id": str(membership.id), "application_id": str(application.id), "source_application_id": str(source.id)}),
             ])
             db.flush()
+            recalculate_candidate_retention(db, principal.organization_id, candidate.id)
             return 201, {"data": _application_data(application)}
 
         try:

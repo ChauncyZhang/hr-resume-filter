@@ -15,19 +15,30 @@ Created:
 - `server/app/governance/schemas.py`
 - `server/app/governance/authorization.py`
 - `server/app/governance/service.py`
+- `server/app/governance/retention.py`
 - `server/app/governance/api.py`
+- `server/migrations/versions/0016a_audit_category_repair.py`
 - `server/tests/test_governance_api.py`
 - `server/tests/test_governance_postgres.py`
 
 Modified:
 
+- `server/app/governance/audit.py`
+- `server/app/governance/orm.py`
 - `server/app/main.py`
+- `server/app/recruiting/api.py`
 - `server/app/recruiting/service.py`
+- `server/app/screening/pipeline.py`
+- `server/app/talent/api.py`
+- `server/app/interviews/api.py`
+- `server/tests/test_governance_migration.py`
+- `server/tests/test_llm_api.py`
+- `server/tests/test_postgres_security.py` (follow-up audit insert contract)
 
-No migration or model change was required. The committed `0016` schema and existing
-`retention_policy.updated` audit metadata allowlist already provide the persistence
-and event contract required by this slice, so `server/app/governance/audit.py` did not
-need another allowlist change.
+No model schema was added. The narrow `0016a_audit_category_repair` migration repairs
+post-0016 category data before the reserved Task B revision `0017`; governance audit
+validation and authoritative category mapping are implemented in
+`server/app/governance/audit.py`.
 
 ## API and data behavior
 
@@ -69,11 +80,12 @@ need another allowlist change.
 
 - Authorization is server-side, tenant-scoped, and union-based for dual-role principals.
 - Direct identifiers do not reveal cross-tenant or unauthorized resource existence.
-- HMAC keys are domain-separated from the configured cursor-secret source.
+- Audit cursors and retention previews use separate purpose-derived HMAC keys from the
+  configured root secret; neither purpose can verify tokens from the other.
 - Problem responses use stable safe codes and do not include SQL, stack traces,
   credentials, object keys, contacts, resume text, feedback text, or raw audit metadata.
-- No schema migration was added. The API consumes Alembic head
-  `0016_governance_audit_retention` as required.
+- Alembic head includes the pre-Task-B `0016a_audit_category_repair`; revision `0017`
+  remains unconsumed for deletion/legal-hold work.
 
 ## TDD evidence
 
@@ -171,7 +183,8 @@ implementing deletion/legal-hold Task B or consuming revision `0017`:
   `Cache-Control: no-store`.
 - Also completed the review's non-blocking hardening: actor display-name joins are
   tenant-qualified and malformed/non-lowercase/non-SHA-256 `ip_hash` values expose no
-  network prefix. Cursor and preview HMAC domain separation remains unchanged.
+  network prefix. The second review later strengthened cursor/preview separation to
+  distinct purpose-derived HMAC keys.
 
 Atomicity coverage injects an audit failure after policy and due-date changes and proves
 rollback of policy version, due date, idempotency record, and update audit. Existing
@@ -252,3 +265,101 @@ POSTGRES_SMOKE_URL=... python -m pytest server/tests -q
 - The category repair intentionally performs controlled updates while its append-only
   trigger is absent inside one transactional migration. Deployments should apply it as a
   normal exclusive schema migration before any future `0017` Task B migration.
+
+## Second independent review fix wave (2026-07-14)
+
+All three additional Important findings and the requested Minor were closed without
+frontend or Task B changes:
+
+- Product authorization decision: `llm.config_updated` and
+  `llm.connection_tested` describe deployment-level provider configuration managed by
+  system administrators, so every `llm.*` audit event is explicitly mapped to `system`.
+  `CATEGORY_PREFIXES`, the ORM persistence boundary, and `0016a` use that same decision;
+  the migration repairs incorrectly recruiting-classified LLM history. A real LLM API
+  producer matrix proves visibility for system administrators and dual-role users,
+  invisibility for recruiting administrators/recruiters, and fail-closed behavior for
+  hiring managers/interviewers.
+- Added `server.app.governance.retention`, a narrow model-level dependency with no service
+  imports. It owns deterministic candidate locking, retention fact queries, timestamp-
+  preserving due updates, and single-candidate recalculation. Governance PATCH and all
+  fact writers share this boundary without recruiting/governance service cycles.
+- Immediate in-transaction recalculation now follows candidate profile/event writes,
+  application create/update/transition paths (including screening and reactivation),
+  interview create/update/transition paths, submitted feedback and amendments, and talent
+  membership create/update/delete. Draft feedback is intentionally excluded because the
+  retention query includes only submitted/amended status.
+- Three PostgreSQL two-session barriers pause retention PATCH after its old fact snapshot,
+  then start real talent-membership, feedback-amendment, or candidate-event HTTP writes.
+  Each writer must block on the shared candidate row; after PATCH commits it acquires the
+  lock, writes, recalculates, and leaves stored due equal to the final committed fact set.
+- Audit cursor and retention preview codecs now derive distinct HMAC keys from the root
+  secret using explicit purpose labels. Tests prove key inequality and cross-purpose
+  verification rejection.
+
+### Second-review TDD evidence
+
+Expected RED before implementation:
+
+```text
+python -m pytest \
+  server/tests/test_governance_api.py::test_llm_audit_events_are_explicitly_system_and_governance_keys_are_domain_separated -q
+1 failed
+
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py::test_retention_patch_serializes_with_every_retention_fact_writer -q
+3 failed in 13.81s
+```
+
+The first test failed because no explicit category-prefix table/key derivation API existed.
+The PostgreSQL tests demonstrated stale final due dates for talent and candidate events;
+the corrected feedback payload separately proved its writer completed without waiting for
+the candidate lock (`writer_was_serialized == False`).
+
+Final focused GREEN:
+
+```text
+python -m pytest server/tests/test_governance_api.py \
+  server/tests/test_governance_models.py server/tests/test_llm_api.py -q
+17 passed in 19.59s
+```
+
+Final PostgreSQL migration/concurrency GREEN:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest \
+  server/tests/test_governance_postgres.py server/tests/test_governance_migration.py -q
+13 passed in 84.81s
+```
+
+Affected GREEN:
+
+```text
+python -m pytest server/tests/test_recruiting.py server/tests/test_recruiting_api.py \
+  server/tests/test_screening_api.py server/tests/test_screening_pipeline.py \
+  server/tests/test_screening_actions.py server/tests/test_talent_api.py \
+  server/tests/test_interview_api.py server/tests/test_llm_api.py -q
+138 passed in 169.12s
+```
+
+Final PostgreSQL-enabled backend gate:
+
+```text
+POSTGRES_SMOKE_URL=... python -m pytest server/tests -q
+562 passed, 4 skipped in 850.39s
+```
+
+Compilation and patch hygiene:
+
+```text
+python -m compileall -q server
+exit 0
+
+git diff --check
+exit 0
+```
+
+### Final concerns
+
+- No known failing test or open Critical/Important review finding remains.
+- `0016a` retains its controlled transactional trigger drop/repair/recreate behavior and
+  must be deployed before any future Task B `0017` migration.

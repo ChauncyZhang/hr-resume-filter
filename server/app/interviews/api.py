@@ -8,6 +8,7 @@ from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, delete, exists, func, or_, select, text
 
+from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
@@ -387,6 +388,20 @@ def _advance_application_if_interviews_complete(
     return True
 
 
+def _lock_application_candidate_retention(db, organization_id, application_id):
+    candidate_id = db.scalar(
+        select(Application.candidate_id).where(
+            Application.organization_id == organization_id,
+            Application.id == application_id,
+        )
+    )
+    if candidate_id is None or lock_candidate_retention_facts(
+        db, organization_id, candidate_id
+    ) is None:
+        raise InvalidStateTransition
+    return candidate_id
+
+
 def _participant_role_predicate():
     return exists().where(
         UserRole.user_id == User.id,
@@ -658,13 +673,8 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                 )
                 if locked_application is None:
                     raise InvalidStateTransition
-                locked_candidate = db.scalar(
-                    select(Candidate)
-                    .where(
-                        Candidate.organization_id == principal.organization_id,
-                        Candidate.id == locked_application.candidate_id,
-                    )
-                    .with_for_update()
+                locked_candidate = lock_candidate_retention_facts(
+                    db, principal.organization_id, locked_application.candidate_id
                 )
                 if locked_candidate is None:
                     raise InvalidStateTransition
@@ -754,6 +764,9 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                     )
                 )
                 db.flush()
+                recalculate_candidate_retention(
+                    db, principal.organization_id, locked_candidate.id
+                )
                 return 201, {"data": _interview_data(db, interview)}
 
             status_code, body = persisted_idempotent(
@@ -838,13 +851,8 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
         if final_method == "onsite" and not final_location:
             return problem(request, 422, "validation_failed", "location is required for onsite interviews.")
         application = db.get(Application, interview.application_id)
-        candidate = db.scalar(
-            select(Candidate)
-            .where(
-                Candidate.organization_id == principal.organization_id,
-                Candidate.id == application.candidate_id,
-            )
-            .with_for_update()
+        candidate = lock_candidate_retention_facts(
+            db, principal.organization_id, application.candidate_id
         )
         if candidate is None:
             return _denied(request)
@@ -940,6 +948,9 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
                 )
             )
             db.flush()
+            recalculate_candidate_retention(
+                db, principal.organization_id, candidate.id
+            )
             body = {"data": _interview_data(db, interview)}
             db.commit()
             response = JSONResponse(body)
@@ -1028,6 +1039,9 @@ def transition_interview(
                 )
                 if locked is None or locked.version != expected:
                     raise ResourceVersionConflict
+                candidate_id = _lock_application_candidate_retention(
+                    db, principal.organization_id, locked.application_id
+                )
                 source = locked.status
                 target = payload.target
                 allowed = {
@@ -1096,6 +1110,9 @@ def transition_interview(
                     )
                 )
                 db.flush()
+                recalculate_candidate_retention(
+                    db, principal.organization_id, candidate_id
+                )
                 return 200, {"data": _interview_data(db, locked)}
 
             status_code, body = persisted_idempotent(
@@ -1406,6 +1423,9 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                 )
                 if locked_interview is None or locked_interview.status != "pending_feedback":
                     raise InvalidStateTransition
+                candidate_id = _lock_application_candidate_retention(
+                    db, principal.organization_id, locked_interview.application_id
+                )
                 feedback = db.scalar(
                     select(InterviewFeedback)
                     .where(
@@ -1485,6 +1505,9 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                     )
                 )
                 db.flush()
+                recalculate_candidate_retention(
+                    db, principal.organization_id, candidate_id
+                )
                 return 200, {"data": _feedback_data(feedback)}
 
             status_code, body = persisted_idempotent(
@@ -1535,6 +1558,15 @@ def amend_feedback(feedback_id: UUID, payload: FeedbackAmendment, request: Reque
             return problem(request, 409, "invalid_state_transition", "Only submitted feedback can be amended.")
         if feedback.version != expected:
             return problem(request, 409, "resource_version_conflict", "The feedback changed. Refresh and retry.")
+        application_id = db.scalar(
+            select(Interview.application_id).where(
+                Interview.organization_id == principal.organization_id,
+                Interview.id == feedback.interview_id,
+            )
+        )
+        candidate_id = _lock_application_candidate_retention(
+            db, principal.organization_id, application_id
+        )
         previous = _feedback_document(feedback)
         changes = payload.model_dump(exclude={"reason"})
         now = datetime.now(timezone.utc)
@@ -1591,6 +1623,9 @@ def amend_feedback(feedback_id: UUID, payload: FeedbackAmendment, request: Reque
                 )
             )
             db.flush()
+            recalculate_candidate_retention(
+                db, principal.organization_id, candidate_id
+            )
             body = {"data": _feedback_data(feedback)}
             db.commit()
             response = JSONResponse(body)

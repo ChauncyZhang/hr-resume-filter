@@ -1,7 +1,5 @@
 import asyncio
 import logging
-import hashlib
-import hmac
 import re
 import secrets
 from contextlib import asynccontextmanager
@@ -27,7 +25,7 @@ from server.app.recruiting.http import derive_cursor_key
 from server.app.talent.api import router as talent_router
 from server.app.reports.api import router as reports_router
 from server.app.governance.api import router as governance_router
-from server.app.governance.service import GovernanceTokenCodec
+from server.app.governance.service import GovernanceTokenCodec, derive_governance_key
 
 
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
@@ -100,10 +98,12 @@ def create_app(
     cursor_secret = settings.contact_lookup_secret.get_secret_value()
     cursor_source = cursor_secret.encode() if cursor_secret != "change-me" else b"test-only-cursor-signing-boundary"
     app.state.recruiting_cursor = CursorCodec(derive_cursor_key(cursor_source))
-    governance_key = hmac.new(
-        cursor_source, b"ux09/governance/tokens/v1", hashlib.sha256
-    ).digest()
-    app.state.governance_tokens = GovernanceTokenCodec(governance_key)
+    app.state.governance_audit_cursor = GovernanceTokenCodec(
+        derive_governance_key(cursor_source, "audit-cursor")
+    )
+    app.state.governance_retention_preview = GovernanceTokenCodec(
+        derive_governance_key(cursor_source, "retention-preview")
+    )
     app.state.contact_cipher = ContactCipher(
         settings.contact_encryption_key.get_secret_value().encode(),
         settings.contact_lookup_secret.get_secret_value().encode(),

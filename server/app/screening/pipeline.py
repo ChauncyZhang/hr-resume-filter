@@ -4,8 +4,8 @@ from pathlib import PurePath
 from sqlalchemy import and_,func,select
 from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError,RetryableJobError
+from server.app.governance.retention import lock_candidate_retention_facts,recalculate_candidate_retention
 from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
-from server.app.recruiting.service import clear_candidate_retention_due,lock_candidate_retention_state
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.parsers import ParserLimits
@@ -86,13 +86,13 @@ class ScreeningPipeline:
             if item.status in {"parsed","scored"}: return
             run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id))
             candidate_id,resume_id,application_id=_uuid(item.id,"candidate"),_uuid(item.id,"resume"),_uuid(item.id,"application")
-            candidate=lock_candidate_retention_state(db,organization_id,candidate_id) or Candidate(id=candidate_id,organization_id=organization_id,display_name=(PurePath(filename).stem[:200] or "Candidate"),owner_id=run.created_by)
+            candidate=lock_candidate_retention_facts(db,organization_id,candidate_id) or Candidate(id=candidate_id,organization_id=organization_id,display_name=(PurePath(filename).stem[:200] or "Candidate"),owner_id=run.created_by)
             if candidate not in db: db.add(candidate)
             resume=db.get(Resume,resume_id) or Resume(id=resume_id,organization_id=organization_id,candidate_id=candidate_id,file_object_id=item.file_object_id,version_number=1,parsed_text=parsed.text)
             if resume not in db: db.add(resume)
             application=db.get(Application,application_id) or Application(id=application_id,organization_id=organization_id,candidate_id=candidate_id,job_id=run.job_id,resume_id=resume_id,owner_id=run.created_by,stage="new",source="screening")
             if application not in db:
-                db.add(application); db.flush(); clear_candidate_retention_due(db,organization_id,candidate_id)
+                db.add(application); db.flush(); recalculate_candidate_retention(db,organization_id,candidate_id)
             item.candidate_id=candidate_id; item.resume_id=resume_id; item.application_id=application_id; item.status="parsed"; item.parser_version=parsed.parser_version; item.parse_quality=parsed.quality; item.safe_error_code=None
             QueueRepository(db).enqueue(organization_id,"screening.score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"rule_engine_version":ENGINE_VERSION},dedupe_key=f"score:{item.id}",trace_id=getattr(job,"trace_id",None),max_attempts=3); run.status="rule_scoring"; db.commit()
     async def score_item(self,job):

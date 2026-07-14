@@ -515,6 +515,7 @@ def test_post_0016_audit_category_repair_preserves_append_only_trigger() -> None
     organization_id = uuid.uuid4()
     recruiting_id = uuid.uuid4()
     system_id = uuid.uuid4()
+    llm_id = uuid.uuid4()
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -532,10 +533,16 @@ def test_post_0016_audit_category_repair_preserves_append_only_trigger() -> None
                   id, organization_id, category, event_type, outcome, metadata_json, created_at
                 ) VALUES
                   (:recruiting, :org, 'system', 'candidate.created', 'success', '{}', now()),
+                  (:llm, :org, 'recruiting', 'llm.config_updated', 'success', '{}', now()),
                   (:system, :org, 'system', 'authentication.login', 'success', '{}', now())
                 """
             ),
-            {"org": organization_id, "recruiting": recruiting_id, "system": system_id},
+            {
+                "org": organization_id,
+                "recruiting": recruiting_id,
+                "llm": llm_id,
+                "system": system_id,
+            },
         )
 
     _alembic(url, "upgrade", "head")
@@ -546,7 +553,11 @@ def test_post_0016_audit_category_repair_preserves_append_only_trigger() -> None
                 {"org": organization_id},
             ).all()
         )
-    assert categories == {recruiting_id: "recruiting", system_id: "system"}
+    assert categories == {
+        recruiting_id: "recruiting",
+        llm_id: "system",
+        system_id: "system",
+    }
     with pytest.raises(Exception, match="append-only"):
         with engine.begin() as connection:
             connection.execute(

@@ -7,6 +7,11 @@ from typing import Callable
 
 from sqlalchemy import func, select, text, update
 
+from server.app.governance.retention import (
+    lock_candidate_retention_facts,
+    recalculate_candidate_retention,
+)
+
 
 class InvalidStateTransition(Exception): pass
 class ResourceVersionConflict(Exception): pass
@@ -100,6 +105,9 @@ def _apply_application_transition(db, application, target, *, actor_user_id, tra
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import ApplicationStageEvent
 
+    lock_candidate_retention_facts(
+        db, application.organization_id, application.candidate_id
+    )
     source = application.stage
     RecruitingService().transition_application_state(source, target, reason_code=reason_code, reason_text=reason_text)
     application.stage = target
@@ -114,6 +122,9 @@ def _apply_application_transition(db, application, target, *, actor_user_id, tra
     db.add(ApplicationStageEvent(organization_id=application.organization_id, application_id=application.id, actor_user_id=actor_user_id, event_type="application.stage_changed", payload=event_payload))
     db.add(AuditLog(organization_id=application.organization_id, actor_user_id=actor_user_id, event_type="application.stage_changed", outcome="success", trace_id=trace_id, metadata_json=safe_payload))
     db.flush()
+    recalculate_candidate_retention(
+        db, application.organization_id, application.candidate_id
+    )
     return application
 
 
@@ -233,6 +244,7 @@ def patch_candidate_record(db, organization_id, candidate_id, changes, *, expect
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import Candidate, CandidateEvent
 
+    lock_candidate_retention_facts(db, organization_id, candidate_id)
     row = db.scalar(update(Candidate).where(
         Candidate.organization_id == organization_id, Candidate.id == candidate_id, Candidate.version == expected_version,
     ).values(**changes, version=Candidate.version + 1, updated_at=datetime.now(timezone.utc)).returning(Candidate))
@@ -242,6 +254,7 @@ def patch_candidate_record(db, organization_id, candidate_id, changes, *, expect
     db.add(CandidateEvent(organization_id=organization_id, candidate_id=candidate_id, actor_user_id=actor_user_id, event_type="candidate.corrected", payload=safe))
     db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="candidate.corrected", outcome="success", trace_id=trace_id, metadata_json=safe))
     db.flush()
+    recalculate_candidate_retention(db, organization_id, candidate_id)
     return row
 
 
@@ -249,6 +262,15 @@ def patch_application_record(db, organization_id, application_id, changes, *, ex
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import Application, CandidateEvent
 
+    candidate_id = db.scalar(
+        select(Application.candidate_id).where(
+            Application.organization_id == organization_id,
+            Application.id == application_id,
+        )
+    )
+    if candidate_id is None:
+        raise ResourceVersionConflict
+    lock_candidate_retention_facts(db, organization_id, candidate_id)
     row = db.scalar(update(Application).where(
         Application.organization_id == organization_id, Application.id == application_id, Application.version == expected_version,
     ).values(**changes, version=Application.version + 1, updated_at=datetime.now(timezone.utc)).returning(Application))
@@ -258,13 +280,14 @@ def patch_application_record(db, organization_id, application_id, changes, *, ex
     db.add(CandidateEvent(organization_id=organization_id, candidate_id=row.candidate_id, actor_user_id=actor_user_id, event_type="application.updated", payload=safe))
     db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="application.updated", outcome="success", trace_id=trace_id, metadata_json=safe))
     db.flush()
+    recalculate_candidate_retention(db, organization_id, row.candidate_id)
     return row
 
 
 def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):
     from server.app.recruiting.models import Application, Candidate, Resume
 
-    lock_candidate_retention_state(db, organization_id, candidate_id)
+    lock_candidate_retention_facts(db, organization_id, candidate_id)
     resume = db.scalar(select(Resume).where(Resume.organization_id == organization_id, Resume.id == resume_id))
     if resume is None or resume.candidate_id != candidate_id:
         raise InvalidAggregateRelationship
@@ -274,48 +297,8 @@ def create_application_record(db, *, organization_id, candidate_id, job_id, resu
     application = Application(organization_id=organization_id, candidate_id=candidate_id, job_id=job_id, resume_id=resume_id, owner_id=owner_id, source=source, stage="new", source_application_id=related[0].id if related else None)
     db.add(application)
     db.flush()
-    clear_candidate_retention_due(db, organization_id, candidate_id)
+    recalculate_candidate_retention(db, organization_id, candidate_id)
     return application
-
-
-def lock_candidate_retention_state(db, organization_id, candidate_id):
-    from server.app.recruiting.models import Candidate
-
-    return db.scalar(
-        select(Candidate).where(
-            Candidate.organization_id == organization_id,
-            Candidate.id == candidate_id,
-        ).with_for_update()
-    )
-
-
-def lock_candidates_for_retention(db, organization_id):
-    from server.app.recruiting.models import Candidate
-
-    return list(
-        db.scalars(
-            select(Candidate.id).where(
-                Candidate.organization_id == organization_id
-            ).order_by(Candidate.id).with_for_update()
-        )
-    )
-
-
-def clear_candidate_retention_due(db, organization_id, candidate_id) -> None:
-    from server.app.recruiting.models import Candidate
-
-    table = Candidate.__table__
-    db.execute(
-        table.update()
-        .where(
-            table.c.organization_id == organization_id,
-            table.c.id == candidate_id,
-        )
-        .values(
-            retention_due_at=None,
-            updated_at=table.c.updated_at,
-        )
-    )
 
 
 def issue_download_ticket_record(db, organization_id, user_id, resume_id, clock, tokens):

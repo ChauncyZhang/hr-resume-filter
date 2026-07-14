@@ -62,23 +62,29 @@ _SENSITIVE_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+CATEGORY_PREFIXES = {
+    "governance": ("retention_policy.", "governance."),
+    "recruiting": (
+        "candidate.",
+        "application.",
+        "job.",
+        "resume.",
+        "screening.",
+        "interview.",
+        "talent_pool.",
+        "report_export.",
+    ),
+    "system": ("authentication.", "authorization.", "llm."),
+}
+
 
 def category_for_event(event_type: str) -> str:
-    if event_type.startswith(("retention_policy.", "governance.")):
+    if event_type.startswith(CATEGORY_PREFIXES["governance"]):
         return "governance"
-    if event_type.startswith(
-        (
-            "candidate.",
-            "application.",
-            "job.",
-            "resume.",
-            "screening.",
-            "interview.",
-            "talent_pool.",
-            "report_export.",
-        )
-    ):
+    if event_type.startswith(CATEGORY_PREFIXES["recruiting"]):
         return "recruiting"
+    if event_type.startswith(CATEGORY_PREFIXES["system"]):
+        return "system"
     return "system"
 
 

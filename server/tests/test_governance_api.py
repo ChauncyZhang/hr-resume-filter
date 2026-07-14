@@ -7,7 +7,10 @@ from sqlalchemy import select
 from server.app.core.settings import Settings
 from server.app.governance.models import RetentionPolicy
 from server.app.governance import api as governance_api
+from server.app.governance import audit as governance_audit
 from server.app.governance import service as governance_service
+from server.app.governance.audit import category_for_event
+from server.app.governance.service import GovernanceTokenCodec, InvalidGovernanceToken
 from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole
 from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.main import create_app
@@ -163,6 +166,25 @@ def test_openapi_registers_only_task_a_governance_families(tmp_path) -> None:
     assert set(paths["/api/v1/settings/retention-policy"]) == {"get", "patch"}
     assert set(paths["/api/v1/settings/retention-policy/previews"]) == {"post"}
     assert "metadata_json" not in str(document)
+
+
+def test_llm_audit_events_are_explicitly_system_and_governance_keys_are_domain_separated() -> None:
+    assert "llm." in governance_audit.CATEGORY_PREFIXES["system"]
+    assert category_for_event("llm.config_updated") == "system"
+    assert category_for_event("llm.connection_tested") == "system"
+    root = b"governance-root-secret"
+    audit_key = governance_service.derive_governance_key(root, "audit-cursor")
+    preview_key = governance_service.derive_governance_key(root, "retention-preview")
+    assert audit_key != preview_key
+    audit_codec = GovernanceTokenCodec(audit_key)
+    preview_codec = GovernanceTokenCodec(preview_key)
+    token = audit_codec.encode({"kind": "audit_cursor"})
+    try:
+        preview_codec.decode(token)
+    except InvalidGovernanceToken:
+        pass
+    else:
+        raise AssertionError("an audit cursor must not verify as a retention preview token")
 
 
 def test_retention_read_roles_defaults_and_fail_closed_denials(tmp_path) -> None:
