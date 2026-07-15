@@ -66,6 +66,10 @@ backup is enabled.
 On the target Linux host, with external traffic still closed, execute:
 
 ```sh
+# The protected env file is authoritative for release image references. Remove
+# build-shell leftovers so Compose cannot silently override it.
+unset APP_IMAGE APP_IMAGE_DIGEST FRONTEND_IMAGE FRONTEND_IMAGE_DIGEST
+
 COMPOSE_ENV_FILE=deploy/.env sh deploy/production-preflight.sh
 COMPOSE_ENV_FILE=deploy/.env sh deploy/observability-preflight.sh
 OBSERVABILITY_PREFLIGHT_MODE=production \
@@ -147,12 +151,22 @@ production volumes in place and never use the disposable drill Compose project
 as a production topology.
 
 For an application-only rollback, first close or reduce external traffic and
-set `APP_IMAGE_DIGEST` and `FRONTEND_IMAGE_DIGEST` in the protected
-`deploy/.env` to the previously recorded compatible values. Preserve the
-forward-migrated database, backup leases, and `/var/lib/ux09-backup/pending-run.json`.
-Then run:
+restore `APP_IMAGE`, `APP_IMAGE_DIGEST`, `FRONTEND_IMAGE`, and
+`FRONTEND_IMAGE_DIGEST` in the protected `deploy/.env` as one previously
+recorded compatible release. Preserve the forward-migrated database, backup
+leases, and `/var/lib/ux09-backup/pending-run.json`. Then run from a shell where
+the protected file is authoritative:
 
 ```sh
+unset APP_IMAGE APP_IMAGE_DIGEST FRONTEND_IMAGE FRONTEND_IMAGE_DIGEST
+COMPOSE_ENV_FILE=deploy/.env sh deploy/production-preflight.sh
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml \
+  -f deploy/compose.production.yaml \
+  -f deploy/compose.observability.yaml \
+  config --images
+# Stop unless the rendered application and frontend repository@digest values
+# exactly match the recorded rollback release.
 docker compose --env-file deploy/.env \
   -f deploy/compose.yaml \
   -f deploy/compose.production.yaml \
