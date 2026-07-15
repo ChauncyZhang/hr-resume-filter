@@ -160,3 +160,139 @@ class Settings(BaseModel):
         if "LLM_PROVIDER_ALLOWLIST_JSON" in os.environ:
             values["llm_provider_allowlist"] = json.loads(os.environ["LLM_PROVIDER_ALLOWLIST_JSON"])
         return cls.model_validate(values)
+
+
+class GovernanceSettings(BaseModel):
+    """Worker-only credentials for privileged deletion execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    environment: Literal["development", "test", "production"] = "development"
+    database_url: SecretStr = SecretStr("")
+    storage_endpoint: str = "minio:9000"
+    storage_secure: bool = False
+    delete_access_key: str = ""
+    delete_secret_key: SecretStr = SecretStr("")
+    resume_bucket: str = "resumes"
+    resume_prefix: str = "clean/"
+    export_bucket: str = "resumes"
+    export_prefix: str = "exports/"
+    ledger_access_key: str = ""
+    ledger_secret_key: SecretStr = SecretStr("")
+    ledger_bucket: str = "governance-ledger"
+    ledger_prefix: str = "deletions/"
+    signing_key: SecretStr = SecretStr("")
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> "GovernanceSettings":
+        database = urlsplit(self.database_url.get_secret_value())
+        if not database.scheme or not database.hostname or not database.username:
+            raise ValueError("governance database URL is invalid")
+        if not database.password:
+            raise ValueError("governance database password is required")
+        credentials = (
+            self.delete_access_key,
+            self.delete_secret_key.get_secret_value(),
+            self.ledger_access_key,
+            self.ledger_secret_key.get_secret_value(),
+            self.signing_key.get_secret_value(),
+        )
+        database_password = unquote(database.password)
+        if self.environment == "production":
+            normalized = tuple(value.strip().lower() for value in credentials)
+            if (
+                any(not value or value in PLACEHOLDERS for value in normalized)
+                or any(
+                    marker in database_password.strip().lower()
+                    for marker in PLACEHOLDER_FRAGMENTS
+                )
+            ):
+                raise ValueError("production governance credentials are required")
+            signing_key = self.signing_key.get_secret_value()
+            if (
+                len(signing_key.encode("utf-8")) < 32
+                or signing_key != signing_key.strip()
+                or any(character.isspace() for character in signing_key)
+                or any(
+                    marker in signing_key.lower()
+                    for marker in PLACEHOLDER_FRAGMENTS
+                )
+                or len(set(signing_key)) < 12
+            ):
+                raise ValueError("production ledger signing key must be high entropy")
+        if self.delete_access_key == self.ledger_access_key:
+            raise ValueError("governance access keys must be independent")
+        secret_values = (
+            self.delete_secret_key.get_secret_value(),
+            self.ledger_secret_key.get_secret_value(),
+            self.signing_key.get_secret_value(),
+        )
+        if any(
+            hmac_compare(left, right)
+            for index, left in enumerate(secret_values)
+            for right in secret_values[index + 1 :]
+        ):
+            raise ValueError("governance secret keys must be independent")
+        if any(not value or value.startswith("/") for value in (self.resume_prefix, self.export_prefix, self.ledger_prefix)):
+            raise ValueError("governance prefixes must be non-empty relative paths")
+        return self
+
+    def validate_runtime_separation(
+        self,
+        *,
+        database_url: str,
+        object_access_key: str,
+        object_secret_key: str,
+    ) -> None:
+        ordinary = urlsplit(database_url)
+        governance = urlsplit(self.database_url.get_secret_value())
+        if ordinary.username == governance.username:
+            raise ValueError("governance database user must differ from application database user")
+        if ordinary.password and governance.password and hmac_compare(
+            unquote(ordinary.password), unquote(governance.password)
+        ):
+            raise ValueError("governance database passwords must differ")
+        if object_access_key in {self.delete_access_key, self.ledger_access_key} or any(
+            hmac_compare(object_secret_key, value.get_secret_value())
+            for value in (self.delete_secret_key, self.ledger_secret_key)
+        ):
+            raise ValueError("governance object credentials must differ from application object credentials")
+
+    @classmethod
+    def from_environment(cls, ordinary: Settings | None = None) -> "GovernanceSettings":
+        mapping = {
+            "APP_ENVIRONMENT": "environment",
+            "GOVERNANCE_DATABASE_URL": "database_url",
+            "GOVERNANCE_STORAGE_ENDPOINT": "storage_endpoint",
+            "GOVERNANCE_STORAGE_SECURE": "storage_secure",
+            "GOVERNANCE_DELETE_ACCESS_KEY": "delete_access_key",
+            "GOVERNANCE_DELETE_SECRET_KEY": "delete_secret_key",
+            "GOVERNANCE_RESUME_BUCKET": "resume_bucket",
+            "GOVERNANCE_RESUME_PREFIX": "resume_prefix",
+            "GOVERNANCE_EXPORT_BUCKET": "export_bucket",
+            "GOVERNANCE_EXPORT_PREFIX": "export_prefix",
+            "GOVERNANCE_LEDGER_ACCESS_KEY": "ledger_access_key",
+            "GOVERNANCE_LEDGER_SECRET_KEY": "ledger_secret_key",
+            "GOVERNANCE_LEDGER_BUCKET": "ledger_bucket",
+            "GOVERNANCE_LEDGER_PREFIX": "ledger_prefix",
+            "GOVERNANCE_LEDGER_SIGNING_KEY": "signing_key",
+        }
+        values = {
+            field_name: os.environ[env_name]
+            for env_name, field_name in mapping.items()
+            if env_name in os.environ
+        }
+        settings = cls.model_validate(values)
+        if ordinary is not None:
+            settings.validate_runtime_separation(
+                database_url=ordinary.database_url,
+                object_access_key=ordinary.object_storage_access_key,
+                object_secret_key=ordinary.object_storage_secret_key,
+            )
+        return settings
+
+
+def hmac_compare(left: str, right: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))

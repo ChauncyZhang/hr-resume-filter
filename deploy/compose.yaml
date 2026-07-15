@@ -4,8 +4,8 @@ x-app-environment: &app-environment
   APP_ENVIRONMENT: ${APP_ENVIRONMENT:-development}
   DATABASE_URL: postgresql+asyncpg://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
   OBJECT_STORAGE_ENDPOINT: minio:9000
-  OBJECT_STORAGE_ACCESS_KEY: ${MINIO_ROOT_USER}
-  OBJECT_STORAGE_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  OBJECT_STORAGE_ACCESS_KEY: ${APP_OBJECT_STORAGE_ACCESS_KEY}
+  OBJECT_STORAGE_SECRET_KEY: ${APP_OBJECT_STORAGE_SECRET_KEY}
   OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-resumes}
   CONTACT_ENCRYPTION_KEY: ${CONTACT_ENCRYPTION_KEY}
   CONTACT_LOOKUP_SECRET: ${CONTACT_LOOKUP_SECRET}
@@ -38,8 +38,8 @@ x-app-service: &app-service
   depends_on:
     postgres:
       condition: service_healthy
-    minio:
-      condition: service_healthy
+    minio-provision:
+      condition: service_completed_successfully
     clamav:
       condition: service_healthy
   restart: unless-stopped
@@ -76,6 +76,22 @@ services:
   worker:
     <<: *app-service
     command: ["python", "-m", "server.app.worker.main"]
+    environment:
+      <<: *app-environment
+      DATABASE_URL: postgresql+asyncpg://${APP_DB_USER}:${APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GOVERNANCE_DATABASE_URL: postgresql+psycopg://${GOVERNANCE_DB_USER}:${GOVERNANCE_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      GOVERNANCE_STORAGE_ENDPOINT: minio:9000
+      GOVERNANCE_DELETE_ACCESS_KEY: ${GOVERNANCE_DELETE_ACCESS_KEY}
+      GOVERNANCE_DELETE_SECRET_KEY: ${GOVERNANCE_DELETE_SECRET_KEY}
+      GOVERNANCE_RESUME_BUCKET: ${GOVERNANCE_RESUME_BUCKET:-resumes}
+      GOVERNANCE_RESUME_PREFIX: ${GOVERNANCE_RESUME_PREFIX:-clean/}
+      GOVERNANCE_EXPORT_BUCKET: ${GOVERNANCE_EXPORT_BUCKET:-${OBJECT_STORAGE_BUCKET:-resumes}}
+      GOVERNANCE_EXPORT_PREFIX: ${GOVERNANCE_EXPORT_PREFIX:-exports/}
+      GOVERNANCE_LEDGER_ACCESS_KEY: ${GOVERNANCE_LEDGER_ACCESS_KEY}
+      GOVERNANCE_LEDGER_SECRET_KEY: ${GOVERNANCE_LEDGER_SECRET_KEY}
+      GOVERNANCE_LEDGER_BUCKET: ${GOVERNANCE_LEDGER_BUCKET:-governance-ledger}
+      GOVERNANCE_LEDGER_PREFIX: ${GOVERNANCE_LEDGER_PREFIX:-deletions/}
+      GOVERNANCE_LEDGER_SIGNING_KEY: ${GOVERNANCE_LEDGER_SIGNING_KEY}
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-40s}
     healthcheck:
       test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
@@ -91,6 +107,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       APP_DB_USER: ${APP_DB_USER}
       APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+      GOVERNANCE_DB_USER: ${GOVERNANCE_DB_USER}
+      GOVERNANCE_DB_PASSWORD: ${GOVERNANCE_DB_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./postgres/provision-app-role.sh:/docker-entrypoint-initdb.d/10-provision-app-role.sh:ro
@@ -116,6 +134,35 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    networks: [private]
+
+  minio-provision:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    entrypoint: ["/bin/sh", "/provision/provision.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      APP_OBJECT_STORAGE_ACCESS_KEY: ${APP_OBJECT_STORAGE_ACCESS_KEY}
+      APP_OBJECT_STORAGE_SECRET_KEY: ${APP_OBJECT_STORAGE_SECRET_KEY}
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-resumes}
+      GOVERNANCE_DELETE_ACCESS_KEY: ${GOVERNANCE_DELETE_ACCESS_KEY}
+      GOVERNANCE_DELETE_SECRET_KEY: ${GOVERNANCE_DELETE_SECRET_KEY}
+      GOVERNANCE_RESUME_BUCKET: ${GOVERNANCE_RESUME_BUCKET:-resumes}
+      GOVERNANCE_RESUME_PREFIX: ${GOVERNANCE_RESUME_PREFIX:-clean/}
+      GOVERNANCE_EXPORT_BUCKET: ${GOVERNANCE_EXPORT_BUCKET:-${OBJECT_STORAGE_BUCKET:-resumes}}
+      GOVERNANCE_EXPORT_PREFIX: ${GOVERNANCE_EXPORT_PREFIX:-exports/}
+      GOVERNANCE_LEDGER_ACCESS_KEY: ${GOVERNANCE_LEDGER_ACCESS_KEY}
+      GOVERNANCE_LEDGER_SECRET_KEY: ${GOVERNANCE_LEDGER_SECRET_KEY}
+      GOVERNANCE_LEDGER_BUCKET: ${GOVERNANCE_LEDGER_BUCKET:-governance-ledger}
+      GOVERNANCE_LEDGER_PREFIX: ${GOVERNANCE_LEDGER_PREFIX:-deletions/}
+      PREVIOUS_GOVERNANCE_DELETE_ACCESS_KEY: ${PREVIOUS_GOVERNANCE_DELETE_ACCESS_KEY:-}
+      PREVIOUS_GOVERNANCE_LEDGER_ACCESS_KEY: ${PREVIOUS_GOVERNANCE_LEDGER_ACCESS_KEY:-}
+    volumes:
+      - ./minio:/provision:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
     networks: [private]
 
   clamav:

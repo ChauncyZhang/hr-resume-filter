@@ -9,6 +9,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import and_, func, select, text
+from sqlalchemy.exc import DBAPIError
 
 from server.app.governance.audit import append_audit
 from server.app.governance.deletion_models import DeletionArtifact, DeletionRequest, LegalHold
@@ -36,6 +37,62 @@ class DeletionDomainError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class DatabaseRedactionResult:
+    checksum: str
+    facts: tuple[int, int, int, int, int, int, int, int, int]
+
+
+_SAFE_REDACTION_ERRORS = frozenset(
+    {
+        "redaction_context_invalid",
+        "redaction_state_invalid",
+        "redaction_manifest_stale",
+        "redaction_tombstone_invalid",
+        "redaction_not_authorized",
+    }
+)
+
+
+def execute_database_redaction(
+    connection,
+    *,
+    organization_id: UUID,
+    request_id: UUID,
+    candidate_id: UUID,
+) -> DatabaseRedactionResult:
+    """Invoke the executor-only routine and expose only checksum/count facts."""
+
+    try:
+        row = connection.execute(
+            text(
+                "SELECT * FROM redact_candidate_data("
+                ":organization_id, :request_id, :candidate_id)"
+            ),
+            {
+                "organization_id": organization_id,
+                "request_id": request_id,
+                "candidate_id": candidate_id,
+            },
+        ).one()
+    except DBAPIError as error:
+        diagnostic = getattr(getattr(error, "orig", None), "diag", None)
+        code = getattr(diagnostic, "message_primary", None)
+        if code not in _SAFE_REDACTION_ERRORS:
+            code = "redaction_failed"
+        raise DeletionDomainError(code) from None
+    checksum = row[0]
+    facts = tuple(int(value) for value in row[1:])
+    if (
+        not isinstance(checksum, str)
+        or len(checksum) != 64
+        or len(facts) != 9
+        or any(value < 0 for value in facts)
+    ):
+        raise DeletionDomainError("redaction_result_invalid")
+    return DatabaseRedactionResult(checksum=checksum, facts=facts)
 
 
 _ALLOWED_TRANSITIONS = {

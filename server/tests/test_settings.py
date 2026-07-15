@@ -111,3 +111,115 @@ def test_production_rejects_equal_contact_keys() -> None:
     key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
     with pytest.raises(ValidationError):
         production_settings(contact_encryption_key=key, contact_lookup_secret=key)
+
+
+def governance_settings(**overrides: object):
+    from server.app.core.settings import GovernanceSettings
+
+    values = {
+        "environment": "production",
+        "database_url": "postgresql+psycopg://ux09_governance:Gov-9f3c7a@postgres/ux09",
+        "delete_access_key": "governance-delete-7f3a",
+        "delete_secret_key": "delete-secret-8e4b6c",
+        "resume_bucket": "resumes",
+        "resume_prefix": "clean/",
+        "export_bucket": "resumes",
+        "export_prefix": "exports/",
+        "ledger_access_key": "governance-ledger-4a8d",
+        "ledger_secret_key": "ledger-secret-2f7c9e",
+        "ledger_bucket": "governance-ledger",
+        "ledger_prefix": "deletions/",
+        "signing_key": "signing-key-c6b8f2d4e9a7-4f1c8a2d",
+    }
+    values.update(overrides)
+    return GovernanceSettings(**values)
+
+
+def test_governance_settings_keep_every_secret_out_of_repr() -> None:
+    settings = governance_settings()
+
+    rendered = repr(settings)
+    for secret in (
+        "Gov-9f3c7a",
+        "delete-secret-8e4b6c",
+        "ledger-secret-2f7c9e",
+        "signing-key-c6b8f2d4e9a7-4f1c8a2d",
+    ):
+        assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("database_url", "postgresql+psycopg://ux09_governance:change-me@postgres/ux09"),
+        ("delete_access_key", "change-me"),
+        ("delete_secret_key", "placeholder"),
+        ("ledger_access_key", "example"),
+        ("ledger_secret_key", "password"),
+        ("signing_key", "secret"),
+    ],
+)
+def test_production_governance_settings_reject_missing_or_placeholder_credentials(
+    field: str, value: str
+) -> None:
+    with pytest.raises(ValidationError):
+        governance_settings(**{field: value})
+
+
+def test_governance_settings_reject_shared_credentials() -> None:
+    settings = governance_settings()
+
+    with pytest.raises(ValidationError):
+        governance_settings(ledger_access_key=settings.delete_access_key)
+    with pytest.raises(ValidationError):
+        governance_settings(
+            ledger_secret_key=settings.delete_secret_key.get_secret_value()
+        )
+    with pytest.raises(ValidationError):
+        governance_settings(
+            signing_key=settings.delete_secret_key.get_secret_value()
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "x" * 31,
+        " " * 40,
+        "a" * 64,
+        "change-me-signing-key-with-padding-1234",
+        "valid-looking-signing-key-with-space 123456",
+    ],
+)
+def test_production_governance_settings_reject_weak_signing_keys(value: str) -> None:
+    with pytest.raises(ValidationError):
+        governance_settings(signing_key=value)
+
+
+def test_governance_export_defaults_match_report_storage_contract() -> None:
+    from server.app.core.settings import GovernanceSettings
+
+    assert GovernanceSettings.model_fields["export_bucket"].default == "resumes"
+    assert GovernanceSettings.model_fields["export_prefix"].default == "exports/"
+
+
+def test_governance_settings_validate_separation_from_ordinary_runtime() -> None:
+    settings = governance_settings()
+
+    settings.validate_runtime_separation(
+        database_url="postgresql+asyncpg://ux09_app:app-secret@postgres/ux09",
+        object_access_key="app-object-access",
+        object_secret_key="app-object-secret",
+    )
+    with pytest.raises(ValueError, match="database user"):
+        settings.validate_runtime_separation(
+            database_url="postgresql+asyncpg://ux09_governance:other@postgres/ux09",
+            object_access_key="app-object-access",
+            object_secret_key="app-object-secret",
+        )
+    with pytest.raises(ValueError, match="object credentials"):
+        settings.validate_runtime_separation(
+            database_url="postgresql+asyncpg://ux09_app:app-secret@postgres/ux09",
+            object_access_key=settings.delete_access_key,
+            object_secret_key="app-object-secret",
+        )

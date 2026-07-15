@@ -14,6 +14,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 COPY server/requirements-dev.txt /opt/ux09/server/requirements-dev.txt
-COPY deploy/nginx/default.conf /opt/ux09/deploy/nginx/default.conf
+COPY deploy /opt/ux09/deploy
 RUN pip install --no-cache-dir -r server/requirements-dev.txt
 CMD ["python", "-m", "pytest", "server/tests", "-q"]

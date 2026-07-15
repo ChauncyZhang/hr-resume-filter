@@ -15,6 +15,8 @@ pytestmark = pytest.mark.skipif(
     not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured"
 )
 
+ALEMBIC_TIMEOUT_SECONDS = 60
+
 
 def _alembic(url: str, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -22,6 +24,7 @@ def _alembic(url: str, *args: str, check: bool = True) -> subprocess.CompletedPr
         check=check,
         capture_output=not check,
         text=True,
+        timeout=ALEMBIC_TIMEOUT_SECONDS,
         env={**os.environ, "DATABASE_URL": url},
     )
 
@@ -162,7 +165,7 @@ def test_0017_upgrade_registers_additive_deletion_schema() -> None:
     }
     with engine.connect() as connection:
         assert connection.scalar(
-            text("SELECT has_function_privilege('public', 'redact_candidate_audit_evidence(uuid, uuid)', 'EXECUTE')")
+            text("SELECT has_function_privilege('public', 'redact_candidate_data(uuid, uuid, uuid)', 'EXECUTE')")
         ) is False
     engine.dispose()
 
@@ -259,7 +262,8 @@ def test_0017_enforces_tenant_fks_partial_uniqueness_and_privileged_boundaries()
         with engine.begin() as connection:
             connection.execute(text("SET LOCAL ROLE task_b1_app"))
             connection.execute(
-                text("SELECT redact_candidate_audit_evidence(:org1, :candidate)"), ids
+                text("SELECT redact_candidate_data(:org1, :request, :candidate)"),
+                {**ids, "request": first_request},
             )
     with pytest.raises(DBAPIError, match="append-only"):
         with engine.begin() as connection:
@@ -268,10 +272,11 @@ def test_0017_enforces_tenant_fks_partial_uniqueness_and_privileged_boundaries()
                 text("UPDATE audit_logs SET outcome = 'failure' WHERE id = :audit"),
                 {"audit": audit_id},
             )
-    with pytest.raises(DBAPIError, match="audit redaction unavailable"):
+    with pytest.raises(DBAPIError, match="redaction_not_authorized"):
         with engine.begin() as connection:
             connection.execute(
-                text("SELECT redact_candidate_audit_evidence(:org1, :candidate)"), ids
+                text("SELECT redact_candidate_data(:org1, :request, :candidate)"),
+                {**ids, "request": first_request},
             )
 
     engine.dispose()
@@ -476,6 +481,8 @@ def test_provisioned_application_role_is_unprivileged_and_cannot_mutate_evidence
             "POSTGRES_PASSWORD": str(owner_url.password),
             "APP_DB_USER": role,
             "APP_DB_PASSWORD": password,
+            "GOVERNANCE_DB_USER": "task_b2b1_governance",
+            "GOVERNANCE_DB_PASSWORD": "task-b2b1-governance-password",
         },
     )
     owner_engine = create_engine(url.replace("+asyncpg", "+psycopg"))
@@ -518,7 +525,7 @@ def test_provisioned_application_role_is_unprivileged_and_cannot_mutate_evidence
         assert connection.scalar(
             text(
                 "SELECT has_function_privilege(current_user, "
-                "'redact_candidate_audit_evidence(uuid, uuid)', 'EXECUTE')"
+                "'redact_candidate_data(uuid, uuid, uuid)', 'EXECUTE')"
             )
         ) is False
     with pytest.raises(DBAPIError, match="permission denied|append-only"):
@@ -530,7 +537,8 @@ def test_provisioned_application_role_is_unprivileged_and_cannot_mutate_evidence
     with pytest.raises(DBAPIError, match="permission denied"):
         with app_engine.begin() as connection:
             connection.execute(
-                text("SELECT redact_candidate_audit_evidence(:org1, :candidate)"), ids
+                text("SELECT redact_candidate_data(:org1, :request, :candidate)"),
+                {**ids, "request": uuid.uuid4()},
             )
 
     app_engine.dispose()
@@ -559,7 +567,7 @@ def test_0017_empty_downgrade_removes_additive_schema() -> None:
     }
     with engine.connect() as connection:
         assert connection.scalar(
-            text("SELECT to_regprocedure('redact_candidate_audit_evidence(uuid, uuid)')")
+            text("SELECT to_regprocedure('redact_candidate_data(uuid, uuid, uuid)')")
         ) is None
     engine.dispose()
 
@@ -639,7 +647,7 @@ def test_0017_downgrade_waits_for_writer_then_refuses_without_dropping() -> None
             column["name"] for column in inspect(engine).get_columns("candidates")
         }
         assert observer.scalar(
-            text("SELECT to_regprocedure('redact_candidate_audit_evidence(uuid, uuid)')")
+            text("SELECT to_regprocedure('redact_candidate_data(uuid, uuid, uuid)')")
         ) is not None
     finally:
         if process.poll() is None:

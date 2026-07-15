@@ -38,8 +38,17 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T postgres `
 ```
 
 The application role receives DML on current non-audit tables, append-only access to audit
-tables, and no function grants. Sensitive redaction remains owner-only. Keep
-`POSTGRES_PASSWORD` and `APP_DB_PASSWORD` distinct and rotate them independently.
+tables, and no function grants. The separate `GOVERNANCE_DB_USER` login receives no table or
+sequence privileges and inherits only the fixed, no-login `ux09_governance_executor` boundary,
+which can execute `redact_candidate_data(uuid, uuid, uuid)`. Keep the owner, application, and
+governance usernames and passwords pairwise distinct. The provisioning script rejects shared
+values, removes stale inbound/outbound governance memberships, and reconciles all three roles
+idempotently after migrations.
+
+The API container receives none of the governance database, object-deletion, ledger, or signing
+settings. The general worker continues to use `DATABASE_URL` for normal queue work and receives a
+separate `GOVERNANCE_DATABASE_URL` for the later deletion handler. Task B2B1 does not register or
+run that handler.
 
 ## Compose
 
@@ -48,6 +57,20 @@ Copy `deploy/.env.example` to `deploy/.env`, replace every `change-me` value, th
 ```powershell
 docker compose --env-file deploy/.env -f deploy/compose.yaml up --build -d
 ```
+
+Compose first runs the one-shot `minio-provision` service. MinIO root credentials exist only in
+the MinIO server and that provisioner; API and worker runtime use the ordinary application object
+credential. The deletion credential can list/delete only configured resume/export prefixes and
+cannot read or write objects. The ledger credential can list/read/write only its ledger prefix and
+cannot delete or access resume/export objects. Report exports use the ordinary object bucket under
+`exports/`, so `GOVERNANCE_EXPORT_BUCKET` must match `OBJECT_STORAGE_BUCKET` and the deletion
+prefix must remain `exports/` unless the report storage contract changes with it.
+
+`server.app.governance.storage` provides the delete-only adapter and canonical signed ledger v1.
+Ledger writes verify an existing object before accepting idempotent re-entry; malformed, tampered,
+or mismatched evidence fails with a stable non-identifying code. Ledger bodies contain only schema
+version, organization/request/candidate UUIDs, completion time, manifest hash, exact object keys,
+database-redaction checksum, and HMAC signature.
 
 Validate the example topology without starting services:
 
@@ -80,6 +103,17 @@ passwords, distinct MinIO
 access and secret keys, and explicit HTTPS CORS origins. Startup rejects placeholders and
 wildcard CORS. Buckets are private and must be provisioned separately; the application never
 enables anonymous/public access. Rotate secrets through the deployment environment, not Git.
+
+Rotate governance credentials through the deployment secret store. Stop the governance deletion
+consumer, rerun PostgreSQL role and MinIO policy provisioning with the new values, deploy worker
+secrets atomically, and run the real PostgreSQL and MinIO smoke tests before resuming work. When
+rotating MinIO access-key identities, set `PREVIOUS_GOVERNANCE_DELETE_ACCESS_KEY` and/or
+`PREVIOUS_GOVERNANCE_LEDGER_ACCESS_KEY` for the provisioning run; the provisioner removes those
+retired users after attaching the new least-privilege policies. Production requires the independent
+ledger signing key to contain at least 32 UTF-8 bytes, no whitespace or placeholder text, and
+non-trivial character diversity.
+Signing-key rotation requires explicit ledger key history/versioning; it is not a safe online
+single-key swap because prior ledgers must remain independently verifiable.
 
 Candidate contacts require separate high-entropy 32-byte base64url
 `CONTACT_ENCRYPTION_KEY` and `CONTACT_LOOKUP_SECRET` values. Generate them independently;
