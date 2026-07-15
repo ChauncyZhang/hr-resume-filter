@@ -74,9 +74,9 @@ const stageMeta = [
 
 const emptyStages = stageMeta.map(() => []);
 
-function IconButton({ label, children, className = "", onClick, disabled = false }) {
+function IconButton({ label, children, className = "", onClick, disabled = false, ...buttonProps }) {
   return (
-    <button className={`icon-button ${className}`} type="button" title={label} aria-label={label} onClick={onClick} disabled={disabled}>
+    <button className={`icon-button ${className}`} type="button" title={label} aria-label={label} onClick={onClick} disabled={disabled} {...buttonProps}>
       {children}
     </button>
   );
@@ -638,12 +638,13 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     <div className="app-shell">
       <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
         <div className="brand">招聘协同平台</div>
-        <nav aria-label="主导航">
+        <nav id="primary-navigation" aria-label="主导航">
           {navItems.filter(([label]) => allowedNavItems.has(label)).map(([label, Icon]) => (
             <button
               key={label}
               type="button"
               className={activeNav === label ? "nav-item active" : "nav-item"}
+              aria-current={activeNav === label ? "page" : undefined}
               onClick={() => {
                 setActiveNav(label);
                 setMenuOpen(false);
@@ -683,7 +684,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
 
       <main className="workspace">
         <header className="topbar">
-          <IconButton label="打开菜单" className="mobile-menu" onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
+          <IconButton label={menuOpen ? "关闭主导航" : "打开主导航"} className="mobile-menu" aria-controls="primary-navigation" aria-expanded={menuOpen} onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
           <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav === "人才库" && talentMode === "detail" ? "人才库详情" : activeNav}</h1>
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}

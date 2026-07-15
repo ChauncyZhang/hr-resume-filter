@@ -20,7 +20,7 @@
 * { box-sizing: border-box; }
 button, input, select, textarea { font: inherit; letter-spacing: 0; }
 button { color: inherit; }
-body { margin: 0; min-width: 320px; min-height: 100vh; background: #f4f6f8; font-size: var(--type-body); line-height: 1.57; -webkit-font-smoothing: antialiased; }
+body { margin: 0; min-width: 320px; min-height: 100vh; overflow-x: hidden; background: #f4f6f8; font-size: var(--type-body); line-height: 1.57; -webkit-font-smoothing: antialiased; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #2a7cc0; outline-offset: 2px; }
 
 .session-loading { min-height: 100dvh; display: flex; align-items: center; justify-content: center; gap: 10px; color: #526574; background: #f4f6f8; }
@@ -276,7 +276,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 
 @media (max-width: 900px) {
-  .sidebar { transform: translateX(-100%); transition: transform .18s ease; }.sidebar.sidebar-open { transform: translateX(0); }.workspace { width: 100%; margin-left: 0; }.mobile-menu { display: inline-flex; }.mobile-scrim { display: block; position: fixed; z-index: 20; inset: 0; border: 0; background: rgba(20,35,50,.25); }.page-body { padding: 12px; grid-template-columns: minmax(0,1fr); }.right-rail { grid-template-columns: 1fr; }.job-switcher { align-items: flex-start; }.job-tabs { overflow-x: auto; padding-bottom: 4px; }.job-tab { min-width: 150px; }.switcher-label { display: none; }.kanban { overflow-x: auto; grid-template-columns: repeat(6, 150px); }.pipeline-panel { overflow: hidden; }
+  .sidebar { visibility: hidden; transform: translateX(-100%); transition: transform .18s ease, visibility 0s linear .18s; }.sidebar.sidebar-open { visibility: visible; transform: translateX(0); transition-delay: 0s; }.workspace { width: 100%; margin-left: 0; }.mobile-menu { display: inline-flex; }.mobile-scrim { display: block; position: fixed; z-index: 20; inset: 0; border: 0; background: rgba(20,35,50,.25); }.page-body { padding: 12px; grid-template-columns: minmax(0,1fr); }.right-rail { grid-template-columns: 1fr; }.job-switcher { align-items: flex-start; }.job-tabs { overflow-x: auto; padding-bottom: 4px; }.job-tab { min-width: 150px; }.switcher-label { display: none; }.kanban { overflow-x: auto; grid-template-columns: repeat(6, 150px); }.pipeline-panel { overflow: hidden; }
   .job-page { padding: 14px 12px 24px; }.job-filters { flex-wrap: wrap; }.job-filters .search-control { flex: 1 1 260px; }.job-form-layout { grid-template-columns: 1fr; }.form-summary { position: static; }.job-detail-hero { align-items: flex-start; flex-direction: column; }.job-detail-actions { width: 100%; flex-wrap: wrap; }.job-metrics { grid-template-columns: repeat(2,1fr); }.detail-candidate-head, .detail-candidate-table > button { grid-template-columns: minmax(190px,1fr) 95px 58px 100px 80px 22px; min-width: 700px; }.detail-candidate-table { overflow-x: auto; }.funnel-strip { overflow-x: auto; grid-template-columns: repeat(6,120px); }
   .screening-task-page { padding: 14px 12px 25px; }.task-progress-panel { grid-template-columns: 1fr; gap: 13px; }.progress-stats { border-top: 1px solid #e4e8eb; padding-top: 10px; }.progress-stats div:first-child { border-left: 0; }
   .candidate-page { padding: 14px 12px 25px; }.candidate-detail-hero { align-items: flex-start; flex-direction: column; }.candidate-detail-actions { justify-content: flex-start; }.candidate-detail-layout { grid-template-columns: 1fr; }.candidate-context { grid-template-columns: repeat(3,1fr); }.candidate-context section { min-width: 0; }
@@ -284,6 +284,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 
 @media (max-width: 600px) {
+  .app-shell { display: block; }
+  .sidebar { position: static; width: 100%; height: 56px; transform: none; visibility: visible; border-right: 0; border-bottom: 1px solid var(--line); transition: none; }
+  .brand, .profile { display: none; }
+  .sidebar nav { height: 55px; padding: 5px 8px; display: flex; gap: 4px; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; }
+  .nav-item { height: 44px; flex: 0 0 auto; gap: 7px; padding: 0 12px; white-space: nowrap; }
+  .mobile-menu, .mobile-scrim { display: none; }
   .login-page { padding: 20px 16px; grid-template-rows: 1fr auto; }
   .login-card { padding: 27px 22px 25px; }
   .login-heading h1 { font-size: 21px; }
