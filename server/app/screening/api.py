@@ -6,7 +6,7 @@ from tempfile import SpooledTemporaryFile
 from uuid import UUID
 from fastapi import APIRouter,File,Header,Query,Request,UploadFile
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_,func,or_,select
+from sqlalchemy import and_,exists,func,or_,select
 from server.app.identity.models import AuditLog,Job
 from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load_job,_principal,_problem_for
 from server.app.recruiting.authorization import RecruitingAction
@@ -40,7 +40,8 @@ def _load_run(db,principal,run_id,action=RecruitingAction.READ,lock=False):
     query=select(ScreeningRun).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningRun.organization_id==principal.organization_id,ScreeningRun.id==run_id,_job_scope(principal,action))
     return db.scalar(query.with_for_update() if lock else query)
 def _load_item_scoped(db,principal,item_id,action=RecruitingAction.READ):
-    return db.scalar(select(ScreeningItem).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.id==item_id,_job_scope(principal,action)))
+    active_candidate=exists().where(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id,Candidate.deleted_at.is_(None))
+    return db.scalar(select(ScreeningItem).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.id==item_id,or_(ScreeningItem.candidate_id.is_(None),active_candidate),_job_scope(principal,action)))
 def _filename(value,extension):
     name=PurePath(unquote(value or "").replace("\\","/")).name; name=re.sub(r"[\x00-\x1f\x7f]","",name).strip().replace("..",".")
     if not name: name=f"resume{extension}"
@@ -212,7 +213,8 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
     with request.app.state.identity_store.sync_session() as db:
         run=_load_run(db,principal,run_id)
         if run is None: return _not_found(request)
-        query=select(ScreeningItem,FileObject).join(FileObject,and_(FileObject.organization_id==ScreeningItem.organization_id,FileObject.id==ScreeningItem.file_object_id)).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id)
+        active_candidate=exists().where(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id,Candidate.deleted_at.is_(None))
+        query=select(ScreeningItem,FileObject).join(FileObject,and_(FileObject.organization_id==ScreeningItem.organization_id,FileObject.id==ScreeningItem.file_object_id)).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,or_(ScreeningItem.candidate_id.is_(None),active_candidate))
         if status: query=query.where(ScreeningItem.status==status)
         if cursor:
             try:
@@ -225,7 +227,7 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             enrichment_scope=(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.id.in_(item_ids))
             application_rows=db.execute(select(ScreeningItem.id,Application).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(*enrichment_scope)).all()
             applications={item_id:application for item_id,application in application_rows}
-            candidate_rows=db.execute(select(ScreeningItem.id,Candidate).join(Candidate,and_(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id)).where(*enrichment_scope)).all()
+            candidate_rows=db.execute(select(ScreeningItem.id,Candidate).join(Candidate,and_(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id)).where(*enrichment_scope,Candidate.deleted_at.is_(None))).all()
             candidates={item_id:candidate for item_id,candidate in candidate_rows}
             result_rows=db.execute(select(ScreeningResult.item_id,ScreeningResult).join(ScreeningItem,and_(ScreeningItem.organization_id==ScreeningResult.organization_id,ScreeningItem.id==ScreeningResult.item_id)).where(*enrichment_scope).order_by(ScreeningResult.created_at.desc(),ScreeningResult.id.desc())).all()
             for item_id,result in result_rows: rule_results.setdefault(item_id,result)

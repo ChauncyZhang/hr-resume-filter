@@ -74,7 +74,7 @@ class RecruitingAuthorizationService:
         if not self.role_allows(principal, action):
             return False
         if self.is_admin(principal):
-            return True
+            return candidate.deleted_at.is_(None)
         authorized_application = exists().where(
             Application.organization_id == candidate.organization_id,
             Application.candidate_id == candidate.id,
@@ -93,4 +93,4 @@ class RecruitingAuthorizationService:
                 Application.candidate_id == candidate.id,
             ),
         )
-        return or_(unassigned_owner, authorized_application)
+        return and_(candidate.deleted_at.is_(None), or_(unassigned_owner, authorized_application))

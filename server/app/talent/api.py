@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import String, and_, cast, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
+from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, User, UserStatus
 from server.app.identity.policy import Principal
@@ -18,7 +18,9 @@ from server.app.recruiting.authorization import RecruitingAction, RecruitingAuth
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, Resume
 from server.app.recruiting.service import (
     ActiveApplicationExists,
+    CandidateUnavailable,
     IdempotencyConflict,
+    lock_active_candidate,
     persisted_idempotent,
 )
 from server.app.talent.models import TalentPool, TalentPoolGrant, TalentPoolMembership
@@ -117,9 +119,17 @@ def _load_membership(db, principal: Principal, membership_id: UUID, *, manage: b
                 TalentPool.id == TalentPoolMembership.pool_id,
             ),
         )
+        .join(
+            Candidate,
+            and_(
+                Candidate.organization_id == TalentPoolMembership.organization_id,
+                Candidate.id == TalentPoolMembership.candidate_id,
+            ),
+        )
         .where(
             TalentPoolMembership.organization_id == principal.organization_id,
             TalentPoolMembership.id == membership_id,
+            Candidate.deleted_at.is_(None),
             _pool_scope(principal, manage=manage),
         )
     )
@@ -503,6 +513,7 @@ def list_talent_pool_memberships(
             .where(
                 TalentPoolMembership.organization_id == principal.organization_id,
                 TalentPoolMembership.pool_id == pool_id,
+                Candidate.deleted_at.is_(None),
             )
         )
         if q:
@@ -560,7 +571,7 @@ def create_talent_pool_membership(pool_id: UUID, payload: MembershipCreate, requ
                 return _denied(request)
 
         def action():
-            lock_candidate_retention_facts(db, principal.organization_id, candidate.id)
+            lock_active_candidate(db, principal.organization_id, candidate.id)
             membership = TalentPoolMembership(
                 organization_id=principal.organization_id,
                 pool_id=pool.id,
@@ -589,6 +600,9 @@ def create_talent_pool_membership(pool_id: UUID, payload: MembershipCreate, requ
         except IdempotencyConflict:
             db.rollback()
             return problem(request, 409, "idempotency_conflict", "The idempotency key was already used.")
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         response = JSONResponse(body, status_code=status)
         response.headers["ETag"] = f'"{body["data"]["version"]}"'
         response.headers["Cache-Control"] = "no-store"
@@ -611,10 +625,9 @@ def patch_talent_pool_membership(membership_id: UUID, payload: MembershipPatch, 
         changes = payload.model_dump(exclude_unset=True)
         if "owner_id" in changes and _active_user(db, principal.organization_id, changes["owner_id"]) is None:
             return _denied(request)
-        candidate = lock_candidate_retention_facts(
-            db, principal.organization_id, candidate_id
-        )
-        if candidate is None:
+        try:
+            candidate = lock_active_candidate(db, principal.organization_id, candidate_id)
+        except CandidateUnavailable:
             return _denied(request)
         membership = _load_membership(
             db, principal, membership_id, manage=True, for_update=True
@@ -649,10 +662,9 @@ def delete_talent_pool_membership(membership_id: UUID, payload: MembershipRemova
         if membership is None:
             return _denied(request)
         candidate_id = membership.candidate_id
-        candidate = lock_candidate_retention_facts(
-            db, principal.organization_id, candidate_id
-        )
-        if candidate is None:
+        try:
+            candidate = lock_active_candidate(db, principal.organization_id, candidate_id)
+        except CandidateUnavailable:
             return _denied(request)
         membership = _load_membership(
             db, principal, membership_id, manage=True, for_update=True
@@ -682,10 +694,9 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
         if membership is None:
             return _denied(request)
         candidate_id = membership.candidate_id
-        candidate = lock_candidate_retention_facts(
-            db, principal.organization_id, candidate_id
-        )
-        if candidate is None:
+        try:
+            candidate = lock_active_candidate(db, principal.organization_id, candidate_id)
+        except CandidateUnavailable:
             return _denied(request)
         membership = _load_membership(
             db, principal, membership_id, manage=True, for_update=True

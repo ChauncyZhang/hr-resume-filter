@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.orm import aliased
 
-from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
+from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Department, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
@@ -34,12 +34,12 @@ from server.app.recruiting.schemas import (
     VersionCollection, VersionResource, WorkbenchResource, Problem,
 )
 from server.app.recruiting.service import (
-    ActiveApplicationExists, IdempotencyConflict, InvalidAggregateRelationship,
+    ActiveApplicationExists, CandidateUnavailable, IdempotencyConflict, InvalidAggregateRelationship,
     InvalidStateTransition, ResourceVersionConflict, SystemClock, SystemTokens,
     TicketInvalid, consume_download_ticket_record, create_application_record,
     create_job_definition_record,
     issue_download_ticket_record, persisted_idempotent, transition_application_record,
-    lock_job_for_version_write,
+    lock_active_candidate, lock_job_for_version_write,
     transition_job_record, patch_job_record, patch_candidate_record, patch_application_record,
     replace_job_definition_record,
 )
@@ -155,6 +155,7 @@ def _problem_for(request: Request, error: Exception) -> JSONResponse:
         IdempotencyConflict: (409, "idempotency_conflict"),
         ActiveApplicationExists: (409, "active_application_exists"),
         InvalidAggregateRelationship: (422, "validation_failed"),
+        CandidateUnavailable: (404, "resource_not_found"),
         TicketInvalid: (404, "resource_not_found"),
         InvalidCursor: (422, "validation_failed"),
     }
@@ -186,7 +187,12 @@ def _candidate_scope(principal: Principal, action: RecruitingAction = Recruiting
 
 
 def _resume_application_scope(principal: Principal, action: RecruitingAction):
-    return exists().where(
+    active_candidate = exists().where(
+        Candidate.organization_id == Resume.organization_id,
+        Candidate.id == Resume.candidate_id,
+        Candidate.deleted_at.is_(None),
+    )
+    visible_application = exists().where(
         Application.organization_id == Resume.organization_id,
         Application.resume_id == Resume.id,
         exists().where(
@@ -195,15 +201,19 @@ def _resume_application_scope(principal: Principal, action: RecruitingAction):
             AUTH.job_predicate(principal, action, Job),
         ),
     )
+    return and_(active_candidate, visible_application)
 
 
 def _load_candidate_application(db, principal: Principal, candidate_id: UUID, application_id: UUID, action: RecruitingAction):
     return db.scalar(select(Application).join(
         Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)
+    ).join(
+        Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id)
     ).where(
         Application.organization_id == principal.organization_id,
         Application.id == application_id,
         Application.candidate_id == candidate_id,
+        Candidate.deleted_at.is_(None),
         AUTH.job_predicate(principal, action, Job),
     ))
 
@@ -520,6 +530,7 @@ def get_workbench(request: Request, response: Response):
                 Application.organization_id == principal.organization_id,
                 Application.job_id.in_(jobs_by_id),
                 Application.stage.in_(WORKBENCH_STAGES),
+                Candidate.deleted_at.is_(None),
                 AUTH.job_predicate(principal, RecruitingAction.READ, Job),
             ).order_by(Application.updated_at.desc(), Application.id.desc())).all()
 
@@ -928,7 +939,7 @@ def patch_candidate(candidate_id: UUID, payload: CandidatePatch, request: Reques
         try:
             candidate = patch_candidate_record(db, principal.organization_id, candidate_id, changes, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
             db.commit(); return _resource(_candidate_data(db, candidate, principal))
-        except ResourceVersionConflict as error:
+        except (ResourceVersionConflict, CandidateUnavailable) as error:
             db.rollback(); return _problem_for(request, error)
 
 
@@ -1002,7 +1013,11 @@ def add_note(candidate_id: UUID, payload: NoteCreate, request: Request):
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate_application(db, principal, candidate_id, payload.application_id, RecruitingAction.COMMENT) is None: return _denied(request)
-        lock_candidate_retention_facts(db, principal.organization_id, candidate_id)
+        try:
+            lock_active_candidate(db, principal.organization_id, candidate_id)
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         application_id = str(payload.application_id)
         note = CandidateNote(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note", payload={"application_id": application_id, "body": payload.body}); db.add(note); db.add(CandidateEvent(organization_id=principal.organization_id, candidate_id=candidate_id, actor_user_id=principal.user_id, event_type="candidate.note_added", payload={"application_id": application_id})); db.flush()
         recalculate_candidate_retention(db, principal.organization_id, candidate_id)
@@ -1054,7 +1069,11 @@ def issue_ticket(resume_id: UUID, request: Request):
     with request.app.state.identity_store.sync_session() as db:
         resume = _load_resume(db, principal, resume_id, RecruitingAction.ISSUE_TICKET)
         if resume is None: return _denied(request)
-        raw = issue_download_ticket_record(db, principal.organization_id, principal.user_id, resume.id, request.app.state.recruiting_clock, request.app.state.recruiting_tokens)
+        try:
+            raw = issue_download_ticket_record(db, principal.organization_id, principal.user_id, resume.id, request.app.state.recruiting_clock, request.app.state.recruiting_tokens)
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         db.add(AuditLog(organization_id=principal.organization_id, actor_user_id=principal.user_id, event_type="resume.download_ticket_issued", outcome="success", trace_id=request.state.trace_id, metadata_json={"resume_id": str(resume.id)})); db.commit()
         response = _resource({"token": raw, "expires_in": 60}, 201); response.headers["Cache-Control"] = "no-store"; return response
 
@@ -1127,7 +1146,7 @@ def create_application(job_id: UUID, payload: ApplicationCreate, request: Reques
 
 
 def _load_application(db, principal: Principal, application_id: UUID, action: RecruitingAction = RecruitingAction.READ):
-    return db.scalar(select(Application).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.id == application_id, _job_scope(principal, action)))
+    return db.scalar(select(Application).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).join(Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id)).where(Application.organization_id == principal.organization_id, Application.id == application_id, Candidate.deleted_at.is_(None), _job_scope(principal, action)))
 
 
 @router.patch("/applications/{application_id}", response_model=ApplicationResource)
@@ -1148,7 +1167,7 @@ def patch_application(application_id: UUID, payload: ApplicationPatch, request: 
         try:
             item = patch_application_record(db, principal.organization_id, application_id, changes, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id)
             db.commit(); return _resource(_application_data(item))
-        except ResourceVersionConflict as error:
+        except (ResourceVersionConflict, CandidateUnavailable) as error:
             db.rollback(); return _problem_for(request, error)
 
 

@@ -1,12 +1,11 @@
 import uuid
 from sqlalchemy import and_, select
-from server.app.governance.retention import lock_candidate_retention_facts
 from server.app.identity.models import AuditLog
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
-from server.app.recruiting.models import Application,FileObject,Resume
-from server.app.recruiting.service import transition_application_record
+from server.app.recruiting.models import Application,Candidate,FileObject,Resume
+from server.app.recruiting.service import CandidateUnavailable,lock_active_candidate,transition_application_record
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.rules import ENGINE_VERSION
@@ -42,6 +41,9 @@ def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None)
     active_jobs=_active_retry_jobs(db,organization_id,item_id)
     item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
     if item is None: raise ScreeningItemNotRetryable
+    if item.candidate_id is not None:
+        try: lock_active_candidate(db,organization_id,item.candidate_id)
+        except CandidateUnavailable: raise ScreeningItemNotRetryable from None
     run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update()); stored_file=db.scalar(select(FileObject).where(FileObject.organization_id==organization_id,FileObject.id==item.file_object_id).with_for_update())
     if run is None or stored_file is None: raise ScreeningItemNotRetryable
     llm_active=any(job.type=="screening.llm_score_item" for job in active_jobs)
@@ -76,11 +78,14 @@ def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None)
 
 def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
     requested={item.item_id:item.expected_application_version for item in payload.items}
-    relationships=list(db.execute(select(ScreeningItem.id,ScreeningItem.application_id,Application.candidate_id).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested))))
+    relationships=list(db.execute(select(ScreeningItem.id,ScreeningItem.application_id,Application.candidate_id).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).join(Candidate,and_(Candidate.organization_id==Application.organization_id,Candidate.id==Application.candidate_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested),Candidate.deleted_at.is_(None))))
     if len(relationships)!=len(requested): raise ScreeningBulkConflict
     expected_relationships={item_id:(application_id,candidate_id) for item_id,application_id,candidate_id in relationships}
     candidate_ids=sorted({candidate_id for _,candidate_id in expected_relationships.values()})
-    if any(lock_candidate_retention_facts(db,organization_id,candidate_id) is None for candidate_id in candidate_ids): raise ScreeningBulkConflict
+    try:
+        for candidate_id in candidate_ids: lock_active_candidate(db,organization_id,candidate_id)
+    except CandidateUnavailable:
+        raise ScreeningBulkConflict from None
     run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==run_id).with_for_update())
     rows=list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested)).order_by(ScreeningItem.id).with_for_update()))
     if run is None or len(rows)!=len(requested): raise ScreeningBulkConflict

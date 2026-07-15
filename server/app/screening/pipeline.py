@@ -1,11 +1,12 @@
 import hashlib,json,uuid
 from datetime import datetime,timezone
 from pathlib import PurePath
-from sqlalchemy import and_,func,select
+from sqlalchemy import and_,exists,func,select
 from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError,RetryableJobError
 from server.app.governance.retention import lock_candidate_retention_facts,recalculate_candidate_retention
 from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
+from server.app.recruiting.service import CandidateUnavailable,lock_active_candidate
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.parsers import ParserLimits
@@ -39,6 +40,9 @@ class ScreeningPipeline:
         with self.sessions() as db:
             item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
             if not item: raise PermanentJobError("screening_item_missing")
+            if item.candidate_id is not None:
+                try: lock_active_candidate(db,organization_id,item.candidate_id)
+                except CandidateUnavailable: raise PermanentJobError("screening_item_missing") from None
             item.attempts=max(item.attempts,getattr(job,"attempts",1)); item.started_at=item.started_at or datetime.now(timezone.utc)
             if item.status in {"parsed","scored","cancelled"} or (item.status=="failed" and item.safe_error_code not in _RETRYABLE): db.commit(); return
             item.status="parsing"; db.commit()
@@ -86,7 +90,9 @@ class ScreeningPipeline:
             if item.status in {"parsed","scored"}: return
             run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id))
             candidate_id,resume_id,application_id=_uuid(item.id,"candidate"),_uuid(item.id,"resume"),_uuid(item.id,"application")
-            candidate=lock_candidate_retention_facts(db,organization_id,candidate_id) or Candidate(id=candidate_id,organization_id=organization_id,display_name=(PurePath(filename).stem[:200] or "Candidate"),owner_id=run.created_by)
+            candidate=lock_candidate_retention_facts(db,organization_id,candidate_id)
+            if candidate is not None and candidate.deleted_at is not None: raise PermanentJobError("screening_item_missing")
+            candidate=candidate or Candidate(id=candidate_id,organization_id=organization_id,display_name=(PurePath(filename).stem[:200] or "Candidate"),owner_id=run.created_by)
             if candidate not in db: db.add(candidate)
             resume=db.get(Resume,resume_id) or Resume(id=resume_id,organization_id=organization_id,candidate_id=candidate_id,file_object_id=item.file_object_id,version_number=1,parsed_text=parsed.text)
             if resume not in db: db.add(resume)
@@ -103,7 +109,8 @@ class ScreeningPipeline:
             if item.status in {"scored","failed","cancelled"}: return
             item.status="scoring"; db.commit()
         with self.sessions() as db:
-            row=db.execute(select(ScreeningItem,ScreeningRun,Resume,JobJdVersion,ScreeningRuleVersion).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Resume,and_(Resume.organization_id==ScreeningItem.organization_id,Resume.id==ScreeningItem.resume_id)).join(JobJdVersion,and_(JobJdVersion.organization_id==ScreeningRun.organization_id,JobJdVersion.id==ScreeningRun.jd_version_id)).join(ScreeningRuleVersion,and_(ScreeningRuleVersion.organization_id==ScreeningRun.organization_id,ScreeningRuleVersion.id==ScreeningRun.rule_version_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id)).one_or_none()
+            active_candidate=exists().where(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id,Candidate.deleted_at.is_(None))
+            row=db.execute(select(ScreeningItem,ScreeningRun,Resume,JobJdVersion,ScreeningRuleVersion).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Resume,and_(Resume.organization_id==ScreeningItem.organization_id,Resume.id==ScreeningItem.resume_id)).join(JobJdVersion,and_(JobJdVersion.organization_id==ScreeningRun.organization_id,JobJdVersion.id==ScreeningRun.jd_version_id)).join(ScreeningRuleVersion,and_(ScreeningRuleVersion.organization_id==ScreeningRun.organization_id,ScreeningRuleVersion.id==ScreeningRun.rule_version_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id,active_candidate)).one_or_none()
             if not row: raise PermanentJobError("screening_item_missing")
             item,run,resume,jd,rule=row
             text=resume.parsed_text or ""
@@ -116,6 +123,8 @@ class ScreeningPipeline:
         except Exception: return await self._retry_or_finish(job,organization_id,item_id,"scoring_failed","score")
         with self.sessions() as db:
             item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update())
+            try: lock_active_candidate(db,organization_id,item.candidate_id)
+            except CandidateUnavailable: raise PermanentJobError("screening_item_missing") from None
             existing=db.scalar(select(ScreeningResult).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id,ScreeningResult.rule_engine_version==result.engine_version))
             if not existing:
                 existing=ScreeningResult(organization_id=organization_id,item_id=item.id,application_id=item.application_id,resume_id=item.resume_id,rule_engine_version=result.engine_version,rule_score=result.score,recommendation=result.recommendation,required_hits=result.required_hits,required_missing=result.required_missing,bonus_hits=result.bonus_hits,estimated_years=result.estimated_years,risks=result.risks,questions=result.questions); db.add(existing); db.flush()

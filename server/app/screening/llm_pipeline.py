@@ -187,7 +187,7 @@ class LlmScreeningPipeline:
             .outerjoin(LlmProviderConfig, and_(LlmProviderConfig.organization_id == ScreeningItem.organization_id, LlmProviderConfig.id == ids["config_id"]))
             .join(PromptVersion, and_(PromptVersion.organization_id == ScreeningItem.organization_id, PromptVersion.id == ids["prompt_version_id"]))
             .join(BackgroundJob, and_(BackgroundJob.organization_id == ScreeningItem.organization_id, BackgroundJob.id == queue_job_id))
-            .where(ScreeningItem.organization_id == ids["organization_id"], ScreeningItem.id == ids["screening_item_id"], ScreeningItem.status == "scored")
+            .where(ScreeningItem.organization_id == ids["organization_id"], ScreeningItem.id == ids["screening_item_id"], ScreeningItem.status == "scored", Candidate.deleted_at.is_(None))
         )
         if lock_item:
             statement = statement.with_for_update()

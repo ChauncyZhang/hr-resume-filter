@@ -8,7 +8,7 @@ from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, delete, exists, func, or_, select, text
 
-from server.app.governance.retention import lock_candidate_retention_facts, recalculate_candidate_retention
+from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
@@ -37,10 +37,12 @@ from server.app.recruiting.authorization import RecruitingAction, RecruitingAuth
 from server.app.recruiting.models import Application, Candidate, JobJdVersion, Resume
 from server.app.recruiting.storage import MAX_PREVIEW_BYTES
 from server.app.recruiting.service import (
+    CandidateUnavailable,
     IdempotencyConflict,
     InvalidStateTransition,
     ResourceVersionConflict,
     persisted_idempotent,
+    lock_active_candidate,
     transition_application_record,
 )
 from server.app.screening.models import ScreeningResult
@@ -102,9 +104,11 @@ def _load_application_for_management(db, principal: Principal, application_id: U
     return db.scalar(
         select(Application)
         .join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id))
+        .join(Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id))
         .where(
             Application.organization_id == principal.organization_id,
             Application.id == application_id,
+            Candidate.deleted_at.is_(None),
             AUTH.job_predicate(principal, RecruitingAction.TRANSITION, Job),
         )
     )
@@ -130,9 +134,11 @@ def _load_interview(db, principal: Principal, interview_id: UUID, *, manage: boo
         select(Interview)
         .join(Application, and_(Application.organization_id == Interview.organization_id, Application.id == Interview.application_id))
         .join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id))
+        .join(Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id))
         .where(
             Interview.organization_id == principal.organization_id,
             Interview.id == interview_id,
+            Candidate.deleted_at.is_(None),
             allowed,
         )
     )
@@ -181,9 +187,11 @@ def _load_interview_for_feedback_summary(db, principal: Principal, interview_id:
                 Job.id == Application.job_id,
             ),
         )
+        .join(Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id))
         .where(
             Interview.organization_id == principal.organization_id,
             Interview.id == interview_id,
+            Candidate.deleted_at.is_(None),
             or_(*allowed),
         )
     )
@@ -217,9 +225,11 @@ def _load_interview_material_context(db, principal: Principal, interview_id: UUI
                 Job.id == Application.job_id,
             ),
         )
+        .join(Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id))
         .where(
             Interview.organization_id == principal.organization_id,
             Interview.id == interview_id,
+            Candidate.deleted_at.is_(None),
             or_(AUTH.job_predicate(principal, RecruitingAction.READ, Job), assigned),
         )
     ).one_or_none()
@@ -399,10 +409,9 @@ def _lock_application_candidate_retention(db, organization_id, application_id):
             Application.id == application_id,
         )
     )
-    if candidate_id is None or lock_candidate_retention_facts(
-        db, organization_id, candidate_id
-    ) is None:
+    if candidate_id is None:
         raise InvalidStateTransition
+    lock_active_candidate(db, organization_id, candidate_id)
     return candidate_id
 
 
@@ -592,8 +601,10 @@ def list_interviews(
             select(Interview)
             .join(Application, and_(Application.organization_id == Interview.organization_id, Application.id == Interview.application_id))
             .join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id))
+            .join(Candidate, and_(Candidate.organization_id == Application.organization_id, Candidate.id == Application.candidate_id))
             .where(
                 Interview.organization_id == principal.organization_id,
+                Candidate.deleted_at.is_(None),
                 or_(AUTH.job_predicate(principal, RecruitingAction.READ, Job), assigned),
             )
         )
@@ -799,6 +810,9 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                 f"schedule_{error.kind}_conflict",
                 "One or more interviewers are unavailable.",
             )
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         except (InvalidStateTransition, ValueError):
             db.rollback()
             return problem(request, 409, "invalid_state_transition", "The application cannot be scheduled for an interview.")
@@ -1142,6 +1156,9 @@ def transition_interview(
             response = JSONResponse(body, status_code=status_code)
             response.headers["ETag"] = f'"{body["data"]["version"]}"'
             return response
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         except ResourceVersionConflict:
             db.rollback()
             return problem(request, 409, "resource_version_conflict", "The interview changed. Refresh and retry.")
@@ -1163,7 +1180,11 @@ def download_calendar(interview_id: UUID, request: Request) -> Response:
         if interview is None:
             return _denied(request)
         application = db.get(Application, interview.application_id)
-        candidate = db.get(Candidate, application.candidate_id)
+        try:
+            candidate = lock_active_candidate(db, principal.organization_id, application.candidate_id)
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         job = db.get(Job, application.job_id)
         payload = build_calendar_invitation(
             interview_id=interview.id,
@@ -1216,6 +1237,7 @@ def get_interview_materials(interview_id: UUID, request: Request):
             select(Candidate).where(
                 Candidate.organization_id == principal.organization_id,
                 Candidate.id == application.candidate_id,
+                Candidate.deleted_at.is_(None),
             )
         )
         resume = db.scalar(
@@ -1226,6 +1248,11 @@ def get_interview_materials(interview_id: UUID, request: Request):
             )
         )
         if candidate is None or resume is None:
+            return _denied(request)
+        try:
+            candidate = lock_active_candidate(db, principal.organization_id, candidate.id)
+        except CandidateUnavailable:
+            db.rollback()
             return _denied(request)
         preview_source = resume.parsed_text or ""
         if len(preview_source.encode("utf-8")) > MAX_PREVIEW_BYTES:
@@ -1369,6 +1396,13 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
             return value
     with request.app.state.identity_store.sync_session() as db:
         interview = _load_interview(db, principal, interview_id)
+        if interview is None:
+            return _denied(request)
+        try:
+            _lock_application_candidate_retention(db, principal.organization_id, interview.application_id)
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         participant = _assigned_participant(db, principal, interview_id, for_update=True)
         if interview is None or participant is None:
             return _denied(request)
@@ -1548,6 +1582,9 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
             response.headers["ETag"] = f'"{body["data"]["version"]}"'
             response.headers["Cache-Control"] = "no-store"
             return response
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         except InvalidStateTransition:
             db.rollback()
             return problem(request, 409, "invalid_state_transition", "The feedback cannot be submitted in its current state.")
@@ -1586,9 +1623,13 @@ def amend_feedback(feedback_id: UUID, payload: FeedbackAmendment, request: Reque
         )
         if application_id is None:
             return _denied(request)
-        candidate_id = _lock_application_candidate_retention(
-            db, principal.organization_id, application_id
-        )
+        try:
+            candidate_id = _lock_application_candidate_retention(
+                db, principal.organization_id, application_id
+            )
+        except CandidateUnavailable:
+            db.rollback()
+            return _denied(request)
         feedback = db.scalar(
             select(InterviewFeedback)
             .where(
@@ -1718,6 +1759,7 @@ def my_tasks(request: Request):
                 InterviewParticipant.role == "interviewer",
                 InterviewParticipant.task_status == "ready",
                 Interview.status.in_(("scheduled", "rescheduled", "confirmed", "pending_feedback")),
+                Candidate.deleted_at.is_(None),
             )
             .order_by(Interview.starts_at, Interview.id)
         ).all()

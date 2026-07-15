@@ -19,6 +19,14 @@ class IdempotencyConflict(Exception): pass
 class ActiveApplicationExists(Exception): pass
 class TicketInvalid(Exception): pass
 class InvalidAggregateRelationship(Exception): pass
+class CandidateUnavailable(InvalidStateTransition): pass
+
+
+def lock_active_candidate(db, organization_id, candidate_id):
+    candidate = lock_candidate_retention_facts(db, organization_id, candidate_id)
+    if candidate is None or candidate.deleted_at is not None:
+        raise CandidateUnavailable
+    return candidate
 
 
 class SystemClock:
@@ -136,7 +144,7 @@ def transition_application_record(db, organization_id, application_id, target, *
     )
     if candidate_id is None:
         raise ResourceVersionConflict
-    lock_candidate_retention_facts(db, organization_id, candidate_id)
+    lock_active_candidate(db, organization_id, candidate_id)
     application = db.scalar(
         select(Application)
         .where(
@@ -261,7 +269,7 @@ def patch_candidate_record(db, organization_id, candidate_id, changes, *, expect
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import Candidate, CandidateEvent
 
-    lock_candidate_retention_facts(db, organization_id, candidate_id)
+    lock_active_candidate(db, organization_id, candidate_id)
     row = db.scalar(update(Candidate).where(
         Candidate.organization_id == organization_id, Candidate.id == candidate_id, Candidate.version == expected_version,
     ).values(**changes, version=Candidate.version + 1, updated_at=datetime.now(timezone.utc)).returning(Candidate))
@@ -287,7 +295,7 @@ def patch_application_record(db, organization_id, application_id, changes, *, ex
     )
     if candidate_id is None:
         raise ResourceVersionConflict
-    lock_candidate_retention_facts(db, organization_id, candidate_id)
+    lock_active_candidate(db, organization_id, candidate_id)
     row = db.scalar(update(Application).where(
         Application.organization_id == organization_id, Application.id == application_id, Application.version == expected_version,
     ).values(**changes, version=Application.version + 1, updated_at=datetime.now(timezone.utc)).returning(Application))
@@ -304,7 +312,7 @@ def patch_application_record(db, organization_id, application_id, changes, *, ex
 def create_application_record(db, *, organization_id, candidate_id, job_id, resume_id, owner_id, source="manual"):
     from server.app.recruiting.models import Application, Candidate, Resume
 
-    lock_candidate_retention_facts(db, organization_id, candidate_id)
+    lock_active_candidate(db, organization_id, candidate_id)
     resume = db.scalar(select(Resume).where(Resume.organization_id == organization_id, Resume.id == resume_id))
     if resume is None or resume.candidate_id != candidate_id:
         raise InvalidAggregateRelationship
@@ -319,8 +327,12 @@ def create_application_record(db, *, organization_id, candidate_id, job_id, resu
 
 
 def issue_download_ticket_record(db, organization_id, user_id, resume_id, clock, tokens):
-    from server.app.recruiting.models import DownloadTicket
+    from server.app.recruiting.models import DownloadTicket, Resume
 
+    candidate_id = db.scalar(select(Resume.candidate_id).where(Resume.organization_id == organization_id, Resume.id == resume_id))
+    if candidate_id is None:
+        raise CandidateUnavailable
+    lock_active_candidate(db, organization_id, candidate_id)
     raw = tokens.new_token()
     db.add(DownloadTicket(organization_id=organization_id, user_id=user_id, resume_id=resume_id, token_hash=hashlib.sha256(raw.encode()).hexdigest(), expires_at=clock.current_time() + timedelta(seconds=60)))
     db.flush()
@@ -328,11 +340,18 @@ def issue_download_ticket_record(db, organization_id, user_id, resume_id, clock,
 
 
 def consume_download_ticket_record(db, raw, organization_id, user_id, resume_id, clock):
-    from server.app.recruiting.models import DownloadTicket
+    from server.app.recruiting.models import DownloadTicket, Resume
 
     ticket = db.scalar(select(DownloadTicket).where(DownloadTicket.token_hash == hashlib.sha256(raw.encode()).hexdigest()).with_for_update())
     if ticket is None or ticket.consumed_at is not None or ticket.expires_at.replace(tzinfo=ticket.expires_at.tzinfo or timezone.utc) <= clock.current_time() or ticket.organization_id != organization_id or ticket.user_id != user_id or ticket.resume_id != resume_id:
         raise TicketInvalid
+    candidate_id = db.scalar(select(Resume.candidate_id).where(Resume.organization_id == organization_id, Resume.id == resume_id))
+    if candidate_id is None:
+        raise TicketInvalid
+    try:
+        lock_active_candidate(db, organization_id, candidate_id)
+    except CandidateUnavailable:
+        raise TicketInvalid from None
     ticket.consumed_at = clock.current_time()
     db.flush()
     return ticket

@@ -47,6 +47,10 @@ def service():
     return RecruitingService(clock=clock, tokens=Tokens()), clock
 
 
+def active_candidate():
+    return Candidate(id=UUID(int=2), organization_id=UUID(int=1), display_name="Active candidate")
+
+
 def test_job_state_machine_accepts_every_legal_edge_and_rejects_illegal_adjacency():
     svc, _ = service()
     legal = {
@@ -165,7 +169,7 @@ def test_persisted_transition_increments_version_and_writes_timeline_and_audit_a
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         application = Application(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="new", source="manual")
-        db.add(application)
+        db.add_all([active_candidate(), application])
         db.flush()
         transition_application_record(db, application.organization_id, application.id, "review", expected_version=1, actor_user_id=application.owner_id, trace_id="trace")
         db.commit()
@@ -179,7 +183,7 @@ def test_transition_rolls_back_aggregate_and_timeline_when_audit_insert_fails():
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         application = Application(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="new", source="manual")
-        db.add(application)
+        db.add_all([active_candidate(), application])
         db.commit()
 
         def reject_audit(*_):
@@ -203,7 +207,7 @@ def test_persisted_transitions_require_expected_version_and_increment_once():
     with Session(engine) as db:
         application = Application(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="new", source="manual")
         job = Job(organization_id=UUID(int=1), title="Role", owner_id=UUID(int=5), status="draft")
-        db.add_all([application, job])
+        db.add_all([active_candidate(), application, job])
         db.flush()
         transition_application_record(db, application.organization_id, application.id, "review", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
         transition_job_record(db, job.id, "open", expected_version=1, actor_user_id=UUID(int=5), trace_id="trace")
@@ -219,7 +223,7 @@ def test_persisted_application_duplicate_and_linked_reapplication():
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         args = dict(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5))
-        db.add(Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1))
+        db.add_all([active_candidate(), Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1)])
         db.flush()
         first = create_application_record(db, **args)
         db.commit()
@@ -236,7 +240,7 @@ def test_reapplication_selects_latest_terminal_source_deterministically_by_creat
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         args = dict(organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5), stage="rejected", source="manual", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
-        db.add(Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1))
+        db.add_all([active_candidate(), Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1)])
         db.add_all([Application(id=UUID(int=10), **args), Application(id=UUID(int=11), **args)])
         db.commit()
         later = create_application_record(db, **{key: args[key] for key in ("organization_id", "candidate_id", "job_id", "resume_id", "owner_id")})
@@ -247,7 +251,7 @@ def test_application_service_rejects_resume_from_another_candidate():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        db.add(Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=99), file_object_id=UUID(int=8), version_number=1))
+        db.add_all([active_candidate(), Resume(id=UUID(int=4), organization_id=UUID(int=1), candidate_id=UUID(int=99), file_object_id=UUID(int=8), version_number=1)])
         db.commit()
         with pytest.raises(InvalidAggregateRelationship):
             create_application_record(db, organization_id=UUID(int=1), candidate_id=UUID(int=2), job_id=UUID(int=3), resume_id=UUID(int=4), owner_id=UUID(int=5))
@@ -258,6 +262,8 @@ def test_persisted_ticket_never_stores_raw_value_and_is_bound_single_use():
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
+        db.add_all([active_candidate(), Resume(id=UUID(int=3), organization_id=UUID(int=1), candidate_id=UUID(int=2), file_object_id=UUID(int=8), version_number=1)])
+        db.flush()
         raw = issue_download_ticket_record(db, UUID(int=1), UUID(int=2), UUID(int=3), clock, svc.tokens)
         db.commit()
         assert raw not in repr(db.query(Base.metadata.tables["download_tickets"]).first())
