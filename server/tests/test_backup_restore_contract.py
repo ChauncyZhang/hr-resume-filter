@@ -10,9 +10,12 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import subprocess
 import sys
 import tarfile
+import time
+import uuid
 
 import pytest
 
@@ -24,6 +27,8 @@ DRILL_COMPOSE = ROOT / "deploy" / "compose.backup-drill.yaml"
 BACKUP_RUNBOOK = ROOT / "deploy" / "backup-recovery-runbook.md"
 OPERATIONS_RUNBOOK = ROOT / "deploy" / "production-operations-runbook.md"
 FOUNDATION_REPORT = ROOT / ".superpowers" / "sdd" / "task-phase6c-report.md"
+PUBLISHER = BACKUP_DIR / "s3-atomic-publisher.py"
+PUBLISHER_REPORT = ROOT / ".superpowers" / "sdd" / "task-phase6c-publisher-report.md"
 REFERENCE_QUERY = """SELECT storage_key FROM file_objects WHERE storage_state <> 'deleted'
 UNION
 SELECT object_key FROM report_exports WHERE object_key IS NOT NULL AND status = 'succeeded'
@@ -43,6 +48,114 @@ def _load_backupctl():
     finally:
         sys.dont_write_bytecode = previous
     return module
+
+
+def _load_publisher():
+    assert PUBLISHER.is_file(), "Phase 6C S3-compatible publisher is missing"
+    spec = importlib.util.spec_from_file_location("phase6c_s3_publisher", PUBLISHER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+def _write_publisher_source(root: Path, run_id: str, marker: bytes = b"writer-one") -> Path:
+    source = root / "source"
+    source.mkdir(parents=True)
+    (source / "database.dump").write_bytes(marker)
+    database = marker
+    snapshot = b"business-snapshot"
+    inventory = b'{"key_hash":"' + b"a" * 64 + b'"}\n'
+    (source / "business.snapshot").write_bytes(snapshot)
+    (source / "inventory.jsonl").write_bytes(inventory)
+    (source / "reference-proof.json").write_text('{"schema_version":1}\n', encoding="utf-8")
+    manifest = (json.dumps({
+        "backup_run_id": run_id,
+        "database": {"sha256": hashlib.sha256(database).hexdigest(), "size_bytes": len(database)},
+        "business_snapshot": {
+            "sha256": hashlib.sha256(snapshot).hexdigest(),
+            "size_bytes": len(snapshot),
+            "inventory_sha256": hashlib.sha256(inventory).hexdigest(),
+        },
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    (source / "manifest.json").write_bytes(manifest)
+    (source / "manifest.sig").write_bytes(("b" * 64 + "\n").encode("ascii"))
+    (source / "COMPLETE").write_bytes((hashlib.sha256(manifest).hexdigest() + "\n").encode("ascii"))
+    return source
+
+
+def _publisher_args(config: Path, source: Path, receipt: Path, run_id: str) -> list[str]:
+    return [
+        "publish-complete-group",
+        "--lease-config-file", str(config),
+        "--destination", "minio://backup/vault/ux09",
+        "--run-id", run_id,
+        "--source", str(source),
+        "--receipt", str(receipt),
+    ]
+
+
+def _write_test_mc_config(path: Path) -> None:
+    path.write_text(
+        json.dumps({
+            "version": "10",
+            "aliases": {
+                "backup": {
+                    "url": "http://provider.invalid",
+                    "accessKey": "synthetic-user",
+                    "secretKey": "synthetic-password",
+                    "api": "S3v4",
+                    "path": "auto",
+                }
+            },
+        }),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+class _FakeConditionalStore:
+    def __init__(self, publisher, *, fail_upload_number: int | None = None):
+        self.publisher = publisher
+        self.fail_upload_number = fail_upload_number
+        self.objects: dict[str, bytes] = {}
+        self.commands: list[tuple[str, ...]] = []
+        self.uploads = 0
+
+    def __call__(self, command, *, stdin=None, capture_stdout=False):
+        args = tuple(command)
+        self.commands.append(args)
+        operation = next(item for item in ("pipe", "put", "stat", "get") if item in args)
+        target = args[-1]
+        if operation == "pipe":
+            assert "If-None-Match:*" in args
+            if target in self.objects:
+                raise self.publisher.LeaseConflict()
+            assert stdin is not None
+            self.objects[target] = stdin.read()
+            return b""
+        if operation == "put":
+            self.uploads += 1
+            if self.uploads == self.fail_upload_number:
+                raise self.publisher.ProviderFailure()
+            self.objects[target] = Path(args[-2]).read_bytes()
+            return b""
+        if operation == "stat":
+            if target not in self.objects:
+                raise self.publisher.ObjectMissing()
+            return json.dumps({"size": len(self.objects[target])}).encode()
+        if operation == "get":
+            target = args[-2]
+            if target not in self.objects:
+                raise self.publisher.ObjectMissing()
+            Path(args[-1]).write_bytes(self.objects[target])
+            return b""
+        raise AssertionError("unexpected fake provider operation")
 
 
 def _manifest(**overrides):
@@ -114,6 +227,8 @@ def _catalog_entry(run_id: str, cutoff: str, **overrides):
 def test_phase6c_foundation_files_are_new_isolated_contract_surface() -> None:
     required = {
         BACKUPCTL,
+        PUBLISHER,
+        PUBLISHER_REPORT,
         BACKUP_DIR / "Dockerfile",
         BACKUP_DIR / "backup.sh",
         BACKUP_DIR / "ledger-archive.sh",
@@ -146,9 +261,8 @@ def test_phase6c_scope_rejects_generated_artifacts_and_staged_files_outside_allo
         check=True,
     ).stdout.splitlines()
     exact = {
-        ".superpowers/sdd/task-phase6c-report.md",
+        ".superpowers/sdd/task-phase6c-publisher-report.md",
         "deploy/backup-recovery-runbook.md",
-        "deploy/compose.backup-drill.yaml",
         "deploy/production-operations-runbook.md",
         "server/tests/test_backup_restore_contract.py",
     }
@@ -284,6 +398,183 @@ def test_atomic_publisher_receipt_is_strict_and_run_hash_bound(tmp_path: Path) -
         backupctl._write_json(receipt, broken)
         with pytest.raises(ValueError, match="publisher|receipt|bound|hash"):
             backupctl.validate_publish_receipt(receipt, "business-run-safe1", "a" * 64)
+
+
+def test_s3_publisher_uses_one_conditional_lease_and_complete_last(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-publisher1"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    receipt = tmp_path / "receipt.json"
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+
+    assert publisher.main(_publisher_args(config, source, receipt, run_id)) == 0
+    backupctl = _load_backupctl()
+    complete_hash = hashlib.sha256((source / "manifest.json").read_bytes()).hexdigest()
+    backupctl.validate_publish_receipt(receipt, run_id, complete_hash)
+
+    lease_commands = [command for command in store.commands if "pipe" in command]
+    assert len(lease_commands) == 1
+    assert "If-None-Match:*" in lease_commands[0]
+    assert not any("ls" in command or "find" in command for command in store.commands)
+    put_targets = [command[-1] for command in store.commands if "put" in command]
+    assert put_targets[-1].endswith("/COMPLETE")
+    assert all(not target.endswith("/COMPLETE") for target in put_targets[:-1])
+    assert hashlib.sha256(store.objects[lease_commands[0][-1]]).hexdigest() == json.loads(
+        receipt.read_text(encoding="utf-8")
+    )["lease_id_hash"]
+
+
+def test_s3_publisher_passes_in_memory_lease_as_subprocess_input(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    config_dir = tmp_path / "mc"
+    config_dir.mkdir()
+    observed = {}
+
+    def fake_run(*args, **kwargs):
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args[0], 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(publisher.subprocess, "run", fake_run)
+    publisher._execute_mc(
+        [publisher.MC_BIN, "-C", str(config_dir), "pipe", "provider/bucket/private-lease"],
+        stdin=io.BytesIO(b"lease-bytes"),
+    )
+    assert observed["input"] == b"lease-bytes"
+    assert "stdin" not in observed
+
+
+@pytest.mark.parametrize(
+    ("operation", "provider_code", "expected"),
+    [
+        ("stat", "NoSuchKey", "ObjectMissing"),
+        ("pipe", "PreconditionFailed", "LeaseConflict"),
+        ("pipe", "ConditionalRequestConflict", "LeaseConflict"),
+    ],
+)
+def test_s3_publisher_classifies_mc_json_errors_from_stdout(
+    tmp_path: Path, monkeypatch, operation: str, provider_code: str, expected: str
+) -> None:
+    publisher = _load_publisher()
+    config_dir = tmp_path / "mc"
+    config_dir.mkdir()
+    payload = json.dumps({"status": "error", "error": {"cause": {"error": {"Code": provider_code}}}}).encode()
+    monkeypatch.setattr(
+        publisher.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 1, stdout=payload, stderr=b""),
+    )
+    error_type = getattr(publisher, expected)
+    with pytest.raises(error_type):
+        publisher._execute_mc(
+            [publisher.MC_BIN, "-C", str(config_dir), operation, "provider/bucket/private-object"],
+            capture_stdout=True,
+        )
+
+
+def test_s3_publisher_partial_upload_stays_invisible_and_lease_is_permanent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-partial01"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    receipt = tmp_path / "receipt.json"
+    store = _FakeConditionalStore(publisher, fail_upload_number=2)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+
+    assert publisher.main(_publisher_args(config, source, receipt, run_id)) == publisher.EXIT_PROVIDER_FAILURE
+    assert not receipt.exists()
+    assert not any(target.endswith("/COMPLETE") for target in store.objects)
+    lease_target = next(command[-1] for command in store.commands if "pipe" in command)
+    assert lease_target in store.objects
+
+    store.fail_upload_number = None
+    immutable = dict(store.objects)
+    assert publisher.main(_publisher_args(config, source, receipt, run_id)) == publisher.EXIT_CONFLICT
+    assert store.objects == immutable
+    assert not receipt.exists()
+
+
+def test_s3_publisher_rejects_payload_tamper_against_complete_manifest(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-tamper001"
+    source = _write_publisher_source(tmp_path, run_id)
+    (source / "database.dump").write_bytes(b"tampered-after-complete")
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    calls = []
+    monkeypatch.setattr(publisher, "_execute_mc", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    assert publisher.main(_publisher_args(config, source, tmp_path / "receipt.json", run_id)) == publisher.EXIT_SAFETY
+    assert not calls
+
+
+@pytest.mark.parametrize("kind", ["bad-run", "bad-destination", "unexpected", "invalid-complete", "source-symlink"])
+def test_s3_publisher_rejects_malformed_sources_before_provider_call(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-input001"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    receipt = tmp_path / "receipt.json"
+    args = _publisher_args(config, source, receipt, run_id)
+    if kind == "bad-run":
+        args[args.index("--run-id") + 1] = "../escape"
+    elif kind == "bad-destination":
+        args[args.index("--destination") + 1] = "s3://user:secret@example.test/vault"
+    elif kind == "unexpected":
+        (source / "operator-notes.txt").write_text("not allowed", encoding="utf-8")
+    elif kind == "invalid-complete":
+        (source / "COMPLETE").write_bytes(("0" * 64 + "\n").encode("ascii"))
+    else:
+        linked_source = tmp_path / "linked-source"
+        try:
+            linked_source.symlink_to(source, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("directory symlink creation is unavailable")
+        args[args.index("--source") + 1] = str(linked_source)
+    calls = []
+    monkeypatch.setattr(publisher, "_execute_mc", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    assert publisher.main(args) == publisher.EXIT_SAFETY
+    assert not calls
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("kind", ["permissive", "hardlink", "symlink"])
+def test_s3_publisher_rejects_unprotected_or_aliased_config(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-config001"
+    source = _write_publisher_source(tmp_path, run_id)
+    original = tmp_path / "original-config.json"
+    _write_test_mc_config(original)
+    config = original
+    if kind == "permissive":
+        if os.name == "nt":
+            pytest.skip("Windows does not expose POSIX group/world mode bits")
+        original.chmod(0o640)
+    elif kind == "hardlink":
+        config = tmp_path / "linked-config.json"
+        os.link(original, config)
+    else:
+        config = tmp_path / "symlink-config.json"
+        try:
+            config.symlink_to(original)
+        except (OSError, NotImplementedError):
+            pytest.skip("file symlink creation is unavailable")
+    calls = []
+    monkeypatch.setattr(publisher, "_execute_mc", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    assert publisher.main(_publisher_args(config, source, tmp_path / "receipt.json", run_id)) == publisher.EXIT_SAFETY
+    assert not calls
 
 
 @pytest.mark.parametrize(
@@ -982,6 +1273,7 @@ def test_backup_image_is_digest_pinned_and_contains_versioned_toolchain() -> Non
     assert all(re.search(r":[^@\s]+@sha256:[0-9a-f]{64}$", image) for image in from_lines)
     for required in ("postgres:16.9", "minio/mc:RELEASE.2025-07-21T05-28-08Z", "rclone/rclone:1.70.3"):
         assert required in dockerfile
+    assert "COPY *.py *.sh /opt/ux09-backup/" in dockerfile
 
 
 def test_destination_adapter_refuses_to_overwrite_existing_run_id() -> None:
@@ -990,6 +1282,144 @@ def test_destination_adapter_refuses_to_overwrite_existing_run_id() -> None:
     assert "stage-group)" not in source or "exit 78" in source
     assert "publish-group)" not in source or "exit 78" in source
     assert "BACKUP_ATOMIC_PUBLISHER" in BACKUPCTL.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    os.environ.get("UX09_RUN_MINIO_PUBLISHER_TEST") != "1",
+    reason="set UX09_RUN_MINIO_PUBLISHER_TEST=1 for the disposable MinIO process race",
+)
+def test_s3_publisher_real_disposable_minio_two_process_race(tmp_path: Path) -> None:
+    image = os.environ.get("UX09_BACKUP_PUBLISHER_IMAGE", "ux09-backup:phase6c-publisher-test")
+    suffix = uuid.uuid4().hex[:12]
+    network = f"ux09-publisher-{suffix}"
+    server = f"ux09-publisher-minio-{suffix}"
+    runner = f"ux09-publisher-runner-{suffix}"
+    minio_image = "minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0"
+    access_key = "u" + secrets.token_hex(12)
+    secret_key = "p" + secrets.token_hex(24)
+    env_file = tmp_path / "minio.env"
+    env_file.write_text(f"MINIO_ROOT_USER={access_key}\nMINIO_ROOT_PASSWORD={secret_key}\n", encoding="utf-8")
+    env_file.chmod(0o600)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "version": "10",
+        "aliases": {
+            "backup": {
+                "url": f"http://{server}:9000",
+                "accessKey": access_key,
+                "secretKey": secret_key,
+                "api": "S3v4",
+                "path": "auto",
+            }
+        },
+    }), encoding="utf-8")
+    config.chmod(0o600)
+
+    def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(["docker", *args], cwd=ROOT, capture_output=True, text=True, check=False)
+        if check and result.returncode != 0:
+            pytest.fail("disposable MinIO Docker operation failed without exposing provider output")
+        return result
+
+    docker("network", "create", network)
+    try:
+        docker(
+            "run", "-d", "--name", server, "--network", network,
+            "--env-file", str(env_file), minio_image, "server", "/data",
+        )
+        docker(
+            "run", "-d", "--name", runner, "--network", network,
+            "--entrypoint", "sh", image, "-c", "sleep 300",
+        )
+        docker("cp", str(config), f"{runner}:/tmp/config.json")
+        docker("exec", "-u", "0", runner, "chmod", "0600", "/tmp/config.json")
+        docker("exec", "-u", "0", runner, "chown", "10001:10001", "/tmp/config.json")
+        ready = False
+        for _ in range(40):
+            probe = docker(
+                "exec", runner, "mc", "-C", "/tmp", "--quiet", "ready", "backup",
+                check=False,
+            )
+            if probe.returncode == 0:
+                ready = True
+                break
+            time.sleep(0.25)
+        assert ready, "disposable MinIO did not become ready"
+        docker("exec", runner, "mc", "-C", "/tmp", "--quiet", "mb", "backup/vault")
+
+        run_id = "business-run-race0001"
+        source_one = _write_publisher_source(tmp_path / "one", run_id, b"writer-one")
+        source_two = _write_publisher_source(tmp_path / "two", run_id, b"writer-two")
+        docker("cp", str(source_one), f"{runner}:/tmp/source-one")
+        docker("cp", str(source_two), f"{runner}:/tmp/source-two")
+
+        def guarded_publish(config_path: str, source_path: str, receipt_path: str) -> subprocess.CompletedProcess[str]:
+            return docker(
+                "exec", runner, "python3", "/opt/ux09-backup/s3-atomic-publisher.py",
+                "publish-complete-group", "--lease-config-file", config_path,
+                "--destination", "minio://backup/vault/ux09", "--run-id", run_id,
+                "--source", source_path, "--receipt", receipt_path, check=False,
+            )
+
+        docker("exec", "-u", "0", runner, "chmod", "0640", "/tmp/config.json")
+        assert guarded_publish("/tmp/config.json", "/tmp/source-one", "/tmp/rejected-mode.json").returncode == 78
+        docker("exec", "-u", "0", runner, "chmod", "0600", "/tmp/config.json")
+        docker("exec", runner, "ln", "-s", "/tmp/config.json", "/tmp/config-link.json")
+        assert guarded_publish("/tmp/config-link.json", "/tmp/source-one", "/tmp/rejected-link.json").returncode == 78
+        docker("exec", runner, "rm", "/tmp/config-link.json")
+        docker("exec", runner, "ln", "/tmp/config.json", "/tmp/config-hard.json")
+        assert guarded_publish("/tmp/config-hard.json", "/tmp/source-one", "/tmp/rejected-hard.json").returncode == 78
+        docker("exec", runner, "rm", "/tmp/config-hard.json")
+        docker("exec", runner, "ln", "-s", "/tmp/source-one", "/tmp/source-link")
+        assert guarded_publish("/tmp/config.json", "/tmp/source-link", "/tmp/rejected-source.json").returncode == 78
+        docker("exec", runner, "rm", "/tmp/source-link")
+
+        def publish(label: str) -> subprocess.CompletedProcess[str]:
+            return guarded_publish("/tmp/config.json", f"/tmp/source-{label}", f"/tmp/receipt-{label}.json")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(publish, ("one", "two")))
+        diagnostic_listing = docker(
+            "exec", runner, "mc", "-C", "/tmp", "--json", "ls", "--recursive", "backup/vault",
+            check=False,
+        )
+        diagnostic_count = len([line for line in diagnostic_listing.stdout.splitlines() if line.strip()])
+        assert sorted(result.returncode for result in results) == [0, 75], (
+            f"unexpected publisher exit codes; remote_object_count={diagnostic_count}"
+        )
+        assert all(result.stdout == "" for result in results)
+        assert all("vault" not in result.stderr and "source-" not in result.stderr for result in results)
+
+        listing = docker(
+            "exec", runner, "mc", "-C", "/tmp", "--json", "ls", "--recursive", "backup/vault"
+        )
+        entries = [json.loads(line) for line in listing.stdout.splitlines() if line.strip()]
+        keys = {entry["key"] for entry in entries}
+        group_prefix = f"ux09/{run_id}/"
+        expected_members = {
+            "COMPLETE", "business.snapshot", "database.dump", "inventory.jsonl",
+            "manifest.json", "manifest.sig", "reference-proof.json",
+        }
+        assert {key.removeprefix(group_prefix) for key in keys if key.startswith(group_prefix)} == expected_members
+        lease_keys = [key for key in keys if "/.ux09-private-leases/" in f"/{key}"]
+        assert len(lease_keys) == 1
+
+        winner_payload = docker(
+            "exec", runner, "mc", "-C", "/tmp", "--quiet", "cat",
+            f"backup/vault/{group_prefix}database.dump",
+        ).stdout.encode()
+        assert winner_payload in {b"writer-one", b"writer-two"}
+        complete_entry = next(entry for entry in entries if entry["key"] == group_prefix + "COMPLETE")
+        payload_entries = [entry for entry in entries if entry["key"].startswith(group_prefix) and not entry["key"].endswith("COMPLETE")]
+        assert all(entry["lastModified"] <= complete_entry["lastModified"] for entry in payload_entries)
+        receipt_checks = [
+            docker("exec", runner, "test", "-f", f"/tmp/receipt-{label}.json", check=False).returncode
+            for label in ("one", "two")
+        ]
+        assert sorted(receipt_checks) == [0, 1]
+    finally:
+        docker("rm", "-f", runner, server, check=False)
+        docker("network", "rm", network, check=False)
 
 
 def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> None:

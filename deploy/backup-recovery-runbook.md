@@ -31,11 +31,12 @@ open transition.
 - `ledger-archive.sh` uses separate source, append, restore, lifecycle, and
   signing-key-history contracts. The business read/append/prune identities must
   have no ledger restore or delete grants.
-- COMPLETE-last publication requires a destination-native conditional create
-  or trusted external lease. `BACKUP_ATOMIC_PUBLISHER` and
-  `LEDGER_ATOMIC_PUBLISHER` must atomically acquire the run-ID lease, commit the
-  immutable group once, and return a run/hash-bound receipt. The bundled rclone
-  adapter exits 78 for stage/publish because copy cannot prove this contract.
+- `s3-atomic-publisher.py` provides COMPLETE-last publication for allowlisted
+  S3-compatible destinations. It uses the pinned `mc` to create one permanent
+  lease with provider-native `If-None-Match:*` under the fixed private lease
+  prefix, verifies every uploaded size and SHA-256, uploads COMPLETE last, and
+  returns the existing run/hash-bound receipt. The bundled rclone adapter still
+  exits 78 for stage/publish because copy cannot prove this contract.
 - PostgreSQL passwords, MinIO aliases, destination credentials, and signing
   material are protected regular files with one link, no symlink, and mode
   0600 or stricter. The coordinator opens with no-follow semantics, checks the
@@ -81,6 +82,12 @@ fail closed. The application host is not an acceptable off-host destination.
    capacity for a full dump plus object snapshot, and clock synchronization.
    Provisioning of production roles/policies remains outside this independent
    slice and requires the B2B shared-file release.
+6. Set `BACKUP_ATOMIC_PUBLISHER` and, when approved for the independent ledger
+   destination, `LEDGER_ATOMIC_PUBLISHER` to
+   `/opt/ux09-backup/s3-atomic-publisher.py`. The protected `mc` config must
+   contain alias `s3` for `s3://BUCKET/PREFIX`, or the URI authority alias for
+   `minio://ALIAS/BUCKET/PREFIX`. Do not use `--insecure` or place endpoint or
+   credential values in environment variables.
 
 ## Required secret-file and adapter contract
 
@@ -95,6 +102,10 @@ endpoint identifiers, run IDs, and local evidence paths.
   --destination URI --run-id ID --source PATH --receipt PATH`. It must perform
   cross-process/cross-host conditional creation; exactly one publisher may win
   a run ID and a loser must not overwrite payload, manifest, or COMPLETE.
+  `s3-atomic-publisher.py` exits 75 for an existing lease/complete group, 74 for
+  a provider failure, and 78 for rejected input. Its messages are deliberately
+  generic; investigate through aggregate provider metrics without copying
+  object names, local filenames, client stderr, or config contents into logs.
 - `BACKUP_DESTINATION_CLIENT`: signed `catalog`, verified
   `fetch-complete-group`, and complete-group `delete-complete-group` only.
 - Reference validation is bundled and pinned. The coordinator executes the
@@ -109,10 +120,12 @@ endpoint identifiers, run IDs, and local evidence paths.
 - `BUSINESS_RESTORE_CLIENT`: restores the verified snapshot with the temporary
   business restore identity; it has no access to the ledger archive.
 
-`destination-rclone.sh` is read/catalog/delete only in this foundation and
-`minio-business.sh` prevalidates every tar member before extraction. Production
-enablement requires a separate reviewed atomic publisher/lease implementation,
-least-privilege policies, TLS, and lifecycle behavior.
+`destination-rclone.sh` remains read/catalog/delete only and
+`minio-business.sh` prevalidates every tar member before extraction. The
+publisher adapter is implemented, but production enablement still requires a
+real off-host provider endpoint, reviewed least-privilege policies, TLS,
+encryption/lifecycle behavior, and provider-specific conditional-write proof.
+The disposable MinIO race is local evidence only and is not off-host evidence.
 
 ## First paired backup
 
@@ -136,6 +149,13 @@ least-privilege policies, TLS, and lifecycle behavior.
 5. Fetch the published group with a read-only identity and rerun manifest,
    marker, hash, inventory, and `pg_restore --list` validation. Record only the
    non-PII evidence location and result.
+
+If publication exits 74 after acquiring the lease, COMPLETE remains absent and
+the partial group is invisible to catalog consumers. Do not delete the lease or
+retry the same run ID. Stop the scheduler, preserve the partial group for
+forensics, correct the provider condition, and create a newly validated restore
+point with a new run ID. Exit 75 is a duplicate/conflict signal and must never
+be worked around with list-then-write or manual overwrite.
 
 Schedule ledger archive followed by paired backup at least every 12 hours. A
 systemd timer should use `OnCalendar=*-*-* 00,12:00:00`,

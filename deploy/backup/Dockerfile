@@ -5,7 +5,7 @@ FROM postgres:16.9-alpine@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e
 RUN apk add --no-cache python3=3.12.13-r0
 COPY --from=minio_client /usr/bin/mc /usr/local/bin/mc
 COPY --from=destination_client /usr/local/bin/rclone /usr/local/bin/rclone
-COPY backupctl.py *.sh /opt/ux09-backup/
+COPY *.py *.sh /opt/ux09-backup/
 RUN chmod 0555 /opt/ux09-backup/*.py /opt/ux09-backup/*.sh \
     && addgroup -S -g 10001 backup \
     && adduser -S -D -H -u 10001 -G backup backup

@@ -5,10 +5,12 @@
 This canonical operations runbook describes the Phase 6C foundation operating
 contract. It does not declare Phase 6C or the service production ready. Launch
 still requires provider-specific off-host storage, reviewed identities,
-production preflight/provisioning integration after shared-file release, a
-trusted destination-native atomic publisher/lease, the real B2B3 CLI and B2B3
-Worker signed evidence protocol, and a complete real restore drill. The
-foundation traffic gate always exits 78 and cannot open traffic.
+production preflight/provisioning integration after shared-file release,
+provider-specific validation of the bundled S3-compatible atomic publisher,
+the real B2B3 CLI and B2B3 Worker signed evidence protocol, and a complete real
+restore drill. The local disposable MinIO race proves process concurrency only;
+it is not an off-host deployment. The foundation traffic gate always exits 78
+and cannot open traffic.
 
 ## Preflight and launch
 
@@ -29,10 +31,10 @@ traffic-open path are launch blockers. Caller JSON, mock output, unsigned or
 replayed B2B3 evidence cannot change the foundation closed state.
 
 Use a progressive rollout: deploy one compatible instance with traffic closed,
-pass migrations/readiness and a read-only smoke, then increase traffic in
-bounded steps while watching user-facing HTTPS success, latency, queue age,
-storage errors, and restore-point freshness. Resource metrics are supporting
-diagnostics, not the only alerts.
+run one synthetic publisher canary with a new run ID, pass migrations/readiness
+and a read-only smoke, then increase traffic in bounded steps while watching
+user-facing HTTPS success, latency, queue age, storage errors, and restore-point
+freshness. Resource metrics are supporting diagnostics, not the only alerts.
 
 ## Upgrade and migration
 
@@ -91,6 +93,19 @@ user-impacting symptoms: no valid restore point by 18 hours, projected breach of
 the 24-hour RPO, recovery unable to meet the 4-hour RTO, or traffic exposed
 without completed B2B3 evidence. Route every alert to the canonical backup
 recovery procedure.
+
+Publisher exit 75 is a duplicate/lease conflict; alert if it occurs for a newly
+allocated scheduler run ID. Exit 74 means provider upload or verification
+failed; page when it prevents a valid point from completing within 18 hours.
+Exit 78 is an input/security-contract rejection and blocks rollout. Keep alert
+labels aggregate—never attach destination objects, source filenames, config
+contents, credentials, or raw `mc` stderr.
+
+Publisher rollback is operationally reversible: stop new backup launches and
+restore the refusing rclone publication configuration while preserving all
+remote leases and incomplete groups. Never delete a lease to force retry. After
+root cause and provider policy are reviewed, resume with a fresh run ID and one
+canary before restoring the 12-hour schedule.
 
 Evidence is aggregate and non-PII: versions/digests, timestamps, sizes, hashes,
 counts, mismatches, retention decisions, and gates. It must not contain object
