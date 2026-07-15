@@ -74,9 +74,9 @@ const stageMeta = [
 
 const emptyStages = stageMeta.map(() => []);
 
-function IconButton({ label, children, className = "", onClick, disabled = false, ...buttonProps }) {
+function IconButton({ label, children, className = "", onClick, disabled = false, buttonRef, ...buttonProps }) {
   return (
-    <button className={`icon-button ${className}`} type="button" title={label} aria-label={label} onClick={onClick} disabled={disabled} {...buttonProps}>
+    <button ref={buttonRef} className={`icon-button ${className}`} type="button" title={label} aria-label={label} onClick={onClick} disabled={disabled} {...buttonProps}>
       {children}
     </button>
   );
@@ -164,6 +164,9 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   const [activeNav, setActiveNav] = useState(() => getDefaultNavItem(currentRole) || "设置");
   const [activeJob, setActiveJob] = useState("AI 工程师");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [drawerViewport, setDrawerViewport] = useState(false);
+  const menuButtonRef = useRef(null);
+  const navigationRef = useRef(null);
   const [view, setView] = useState("board");
   const [modal, setModal] = useState(null);
   const [selectedCandidate, setSelectedCandidate] = useState(null);
@@ -239,6 +242,13 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
       failed: recentTask.files.filter((file) => file.status === "failed").length,
     };
   }, [recentTask]);
+
+  const closeNavigation = useCallback(({ restoreFocus = false } = {}) => {
+    setMenuOpen(false);
+    if (restoreFocus && drawerViewport) {
+      window.requestAnimationFrame(() => menuButtonRef.current?.focus());
+    }
+  }, [drawerViewport]);
 
   const loadInterviews = useCallback(async ({ cursor = null, append = false } = {}) => {
     interviewLoadRef.current?.abort();
@@ -424,6 +434,50 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
   }, [activeNav, jobMode, candidateMode, interviewMode, talentMode, Boolean(screeningTask)]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 601px) and (max-width: 900px)");
+    const syncDrawerViewport = () => {
+      setDrawerViewport(media.matches);
+      if (!media.matches) setMenuOpen(false);
+    };
+    syncDrawerViewport();
+    media.addEventListener("change", syncDrawerViewport);
+    return () => media.removeEventListener("change", syncDrawerViewport);
+  }, []);
+
+  useEffect(() => {
+    if (!drawerViewport || !menuOpen) return undefined;
+    const navigation = navigationRef.current;
+    const visibleItems = () => Array.from(navigation?.querySelectorAll(".nav-item:not([disabled])") || [])
+      .filter((item) => item.getClientRects().length > 0 && window.getComputedStyle(item).visibility !== "hidden");
+    const focusFrame = window.requestAnimationFrame(() => visibleItems()[0]?.focus());
+    const handleDrawerKeyDown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeNavigation({ restoreFocus: true });
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const items = visibleItems();
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const activeElement = document.activeElement;
+      if (event.shiftKey && (activeElement === first || !navigation.contains(activeElement))) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (activeElement === last || !navigation.contains(activeElement))) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", handleDrawerKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFrame);
+      document.removeEventListener("keydown", handleDrawerKeyDown);
+    };
+  }, [closeNavigation, drawerViewport, menuOpen]);
 
   useEffect(() => {
     window.localStorage.removeItem(LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY);
@@ -636,9 +690,15 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
 
   return (
     <div className="app-shell">
-      <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
+      <aside
+        className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}
+        role={drawerViewport && menuOpen ? "dialog" : undefined}
+        aria-modal={drawerViewport && menuOpen ? "true" : undefined}
+        aria-label={drawerViewport && menuOpen ? "主导航抽屉" : undefined}
+        inert={drawerViewport && !menuOpen ? "" : undefined}
+      >
         <div className="brand">招聘协同平台</div>
-        <nav id="primary-navigation" aria-label="主导航">
+        <nav ref={navigationRef} id="primary-navigation" aria-label="主导航">
           {navItems.filter(([label]) => allowedNavItems.has(label)).map(([label, Icon]) => (
             <button
               key={label}
@@ -647,7 +707,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
               aria-current={activeNav === label ? "page" : undefined}
               onClick={() => {
                 setActiveNav(label);
-                setMenuOpen(false);
+                closeNavigation({ restoreFocus: true });
                 setScreeningTask(null);
                 setCandidateOrigin(null);
                 setSelectedCandidate(null);
@@ -684,7 +744,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
 
       <main className="workspace">
         <header className="topbar">
-          <IconButton label={menuOpen ? "关闭主导航" : "打开主导航"} className="mobile-menu" aria-controls="primary-navigation" aria-expanded={menuOpen} onClick={() => setMenuOpen((value) => !value)}><Menu size={21} /></IconButton>
+          <IconButton buttonRef={menuButtonRef} label={menuOpen ? "关闭主导航" : "打开主导航"} className="mobile-menu" aria-controls="primary-navigation" aria-expanded={menuOpen} onClick={() => menuOpen ? closeNavigation() : setMenuOpen(true)}><Menu size={21} /></IconButton>
           <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav === "人才库" && talentMode === "detail" ? "人才库详情" : activeNav}</h1>
           <div className="top-actions">
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
@@ -854,7 +914,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
         </Modal>
       )}
 
-      {menuOpen && <button className="mobile-scrim" type="button" aria-label="关闭菜单" onClick={() => setMenuOpen(false)} />}
+      {menuOpen && <button className="mobile-scrim" type="button" aria-label="关闭菜单" onClick={() => closeNavigation({ restoreFocus: true })} />}
       {toast && <div className="toast" role="status"><Check size={16} />{toast}</div>}
       {sessionMessage && <div className="toast error" role="alert"><CircleAlert size={16} />{sessionMessage}</div>}
     </div>
