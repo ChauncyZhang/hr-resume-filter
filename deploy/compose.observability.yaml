@@ -1,0 +1,91 @@
+services:
+  minio:
+    environment:
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+
+  queue-exporter:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+      target: runtime
+    command: ["python", "-m", "server.app.observability.exporter"]
+    environment:
+      OBSERVABILITY_DATABASE_URL: postgresql://${OBSERVABILITY_DB_USER:?Set OBSERVABILITY_DB_USER to the read-only monitoring role}:${OBSERVABILITY_DB_PASSWORD:?Set OBSERVABILITY_DB_PASSWORD to the read-only monitoring password}@postgres:5432/${POSTGRES_DB}
+      OBSERVABILITY_EXPORTER_PORT: "9108"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    networks: [private]
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      api:
+        condition: service_healthy
+      queue-exporter:
+        condition: service_started
+      alertmanager:
+        condition: service_started
+    restart: unless-stopped
+    networks: [private]
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    restart: unless-stopped
+    networks: [private]
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro,rslave
+    restart: unless-stopped
+    networks: [private]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.52.1
+    privileged: true
+    read_only: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    restart: unless-stopped
+    networks: [private]
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_NAME: postgresql://${OBSERVABILITY_DB_USER:?Set OBSERVABILITY_DB_USER to the read-only monitoring role}:${OBSERVABILITY_DB_PASSWORD:?Set OBSERVABILITY_DB_PASSWORD to the read-only monitoring password}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [private]
+
+volumes:
+  prometheus-data:
+  alertmanager-data:

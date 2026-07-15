@@ -10,5 +10,6 @@ pypdf==5.8.0
 python-docx==1.2.0
 python-multipart==0.0.20
 psycopg[binary]==3.2.9
+prometheus-client==0.22.1
 SQLAlchemy==2.0.41
 uvicorn==0.35.0

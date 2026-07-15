@@ -3,16 +3,24 @@ import logging
 import re
 import secrets
 from contextlib import asynccontextmanager
+from time import perf_counter
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
 from server.app.core.settings import Settings
+from server.app.observability.http_metrics import (
+    HttpMetrics,
+    InstrumentedReadinessProbe,
+    method_label,
+    route_template,
+)
 from server.app.identity.api import allowed_origin, problem, router as identity_router, session_token
 from server.app.identity.service import Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
@@ -88,6 +96,8 @@ def create_app(
         yield
 
     app = FastAPI(title="UX-09 Recruiting API", lifespan=lifespan)
+    http_metrics = HttpMetrics()
+    app.state.http_metrics = http_metrics
     app.state.settings = settings
     app.state.identity_store = IdentityStore(settings.database_url)
     app.state.identity_service = IdentityService(
@@ -149,6 +159,7 @@ def create_app(
 
     @app.middleware("http")
     async def trace_requests(request: Request, call_next):  # type: ignore[no-untyped-def]
+        started = perf_counter()
         supplied = request.headers.get("x-trace-id", "")
         trace_id = supplied if TRACE_ID_PATTERN.fullmatch(supplied) else _new_trace_id()
         request.state.trace_id = trace_id
@@ -172,7 +183,35 @@ def create_app(
                         logger.info("anonymous_csrf_denied", extra={"context": {"trace_id": trace_id}})
                     response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
         if response is None:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception as error:
+                route = route_template(request)
+                http_metrics.observe_request(
+                    method=request.method,
+                    route=route,
+                    status_code=500,
+                    duration_seconds=perf_counter() - started,
+                )
+                logger.exception(
+                    "request_failed",
+                    extra={
+                        "context": {
+                            "trace_id": trace_id,
+                            "method": method_label(request.method),
+                            "route": route,
+                            "error_type": type(error).__name__,
+                        }
+                    },
+                )
+                raise
+        route = route_template(request)
+        http_metrics.observe_request(
+            method=request.method,
+            route=route,
+            status_code=response.status_code,
+            duration_seconds=perf_counter() - started,
+        )
         if _is_governance_path(request.url.path):
             response.headers["Cache-Control"] = "no-store"
         response.headers["X-Trace-ID"] = trace_id
@@ -181,8 +220,8 @@ def create_app(
             extra={
                 "context": {
                     "trace_id": trace_id,
-                    "method": request.method,
-                    "path": request.url.path,
+                    "method": method_label(request.method),
+                    "route": route,
                     "status_code": response.status_code,
                 }
             },
@@ -216,11 +255,21 @@ def create_app(
     async def live() -> dict[str, str]:
         return {"status": "live"}
 
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        return Response(
+            content=generate_latest(http_metrics.registry),
+            headers={"Content-Type": CONTENT_TYPE_LATEST},
+        )
+
     @app.get("/health/ready")
     async def ready(request: Request):  # type: ignore[no-untyped-def]
         try:
             await asyncio.wait_for(
-                check_readiness(database_probe, storage_probe),
+                check_readiness(
+                    InstrumentedReadinessProbe("database", database_probe, http_metrics),
+                    InstrumentedReadinessProbe("storage", storage_probe, http_metrics),
+                ),
                 timeout=settings.readiness_timeout_seconds,
             )
         except Exception as error:

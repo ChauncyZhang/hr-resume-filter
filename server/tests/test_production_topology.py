@@ -16,6 +16,7 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[2]
 BASE_COMPOSE = ROOT / "deploy" / "compose.yaml"
 PRODUCTION_COMPOSE = ROOT / "deploy" / "compose.production.yaml"
+OBSERVABILITY_COMPOSE = ROOT / "deploy" / "compose.observability.yaml"
 ENV_EXAMPLE = ROOT / "deploy" / ".env.example"
 NGINX_TEMPLATE = ROOT / "deploy" / "nginx" / "production.conf.template"
 SECURITY_HEADERS = ROOT / "deploy" / "nginx" / "snippets" / "security-headers.conf"
@@ -40,6 +41,8 @@ def _compose_environment(
         {
             "HTTPS_BIND_ADDRESS": "127.0.0.1",
             "HTTPS_PORT": "443",
+            "OBSERVABILITY_DB_PASSWORD": "synthetic-observer-password",
+            "OBSERVABILITY_DB_USER": "ux09_observer",
             "TLS_CERTIFICATE_PATH": str(cert_path),
             "TLS_PRIVATE_KEY_PATH": str(key_path),
         }
@@ -62,6 +65,8 @@ def _run_compose_config(environment: dict[str, str]) -> subprocess.CompletedProc
             str(BASE_COMPOSE),
             "-f",
             str(PRODUCTION_COMPOSE),
+            "-f",
+            str(OBSERVABILITY_COMPOSE),
             "config",
             "--format",
             "json",

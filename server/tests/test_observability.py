@@ -69,3 +69,19 @@ def test_json_formatter_redacts_structured_context() -> None:
 
     assert payload["context"]["cookie"] == "[REDACTED]"
     assert payload["context"]["path"] == "/health/live"
+
+
+def test_request_log_uses_route_template_instead_of_raw_identifier(caplog) -> None:
+    app = create_app(database_probe=HealthyProbe(), storage_probe=HealthyProbe())
+
+    @app.get("/test/resumes/{resume_id}")
+    async def resume(resume_id: str) -> dict[str, str]:
+        return {"resume_id": resume_id}
+
+    canary = "550e8400-e29b-41d4-a716-446655440000"
+    with caplog.at_level(logging.INFO, logger="server.app.main"):
+        TestClient(app).get(f"/test/resumes/{canary}")
+
+    contexts = [getattr(record, "context", {}) for record in caplog.records]
+    assert canary not in repr(contexts)
+    assert any(context.get("route") == "/test/resumes/{resume_id}" for context in contexts)
