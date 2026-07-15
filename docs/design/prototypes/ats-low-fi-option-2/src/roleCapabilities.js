@@ -4,6 +4,10 @@ const HIRING_MANAGER_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", 
 const ALL_SETTINGS_SECTIONS = ["组织与权限", "流程与评价模板", "AI 设置", "审计与数据治理"];
 const GOVERNANCE_VIEW_ROLES = new Set(["系统管理员", "system_admin", "招聘管理员", "recruiting_admin", "HR 招聘专员", "HR"]);
 const GOVERNANCE_EDIT_ROLES = new Set(["系统管理员", "system_admin"]);
+const CANDIDATE_GOVERNANCE_READ_ROLES = new Set(["招聘管理员", "recruiting_admin", "HR 招聘专员", "recruiter", "HR", "用人经理", "hiring_manager"]);
+const CANDIDATE_DELETION_REQUEST_ROLES = new Set(["招聘管理员", "recruiting_admin", "HR 招聘专员", "recruiter", "HR"]);
+const DELETION_APPROVAL_ROLES = new Set(["系统管理员", "system_admin"]);
+const LEGAL_HOLD_ROLES = new Set(["招聘管理员", "recruiting_admin"]);
 
 const RECRUITING_ACTIONS = [
   "导入简历",
@@ -104,6 +108,22 @@ export function canViewRetentionSettings(role) {
 
 export function canEditRetentionSettings(role) {
   return GOVERNANCE_EDIT_ROLES.has(role);
+}
+
+export function canReadCandidateGovernance(role) {
+  return CANDIDATE_GOVERNANCE_READ_ROLES.has(role);
+}
+
+export function canRequestCandidateDeletion(role) {
+  return CANDIDATE_DELETION_REQUEST_ROLES.has(role);
+}
+
+export function canViewDeletionApprovalQueue(role) {
+  return DELETION_APPROVAL_ROLES.has(role);
+}
+
+export function canManageCandidateLegalHold(role) {
+  return LEGAL_HOLD_ROLES.has(role);
 }
 
 export function getRoleIdentity(role) {

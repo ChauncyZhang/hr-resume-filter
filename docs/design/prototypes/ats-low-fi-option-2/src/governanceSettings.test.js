@@ -10,9 +10,21 @@ const {
   createGovernanceSettingsController,
   getGovernanceErrorMessage,
   normalizeAuditRecord,
+  normalizeDeletionRequest,
+  buildDeletionRequestsPath,
   normalizeRetentionPolicy,
   releaseGovernanceSettingsSubscription,
 } = governance;
+
+const deletionCounts = {
+  contacts: 1, resumes: 2, applications: 3, screening_records: 4, interviews: 5,
+  feedback_records: 6, talent_memberships: 7, resume_objects: 8, temporary_exports: 9,
+};
+const deletionRequest = {
+  id: "22222222-2222-4222-8222-222222222222", status: "requested", version: 4,
+  reason_code: "administrator_request", requested_at: "2026-07-15T01:00:00Z", approved_at: null,
+  safe_error_code: null, impact: { schema_version: 1, candidate_ref: "11111111-1111-4111-8111-111111111111", candidate_version: 8, policy_version: 3, counts: deletionCounts, backup_window_ends_at: "2026-08-15T01:00:00Z" },
+};
 
 const policy = {
   id: "policy-1",
@@ -621,4 +633,107 @@ test("Settings UI uses the real governance controller and safe SET-04 projection
   assert.doesNotMatch(source, /const auditRows/);
   assert.doesNotMatch(source, /来源 IP/);
   assert.doesNotMatch(source, /raw_metadata|error\.detail/);
+  assert.match(source, /loadDeletionRequests/);
+  assert.match(source, /loadMoreDeletionRequests/);
+  assert.match(source, /approveDeletionRequest/);
+  assert.match(source, /删除请求审批/);
+  assert.match(source, /候选人版本/);
+  assert.doesNotMatch(source, /候选人姓名|candidateName|candidate\.name/);
+});
+
+test("deletion queue path supports status and cursor without candidate joins", () => {
+  requireFunction(buildDeletionRequestsPath, "buildDeletionRequestsPath");
+  assert.equal(buildDeletionRequestsPath("failed", { cursor: "next-token", limit: 25 }), "/api/v1/deletion-requests?status=failed&cursor=next-token&limit=25");
+  assert.equal(buildDeletionRequestsPath("", {}), "/api/v1/deletion-requests?limit=50");
+});
+
+test("deletion request normalization keeps only the safe detail projection", () => {
+  requireFunction(normalizeDeletionRequest, "normalizeDeletionRequest");
+  const normalized = normalizeDeletionRequest({ ...deletionRequest, object_key: "private", impact_manifest: { secret: true } });
+  assert.equal(normalized.id, deletionRequest.id);
+  assert.equal(normalized.impact.counts.temporaryExports, 9);
+  assert.equal(Object.hasOwn(normalized, "object_key"), false);
+  assert.equal(Object.hasOwn(normalized, "impact_manifest"), false);
+});
+
+test("deletion queue loads, paginates, de-duplicates and fetches selected detail", async () => {
+  const second = { ...deletionRequest, id: "33333333-3333-4333-8333-333333333333", status: "failed" };
+  const client = createClient((path) => {
+    if (path.includes(`/deletion-requests/${second.id}`)) return { data: second };
+    if (path.includes("cursor=next")) return { data: [deletionRequest, second], meta: { next_cursor: null, limit: 50 } };
+    return { data: [deletionRequest], meta: { next_cursor: "next", limit: 50 } };
+  });
+  const controller = createGovernanceSettingsController({ client });
+  await controller.loadDeletionRequests("requested");
+  await controller.loadMoreDeletionRequests();
+  await controller.loadDeletionRequest(second.id);
+  assert.deepEqual(controller.getState().deletionQueue.rows.map((row) => row.id), [deletionRequest.id, second.id]);
+  assert.equal(controller.getState().deletionQueue.selected.id, second.id);
+  assert.deepEqual(client.calls.map((call) => call.path), [
+    "/api/v1/deletion-requests?status=requested&limit=50",
+    "/api/v1/deletion-requests?status=requested&cursor=next&limit=50",
+    `/api/v1/deletion-requests/${second.id}`,
+  ]);
+});
+
+test("approval posts exact transition contract and rotates key after success", async () => {
+  const keys = ["approve-key-1", "approve-key-2"];
+  let version = 4;
+  const client = createClient((path, options) => {
+    if (options.method === "POST") {
+      version += 1;
+      return { data: { ...deletionRequest, version, status: "approved", approved_at: "2026-07-15T03:00:00Z" } };
+    }
+    return { data: { ...deletionRequest, version }, meta: { next_cursor: null, limit: 50 } };
+  });
+  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => keys.shift() });
+  await controller.loadDeletionRequests();
+  await controller.loadDeletionRequest(deletionRequest.id);
+  assert.equal(await controller.approveDeletionRequest(), true);
+  await controller.loadDeletionRequest(deletionRequest.id);
+  controller.getState().deletionQueue.selected.status = "failed";
+  assert.equal(await controller.approveDeletionRequest(), true);
+  const posts = client.calls.filter((call) => call.options.method === "POST");
+  assert.deepEqual(posts.map((call) => call.path), Array(2).fill(`/api/v1/deletion-requests/${deletionRequest.id}/transitions`));
+  assert.deepEqual(posts.map((call) => call.options.body), Array(2).fill({ target_status: "approved" }));
+  assert.deepEqual(posts.map((call) => call.options.ifMatch), ['"4"', '"5"']);
+  assert.deepEqual(posts.map((call) => call.options.idempotencyKey), ["approve-key-1", "approve-key-2"]);
+});
+
+test("stale manifest and version conflict refresh detail and require a new confirmation", async () => {
+  let gets = 0;
+  const refreshed = { ...deletionRequest, version: 5, status: "failed", impact: { ...deletionRequest.impact, counts: { ...deletionCounts, contacts: 2 } } };
+  const client = createClient((_path, options) => {
+    if (options.method === "POST") throw new ApiError({ status: 409, code: "stale_manifest" });
+    gets += 1;
+    return { data: gets === 1 ? deletionRequest : refreshed };
+  });
+  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => "stale-key" });
+  await controller.loadDeletionRequest(deletionRequest.id);
+  assert.equal(await controller.approveDeletionRequest(), false);
+  const state = controller.getState().deletionQueue;
+  assert.equal(state.selected.version, 5);
+  assert.equal(state.impactChanged, true);
+  assert.equal(state.confirmationRequired, true);
+  assert.equal(state.approving, false);
+  assert.equal(client.calls.filter((call) => call.options.method === "POST").length, 1);
+});
+
+test("ambiguous approval retries reuse the key while definitive 4xx rotates it", async () => {
+  const keys = ["key-1", "key-2"];
+  let attempts = 0;
+  const client = createClient((_path, options) => {
+    if (options.method !== "POST") return { data: deletionRequest };
+    attempts += 1;
+    if (attempts === 1) throw new ApiError({ status: 503, code: "service_unavailable", kind: "unavailable" });
+    throw new ApiError({ status: 422, code: "validation_failed" });
+  });
+  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => keys.shift() });
+  await controller.loadDeletionRequest(deletionRequest.id);
+  await controller.approveDeletionRequest();
+  await controller.approveDeletionRequest();
+  controller.getState().deletionQueue.selected.status = "failed";
+  await controller.approveDeletionRequest();
+  const posts = client.calls.filter((call) => call.options.method === "POST");
+  assert.deepEqual(posts.map((call) => call.options.idempotencyKey), ["key-1", "key-1", "key-2"]);
 });

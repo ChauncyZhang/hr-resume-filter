@@ -1,4 +1,7 @@
 import { apiClient } from "./apiClient.js";
+import { normalizeDeletionRequest } from "./candidateGovernance.js";
+
+export { normalizeDeletionRequest };
 
 const ERROR_MESSAGES = {
   authentication_required: "登录状态已失效，请重新登录。",
@@ -15,6 +18,7 @@ const ERROR_MESSAGES = {
   retention_preview_invalid: "影响预览已失效，请重新预览后确认。",
   validation_failed: "设置内容无效，请检查后重试。",
   service_unavailable: "服务暂时不可用，请稍后重试。",
+  stale_manifest: "删除影响已变化，已加载最新影响，请重新确认。",
 };
 
 const PREVIEW_FAILURE_CODES = new Set([
@@ -83,6 +87,14 @@ export function buildAuditLogsPath(filters = {}, { cursor = "", limit = 50 } = {
   const normalizedLimit = Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : 50;
   params.set("limit", String(normalizedLimit));
   return `/api/v1/audit-logs?${params}`;
+}
+
+export function buildDeletionRequestsPath(status = "", { cursor = "", limit = 50 } = {}) {
+  const params = new URLSearchParams();
+  if (safeString(status)) params.set("status", status);
+  if (safeString(cursor)) params.set("cursor", cursor);
+  params.set("limit", String(Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : 50));
+  return `/api/v1/deletion-requests?${params}`;
 }
 
 export function normalizeAuditRecord(value) {
@@ -211,10 +223,13 @@ export function createGovernanceSettingsController({
   let disposed = false;
   let auditGeneration = 0;
   let retentionGeneration = 0;
+  let deletionGeneration = 0;
   let auditRequest = null;
   let retentionRequest = null;
+  let deletionRequest = null;
   let previewToken = "";
   let saveIntent = null;
+  let approvalIntent = null;
   const listeners = new Set();
   let state = {
     audit: {
@@ -233,6 +248,21 @@ export function createGovernanceSettingsController({
       preview: null,
       error: "",
       message: "",
+    },
+    deletionQueue: {
+      status: "idle",
+      rows: [],
+      statusFilter: "",
+      nextCursor: null,
+      loadingMore: false,
+      selected: null,
+      detailStatus: "idle",
+      approving: false,
+      error: "",
+      detailError: "",
+      message: "",
+      impactChanged: false,
+      confirmationRequired: false,
     },
   };
 
@@ -254,12 +284,122 @@ export function createGovernanceSettingsController({
     return { generation: ++retentionGeneration, request: retentionRequest };
   }
 
+  function startDeletionRequest() {
+    deletionRequest?.abort();
+    deletionRequest = createAbortController();
+    return { generation: ++deletionGeneration, request: deletionRequest };
+  }
+
   function isCurrentAudit(generation) {
     return !disposed && generation === auditGeneration;
   }
 
   function isCurrentRetention(generation) {
     return !disposed && generation === retentionGeneration;
+  }
+
+  function isCurrentDeletion(generation) {
+    return !disposed && generation === deletionGeneration;
+  }
+
+  function normalizedDeletionRows(values) {
+    return (Array.isArray(values) ? values : []).map(normalizeDeletionRequest).filter(Boolean);
+  }
+
+  async function loadDeletionRequests(statusFilter = "") {
+    const status = safeString(statusFilter);
+    const { generation, request } = startDeletionRequest();
+    approvalIntent = null;
+    publish("deletionQueue", { status: "loading", rows: [], statusFilter: status, nextCursor: null, loadingMore: false, selected: null, detailStatus: "idle", error: "", detailError: "", message: "", impactChanged: false, confirmationRequired: false });
+    try {
+      const response = await client.request(buildDeletionRequestsPath(status), { signal: request.signal });
+      if (!isCurrentDeletion(generation)) return false;
+      const rows = normalizedDeletionRows(response?.data);
+      publish("deletionQueue", { status: rows.length ? "ready" : "empty", rows, nextCursor: safeNullableString(response?.meta?.next_cursor), error: "" });
+      return true;
+    } catch (error) {
+      if (isAbortError(error) || !isCurrentDeletion(generation)) return false;
+      publish("deletionQueue", { status: isDenied(error) ? "denied" : "error", error: getGovernanceErrorMessage(error) });
+      return false;
+    }
+  }
+
+  async function loadMoreDeletionRequests() {
+    const cursor = state.deletionQueue.nextCursor;
+    if (!cursor || state.deletionQueue.loadingMore) return false;
+    const { generation, request } = startDeletionRequest();
+    publish("deletionQueue", { loadingMore: true, error: "" });
+    try {
+      const response = await client.request(buildDeletionRequestsPath(state.deletionQueue.statusFilter, { cursor }), { signal: request.signal });
+      if (!isCurrentDeletion(generation)) return false;
+      const seen = new Set(state.deletionQueue.rows.map((row) => row.id));
+      const rows = [...state.deletionQueue.rows, ...normalizedDeletionRows(response?.data).filter((row) => !seen.has(row.id) && seen.add(row.id))];
+      publish("deletionQueue", { status: rows.length ? "ready" : "empty", rows, nextCursor: safeNullableString(response?.meta?.next_cursor), loadingMore: false });
+      return true;
+    } catch (error) {
+      if (isAbortError(error) || !isCurrentDeletion(generation)) return false;
+      publish("deletionQueue", { loadingMore: false, error: getGovernanceErrorMessage(error) });
+      return false;
+    }
+  }
+
+  function impactSignature(request) {
+    return request ? JSON.stringify({ version: request.version, impact: request.impact }) : "";
+  }
+
+  async function loadDeletionRequest(requestId, { previousImpact = "", reviewMessage = "" } = {}) {
+    const id = safeString(requestId);
+    if (!id) return false;
+    const { generation, request } = startDeletionRequest();
+    publish("deletionQueue", { detailStatus: "loading", detailError: "", message: "", confirmationRequired: false });
+    try {
+      const response = await client.request(`/api/v1/deletion-requests/${id}`, { signal: request.signal });
+      if (!isCurrentDeletion(generation)) return false;
+      const selected = normalizeDeletionRequest(response?.data);
+      if (!selected) throw new Error("invalid deletion request projection");
+      const changed = Boolean(previousImpact && previousImpact !== impactSignature(selected));
+      publish("deletionQueue", { selected, detailStatus: "ready", detailError: "", message: reviewMessage, impactChanged: changed, confirmationRequired: changed, approving: false });
+      return true;
+    } catch (error) {
+      if (isAbortError(error) || !isCurrentDeletion(generation)) return false;
+      publish("deletionQueue", { detailStatus: "error", detailError: getGovernanceErrorMessage(error), approving: false });
+      return false;
+    }
+  }
+
+  function ensureApprovalIntent(selected) {
+    const signature = JSON.stringify({ id: selected.id, version: selected.version, target_status: "approved" });
+    if (!approvalIntent || approvalIntent.signature !== signature) approvalIntent = { signature, key: createIdempotencyKey() };
+    if (!safeString(approvalIntent.key) || approvalIntent.key.length > 255) approvalIntent.key = createUniqueIdempotencyKey();
+    return approvalIntent;
+  }
+
+  async function approveDeletionRequest() {
+    const selected = state.deletionQueue.selected;
+    if (!selected || !["requested", "failed"].includes(selected.status) || state.deletionQueue.approving) return false;
+    const operation = ensureApprovalIntent(selected);
+    const previousImpact = impactSignature(selected);
+    const { generation, request } = startDeletionRequest();
+    publish("deletionQueue", { approving: true, detailError: "", message: "", confirmationRequired: false });
+    try {
+      const response = await client.request(`/api/v1/deletion-requests/${selected.id}/transitions`, { method: "POST", body: { target_status: "approved" }, ifMatch: `"${selected.version}"`, idempotencyKey: operation.key, signal: request.signal });
+      if (!isCurrentDeletion(generation)) return false;
+      const approved = normalizeDeletionRequest(response?.data);
+      if (!approved) throw new Error("invalid deletion request projection");
+      approvalIntent = null;
+      publish("deletionQueue", { selected: approved, approving: false, detailStatus: "ready", message: "删除请求已批准。", impactChanged: false, confirmationRequired: false, rows: state.deletionQueue.rows.map((row) => row.id === approved.id ? approved : row) });
+      return true;
+    } catch (error) {
+      if (isAbortError(error) || !isCurrentDeletion(generation)) return false;
+      const conflict = error?.code === "stale_manifest" || error?.code === "resource_version_conflict";
+      if (!isAmbiguousFailure(error)) approvalIntent = null;
+      if (conflict) {
+        await loadDeletionRequest(selected.id, { previousImpact, reviewMessage: getGovernanceErrorMessage(error) });
+        return false;
+      }
+      publish("deletionQueue", { approving: false, detailError: getGovernanceErrorMessage(error), confirmationRequired: true });
+      return false;
+    }
   }
 
   function clearPreview() {
@@ -540,12 +680,16 @@ export function createGovernanceSettingsController({
   function releaseRequests() {
     auditRequest?.abort();
     retentionRequest?.abort();
+    deletionRequest?.abort();
     auditRequest = null;
     retentionRequest = null;
+    deletionRequest = null;
     auditGeneration += 1;
     retentionGeneration += 1;
+    deletionGeneration += 1;
     clearPreview();
     saveIntent = null;
+    approvalIntent = null;
     if (state.retention.preview) publish("retention", { preview: null });
   }
 
@@ -558,6 +702,10 @@ export function createGovernanceSettingsController({
     loadAudit,
     loadMoreAudit,
     loadRetention,
+    loadDeletionRequests,
+    loadMoreDeletionRequests,
+    loadDeletionRequest,
+    approveDeletionRequest,
     updateRetentionDraft,
     saveRetention,
     confirmRetentionSave,

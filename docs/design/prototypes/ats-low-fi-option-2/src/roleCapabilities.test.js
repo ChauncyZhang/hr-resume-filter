@@ -9,6 +9,10 @@ import {
   canPerformAction,
   canViewAuditSettings,
   canViewRetentionSettings,
+  canReadCandidateGovernance,
+  canRequestCandidateDeletion,
+  canViewDeletionApprovalQueue,
+  canManageCandidateLegalHold,
   getAllowedNavItems,
   getAllowedSettingsSections,
   getDefaultNavItem,
@@ -119,5 +123,28 @@ test("治理设置显式区分审计查看和保留策略编辑权限", () => {
     assert.equal(canViewAuditSettings(role), auditView, `${role} audit view`);
     assert.equal(canViewRetentionSettings(role), retentionView, `${role} retention view`);
     assert.equal(canEditRetentionSettings(role), retentionEdit, `${role} retention edit`);
+  }
+});
+
+test("候选人治理权限按四种能力独立且未知角色默认拒绝", () => {
+  const matrix = [
+    ["系统管理员", false, false, true, false],
+    ["system_admin", false, false, true, false],
+    ["招聘管理员", true, true, false, true],
+    ["recruiting_admin", true, true, false, true],
+    ["HR 招聘专员", true, true, false, false],
+    ["recruiter", true, true, false, false],
+    ["HR", true, true, false, false],
+    ["用人经理", true, false, false, false],
+    ["hiring_manager", true, false, false, false],
+    ["面试官", false, false, false, false],
+    ["interviewer", false, false, false, false],
+    ["未知角色", false, false, false, false],
+  ];
+  for (const [role, read, request, approve, hold] of matrix) {
+    assert.equal(canReadCandidateGovernance(role), read, `${role} status read`);
+    assert.equal(canRequestCandidateDeletion(role), request, `${role} deletion request`);
+    assert.equal(canViewDeletionApprovalQueue(role), approve, `${role} approval queue`);
+    assert.equal(canManageCandidateLegalHold(role), hold, `${role} legal hold`);
   }
 });
