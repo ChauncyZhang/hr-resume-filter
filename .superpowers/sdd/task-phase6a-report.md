@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented the production-only HTTPS overlay and topology gate within the five
+Implemented the production-only HTTPS overlay and topology gate within the six
 owned files. The base development Compose, backend, Worker, migrations, MinIO
 provisioning, Dockerfile, README, and pre-existing user-owned files were not
 modified or staged by this task.
@@ -12,6 +12,7 @@ modified or staged by this task.
 - `deploy/compose.production.yaml`
 - `deploy/nginx/production.conf.template`
 - `deploy/nginx/snippets/security-headers.conf`
+- `deploy/production-preflight.sh`
 - `server/tests/test_production_topology.py`
 - `.superpowers/sdd/task-phase6a-report.md`
 
