@@ -190,6 +190,8 @@ class GovernanceSettings(BaseModel):
     ledger_bucket: str = "governance-ledger"
     ledger_prefix: str = "deletions/"
     signing_key: SecretStr = SecretStr("")
+    retention_sweep_batch_size: int = Field(default=100, ge=1, le=1_000)
+    recovery_max_ledgers: int = Field(default=10_000, ge=1, le=100_000)
 
     @model_validator(mode="after")
     def validate_credentials(self) -> "GovernanceSettings":
@@ -288,6 +290,8 @@ class GovernanceSettings(BaseModel):
             "GOVERNANCE_LEDGER_BUCKET": "ledger_bucket",
             "GOVERNANCE_LEDGER_PREFIX": "ledger_prefix",
             "GOVERNANCE_LEDGER_SIGNING_KEY": "signing_key",
+            "GOVERNANCE_RETENTION_SWEEP_BATCH_SIZE": "retention_sweep_batch_size",
+            "GOVERNANCE_RECOVERY_MAX_LEDGERS": "recovery_max_ledgers",
         }
         values = {
             field_name: os.environ[env_name]

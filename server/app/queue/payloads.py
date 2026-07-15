@@ -117,3 +117,22 @@ DEFAULT_PAYLOAD_POLICIES.register_job(
         }
     ),
 )
+DEFAULT_PAYLOAD_POLICIES.register_job(
+    "governance.retention_sweep",
+    PayloadSchema(
+        {
+            "organization_id": OpaqueIdField(),
+            "scheduled_date": IdentifierField(),
+        }
+    ),
+)
+DEFAULT_PAYLOAD_POLICIES.register_job(
+    "governance.redelete_after_restore",
+    PayloadSchema(
+        {
+            "organization_id": OpaqueIdField(),
+            "recovery_run_id": OpaqueIdField(),
+            "checkpoint_id": OpaqueIdField(),
+        }
+    ),
+)

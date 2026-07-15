@@ -59,7 +59,9 @@ class DeletionRequest(Base):
         CheckConstraint(
             "reason_code in ('retention_expired','candidate_request','administrator_request')"
         ),
-        CheckConstraint("requested_by IS NOT NULL OR reason_code = 'retention_expired'"),
+        CheckConstraint(
+            "requested_by IS NOT NULL OR reason_code = 'retention_expired' OR recovery_generation > 0"
+        ),
         CheckConstraint("manifest_schema_version = 1"),
         CheckConstraint(_MANIFEST_HASH_CHECK),
         CheckConstraint("policy_version >= 1"),
@@ -224,6 +226,50 @@ class DeletionRecoveryRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     queue_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+
+class DeletionRecoveryCheckpoint(Base):
+    __tablename__ = "deletion_recovery_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id"),
+        UniqueConstraint("run_id", "ledger_sha256"),
+        ForeignKeyConstraint(
+            ["organization_id", "run_id"],
+            ["deletion_recovery_runs.organization_id", "deletion_recovery_runs.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "queue_job_id"],
+            ["background_jobs.organization_id", "background_jobs.id"],
+        ),
+        CheckConstraint("status in ('pending','running','completed','failed')"),
+        CheckConstraint("attempts >= 0"),
+        CheckConstraint("target_generation >= 1"),
+        CheckConstraint(_MANIFEST_HASH_CHECK.replace("manifest_hash", "ledger_sha256")),
+        Index("ix_deletion_recovery_checkpoints_run_status", "run_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    deletion_request_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    ledger_object_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    ledger_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    safe_error_code: Mapped[str | None] = mapped_column(String(64))
+    queue_job_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

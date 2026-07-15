@@ -140,6 +140,8 @@ def test_openapi_and_queue_contract_are_exact(tmp_path) -> None:
         with pytest.raises(UnsafePayload):
             DEFAULT_PAYLOAD_POLICIES.validate_job("governance.delete_candidate", invalid)
     assert "governance.delete_candidate" in TERMINAL_CALLBACK_TYPES
+    assert "governance.retention_sweep" in TERMINAL_CALLBACK_TYPES
+    assert "governance.redelete_after_restore" in TERMINAL_CALLBACK_TYPES
 
 
 @pytest.mark.parametrize(

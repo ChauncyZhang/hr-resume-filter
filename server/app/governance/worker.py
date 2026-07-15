@@ -16,7 +16,12 @@ from server.app.governance.deletion_service import (
     execute_database_redaction,
     lock_deletion_request_context,
 )
-from server.app.governance.storage import GovernanceStorageError, LedgerEntry
+from server.app.governance.storage import (
+    GovernanceStorageError,
+    LedgerArtifact,
+    LedgerEntry,
+    LedgerEntryV2,
+)
 from server.app.queue.models import BackgroundJob
 from server.app.queue.payloads import IntegerField, OpaqueIdField, PayloadSchema, UnsafePayload
 from server.app.queue.repository import QueueRepository
@@ -452,7 +457,7 @@ class DeletionJobHandler:
 
     def _persist_redaction_and_build_entry(
         self, organization_id, request_id, request_version, result
-    ) -> LedgerEntry:
+    ) -> LedgerEntryV2:
         with self._sessions.begin() as db:
             request = db.scalar(
                 select(DeletionRequest)
@@ -476,26 +481,38 @@ class DeletionJobHandler:
                 raise PermanentJobError("deletion_redaction_mismatch")
             request.database_redaction_checksum = result.checksum
             request.ledger_completed_at = request.ledger_completed_at or candidate.deleted_at
-            keys = tuple(
-                db.scalars(
-                    select(DeletionArtifact.storage_key)
+            artifacts = tuple(
+                LedgerArtifact(
+                    kind=kind,
+                    bucket=self._resume_bucket if kind == "resume_object" else self._export_bucket,
+                    storage_key=storage_key,
+                )
+                for kind, storage_key in db.execute(
+                    select(DeletionArtifact.kind, DeletionArtifact.storage_key)
                     .where(
                         DeletionArtifact.organization_id == organization_id,
                         DeletionArtifact.request_id == request_id,
                         DeletionArtifact.status == "deleted",
                     )
-                    .order_by(DeletionArtifact.storage_key)
+                    .order_by(DeletionArtifact.kind, DeletionArtifact.storage_key)
                 )
             )
-            return LedgerEntry(
+            return LedgerEntryV2(
                 organization_id=organization_id,
                 deletion_request_id=request.id,
                 candidate_id=request.candidate_id,
+                completed_request_version=request.version,
                 completed_at=request.ledger_completed_at.replace(tzinfo=timezone.utc)
                 if request.ledger_completed_at.tzinfo is None
                 else request.ledger_completed_at,
+                requested_at=request.requested_at.replace(tzinfo=timezone.utc)
+                if request.requested_at.tzinfo is None
+                else request.requested_at,
+                reason_code=request.reason_code,
+                impact_manifest=request.impact_manifest,
                 manifest_hash=request.manifest_hash,
-                object_keys=keys,
+                recovery_generation=request.recovery_generation,
+                artifacts=artifacts,
                 database_redaction_checksum=request.database_redaction_checksum,
             )
 
@@ -556,29 +573,58 @@ class DeletionJobHandler:
                 or request.ledger_object_key is None
             ):
                 raise PermanentJobError("deletion_job_stale")
-            keys = tuple(
-                db.scalars(
-                    select(DeletionArtifact.storage_key)
+            artifact_rows = tuple(
+                db.execute(
+                    select(DeletionArtifact.kind, DeletionArtifact.storage_key)
                     .where(
                         DeletionArtifact.organization_id == organization_id,
                         DeletionArtifact.request_id == request_id,
                         DeletionArtifact.status == "deleted",
                     )
-                    .order_by(DeletionArtifact.storage_key)
+                    .order_by(DeletionArtifact.kind, DeletionArtifact.storage_key)
                 )
             )
-            entry = LedgerEntry(
-                organization_id=organization_id,
-                deletion_request_id=request.id,
-                candidate_id=request.candidate_id,
-                completed_at=request.ledger_completed_at.replace(tzinfo=timezone.utc)
-                if request.ledger_completed_at.tzinfo is None
-                else request.ledger_completed_at,
-                manifest_hash=request.manifest_hash,
-                object_keys=keys,
-                database_redaction_checksum=request.database_redaction_checksum,
-            )
             object_key = request.ledger_object_key
+            completed_at = (
+                request.ledger_completed_at.replace(tzinfo=timezone.utc)
+                if request.ledger_completed_at.tzinfo is None
+                else request.ledger_completed_at
+            )
+            path_parts = object_key.rsplit("/", 3)
+            if len(path_parts) == 4 and path_parts[-3] == "v1":
+                entry = LedgerEntry(
+                    organization_id=organization_id,
+                    deletion_request_id=request.id,
+                    candidate_id=request.candidate_id,
+                    completed_at=completed_at,
+                    manifest_hash=request.manifest_hash,
+                    object_keys=tuple(sorted(storage_key for _, storage_key in artifact_rows)),
+                    database_redaction_checksum=request.database_redaction_checksum,
+                )
+            else:
+                entry = LedgerEntryV2(
+                    organization_id=organization_id,
+                    deletion_request_id=request.id,
+                    candidate_id=request.candidate_id,
+                    completed_request_version=request.version,
+                    completed_at=completed_at,
+                    requested_at=request.requested_at.replace(tzinfo=timezone.utc)
+                    if request.requested_at.tzinfo is None
+                    else request.requested_at,
+                    reason_code=request.reason_code,
+                    impact_manifest=request.impact_manifest,
+                    manifest_hash=request.manifest_hash,
+                    recovery_generation=request.recovery_generation,
+                    artifacts=tuple(
+                        LedgerArtifact(
+                            kind=kind,
+                            bucket=self._resume_bucket if kind == "resume_object" else self._export_bucket,
+                            storage_key=storage_key,
+                        )
+                        for kind, storage_key in artifact_rows
+                    ),
+                    database_redaction_checksum=request.database_redaction_checksum,
+                )
         try:
             verified = self._ledger.read(object_key)
         except GovernanceStorageError as error:

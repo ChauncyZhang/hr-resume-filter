@@ -239,6 +239,22 @@ def test_governance_export_defaults_match_report_storage_contract() -> None:
 
     assert GovernanceSettings.model_fields["export_bucket"].default == "resumes"
     assert GovernanceSettings.model_fields["export_prefix"].default == "exports/"
+    assert GovernanceSettings.model_fields["retention_sweep_batch_size"].default == 100
+    assert GovernanceSettings.model_fields["recovery_max_ledgers"].default == 10_000
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"retention_sweep_batch_size": 0},
+        {"retention_sweep_batch_size": 1001},
+        {"recovery_max_ledgers": 0},
+        {"recovery_max_ledgers": 100_001},
+    ],
+)
+def test_governance_operation_bounds_fail_closed(overrides) -> None:
+    with pytest.raises(ValidationError):
+        governance_settings(**overrides)
 
 
 @pytest.mark.parametrize(

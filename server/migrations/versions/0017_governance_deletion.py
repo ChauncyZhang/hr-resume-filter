@@ -109,7 +109,7 @@ def upgrade() -> None:
             name="ck_deletion_requests_reason_code",
         ),
         sa.CheckConstraint(
-            "requested_by IS NOT NULL OR reason_code = 'retention_expired'",
+            "requested_by IS NOT NULL OR reason_code = 'retention_expired' OR recovery_generation > 0",
             name="ck_deletion_requests_requester",
         ),
         sa.CheckConstraint(
@@ -278,6 +278,52 @@ def upgrade() -> None:
             "requeued_request_count >= 0",
             name="ck_deletion_recovery_runs_requeued_count",
         ),
+    )
+    op.create_table(
+        "deletion_recovery_checkpoints",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("organization_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("run_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("deletion_request_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("ledger_object_key", sa.String(512), nullable=False),
+        sa.Column("ledger_sha256", sa.String(64), nullable=False),
+        sa.Column("target_generation", sa.Integer(), nullable=False),
+        sa.Column("status", sa.String(20), nullable=False, server_default="pending"),
+        sa.Column("attempts", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("safe_error_code", sa.String(64), nullable=True),
+        sa.Column("queue_job_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
+        sa.UniqueConstraint("organization_id", "id", name="uq_deletion_recovery_checkpoints_tenant_id"),
+        sa.UniqueConstraint("run_id", "ledger_sha256", name="uq_deletion_recovery_checkpoints_run_ledger"),
+        sa.ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_deletion_recovery_checkpoints_organization", ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["organization_id", "run_id"],
+            ["deletion_recovery_runs.organization_id", "deletion_recovery_runs.id"],
+            name="fk_deletion_recovery_checkpoints_run", ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["organization_id", "queue_job_id"],
+            ["background_jobs.organization_id", "background_jobs.id"],
+            name="fk_deletion_recovery_checkpoints_queue_job",
+        ),
+        sa.CheckConstraint(
+            "status in ('pending','running','completed','failed')",
+            name="ck_deletion_recovery_checkpoints_status",
+        ),
+        sa.CheckConstraint("attempts >= 0", name="ck_deletion_recovery_checkpoints_attempts"),
+        sa.CheckConstraint("target_generation >= 1", name="ck_deletion_recovery_checkpoints_generation"),
+        sa.CheckConstraint("ledger_sha256 ~ '^[0-9a-f]{64}$'", name="ck_deletion_recovery_checkpoints_ledger_sha256"),
+    )
+    op.create_index(
+        "ix_deletion_recovery_checkpoints_run_status",
+        "deletion_recovery_checkpoints",
+        ["run_id", "status"],
     )
     op.execute(
         """
@@ -1022,6 +1068,7 @@ def downgrade() -> None:
               audit_logs,
               candidates,
               deletion_artifacts,
+              deletion_recovery_checkpoints,
               deletion_recovery_runs,
               deletion_requests,
               legal_holds,
@@ -1039,6 +1086,7 @@ def downgrade() -> None:
               OR EXISTS (SELECT 1 FROM deletion_artifacts)
               OR EXISTS (SELECT 1 FROM legal_holds)
               OR EXISTS (SELECT 1 FROM deletion_recovery_runs)
+              OR EXISTS (SELECT 1 FROM deletion_recovery_checkpoints)
               OR EXISTS (
                 SELECT 1 FROM audit_logs
                 WHERE event_type LIKE 'governance.deletion_%'
@@ -1181,6 +1229,7 @@ def downgrade() -> None:
         $$
         """
     )
+    op.drop_table("deletion_recovery_checkpoints")
     op.drop_table("deletion_recovery_runs")
     op.drop_table("legal_holds")
     op.drop_table("deletion_artifacts")

@@ -8,6 +8,7 @@ from sqlalchemy import CheckConstraint, ForeignKeyConstraint, Index, UniqueConst
 
 from server.app.governance.deletion_models import (
     DeletionArtifact,
+    DeletionRecoveryCheckpoint,
     DeletionRecoveryRun,
     DeletionRequest,
     LegalHold,
@@ -34,11 +35,13 @@ def test_deletion_models_register_tenant_scoped_schema_contract() -> None:
     artifact = DeletionArtifact.__table__
     hold = LegalHold.__table__
     recovery = DeletionRecoveryRun.__table__
+    checkpoint = DeletionRecoveryCheckpoint.__table__
 
     assert request.name == "deletion_requests"
     assert artifact.name == "deletion_artifacts"
     assert hold.name == "legal_holds"
     assert recovery.name == "deletion_recovery_runs"
+    assert checkpoint.name == "deletion_recovery_checkpoints"
     assert Candidate.__table__.c.deleted_at.nullable
     assert "reason_code" in request.c
     assert "reason" not in request.c
@@ -67,6 +70,11 @@ def test_deletion_models_register_tenant_scoped_schema_contract() -> None:
         isinstance(constraint, UniqueConstraint)
         and _constraint_columns(constraint) == ["organization_id", "restore_id"]
         for constraint in recovery.constraints
+    )
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and _constraint_columns(constraint) == ["run_id", "ledger_sha256"]
+        for constraint in checkpoint.constraints
     )
 
     checks = {

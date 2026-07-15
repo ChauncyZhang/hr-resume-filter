@@ -103,7 +103,11 @@ def test_deletion_handler_rejects_payload_tenant_mismatch_before_dependencies() 
 def test_production_registry_contains_deletion_handler_and_terminal_callback() -> None:
     from server.app.worker.main import build_terminal_callbacks
 
-    assert "governance.delete_candidate" in build_terminal_callbacks()
+    assert {
+        "governance.delete_candidate",
+        "governance.retention_sweep",
+        "governance.redelete_after_restore",
+    } <= set(build_terminal_callbacks())
 
 
 class RecordingDeleter:
@@ -668,6 +672,18 @@ def test_object_checkpoint_resume_precedes_redaction_and_ledger(tmp_path, monkey
         request = db.get(DeletionRequest, request_id)
         assert request.status == "completed"
         assert request.recovery_generation == 0
+        assert ledger.entry.schema_version == 2
+        assert ledger.entry.completed_request_version == request.version
+        assert ledger.entry.requested_at == request.requested_at.replace(tzinfo=timezone.utc)
+        assert ledger.entry.reason_code == request.reason_code
+        assert ledger.entry.impact_manifest == request.impact_manifest
+        assert ledger.entry.recovery_generation == request.recovery_generation
+        assert {(item.kind, item.bucket, item.storage_key) for item in ledger.entry.artifacts} == {
+            (artifact.kind, "resumes", artifact.storage_key)
+            for artifact in db.scalars(
+                select(DeletionArtifact).where(DeletionArtifact.request_id == request_id)
+            )
+        }
 
     counts_before_reentry = {
         name: [event[0] for event in events].count(name)
@@ -1286,7 +1302,11 @@ def test_real_minio_deletes_resume_and_export_before_redaction_and_writes_ledger
         root.put_object(bucket, key, io.BytesIO(b"private"), 7)
 
     real_ledger = SignedLedgerAdapter(
-        ledger_client, ledger_bucket, "deletions/", b"b2b2-independent-signing-key-32-bytes"
+        ledger_client,
+        ledger_bucket,
+        "deletions/",
+        b"b2b2-independent-signing-key-32-bytes",
+        allowed_buckets={resume_bucket, export_bucket},
     )
 
     class FailFirstLedger:

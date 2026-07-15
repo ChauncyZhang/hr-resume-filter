@@ -45,6 +45,14 @@ def test_worker_entrypoint_configures_structured_logging(
     assert calls == ["logging", "run"]
 
 
+def test_governance_worker_job_types_are_explicit_and_complete() -> None:
+    assert worker_main.GOVERNANCE_JOB_TYPES == {
+        "governance.delete_candidate",
+        "governance.retention_sweep",
+        "governance.redelete_after_restore",
+    }
+
+
 def test_worker_stops_after_shutdown_request() -> None:
     database = CountingProbe()
     storage = CountingProbe()

@@ -9,7 +9,7 @@ from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, PayloadPolicyReg
 from server.app.queue.service import normalize_safe_code, retry_delay
 
 class LeaseRejected(RuntimeError): pass
-TERMINAL_CALLBACK_TYPES={"screening.parse_item","screening.score_item","screening.llm_score_item","reports.export","governance.delete_candidate"}
+TERMINAL_CALLBACK_TYPES={"screening.parse_item","screening.score_item","screening.llm_score_item","reports.export","governance.delete_candidate","governance.retention_sweep","governance.redelete_after_restore"}
 LEASE_REAP_BATCH_SIZE = 100
 
 class QueueRepository:

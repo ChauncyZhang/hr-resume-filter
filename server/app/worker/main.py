@@ -19,6 +19,12 @@ from server.app.reports.service import ExportLimitExceeded, finalize_export, pre
 
 logger = logging.getLogger(__name__)
 
+GOVERNANCE_JOB_TYPES = {
+    "governance.delete_candidate",
+    "governance.retention_sweep",
+    "governance.redelete_after_restore",
+}
+
 
 REPORT_EXPORT_PAYLOAD = PayloadSchema(
     {"organization_id": OpaqueIdField(), "export_id": OpaqueIdField()}
@@ -99,11 +105,13 @@ def build_screening_handlers(settings,storage_client,bucket):
     return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"reports.export":report_export}
 
 
-def build_governance_handler(settings: Settings, governance: GovernanceSettings):
+def build_governance_handlers(settings: Settings, governance: GovernanceSettings):
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
     from server.app.core.storage import create_storage_client
+    from server.app.governance.recovery import RecoveryJobHandler
+    from server.app.governance.retention_sweep import RetentionSweepJobHandler
     from server.app.governance.storage import DeleteOnlyObjectAdapter, SignedLedgerAdapter
     from server.app.governance.worker import DeletionJobHandler
 
@@ -138,15 +146,34 @@ def build_governance_handler(settings: Settings, governance: GovernanceSettings)
         governance.ledger_bucket,
         governance.ledger_prefix,
         governance.signing_key.get_secret_value().encode("utf-8"),
+        allowed_buckets={governance.resume_bucket, governance.export_bucket},
+        allowed_locations={
+            "resume_object": (governance.resume_bucket, governance.resume_prefix),
+            "report_export_object": (governance.export_bucket, governance.export_prefix),
+        },
     )
-    return DeletionJobHandler(
+    deleter = DeleteOnlyObjectAdapter(delete_client)
+    deletion = DeletionJobHandler(
         sessions,
         governance_engine,
-        DeleteOnlyObjectAdapter(delete_client),
+        deleter,
         ledger,
         resume_bucket=governance.resume_bucket,
         export_bucket=governance.export_bucket,
     )
+    return {
+        "governance.delete_candidate": deletion,
+        "governance.retention_sweep": RetentionSweepJobHandler(
+            sessions, batch_size=governance.retention_sweep_batch_size
+        ),
+        "governance.redelete_after_restore": RecoveryJobHandler(
+            sessions, governance_engine, deleter, ledger
+        ),
+    }
+
+
+def build_governance_handler(settings: Settings, governance: GovernanceSettings):
+    return build_governance_handlers(settings, governance)["governance.delete_candidate"]
 
 
 def build_terminal_callbacks():
@@ -292,7 +319,7 @@ async def _run() -> None:
     from server.app.queue.runtime import DatabaseQueueGateway
     settings = Settings.from_environment(); governance = GovernanceSettings.from_environment(settings); gateway = DatabaseQueueGateway(settings.database_url,terminal_callbacks=build_terminal_callbacks()); storage_client=create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds)
     handlers=build_screening_handlers(settings,storage_client,settings.object_storage_bucket)
-    handlers["governance.delete_candidate"] = build_governance_handler(settings, governance)
+    handlers.update(build_governance_handlers(settings, governance))
     worker = Worker(DatabaseProbe(create_engine(settings.database_url)), ObjectStorageProbe(storage_client, settings.object_storage_bucket), interval_seconds=settings.worker_poll_interval_seconds, readiness_timeout_seconds=settings.readiness_timeout_seconds, worker_id=settings.worker_id, lease_seconds=settings.worker_lease_seconds, shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds, cancel_timeout_seconds=settings.worker_cancel_timeout_seconds, heartbeat_seconds=settings.worker_heartbeat_seconds, queue=gateway, handlers=handlers, outbox_handlers={})
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(event, worker.request_shutdown)

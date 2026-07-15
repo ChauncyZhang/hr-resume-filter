@@ -153,6 +153,7 @@ def test_0017_upgrade_registers_additive_deletion_schema() -> None:
         "deletion_artifacts",
         "legal_holds",
         "deletion_recovery_runs",
+        "deletion_recovery_checkpoints",
         "report_export_candidates",
     } <= set(inspector.get_table_names())
     assert "deleted_at" in {column["name"] for column in inspector.get_columns("candidates")}
@@ -165,6 +166,15 @@ def test_0017_upgrade_registers_additive_deletion_schema() -> None:
         "ledger_object_key",
         "ledger_sha256",
     } <= {column["name"] for column in inspector.get_columns("deletion_requests")}
+    assert {
+        "ledger_object_key",
+        "ledger_sha256",
+        "target_generation",
+        "queue_job_id",
+    } <= {
+        column["name"]
+        for column in inspector.get_columns("deletion_recovery_checkpoints")
+    }
     assert {
         "uq_deletion_requests_open_candidate",
         "uq_legal_holds_active_candidate",
@@ -577,6 +587,7 @@ def test_0017_empty_downgrade_removes_additive_schema() -> None:
             "deletion_artifacts",
             "legal_holds",
             "deletion_recovery_runs",
+            "deletion_recovery_checkpoints",
             "report_export_candidates",
         }
         & set(inspector.get_table_names())

@@ -102,11 +102,48 @@ All configured governance prefixes are non-empty relative paths ending in `/`. R
 users are ignored only when `mc` explicitly reports that the user does not exist; authentication,
 network, or CLI failures stop provisioning without printing the retired key or command output.
 
-`server.app.governance.storage` provides the delete-only adapter and canonical signed ledger v1.
-Ledger writes verify an existing object before accepting idempotent re-entry; malformed, tampered,
-or mismatched evidence fails with a stable non-identifying code. Ledger bodies contain only schema
-version, organization/request/candidate UUIDs, completion time, manifest hash, exact object keys,
-database-redaction checksum, and HMAC signature.
+`server.app.governance.storage` provides the delete-only adapter and canonical signed ledger v1/v2.
+V1 remains readable only for B2B2 completion/redelivery. New deletions write v2, which adds the
+original request facts, canonical private manifest, recovery generation, and exact typed
+bucket/key descriptors needed for restore recovery. Ledger writes verify an existing object before
+accepting idempotent re-entry; malformed, tampered, mismatched, non-canonical, or applicable v1
+evidence fails with a stable non-identifying code. Recovery validates every discovered ledger and
+the restored database state before it creates a run, checkpoint, or queue job.
+
+## Retention and restore recovery operations
+
+Seed the first daily retention sweep explicitly after deployment (Alembic never schedules jobs):
+
+```powershell
+docker compose --env-file deploy/.env -f deploy/compose.yaml run --rm worker `
+  python -m server.app.governance.retention_sweep --scheduled-date 2026-07-16
+```
+
+Each tenant/date has a stable dedupe key. A sweep claims a bounded batch with `SKIP LOCKED`,
+recomputes due facts under lock, excludes active applications/holds/open requests, creates only
+non-PII `requested` deletion evidence, and schedules the next UTC date. Configure the bounds with
+`GOVERNANCE_RETENTION_SWEEP_BATCH_SIZE` (1-1000, default 100).
+
+Restore recovery is an operator-only CLI and has no HTTP/OpenAPI route. Preserve the ledger bucket
+outside the restored data plane, restore PostgreSQL and data objects first, then run:
+
+```powershell
+docker compose --env-file deploy/.env -f deploy/compose.yaml run --rm worker `
+  python -m server.app.governance.redelete_after_restore `
+  --restore-id 00000000-0000-4000-8000-000000000001 `
+  --restored-at 2026-07-15T00:00:00Z
+```
+
+The CLI accepts only those two arguments. Before its first durable mutation it validates the
+separate application/governance PostgreSQL identities, scoped list access for the delete and
+ledger storage identities, all bounded v1/v2 ledger pages, signatures, canonical evidence, and
+restored candidate/organization rows. It then creates one durable checkpoint and queue job per
+applicable v2 ledger. Same restore ID/timestamp is a no-op; reusing an ID with another timestamp
+fails closed. Workers re-read the exact ledger checksum, repair only minimum non-PII request and
+artifact evidence, delete only signed objects, invoke the frozen redaction routine, and increment
+the request generation once per restore. Configure the discovery ceiling with
+`GOVERNANCE_RECOVERY_MAX_LEDGERS` (1-100000, default 10000). Stop recovery workers before restoring
+again; never restore or overwrite the independently preserved ledger bucket.
 
 Validate the example topology without starting services:
 
