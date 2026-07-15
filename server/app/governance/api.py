@@ -1153,6 +1153,8 @@ def get_candidate_governance_status(candidate_id: UUID, request: Request):
         }
         if hold is not None and "recruiting_admin" in principal.roles:
             data["legal_hold_reason"] = hold.reason
+            data["legal_hold_id"] = hold.id
+            data["legal_hold_version"] = hold.version
         body = GovernanceStatusResource.model_validate({"data": data}).model_dump(
             mode="json", exclude_none=True
         )

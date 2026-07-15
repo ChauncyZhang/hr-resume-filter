@@ -171,6 +171,8 @@ class GovernanceStatusOut(BaseModel):
     deletion_request_id: UUID | None
     legal_hold_active: bool
     legal_hold_reason: str | None = None
+    legal_hold_id: UUID | None = None
+    legal_hold_version: int | None = Field(default=None, ge=1)
 
 
 class GovernanceStatusResource(StrictModel):

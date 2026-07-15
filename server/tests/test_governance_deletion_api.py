@@ -539,7 +539,14 @@ def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path
         admin_status = client.get(f"/api/v1/candidates/{candidate_id}/governance-status", headers=admin)
         recruiter = login(client, "hold-reader@deletion.test")
         recruiter_status = client.get(f"/api/v1/candidates/{candidate_id}/governance-status", headers=recruiter)
-        assert admin_status.json()["data"]["legal_hold_reason"] == "Privileged litigation detail"
+        assert admin_status.json()["data"] == {
+            "deletion_status": "requested",
+            "deletion_request_id": created.json()["data"]["id"],
+            "legal_hold_active": True,
+            "legal_hold_reason": "Privileged litigation detail",
+            "legal_hold_id": hold_id,
+            "legal_hold_version": 1,
+        }
         assert "legal_hold_reason" not in recruiter_status.json()["data"]
         assert set(recruiter_status.json()["data"]) == {
             "deletion_status", "deletion_request_id", "legal_hold_active"
@@ -587,10 +594,20 @@ def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path
             json={"reason": "Different release reason"},
             headers={**admin, "If-Match": '"1"', "Idempotency-Key": "release-1"},
         )
+        released_status = client.get(
+            f"/api/v1/candidates/{candidate_id}/governance-status", headers=admin
+        )
     assert released.status_code == replay.status_code == 200
     assert released.json() == replay.json()
     assert released.headers["ETag"] == '"2"'
     assert_problem(conflict, 409, "idempotency_conflict")
+    assert released_status.status_code == 200
+    assert released_status.headers["Cache-Control"] == "no-store"
+    assert released_status.json()["data"] == {
+        "deletion_status": "requested",
+        "deletion_request_id": created.json()["data"]["id"],
+        "legal_hold_active": False,
+    }
     with app.state.identity_store.sync_session() as db:
         assert db.get(LegalHold, UUID(hold_id)).released_at is not None
         events = list(db.scalars(select(AuditLog).where(AuditLog.category == "governance")))
@@ -808,12 +825,21 @@ def test_authenticated_list_denial_is_audited(tmp_path, monkeypatch) -> None:
         ]
 
 
-def test_all_b2a_endpoints_are_non_enumerating_for_known_cross_tenant_ids(tmp_path) -> None:
+def test_all_b2a_endpoints_are_non_enumerating_for_known_cross_tenant_ids(
+    tmp_path, monkeypatch
+) -> None:
     app = make_app(tmp_path)
     local_users = {}
-    for role in ("recruiter", "recruiting_admin", "system_admin", "hiring_manager", "interviewer"):
+    for role in (
+        "recruiter",
+        "recruiting_admin",
+        "system_admin",
+        "hiring_manager",
+        "interviewer",
+    ):
         local_users[role] = seed_user(app, role, f"matrix-{role}@deletion.test")
     with app.state.identity_store.sync_session() as db:
+        local_organization_id = db.get(User, local_users["system_admin"]).organization_id
         other_org = Organization(slug="other-matrix", name="Other", status="active")
         other_user = User(organization=other_org, email="other@matrix.test", normalized_email="other@matrix.test", display_name="Other private", password_hash=PasswordService().hash("correct horse"))
         other_user.roles.append(UserRole(role="recruiting_admin")); db.add(other_user); db.flush()
@@ -841,6 +867,27 @@ def test_all_b2a_endpoints_are_non_enumerating_for_known_cross_tenant_ids(tmp_pa
             assert responses[0].status_code == 404
             assert str(request_id) not in responses[1].text
             assert all(response.status_code == 404 for response in responses[2:])
+            governance_status = responses[-1]
+            assert str(hold_id) not in governance_status.text
+            assert "Cross tenant hold secret" not in governance_status.text
+            assert "legal_hold_active" not in governance_status.text
+        monkeypatch.setattr(
+            app.state.identity_service,
+            "principal",
+            lambda token: Principal(
+                user_id=local_users["system_admin"],
+                organization_id=local_organization_id,
+                roles=frozenset({"unknown_role"}),
+                active=True,
+            ),
+        )
+        unknown_status = client.get(
+            f"/api/v1/candidates/{candidate_id}/governance-status", headers=headers
+        )
+        assert_problem(unknown_status, 404, "resource_not_found")
+        assert str(hold_id) not in unknown_status.text
+        assert "Cross tenant hold secret" not in unknown_status.text
+        assert "legal_hold_active" not in unknown_status.text
     with app.state.identity_store.sync_session() as db:
         after = (db.scalar(select(func.count()).select_from(DeletionRequest)), db.scalar(select(func.count()).select_from(LegalHold)), db.scalar(select(func.count()).select_from(BackgroundJob)))
         assert after == before
