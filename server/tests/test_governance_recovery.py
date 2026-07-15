@@ -1102,6 +1102,7 @@ def test_real_postgres_concurrent_restore_id_is_idempotent_or_conflicts_safely()
         for name in (
             "REAL_RECOVERY_DATABASE_URL",
             "GOVERNANCE_DATABASE_URL",
+            "POSTGRES_APP_URL",
             "GOVERNANCE_MINIO_ENDPOINT",
             "MINIO_SMOKE_ROOT_ACCESS_KEY",
             "MINIO_SMOKE_ROOT_SECRET_KEY",
@@ -1156,9 +1157,28 @@ def test_real_pg_minio_wrong_delete_acl_fails_with_zero_business_or_db_mutation(
     root.put_object(resume_bucket, business_key, io.BytesIO(b"business"), 8)
 
     database_url = os.environ["REAL_RECOVERY_DATABASE_URL"]
+    owner_url = make_url(database_url)
+    app_url = make_url(os.environ["POSTGRES_APP_URL"])
+    governance_url = make_url(os.environ["GOVERNANCE_DATABASE_URL"])
+    subprocess.run(
+        ["sh", "deploy/postgres/provision-app-role.sh"],
+        check=True,
+        env={
+            **os.environ,
+            "PGHOST": str(owner_url.host),
+            "PGPORT": str(owner_url.port or 5432),
+            "POSTGRES_DB": str(owner_url.database),
+            "POSTGRES_USER": str(owner_url.username),
+            "POSTGRES_PASSWORD": str(owner_url.password),
+            "APP_DB_USER": str(app_url.username),
+            "APP_DB_PASSWORD": str(app_url.password),
+            "GOVERNANCE_DB_USER": str(governance_url.username),
+            "GOVERNANCE_DB_PASSWORD": str(governance_url.password),
+        },
+    )
     database_engine = create_engine(database_url)
-    governance_url = os.environ["GOVERNANCE_DATABASE_URL"]
-    governance_engine = create_engine(governance_url)
+    governance_database_url = os.environ["GOVERNANCE_DATABASE_URL"]
+    governance_engine = create_engine(governance_database_url)
 
     def counts():
         with database_engine.connect() as connection:
@@ -1176,7 +1196,9 @@ def test_real_pg_minio_wrong_delete_acl_fails_with_zero_business_or_db_mutation(
 
     try:
         before = counts()
-        _validate_governance_database_identity(governance_engine, governance_url)
+        _validate_governance_database_identity(
+            governance_engine, governance_database_url
+        )
         with pytest.raises(
             RecoveryError, match="recovery_storage_permission_invalid"
         ):

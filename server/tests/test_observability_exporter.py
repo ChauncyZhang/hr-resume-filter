@@ -198,6 +198,7 @@ def test_real_postgres_snapshot_exports_queue_metrics_without_private_dimensions
         with connection.cursor() as cursor:
             cursor.execute(
                 """
+                DROP VIEW IF EXISTS observability.queue_metrics;
                 DROP TABLE IF EXISTS job_attempts, outbox_events, background_jobs;
                 CREATE TABLE background_jobs (
                     id uuid PRIMARY KEY, type text NOT NULL, status text NOT NULL,

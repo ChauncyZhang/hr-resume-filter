@@ -85,8 +85,8 @@ def test_postgres_concurrent_retry_preserves_history_and_restores_progress_once(
         user = User(organization=org, email="retry@pg.test", normalized_email="retry@pg.test", display_name="Retry", password_hash=PasswordService().hash("correct"))
         user.roles.append(UserRole(role="recruiting_admin")); db.add(user); db.flush()
         job = Job(organization_id=org.id, title="Retry", owner_id=user.id, status="draft"); db.add(job); db.flush()
-        jd = JobJdVersion(organization_id=org.id, job_id=job.id, version_number=1, content={}, created_by=user.id)
-        rule = ScreeningRuleVersion(organization_id=org.id, job_id=job.id, version_number=1, content={}, created_by=user.id); db.add_all([jd, rule]); db.flush()
+        jd = JobJdVersion(organization_id=org.id, job_id=job.id, version_number=1, content={"text": "candidate"}, created_by=user.id)
+        rule = ScreeningRuleVersion(organization_id=org.id, job_id=job.id, version_number=1, content={"required_terms": [], "bonus_terms": []}, created_by=user.id); db.add_all([jd, rule]); db.flush()
         run = ScreeningRun(organization_id=org.id, job_id=job.id, jd_version_id=jd.id, rule_version_id=rule.id, source="upload", status="failed", total_count=1, processed_count=1, succeeded_count=0, failed_count=1, created_by=user.id); db.add(run); db.flush()
         data = b"candidate"
         stored_file = FileObject(organization_id=org.id, storage_key="quarantine/retry", original_filename="candidate.txt", mime_type="text/plain", size_bytes=len(data), sha256=hashlib.sha256(data).hexdigest(), uploaded_by=user.id, storage_state="quarantine", detected_type="txt", scan_status="pending"); db.add(stored_file); db.flush()

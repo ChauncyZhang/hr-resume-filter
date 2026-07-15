@@ -940,7 +940,7 @@ def test_fact_writer_waits_for_candidate_before_locking_business_row(
     done = threading.Event()
     writer_before_candidate = threading.Event()
     writer_module = interviews_api if writer_kind == "feedback" else talent_api
-    original_lock = writer_module.lock_candidate_retention_facts
+    original_lock = writer_module.lock_active_candidate
 
     def observed_lock(db, organization_id, candidate_id):
         db.execute(text("SET LOCAL lock_timeout = '3s'"))
@@ -948,7 +948,7 @@ def test_fact_writer_waits_for_candidate_before_locking_business_row(
         writer_before_candidate.set()
         return original_lock(db, organization_id, candidate_id)
 
-    monkeypatch.setattr(writer_module, "lock_candidate_retention_facts", observed_lock)
+    monkeypatch.setattr(writer_module, "lock_active_candidate", observed_lock)
 
     def write_business_fact():
         with TestClient(app) as client:
