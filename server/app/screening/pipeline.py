@@ -1,12 +1,12 @@
 import hashlib,json,uuid
 from datetime import datetime,timezone
 from pathlib import PurePath
-from sqlalchemy import and_,exists,func,select
+from sqlalchemy import and_,func,select
 from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError,RetryableJobError
-from server.app.governance.retention import lock_candidate_retention_facts,recalculate_candidate_retention
+from server.app.governance.retention import recalculate_candidate_retention
 from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
-from server.app.recruiting.service import CandidateUnavailable,lock_active_candidate
+from server.app.screening.actions import CandidateTombstoned,lock_candidate_screening_item
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.parsers import ParserLimits
@@ -37,12 +37,10 @@ class ScreeningPipeline:
         s=self.settings; return ParserLimits(s.parser_max_source_bytes,s.parser_max_text_chars,s.parser_pdf_max_pages,s.parser_docx_max_entries,s.parser_docx_max_uncompressed_bytes,s.parser_docx_max_compression_ratio)
     async def parse_item(self,job):
         organization_id=uuid.UUID(str(job.payload["organization_id"])); item_id=uuid.UUID(str(job.payload["screening_item_id"])); limits=self._limits()
+        candidate_id=_uuid(item_id,"candidate")
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
-            if not item: raise PermanentJobError("screening_item_missing")
-            if item.candidate_id is not None:
-                try: lock_active_candidate(db,organization_id,item.candidate_id)
-                except CandidateUnavailable: raise PermanentJobError("screening_item_missing") from None
+            try: _,item,_=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_unassociated=True,allow_missing_candidate=True)
+            except CandidateTombstoned: raise PermanentJobError("screening_item_missing") from None
             item.attempts=max(item.attempts,getattr(job,"attempts",1)); item.started_at=item.started_at or datetime.now(timezone.utc)
             if item.status in {"parsed","scored","cancelled"} or (item.status=="failed" and item.safe_error_code not in _RETRYABLE): db.commit(); return
             item.status="parsing"; db.commit()
@@ -86,12 +84,11 @@ class ScreeningPipeline:
         finally:
             if stream is not None: stream.close()
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
+            try: candidate,item,_=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_unassociated=True,allow_missing_candidate=True)
+            except CandidateTombstoned: raise PermanentJobError("screening_item_missing") from None
             if item.status in {"parsed","scored"}: return
             run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id))
-            candidate_id,resume_id,application_id=_uuid(item.id,"candidate"),_uuid(item.id,"resume"),_uuid(item.id,"application")
-            candidate=lock_candidate_retention_facts(db,organization_id,candidate_id)
-            if candidate is not None and candidate.deleted_at is not None: raise PermanentJobError("screening_item_missing")
+            resume_id,application_id=_uuid(item.id,"resume"),_uuid(item.id,"application")
             candidate=candidate or Candidate(id=candidate_id,organization_id=organization_id,display_name=(PurePath(filename).stem[:200] or "Candidate"),owner_id=run.created_by)
             if candidate not in db: db.add(candidate)
             resume=db.get(Resume,resume_id) or Resume(id=resume_id,organization_id=organization_id,candidate_id=candidate_id,file_object_id=item.file_object_id,version_number=1,parsed_text=parsed.text)
@@ -104,13 +101,15 @@ class ScreeningPipeline:
     async def score_item(self,job):
         organization_id=uuid.UUID(str(job.payload["organization_id"])); item_id=uuid.UUID(str(job.payload["screening_item_id"]))
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
-            if not item: raise PermanentJobError("screening_item_missing")
-            if item.status in {"scored","failed","cancelled"}: return
+            candidate_id=db.scalar(select(ScreeningItem.candidate_id).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id))
+        if candidate_id is None: raise PermanentJobError("screening_item_missing")
+        with self.sessions() as db:
+            try: _,item,_=lock_candidate_screening_item(db,organization_id,item_id,candidate_id)
+            except CandidateTombstoned: raise PermanentJobError("screening_item_missing") from None
+            if item.status!="parsed": return
             item.status="scoring"; db.commit()
         with self.sessions() as db:
-            active_candidate=exists().where(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id,Candidate.deleted_at.is_(None))
-            row=db.execute(select(ScreeningItem,ScreeningRun,Resume,JobJdVersion,ScreeningRuleVersion).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Resume,and_(Resume.organization_id==ScreeningItem.organization_id,Resume.id==ScreeningItem.resume_id)).join(JobJdVersion,and_(JobJdVersion.organization_id==ScreeningRun.organization_id,JobJdVersion.id==ScreeningRun.jd_version_id)).join(ScreeningRuleVersion,and_(ScreeningRuleVersion.organization_id==ScreeningRun.organization_id,ScreeningRuleVersion.id==ScreeningRun.rule_version_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id,active_candidate)).one_or_none()
+            row=db.execute(select(ScreeningItem,ScreeningRun,Resume,JobJdVersion,ScreeningRuleVersion).join(ScreeningRun,and_(ScreeningRun.organization_id==ScreeningItem.organization_id,ScreeningRun.id==ScreeningItem.run_id)).join(Resume,and_(Resume.organization_id==ScreeningItem.organization_id,Resume.id==ScreeningItem.resume_id)).join(JobJdVersion,and_(JobJdVersion.organization_id==ScreeningRun.organization_id,JobJdVersion.id==ScreeningRun.jd_version_id)).join(ScreeningRuleVersion,and_(ScreeningRuleVersion.organization_id==ScreeningRun.organization_id,ScreeningRuleVersion.id==ScreeningRun.rule_version_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id)).one_or_none()
             if not row: raise PermanentJobError("screening_item_missing")
             item,run,resume,jd,rule=row
             text=resume.parsed_text or ""
@@ -122,9 +121,10 @@ class ScreeningPipeline:
         try: result=score_resume(text,snapshot)
         except Exception: return await self._retry_or_finish(job,organization_id,item_id,"scoring_failed","score")
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update())
-            try: lock_active_candidate(db,organization_id,item.candidate_id)
-            except CandidateUnavailable: raise PermanentJobError("screening_item_missing") from None
+            _,item,blocked=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_blocked=True)
+            run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update())
+            if blocked:
+                item.status="cancelled"; item.safe_error_code="candidate_unavailable"; item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,run); db.commit(); raise PermanentJobError("screening_item_missing")
             existing=db.scalar(select(ScreeningResult).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id,ScreeningResult.rule_engine_version==result.engine_version))
             if not existing:
                 existing=ScreeningResult(organization_id=organization_id,item_id=item.id,application_id=item.application_id,resume_id=item.resume_id,rule_engine_version=result.engine_version,rule_score=result.score,recommendation=result.recommendation,required_hits=result.required_hits,required_missing=result.required_missing,bonus_hits=result.bonus_hits,estimated_years=result.estimated_years,risks=result.risks,questions=result.questions); db.add(existing); db.flush()
@@ -140,19 +140,27 @@ class ScreeningPipeline:
             self._aggregate(db,run); db.commit()
     async def _retry_or_finish(self,job,organization_id,item_id,code,stage):
         final=getattr(job,"attempts",1)>=getattr(job,"max_attempts",3)
+        candidate_id=_uuid(item_id,"candidate")
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); item.status="failed" if final else "queued" if stage=="parse" else "parsed"; item.safe_error_code=code
+            _candidate,item,blocked=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_unassociated=True,allow_missing_candidate=True,allow_blocked=True)
+            run=db.get(ScreeningRun,item.run_id)
+            if blocked:
+                item.status="cancelled"; item.safe_error_code="candidate_unavailable"; item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,run); db.commit(); raise PermanentJobError("screening_item_missing")
+            item.status="failed" if final else "queued" if stage=="parse" else "parsed"; item.safe_error_code=code
             if stage=="parse": item.attempts=max(item.attempts,getattr(job,"attempts",1))
-            if final: item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,db.get(ScreeningRun,item.run_id))
+            if final: item.finished_at=item.finished_at or datetime.now(timezone.utc); self._aggregate(db,run)
             db.commit()
         if final: raise PermanentJobError(code)
         raise RetryableJobError(code)
     def _fail_terminal(self,organization_id,item_id,code,file_state=None):
+        candidate_id=_uuid(item_id,"candidate")
         with self.sessions() as db:
-            item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update()); item.status="failed"; item.safe_error_code=code; item.finished_at=item.finished_at or datetime.now(timezone.utc)
+            _candidate,item,blocked=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_unassociated=True,allow_missing_candidate=True,allow_blocked=True)
+            run=db.get(ScreeningRun,item.run_id)
+            item.status="cancelled" if blocked else "failed"; item.safe_error_code="candidate_unavailable" if blocked else code; item.finished_at=item.finished_at or datetime.now(timezone.utc)
             if file_state:
                 stored=db.get(FileObject,item.file_object_id); stored.storage_state,stored.scan_status=file_state
-            self._aggregate(db,db.get(ScreeningRun,item.run_id)); db.commit()
+            self._aggregate(db,run); db.commit()
     @staticmethod
     def _aggregate(db,run):
         aggregate_run(db,run)

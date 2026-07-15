@@ -1,11 +1,12 @@
 import uuid
 from sqlalchemy import and_, select
+from server.app.governance.deletion_models import DeletionRequest
 from server.app.identity.models import AuditLog
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
 from server.app.recruiting.models import Application,Candidate,FileObject,Resume
-from server.app.recruiting.service import CandidateUnavailable,lock_active_candidate,transition_application_record
+from server.app.recruiting.service import transition_application_record
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.rules import ENGINE_VERSION
@@ -16,6 +17,29 @@ class ScreeningActionConflict(Exception): pass
 class ScreeningItemNotRetryable(ScreeningActionConflict): pass
 class ScreeningRetryActive(ScreeningActionConflict): pass
 class ScreeningBulkConflict(ScreeningActionConflict): pass
+class CandidateTombstoned(ScreeningActionConflict): pass
+
+ACTIVE_DELETION_STATUSES=("approved","executing","completed")
+
+def lock_screening_candidate(db,organization_id,candidate_id,*,allow_missing=False):
+    candidate=db.scalar(select(Candidate).where(Candidate.organization_id==organization_id,Candidate.id==candidate_id).with_for_update())
+    blocked=candidate is not None and (candidate.deleted_at is not None or db.scalar(select(DeletionRequest.id).where(DeletionRequest.organization_id==organization_id,DeletionRequest.candidate_id==candidate_id,DeletionRequest.status.in_(ACTIVE_DELETION_STATUSES)).limit(1)) is not None)
+    if (candidate is None and not allow_missing) or blocked: raise CandidateTombstoned
+    return candidate
+
+def lock_candidate_screening_item(db,organization_id,item_id,candidate_id,*,allow_unassociated=False,allow_missing_candidate=False,allow_blocked=False):
+    try:
+        candidate=lock_screening_candidate(db,organization_id,candidate_id,allow_missing=allow_missing_candidate)
+        blocked=False
+    except CandidateTombstoned:
+        if not allow_blocked: raise
+        candidate=db.scalar(select(Candidate).where(Candidate.organization_id==organization_id,Candidate.id==candidate_id).with_for_update())
+        blocked=True
+    item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
+    allowed_candidate_ids={candidate_id}
+    if allow_unassociated: allowed_candidate_ids.add(None)
+    if item is None or item.candidate_id not in allowed_candidate_ids: raise CandidateTombstoned
+    return candidate,item,blocked
 
 def llm_error_code(code):
     return code[4:] if isinstance(code,str) and code.startswith("llm_") else code
@@ -38,12 +62,10 @@ def _audit_retry(db,item,actor_user_id,trace_id,retry_stage):
         db.add(AuditLog(organization_id=item.organization_id,actor_user_id=actor_user_id,event_type="screening.item_retried",outcome="success",trace_id=trace_id,metadata_json={"run_id":str(item.run_id),"item_id":str(item.id),"retry_stage":retry_stage}))
 
 def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None):
+    candidate_id=db.scalar(select(ScreeningItem.candidate_id).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id))
+    candidate_id=candidate_id or uuid.uuid5(uuid.UUID(str(item_id)),"candidate")
+    _,item,_=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_unassociated=True,allow_missing_candidate=True)
     active_jobs=_active_retry_jobs(db,organization_id,item_id)
-    item=db.scalar(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.id==item_id).with_for_update())
-    if item is None: raise ScreeningItemNotRetryable
-    if item.candidate_id is not None:
-        try: lock_active_candidate(db,organization_id,item.candidate_id)
-        except CandidateUnavailable: raise ScreeningItemNotRetryable from None
     run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id).with_for_update()); stored_file=db.scalar(select(FileObject).where(FileObject.organization_id==organization_id,FileObject.id==item.file_object_id).with_for_update())
     if run is None or stored_file is None: raise ScreeningItemNotRetryable
     llm_active=any(job.type=="screening.llm_score_item" for job in active_jobs)
@@ -78,14 +100,11 @@ def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None)
 
 def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
     requested={item.item_id:item.expected_application_version for item in payload.items}
-    relationships=list(db.execute(select(ScreeningItem.id,ScreeningItem.application_id,Application.candidate_id).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).join(Candidate,and_(Candidate.organization_id==Application.organization_id,Candidate.id==Application.candidate_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested),Candidate.deleted_at.is_(None))))
+    relationships=list(db.execute(select(ScreeningItem.id,ScreeningItem.application_id,Application.candidate_id).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested))))
     if len(relationships)!=len(requested): raise ScreeningBulkConflict
     expected_relationships={item_id:(application_id,candidate_id) for item_id,application_id,candidate_id in relationships}
     candidate_ids=sorted({candidate_id for _,candidate_id in expected_relationships.values()})
-    try:
-        for candidate_id in candidate_ids: lock_active_candidate(db,organization_id,candidate_id)
-    except CandidateUnavailable:
-        raise ScreeningBulkConflict from None
+    for candidate_id in candidate_ids: lock_screening_candidate(db,organization_id,candidate_id)
     run=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==run_id).with_for_update())
     rows=list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id==run_id,ScreeningItem.id.in_(requested)).order_by(ScreeningItem.id).with_for_update()))
     if run is None or len(rows)!=len(requested): raise ScreeningBulkConflict

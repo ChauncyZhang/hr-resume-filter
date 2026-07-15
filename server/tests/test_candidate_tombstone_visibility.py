@@ -6,13 +6,17 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
+from sqlalchemy.dialects import postgresql
 
+from server.app.governance.deletion_models import DeletionRequest
 from server.app.identity.models import JobCollaborator, User
+from server.app.llm.models import LlmInvocation, LlmScreeningEvaluation
 from server.app.llm.security import ApiKeyCipher
 from server.app.queue.service import PermanentJobError
 from server.app.recruiting import service as recruiting_service
 from server.app.recruiting.models import Application, Candidate, Resume
 from server.app.screening.llm_pipeline import LlmScreeningPipeline
+from server.app.screening import actions as screening_actions
 from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.tests.test_interview_api import create_interview, make_app, seed_application
 from server.tests.test_llm_pipeline import Gateway, prepared
@@ -27,6 +31,24 @@ def _tombstone(app, candidate_id):
         candidate = db.get(Candidate, candidate_id)
         candidate.deleted_at = datetime.now(timezone.utc)
         db.commit()
+
+
+def _active_deletion(db, candidate, status="approved"):
+    request = DeletionRequest(
+        organization_id=candidate.organization_id,
+        candidate_id=candidate.id,
+        status=status,
+        reason_code="administrator_request",
+        requested_by=candidate.owner_id,
+        approved_by=candidate.owner_id,
+        impact_manifest={},
+        manifest_hash="0" * 64,
+        policy_version=1,
+        candidate_version=candidate.version,
+    )
+    db.add(request)
+    db.flush()
+    return request
 
 
 def test_tombstone_is_non_enumerable_from_candidate_resume_and_download_routes(tmp_path):
@@ -228,6 +250,8 @@ def test_parse_and_score_stale_jobs_do_not_process_tombstones(tmp_path):
         asyncio.run(pipeline.score_item(score_job))
     assert score_error.value.safe_code == "screening_item_missing"
     with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        assert stored.status == "parsed"
         assert db.scalar(select(func.count(ScreeningResult.id))) == 0
 
 
@@ -245,3 +269,168 @@ def test_llm_stale_job_never_calls_provider_for_tombstone(tmp_path):
 
     assert error.value.safe_code == "screening_item_missing"
     assert gateway.calls == []
+
+
+def test_active_deletion_blocks_parse_and_score_without_state_changes(tmp_path):
+    app, pipeline, _storage, _scanner, parse_job, _run, item = seeded_pipeline(tmp_path)
+    candidate_id = uuid.uuid5(uuid.UUID(item["id"]), "candidate")
+    with app.state.identity_store.sync_session() as db:
+        run = db.get(__import__("server.app.screening.models", fromlist=["ScreeningRun"]).ScreeningRun, uuid.UUID(item["run_id"]))
+        candidate = Candidate(id=candidate_id, organization_id=run.organization_id, display_name="deleting", owner_id=run.created_by)
+        db.add(candidate)
+        db.flush()
+        _active_deletion(db, candidate)
+        db.commit()
+
+    with pytest.raises(PermanentJobError) as parse_error:
+        asyncio.run(pipeline.parse_item(parse_job))
+    assert parse_error.value.safe_code == "screening_item_missing"
+    with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        assert stored.status == "queued"
+        assert stored.candidate_id is None
+        assert db.scalar(select(func.count(Resume.id))) == 0
+
+    score_path = tmp_path / "score-active-deletion"
+    score_path.mkdir()
+    app, pipeline, _storage, _scanner, parse_job, run, item = seeded_pipeline(score_path)
+    asyncio.run(pipeline.parse_item(parse_job))
+    with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        candidate = db.get(Candidate, stored.candidate_id)
+        _active_deletion(db, candidate)
+        aggregate = db.get(__import__("server.app.screening.models", fromlist=["ScreeningRun"]).ScreeningRun, uuid.UUID(run["id"]))
+        score_job = SimpleNamespace(payload={"organization_id": str(stored.organization_id), "screening_item_id": str(stored.id), "jd_version_id": str(aggregate.jd_version_id), "rule_version_id": str(aggregate.rule_version_id), "rule_engine_version": "rule-v1"}, attempts=1, max_attempts=3)
+        db.commit()
+    with pytest.raises(PermanentJobError) as score_error:
+        asyncio.run(pipeline.score_item(score_job))
+    assert score_error.value.safe_code == "screening_item_missing"
+    with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        assert stored.status == "parsed"
+        assert db.scalar(select(func.count(ScreeningResult.id))) == 0
+
+
+def test_active_deletion_blocks_llm_provider_and_post_provider_results(tmp_path):
+    app, cipher, job = prepared(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        _active_deletion(db, db.get(Candidate, item.candidate_id))
+        db.commit()
+    gateway = Gateway()
+    asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, gateway, cipher).evaluate_item(job))
+    assert gateway.calls == []
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        assert item.llm_status == "queued"
+        assert db.scalar(select(func.count(LlmInvocation.id))) == 0
+
+    post_path = tmp_path / "post-provider"
+    post_path.mkdir()
+    app, cipher, job = prepared(post_path)
+
+    def approve_during_provider():
+        with app.state.identity_store.sync_session() as db:
+            item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+            _active_deletion(db, db.get(Candidate, item.candidate_id))
+            db.commit()
+
+    gateway = Gateway(inspect=approve_during_provider)
+    asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, gateway, cipher).evaluate_item(job))
+    assert len(gateway.calls) == 1
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        assert item.llm_status == "skipped"
+        assert db.scalar(select(func.count(LlmScreeningEvaluation.id))) == 0
+        assert db.scalar(select(func.count(LlmInvocation.id))) == 0
+
+
+def test_atomic_claim_does_not_reenter_running_llm_or_scoring_item(tmp_path, monkeypatch):
+    app, cipher, job = prepared(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        item.llm_status = "running"
+        db.commit()
+    gateway = Gateway()
+    asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, gateway, cipher).evaluate_item(job))
+    assert gateway.calls == []
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        assert item.llm_status == "running"
+        assert db.scalar(select(func.count(LlmInvocation.id))) == 0
+
+    score_path = tmp_path / "score-running"
+    score_path.mkdir()
+    app, pipeline, _storage, _scanner, parse_job, run, item = seeded_pipeline(score_path)
+    asyncio.run(pipeline.parse_item(parse_job))
+    with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        stored.status = "scoring"
+        aggregate = db.get(__import__("server.app.screening.models", fromlist=["ScreeningRun"]).ScreeningRun, uuid.UUID(run["id"]))
+        score_job = SimpleNamespace(payload={"organization_id": str(stored.organization_id), "screening_item_id": str(stored.id), "jd_version_id": str(aggregate.jd_version_id), "rule_version_id": str(aggregate.rule_version_id), "rule_engine_version": "rule-v1"}, attempts=1, max_attempts=3)
+        db.commit()
+
+    def duplicate_score(*_args, **_kwargs):
+        raise AssertionError("duplicate score computation")
+
+    monkeypatch.setattr("server.app.screening.pipeline.score_resume", duplicate_score)
+    asyncio.run(pipeline.score_item(score_job))
+    with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        assert stored.status == "scoring"
+        assert db.scalar(select(func.count(ScreeningResult.id))) == 0
+
+
+def test_retry_candidate_lock_race_maps_to_non_enumerating_404(tmp_path, monkeypatch):
+    app, pipeline, _storage, _scanner, parse_job, _run, item = seeded_pipeline(tmp_path)
+    asyncio.run(pipeline.parse_item(parse_job))
+    with app.state.identity_store.sync_session() as db:
+        stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
+        stored.status = "failed"
+        stored.safe_error_code = "scoring_failed"
+        db.commit()
+
+    tombstoned = getattr(screening_actions, "CandidateTombstoned", RuntimeError)
+
+    def lose_race(*_args, **_kwargs):
+        raise tombstoned
+
+    monkeypatch.setattr(screening_actions, "lock_candidate_screening_item", lose_race, raising=False)
+    with TestClient(app) as client:
+        headers = screening_login(client, "admin@example.test")
+        response = client.post(f"/api/v1/screening-items/{item['id']}/retry", headers={**headers, "Idempotency-Key": "retry-race"})
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "resource_not_found"
+
+
+def test_screening_claim_locks_candidate_checks_deletion_then_locks_item():
+    organization_id = uuid.uuid4()
+    candidate_id = uuid.uuid4()
+    item_id = uuid.uuid4()
+
+    class RecordingSession:
+        def __init__(self):
+            self.statements = []
+
+        def scalar(self, statement):
+            sql = str(statement.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+            self.statements.append(sql)
+            if "FROM candidates" in sql:
+                return SimpleNamespace(id=candidate_id, deleted_at=None)
+            if "FROM deletion_requests" in sql:
+                return None
+            if "FROM screening_items" in sql:
+                return SimpleNamespace(id=item_id, candidate_id=candidate_id)
+            raise AssertionError(sql)
+
+    db = RecordingSession()
+    screening_actions.lock_candidate_screening_item(db, organization_id, item_id, candidate_id)
+
+    assert ["FROM candidates", "FROM deletion_requests", "FROM screening_items"] == [
+        next(marker for marker in ("FROM candidates", "FROM deletion_requests", "FROM screening_items") if marker in sql)
+        for sql in db.statements
+    ]
+    assert "FOR UPDATE" in db.statements[0]
+    assert "FOR UPDATE" in db.statements[2]
+    assert all(status in db.statements[1] for status in ("approved", "executing", "completed"))

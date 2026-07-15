@@ -26,3 +26,21 @@
 
 - PostgreSQL `FOR UPDATE` behavior was code-reviewed but not exercised against a live PostgreSQL service in this worktree.
 - The complete split was not rerun after correcting the seven unit fixtures; all affected tests and all owned focused modules passed independently.
+
+## Visibility review follow-up
+
+- Added a two-way deletion barrier for rule scoring and LLM scoring. Each claim and finalize transaction locks `Candidate` before `ScreeningItem`, rejects tombstoned candidates and deletion requests in `approved`, `executing`, or `completed`, and commits the running state before external work starts.
+- LLM provider calls run after the claim session closes. A deletion approved while the provider is running causes the response to be discarded without an invocation or evaluation row.
+- Rule scoring computes outside the claim transaction and rechecks the same barrier before writing a result. Parse checks the barrier before beginning and again before candidate association.
+- Retry and bulk mutations preserve the ordinary non-enumerating `404 resource_not_found` contract when the candidate becomes unavailable after the initial API lookup.
+- Atomic claims only transition `queued -> running` for LLM and `parsed -> scoring` for rule scoring; duplicate workers do not repeat provider or scoring work.
+
+### Follow-up verification
+
+- `test_screening_actions.py test_screening_api.py`: 19 passed.
+- `test_candidate_tombstone_visibility.py`: 12 passed.
+- `test_screening_pipeline.py test_llm_pipeline.py`: 41 passed.
+- `test_recruiting.py`: 22 passed as an adjacent visibility regression gate.
+- `test_screening_actions_postgres.py`: 3 skipped because `POSTGRES_SMOKE_URL` is not configured.
+- The lock-order unit gate compiles the emitted statements with the PostgreSQL dialect and verifies `Candidate FOR UPDATE -> active deletion lookup -> ScreeningItem FOR UPDATE`.
+- Live PostgreSQL lock waiting remains unexecuted; no configured disposable PostgreSQL fixture was available.

@@ -18,7 +18,7 @@ from server.app.screening.parsers import ParserError,ParserLimits,validate_uploa
 from server.app.screening.schemas import BulkAction,BulkResource,ItemCollection,ItemResource,RetryResource,RunCreate,RunResource
 from server.app.screening.storage import StorageWriteFailed
 from server.app.queue.repository import QueueRepository
-from server.app.screening.actions import ScreeningBulkConflict,ScreeningItemNotRetryable,ScreeningRetryActive,apply_bulk_action,is_llm_retryable,retry_screening_item,RECOVERABLE_CODES
+from server.app.screening.actions import CandidateTombstoned,ScreeningBulkConflict,ScreeningItemNotRetryable,ScreeningRetryActive,apply_bulk_action,is_llm_retryable,retry_screening_item,RECOVERABLE_CODES
 
 router=APIRouter(prefix="/api/v1"); _SAFE_STATUS={"queued","parsing","parsed","scoring","scored","failed","cancelled"}
 class RunNotQueued(Exception): pass
@@ -158,6 +158,7 @@ def retry_item(item_id:UUID,request:Request,idempotency_key:str|None=Header(None
                 item,run,_=retry_screening_item(db,principal.organization_id,item_id,request.state.trace_id,principal.user_id); stored=db.get(FileObject,item.file_object_id); application=db.get(Application,item.application_id) if item.application_id else None; return 200,{"data":{"item":_item_data(item,stored,application),"run":_run_data(run)}}
             status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.item.retry",key,{"item_id":str(item_id)},action); db.commit()
         except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
+        except CandidateTombstoned: db.rollback(); return _not_found(request)
         except ScreeningItemNotRetryable: db.rollback(); return _problem(request,409,"screening_item_not_retryable")
         except ScreeningRetryActive: db.rollback(); return _problem(request,409,"screening_retry_active")
         except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
@@ -174,6 +175,7 @@ def bulk_actions(run_id:UUID,payload:BulkAction,request:Request,idempotency_key:
             def action(): return 200,{"data":apply_bulk_action(db,principal.organization_id,run_id,payload,principal.user_id,request.state.trace_id)}
             status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.run.bulk_action",key,{"run_id":str(run_id),**payload.model_dump()},action); db.commit()
         except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
+        except CandidateTombstoned: db.rollback(); return _not_found(request)
         except ScreeningBulkConflict: db.rollback(); return _problem(request,409,"screening_bulk_conflict")
         except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
     response=JSONResponse(body,status_code=status); response.headers["Cache-Control"]="no-store"; return response

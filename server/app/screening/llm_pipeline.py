@@ -13,6 +13,7 @@ from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.recruiting.models import Candidate, JobJdVersion, Resume
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.screening.progress import aggregate_run
+from server.app.screening.actions import CandidateTombstoned, lock_candidate_screening_item
 
 
 _TRANSIENT_ERRORS = {"provider_unavailable", "provider_quota_or_rate_limited", "provider_response_invalid"}
@@ -62,6 +63,14 @@ class LlmScreeningPipeline:
             request = self._request(jd, resume, result, candidate)
             input_sha256 = hashlib.sha256(request.provider_content().encode()).hexdigest()
             skip_code = self._skip_code(config, run, ids["config_version"])
+            try:
+                _candidate,item,_blocked=lock_candidate_screening_item(db,ids["organization_id"],ids["screening_item_id"],candidate.id)
+            except CandidateTombstoned:
+                db.rollback()
+                return
+            if item.llm_status != "queued":
+                db.rollback()
+                return
             if skip_code:
                 if config is not None:
                     self._append_invocation(db,ids,queue_job_id,attempt_no,config,input_sha256,status="failed",safe_error_code=skip_code,trace_id=getattr(job,"trace_id",None))
@@ -93,6 +102,12 @@ class LlmScreeningPipeline:
             return self._finish_failure(job, ids, queue_job_id, attempt_no, input_sha256, "provider_unavailable", attempt_no < max_attempts)
 
         with self.sessions() as db:
+            _candidate,item,blocked=lock_candidate_screening_item(db,ids["organization_id"],ids["screening_item_id"],candidate.id,allow_blocked=True)
+            run=db.get(ScreeningRun,item.run_id)
+            if blocked:
+                self._discard_for_deletion(db,item,run)
+                db.commit()
+                return
             existing = db.scalar(
                 select(LlmInvocation).where(
                     LlmInvocation.organization_id == ids["organization_id"],
@@ -102,7 +117,7 @@ class LlmScreeningPipeline:
             )
             if existing:
                 return
-            loaded = self._load(db, ids, queue_job_id, lock_item=True)
+            loaded = self._load(db, ids, queue_job_id)
             if loaded is None:
                 raise PermanentJobError("screening_item_missing")
             item, run, _result, _resume, _jd, _candidate, config, _prompt = loaded
@@ -134,6 +149,15 @@ class LlmScreeningPipeline:
 
     def _finish_failure(self, job, ids, queue_job_id, attempt_no, input_sha256, code, retryable):
         with self.sessions() as db:
+            candidate_id=db.scalar(select(ScreeningItem.candidate_id).where(ScreeningItem.organization_id==ids["organization_id"],ScreeningItem.id==ids["screening_item_id"]))
+            if candidate_id is None:
+                raise PermanentJobError("screening_item_missing")
+            _candidate,item,blocked=lock_candidate_screening_item(db,ids["organization_id"],ids["screening_item_id"],candidate_id,allow_blocked=True)
+            run=db.get(ScreeningRun,item.run_id)
+            if blocked:
+                self._discard_for_deletion(db,item,run)
+                db.commit()
+                return
             existing = db.scalar(
                 select(LlmInvocation).where(
                     LlmInvocation.organization_id == ids["organization_id"],
@@ -142,7 +166,7 @@ class LlmScreeningPipeline:
                 )
             )
             if not existing:
-                loaded = self._load(db, ids, queue_job_id, lock_item=True)
+                loaded = self._load(db, ids, queue_job_id)
                 if loaded is None:
                     raise PermanentJobError("screening_item_missing")
                 item, run, _result, _resume, _jd, _candidate, config, _prompt = loaded
@@ -161,6 +185,13 @@ class LlmScreeningPipeline:
         if retryable:
             raise RetryableJobError(code)
         raise PermanentJobError(code)
+
+    @staticmethod
+    def _discard_for_deletion(db,item,run):
+        if item.llm_status=="running":
+            finished_at=datetime.now(timezone.utc)
+            item.llm_status="skipped"; item.llm_safe_error_code="candidate_unavailable"; item.llm_finished_at=item.llm_finished_at or finished_at; item.finished_at=item.finished_at or finished_at
+            aggregate_run(db,run)
 
     @staticmethod
     def _ids(payload):
