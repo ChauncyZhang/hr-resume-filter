@@ -31,6 +31,21 @@ base + production + observability model:
 COMPOSE_ENV_FILE=deploy/.env sh deploy/observability-preflight.sh
 ```
 
+The default mode is intentionally offline for development and static CI. After
+the exact observability commit is published to `main`, run the production mode
+before deploying alert rules:
+
+```sh
+OBSERVABILITY_PREFLIGHT_MODE=production \
+  COMPOSE_ENV_FILE=deploy/.env \
+  sh deploy/observability-preflight.sh
+```
+
+Production mode fails unless the canonical GitHub blob URL and raw runbook URL
+both resolve successfully and every local alert anchor is present in the
+published runbook. Do not deploy alert rules from an unpublished branch: a
+local anchor test cannot prove that an operator-facing URL is online.
+
 After it passes, start the fixed three-file model. The one-shot
 `observability-role-provision` service idempotently creates the two logins and
 safe aggregate view before either database exporter starts:
@@ -48,6 +63,13 @@ Alertmanager, exporters, and Prometheus first. Confirm every private
 Exercise live, ready, one template route, and a disposable queue item.
    Observe metrics for at least one evaluation interval before enabling alert
    delivery. Route warning notifications before critical paging.
+
+Node-exporter uses the official rootfs pattern with one read-only `rslave`
+mount at `/host/root`, a read-only container filesystem, no capabilities, and
+no-new-privileges. On production Linux this reports production Linux host filesystems.
+On Windows Docker Desktop the same runtime gate observes the Docker Desktop Linux VM,
+not Windows/NTFS capacity; production acceptance must therefore be repeated on
+the target Linux host before enabling host-storage paging.
 
 Rollback is defined before rollout: disable notification delivery, stop the
 observability-only services, and restore the previous API image. The base and
@@ -166,8 +188,9 @@ Phase 6C must add restore-aware evidence semantics, alert tests, and an operator
 procedure before enabling this signal.
 
 Container-level metrics are also deferred. The default overlay intentionally
-does not run cAdvisor or mount the Docker socket, `/var/run`, Docker storage, or
-the host root filesystem. Initial capacity coverage comes from node-exporter,
-postgres-exporter, and MinIO metrics. Revisit container metrics only with a
-reviewed design that requires neither a container-engine socket nor privileged
-host mounts.
+does not run cAdvisor or mount the Docker socket, `/var/run`, or Docker storage.
+The only host-root mapping is node-exporter's exact read-only `rslave` rootfs
+mount for filesystem capacity. Initial capacity coverage comes from
+node-exporter, postgres-exporter, and MinIO metrics. Revisit container metrics
+only with a reviewed design that requires neither a container-engine socket nor
+privileged host mounts.

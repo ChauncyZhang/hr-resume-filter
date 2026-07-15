@@ -37,13 +37,14 @@ fi
 
 export PGPASSWORD=$POSTGRES_PASSWORD
 
-psql --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --set=ON_ERROR_STOP=1 <<'SQL'
+psql --quiet --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --set=ON_ERROR_STOP=1 <<'SQL'
 \getenv database_name POSTGRES_DB
 \getenv owner_user POSTGRES_USER
 \getenv queue_user QUEUE_METRICS_DB_USER
 \getenv queue_password QUEUE_METRICS_DB_PASSWORD
 \getenv postgres_exporter_user POSTGRES_EXPORTER_DB_USER
 \getenv postgres_exporter_password POSTGRES_EXPORTER_DB_PASSWORD
+SET client_min_messages = error;
 
 SELECT format('CREATE ROLE %I', :'queue_user')
 WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = :'queue_user')
@@ -55,9 +56,20 @@ WHERE NOT EXISTS (
 \gexec
 
 ALTER ROLE :"queue_user" LOGIN PASSWORD :'queue_password'
-    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+    CONNECTION LIMIT -1 VALID UNTIL 'infinity';
 ALTER ROLE :"postgres_exporter_user" LOGIN PASSWORD :'postgres_exporter_password'
-    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    NOSUPERUSER INHERIT NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+    CONNECTION LIMIT -1 VALID UNTIL 'infinity';
+ALTER ROLE :"queue_user" RESET ALL;
+ALTER ROLE :"postgres_exporter_user" RESET ALL;
+
+SELECT format('REVOKE %I FROM %I', granted_role.rolname, member_role.rolname)
+FROM pg_catalog.pg_auth_members AS membership
+JOIN pg_catalog.pg_roles AS granted_role ON granted_role.oid = membership.roleid
+JOIN pg_catalog.pg_roles AS member_role ON member_role.oid = membership.member
+WHERE member_role.rolname IN (:'queue_user', :'postgres_exporter_user')
+\gexec
 
 CREATE SCHEMA IF NOT EXISTS observability AUTHORIZATION :"owner_user";
 REVOKE ALL ON SCHEMA observability FROM PUBLIC;
@@ -168,22 +180,41 @@ GROUP BY topic;
 ALTER VIEW observability.queue_metrics OWNER TO :"owner_user";
 REVOKE ALL ON observability.queue_metrics FROM PUBLIC;
 
-REVOKE pg_monitor FROM :"queue_user";
-REVOKE :"postgres_exporter_user" FROM :"queue_user";
-REVOKE :"queue_user" FROM :"postgres_exporter_user";
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM :"queue_user";
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM :"queue_user";
-REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM :"queue_user";
-REVOKE ALL ON SCHEMA observability FROM :"queue_user";
+REVOKE ALL PRIVILEGES ON DATABASE :"database_name"
+    FROM :"queue_user", :"postgres_exporter_user";
+SELECT format(
+    'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM %I, %I',
+    schema_name.nspname, :'queue_user', :'postgres_exporter_user'
+)
+FROM pg_catalog.pg_namespace AS schema_name
+WHERE schema_name.nspname !~ '^pg_temp_'
+\gexec
+SELECT format(
+    'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I, %I',
+    schema_name.nspname, :'queue_user', :'postgres_exporter_user'
+)
+FROM pg_catalog.pg_namespace AS schema_name
+WHERE schema_name.nspname !~ '^pg_temp_'
+\gexec
+SELECT format(
+    'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM %I, %I',
+    schema_name.nspname, :'queue_user', :'postgres_exporter_user'
+)
+FROM pg_catalog.pg_namespace AS schema_name
+WHERE schema_name.nspname !~ '^pg_temp_'
+\gexec
+SELECT format(
+    'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM %I, %I',
+    schema_name.nspname, :'queue_user', :'postgres_exporter_user'
+)
+FROM pg_catalog.pg_namespace AS schema_name
+WHERE schema_name.nspname !~ '^pg_temp_'
+\gexec
+
 GRANT CONNECT ON DATABASE :"database_name" TO :"queue_user";
 GRANT USAGE ON SCHEMA observability TO :"queue_user";
 GRANT SELECT ON observability.queue_metrics TO :"queue_user";
 
-REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM :"postgres_exporter_user";
-REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM :"postgres_exporter_user";
-REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public FROM :"postgres_exporter_user";
-REVOKE ALL ON SCHEMA observability FROM :"postgres_exporter_user";
-REVOKE ALL ON observability.queue_metrics FROM :"postgres_exporter_user";
 GRANT CONNECT ON DATABASE :"database_name" TO :"postgres_exporter_user";
 GRANT pg_monitor TO :"postgres_exporter_user";
 

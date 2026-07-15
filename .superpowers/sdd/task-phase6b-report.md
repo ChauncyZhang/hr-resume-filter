@@ -1,92 +1,126 @@
-# Phase 6B review remediation report
+# Phase 6B final review remediation report
 
 ## Status
 
-All independent-review findings are remediated within the Phase 6B write set.
-The production topology still publishes only the HTTPS proxy port; API and
-exporter metrics remain private, and public `/metrics` paths still return 404.
-No B2B governance/migration file, shared Dockerfile/README/settings file, or
-user-owned file was modified or staged by this remediation.
+The Phase 6B final-review follow-up is implemented on top of `586639f` within
+the Phase 6B write set. The two Important findings and one Minor finding have
+automated regression coverage. No B2B1 WIP, governance/migration file, shared
+Dockerfile/README/settings file, or user-protected file was modified or staged.
 
-## Finding-by-finding remediation
+The code is ready to commit, but production alert deployment is intentionally
+release-gated: the canonical GitHub blob and raw runbook URLs currently return
+HTTP 404 because this branch is not yet published to `main`. The runbook now
+requires merge/publication before production-mode preflight and alert rollout.
 
-1. **Disposable PostgreSQL safety.** Every real-PG test checks
-   `DISPOSABLE_DATABASE_CONFIRMED=1` before connecting and then executes only
-   `SELECT current_database()` until the database is proven to be exactly
-   `ux09_observability_test`. Focused tests prove a missing flag makes no
-   connection and a wrong database executes zero DDL/DML.
-2. **Backup freshness.** `BackupStaleWarning` and `BackupStaleCritical` are
-   removed. Backup freshness remains disabled until Phase 6C provides a tested,
-   restore-aware evidence collector; missing metrics cannot page as critical.
-3. **Readiness results and dependency identity.** The alert now uses
-   `sum by (dependency)` over `result=~"failed|cancelled"`. A real promtool rule
-   test triggers and resolves a cancelled storage check while retaining the
-   `dependency="storage"` alert label. Timed-out probes are recorded as
-   cancelled by the existing readiness instrumentation.
-4. **Safe capacity topology.** cAdvisor and its privileged/Docker/host mounts
-   are removed from both Compose and Prometheus. Tests reject `privileged`,
-   `/var/run`, Docker sockets/storage, and host-root mounts. Initial capacity
-   signals are node-exporter, postgres-exporter, and private MinIO metrics.
-5. **Resolvable runbooks.** All 18 alert `runbook_url` values are absolute
-   canonical GitHub HTTPS links. Each fragment maps to a dedicated Markdown
-   heading and is checked against the generated anchor set.
-6. **Least-privilege monitoring identities.** The idempotent
-   `deploy/observability/provision-roles.sh` creates two distinct logins. The
-   queue exporter receives only `USAGE` on `observability` and `SELECT` on the
-   bounded aggregate view `observability.queue_metrics`; it has no queue base
-   table access and no `pg_monitor`. The third-party postgres-exporter receives
-   `pg_monitor`, no queue view/table access, and a separate DSN/password. The
-   collector now issues one query against the safe view and never queries queue
-   base tables.
-7. **Formal three-layer preflight.** `deploy/observability-preflight.sh` first
-   calls `production-preflight.sh`, inheriting its Docker Compose >= 2.24.4
-   check, then validates the fixed base + production + observability model.
-   The runbook contains copyable preflight and launch commands.
-8. **Review evidence.** This report records RED/GREEN evidence, deferred
-   integrations, and the intended commit subject.
+## Final-review remediation
+
+### 1. Monitoring-role convergence
+
+`deploy/observability/provision-roles.sh` now converges existing roles instead
+of assuming fresh roles:
+
+- dynamically enumerates `pg_auth_members` and revokes every inbound
+  membership from both exporter identities;
+- restores only ordinary, non-admin `pg_monitor` membership to the PostgreSQL
+  exporter, while the queue exporter finishes with zero memberships;
+- resets role-local configuration and explicitly converges login, inheritance,
+  superuser, create-role/database, replication, bypass-RLS, connection-limit,
+  and password-validity attributes;
+- revokes direct database, schema, table/view, sequence, and function grants
+  across existing schemas, then restores only required `CONNECT`, queue-view
+  access, and `pg_monitor`;
+- uses quiet psql execution and fixed success output so successful provisioning
+  exposes neither exporter identities nor passwords.
+
+The disposable PostgreSQL test deliberately creates a malicious extra role
+with `background_jobs` SELECT, grants both exporters that role with admin
+option, grants postgres-exporter `pg_monitor` with admin option, adds direct
+table access, and poisons role attributes/config. After two provisioning runs,
+it proves the queue identity has no memberships and cannot read base tables;
+postgres-exporter has exactly `pg_monitor` without admin option and cannot read
+the queue view or base tables; direct grants and attributes match the contract.
+
+### 2. Host filesystem capacity with bounded privileges
+
+Node-exporter now uses the official rootfs pattern with exactly one host-root
+bind mount at `/host/root`, read-only with `rslave` propagation, plus
+`--path.rootfs=/host/root` and host PID visibility. The service remains private
+and adds `read_only: true`, `cap_drop: [ALL]`, and
+`no-new-privileges:true`. cAdvisor, privileged mode, Docker socket,
+`/var/run`, and Docker data mounts remain forbidden.
+
+Topology tests prove no other service receives a host-root mount and reject a
+writable, propagation-free, or differently targeted root mapping. The runtime
+gate proves a matching `node_filesystem_avail_bytes` /
+`node_filesystem_size_bytes` pair survives the HostStorageLow
+`fstype!~"tmpfs|overlay"` filter.
+
+Docker Desktop cannot start the production `rslave` mount because its Linux VM
+root is not a shared/slave mount. The runtime test detects only that exact
+Docker Desktop limitation and uses an otherwise identically hardened,
+read-only diagnostic mount to prove the Linux VM filesystem topology is
+nonempty. This does not replace the documented production Linux host gate,
+which must exercise the exact Compose service and observe real host filesystems.
+
+### 3. Published runbook availability gate
+
+The ordinary preflight remains offline for development/static CI. With
+`OBSERVABILITY_PREFLIGHT_MODE=production`, it now:
+
+1. runs the existing production preflight and fixed three-file Compose check;
+2. requires `curl` and verifies both the canonical GitHub blob URL and raw URL;
+3. requires every alert URL to use the canonical base;
+4. checks every alert fragment against both local and published runbook
+   headings.
+
+Tests use a local curl shim, so offline CI never depends on external network.
+They prove production mode checks both URLs, accepts aligned remote content,
+and rejects a published runbook missing a local alert anchor. The runbook makes
+publication to `main` a required predecessor of production alert deployment;
+the current real 404 is recorded as that expected release-order block, not as
+evidence of online availability.
 
 ## TDD evidence
 
-The focused RED run failed on the intended old contracts: missing disposable
-database guard, direct queue-table collector SQL, absent role/preflight scripts,
-cAdvisor and host mounts still present, backup alerts still enabled, relative
-runbook URLs, and readiness aggregation that lost `dependency`. Host Docker
-cases were rerun on the host after the container-only RED environment correctly
-reported that it lacked a Docker CLI.
+RED against the `586639f` behavior:
 
-Final GREEN evidence:
+- production preflight made no canonical URL requests and accepted incomplete
+  published content;
+- topology found zero approved host-root mappings, so the host-storage alert
+  lacked a reliable filesystem source;
+- malicious-role real-PG testing exposed exporter identities in psql warnings
+  and retained unexpected membership/admin-option paths.
 
-- Disposable real PostgreSQL exporter and role/grant suite: `8 passed`.
-- Affected HTTP, runtime, exporter, privacy, and role unit tests: `19 passed,
-  2 deselected` (the real-PG cases were run separately above).
-- Phase 6A + Phase 6B host topology suite: `14 passed`.
-- Formal preflight test: `1 passed`; installed preflight and direct three-file
-  `docker compose ... config --quiet` both exited zero.
-- Real promtool configuration/rule load: 18 rules; real amtool configuration
-  load: success. Representative promtool trigger/resolution tests passed.
-- POSIX `sh -n` for both new scripts: success.
-- Runtime image build: success. A real runtime exporter using the restricted
-  queue login returned `ux09_queue_collector_up 1.0` and bounded lease metrics.
-- Python compile, production PII canary scan, `git diff --check`, and
-  owned-only staged-diff audit are final commit gates.
+GREEN after the scoped fixes:
 
-## Deferred integrations and concerns
+- focused real disposable PostgreSQL exporter/role suite: `8 passed`;
+- Phase 6A production topology + Phase 6B topology/preflight: `19 passed`;
+- node-exporter static boundary and Docker Desktop VM runtime subset:
+  `2 passed`;
+- preflight offline/production simulation and release-order documentation:
+  `4 passed`;
+- ordinary installed preflight: success;
+- real production-mode preflight before publication: expected fail-closed,
+  curl exit 22 / HTTP 404 for both canonical URLs.
 
-- Phase 6C owns backup evidence semantics, freshness metrics, restore-aware
-  tests, and backup alert enablement.
-- Container-level metrics remain deferred until a reviewed design requires
-  neither a container-engine socket nor privileged host mounts.
-- The four exporter identity/password values must be supplied by the approved
-  deployment secret mechanism; the B2B-owned `.env.example` is intentionally
-  unchanged.
-- MinIO's metrics endpoint is public only inside the private Compose network.
-  A dedicated authenticated MinIO metrics identity remains a future hardening
-  option if supported by the deployed MinIO contract.
-- Alertmanager still uses the null canary receiver; production routing and
-  credentials require the approved external secret integration.
+## Remaining release gates and deferred work
+
+- Merge the exact alert/runbook commit to `main`, then rerun
+  `OBSERVABILITY_PREFLIGHT_MODE=production` and require a clean pass before
+  deploying alert rules.
+- Repeat the node-exporter runtime gate on the production Linux host; Docker
+  Desktop evidence covers only its Linux VM.
+- Backup freshness remains disabled until Phase 6C supplies restore-aware
+  evidence and tests.
+- Container-level metrics remain deferred; no cAdvisor or container-engine
+  socket access is introduced.
+- Alertmanager still uses the null canary receiver pending approved production
+  routing and secret integration.
 
 ## Commit
 
-Intended subject: `fix(observability): close Phase6B review findings`.
-The immutable commit hash is reported in the final handoff because a commit
+Base commit: `586639f fix(observability): close Phase6B review findings`.
+Intended follow-up subject:
+`fix(observability): close final review gaps`.
+The immutable follow-up hash is reported in the final handoff because a commit
 cannot contain its own hash.

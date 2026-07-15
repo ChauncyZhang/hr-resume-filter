@@ -9,6 +9,7 @@ import pytest
 from psycopg import connect
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.errors import InsufficientPrivilege
+from psycopg import sql
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,6 +55,7 @@ def test_real_postgres_roles_are_idempotent_and_mutually_least_privileged() -> N
     queue_password = f"queue-{uuid4().hex}"
     postgres_user = "ux09_postgres_exporter_test"
     postgres_password = f"postgres-{uuid4().hex}"
+    extra_role = "ux09_observability_extra_test"
     info = conninfo_to_dict(owner_url)
     environment = os.environ.copy()
     environment.update(
@@ -101,6 +103,61 @@ def test_real_postgres_roles_are_idempotent_and_mutually_least_privileged() -> N
                        jsonb_build_object('email', %s::text))""",
             (canary,),
         )
+        for role, password in (
+            (queue_user, queue_password),
+            (postgres_user, postgres_password),
+        ):
+            connection.execute(
+                sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                    sql.Identifier(role), sql.Literal(password)
+                )
+            )
+            connection.execute(
+                sql.SQL(
+                    "ALTER ROLE {} SUPERUSER CREATEDB CREATEROLE REPLICATION BYPASSRLS"
+                ).format(sql.Identifier(role))
+            )
+        connection.execute(
+            sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(extra_role))
+        )
+        connection.execute(
+            sql.SQL("GRANT SELECT ON background_jobs TO {}").format(
+                sql.Identifier(extra_role)
+            )
+        )
+        for role in (queue_user, postgres_user):
+            connection.execute(
+                sql.SQL("GRANT {} TO {} WITH ADMIN OPTION").format(
+                    sql.Identifier(extra_role), sql.Identifier(role)
+                )
+            )
+        connection.execute(
+            sql.SQL("GRANT pg_monitor TO {} WITH ADMIN OPTION").format(
+                sql.Identifier(postgres_user)
+            )
+        )
+        connection.execute(
+            sql.SQL("GRANT SELECT ON background_jobs TO {}").format(
+                sql.Identifier(postgres_user)
+            )
+        )
+
+    queue_url = _role_url(owner_url, queue_user, queue_password)
+    postgres_url = _role_url(owner_url, postgres_user, postgres_password)
+    with connect(queue_url, autocommit=True) as connection:
+        assert connection.execute("SELECT count(*) FROM background_jobs").fetchone() == (
+            1,
+        )
+    with connect(owner_url, autocommit=True) as connection:
+        for role in (queue_user, postgres_user):
+            connection.execute(
+                sql.SQL("ALTER ROLE {} NOINHERIT").format(sql.Identifier(role))
+            )
+            connection.execute(
+                sql.SQL("ALTER ROLE {} SET search_path = public").format(
+                    sql.Identifier(role)
+                )
+            )
 
     for _ in range(2):
         result = subprocess.run(
@@ -112,9 +169,53 @@ def test_real_postgres_roles_are_idempotent_and_mutually_least_privileged() -> N
             check=False,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+        output = result.stdout + result.stderr
+        for secret in (
+            queue_user,
+            queue_password,
+            postgres_user,
+            postgres_password,
+            extra_role,
+        ):
+            assert secret not in output
 
-    queue_url = _role_url(owner_url, queue_user, queue_password)
-    postgres_url = _role_url(owner_url, postgres_user, postgres_password)
+    with connect(owner_url, autocommit=True) as connection:
+        memberships = connection.execute(
+            """SELECT member_role.rolname, granted_role.rolname, membership.admin_option
+               FROM pg_catalog.pg_auth_members AS membership
+               JOIN pg_catalog.pg_roles AS member_role
+                 ON member_role.oid = membership.member
+               JOIN pg_catalog.pg_roles AS granted_role
+                 ON granted_role.oid = membership.roleid
+               WHERE member_role.rolname IN (%s, %s)
+               ORDER BY member_role.rolname, granted_role.rolname""",
+            (queue_user, postgres_user),
+        ).fetchall()
+        assert memberships == [(postgres_user, "pg_monitor", False)]
+        attributes = connection.execute(
+            """SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+                      rolcanlogin, rolreplication, rolbypassrls, rolconnlimit,
+                      rolconfig
+               FROM pg_catalog.pg_roles
+               WHERE rolname IN (%s, %s)
+               ORDER BY rolname""",
+            (queue_user, postgres_user),
+        ).fetchall()
+        assert attributes == [
+            (postgres_user, False, True, False, False, True, False, False, -1, None),
+            (queue_user, False, True, False, False, True, False, False, -1, None),
+        ]
+        direct_table_grants = connection.execute(
+            """SELECT grantee, table_schema, table_name, privilege_type
+               FROM information_schema.role_table_grants
+               WHERE grantee IN (%s, %s)
+               ORDER BY grantee, table_schema, table_name, privilege_type""",
+            (queue_user, postgres_user),
+        ).fetchall()
+        assert direct_table_grants == [
+            (queue_user, "observability", "queue_metrics", "SELECT")
+        ]
+
     with connect(queue_url, autocommit=True) as connection:
         columns = [
             row[0]

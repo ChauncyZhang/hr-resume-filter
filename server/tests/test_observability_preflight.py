@@ -8,6 +8,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 PREFLIGHT = ROOT / "deploy" / "observability-preflight.sh"
+RUNBOOK = ROOT / "deploy" / "observability" / "runbook.md"
 
 
 def _shell_path(path: Path) -> str:
@@ -43,12 +44,23 @@ fi
         encoding="utf-8",
     )
     docker_shim.chmod(0o755)
+    curl_shim = tmp_path / "curl"
+    curl_shim.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$NETWORK_CALL_LOG"
+exit 93
+""",
+        encoding="utf-8",
+    )
+    curl_shim.chmod(0o755)
     call_log = tmp_path / "compose-calls.log"
+    network_call_log = tmp_path / "network-calls.log"
     environment = os.environ.copy()
     environment.update(
         {
             "COMPOSE_CALL_LOG": _shell_path(call_log),
             "COMPOSE_ENV_FILE": "deploy/.env.example",
+            "NETWORK_CALL_LOG": _shell_path(network_call_log),
         }
     )
     shell = shutil.which("sh") or "sh"
@@ -80,3 +92,98 @@ fi
     assert "deploy/compose.yaml" in config_calls[1]
     assert "deploy/compose.production.yaml" in config_calls[1]
     assert "deploy/compose.observability.yaml" in config_calls[1]
+    assert not network_call_log.exists()
+
+
+def _run_production_preflight(
+    tmp_path: Path, remote_runbook: Path
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    docker_shim = tmp_path / "docker"
+    docker_shim.write_text(
+        """#!/bin/sh
+if [ "$1" = compose ] && [ "$2" = version ] && [ "$3" = --short ]; then
+    printf '%s\n' '2.24.4'
+fi
+""",
+        encoding="utf-8",
+    )
+    docker_shim.chmod(0o755)
+    curl_shim = tmp_path / "curl"
+    curl_shim.write_text(
+        """#!/bin/sh
+printf '%s\n' "$*" >> "$NETWORK_CALL_LOG"
+case "$*" in
+    *raw.githubusercontent.com*) cat "$REMOTE_RUNBOOK_SOURCE" ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    curl_shim.chmod(0o755)
+    network_call_log = tmp_path / "network-calls.log"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "COMPOSE_ENV_FILE": "deploy/.env.example",
+            "NETWORK_CALL_LOG": _shell_path(network_call_log),
+            "OBSERVABILITY_PREFLIGHT_MODE": "production",
+            "REMOTE_RUNBOOK_SOURCE": _shell_path(remote_runbook),
+        }
+    )
+    shell = shutil.which("sh") or "sh"
+    result = subprocess.run(
+        [
+            shell,
+            "-c",
+            'PATH="$1:$PATH"; export PATH; exec sh "$2"',
+            "observability-production-preflight-test",
+            _shell_path(tmp_path),
+            _shell_path(PREFLIGHT),
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, network_call_log
+
+
+def test_production_preflight_checks_canonical_blob_raw_and_remote_anchors(
+    tmp_path: Path,
+) -> None:
+    remote_runbook = tmp_path / "remote-runbook.md"
+    remote_runbook.write_text(RUNBOOK.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result, network_call_log = _run_production_preflight(tmp_path, remote_runbook)
+
+    assert result.returncode == 0, result.stderr
+    assert network_call_log.is_file()
+    calls = network_call_log.read_text(encoding="utf-8")
+    assert (
+        "https://github.com/ChauncyZhang/hr-resume-filter/blob/main/"
+        "deploy/observability/runbook.md" in calls
+    )
+    assert (
+        "https://raw.githubusercontent.com/ChauncyZhang/hr-resume-filter/main/"
+        "deploy/observability/runbook.md" in calls
+    )
+
+
+def test_production_preflight_rejects_remote_runbook_missing_local_alert_anchors(
+    tmp_path: Path,
+) -> None:
+    remote_runbook = tmp_path / "remote-runbook.md"
+    remote_runbook.write_text("# published runbook is incomplete\n", encoding="utf-8")
+
+    result, _ = _run_production_preflight(tmp_path, remote_runbook)
+
+    assert result.returncode != 0
+    assert "anchor" in result.stderr.lower()
+
+
+def test_runbook_requires_main_publication_before_production_alert_deploy() -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "OBSERVABILITY_PREFLIGHT_MODE=production" in runbook
+    assert "published to `main`" in runbook
+    assert "before deploying alert rules" in runbook

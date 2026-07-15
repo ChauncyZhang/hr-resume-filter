@@ -5,7 +5,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from urllib.parse import urlparse
+from urllib.request import urlopen
+from uuid import uuid4
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -100,13 +103,30 @@ def test_three_compose_files_publish_only_the_https_proxy(tmp_path: Path) -> Non
         "/var/run",
         "docker.sock",
         "/var/lib/docker",
-        "- /:/",
     ):
         assert forbidden not in overlay
-    node_mount_sources = {
-        volume["source"] for volume in model["services"]["node-exporter"]["volumes"]
-    }
-    assert "/" not in node_mount_sources
+    root_mounts = [
+        (service_name, volume)
+        for service_name, service in model["services"].items()
+        for volume in service.get("volumes", [])
+        if volume.get("source") == "/"
+    ]
+    assert len(root_mounts) == 1
+    service_name, root_mount = root_mounts[0]
+    assert service_name == "node-exporter"
+    assert root_mount["target"] == "/host/root"
+    assert root_mount["read_only"] is True
+    assert root_mount["bind"]["propagation"] == "rslave"
+
+    node = model["services"]["node-exporter"]
+    assert node["read_only"] is True
+    assert node["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in node["security_opt"]
+    assert node["pid"] == "host"
+    assert "--path.rootfs=/host/root" in node["command"]
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert "production Linux host filesystems" in runbook
+    assert "Docker Desktop Linux VM" in runbook
 
     queue_url = model["services"]["queue-exporter"]["environment"][
         "OBSERVABILITY_DATABASE_URL"
@@ -117,6 +137,151 @@ def test_three_compose_files_publish_only_the_https_proxy(tmp_path: Path) -> Non
     assert "ux09_queue_metrics" in queue_url
     assert "ux09_postgres_exporter" in postgres_url
     assert queue_url != postgres_url
+
+
+def test_node_exporter_runtime_exposes_host_filesystem_series(
+    tmp_path: Path,
+) -> None:
+    project = f"ux09-node-runtime-{uuid4().hex[:8]}"
+    container = f"{project}-exporter"
+    compose = [
+        "docker",
+        "compose",
+        "-p",
+        project,
+        "--env-file",
+        str(ENV_EXAMPLE),
+        "-f",
+        str(BASE_COMPOSE),
+        "-f",
+        str(PRODUCTION_COMPOSE),
+        "-f",
+        str(OBSERVABILITY_COMPOSE),
+    ]
+    environment = _compose_environment(tmp_path)
+    started = subprocess.run(
+        [
+            *compose,
+            "run",
+            "-d",
+            "--no-deps",
+            "--name",
+            container,
+            "-p",
+            "127.0.0.1::9100",
+            "node-exporter",
+        ],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    diagnostic_container: str | None = None
+    if started.returncode == 0:
+        container_id = started.stdout.strip()
+    else:
+        operating_system = subprocess.run(
+            ["docker", "info", "--format", "{{.OperatingSystem}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert operating_system == "Docker Desktop"
+        assert "not a shared or slave mount" in started.stderr
+        subprocess.run(
+            [*compose, "down", "--remove-orphans"],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diagnostic_container = f"{container}-desktop-diagnostic"
+        diagnostic = subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                diagnostic_container,
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges:true",
+                "--pid=host",
+                "-p",
+                "127.0.0.1::9100",
+                "--mount",
+                "type=bind,source=/,target=/host/root,readonly",
+                "prom/node-exporter:v1.9.1",
+                "--path.rootfs=/host/root",
+                "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($|/)",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert diagnostic.returncode == 0, diagnostic.stdout + diagnostic.stderr
+        container_id = diagnostic.stdout.strip()
+    try:
+        port_result = subprocess.run(
+            ["docker", "port", container_id, "9100/tcp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert port_result.returncode == 0, subprocess.run(
+            ["docker", "logs", container_id],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stderr
+        host_port = int(port_result.stdout.strip().rsplit(":", 1)[1])
+        payload = ""
+        for _ in range(30):
+            try:
+                with urlopen(
+                    f"http://127.0.0.1:{host_port}/metrics", timeout=1
+                ) as response:
+                    payload = response.read().decode("utf-8")
+                break
+            except OSError:
+                time.sleep(0.1)
+
+        avail = {
+            labels: float(value)
+            for labels, value in re.findall(
+                r'^node_filesystem_avail_bytes\{([^}]*)\}\s+([0-9.eE+-]+)$',
+                payload,
+                flags=re.MULTILINE,
+            )
+            if re.search(r'fstype="(?!tmpfs"|overlay")[^"]+"', labels)
+        }
+        size = {
+            labels: float(value)
+            for labels, value in re.findall(
+                r'^node_filesystem_size_bytes\{([^}]*)\}\s+([0-9.eE+-]+)$',
+                payload,
+                flags=re.MULTILINE,
+            )
+        }
+        assert any(labels in size and size[labels] > 0 for labels in avail), payload
+    finally:
+        if diagnostic_container is not None:
+            subprocess.run(
+                ["docker", "rm", "-f", diagnostic_container],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        subprocess.run(
+            [*compose, "down", "--remove-orphans"],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def test_prometheus_scrapes_only_private_service_targets() -> None:

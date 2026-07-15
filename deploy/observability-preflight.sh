@@ -8,6 +8,17 @@ base_compose="$script_directory/compose.yaml"
 production_overlay="$script_directory/compose.production.yaml"
 observability_overlay="$script_directory/compose.observability.yaml"
 compose_env_file=${COMPOSE_ENV_FILE:-"$script_directory/.env"}
+alert_rules="$script_directory/observability/alerts/ux09.rules.yml"
+local_runbook="$script_directory/observability/runbook.md"
+preflight_mode=${OBSERVABILITY_PREFLIGHT_MODE:-development}
+canonical_runbook_url=https://github.com/ChauncyZhang/hr-resume-filter/blob/main/deploy/observability/runbook.md
+canonical_raw_runbook_url=https://raw.githubusercontent.com/ChauncyZhang/hr-resume-filter/main/deploy/observability/runbook.md
+
+runbook_anchors() {
+    sed -n 's/^###[[:space:]]*//p' "$1" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[^a-z0-9 -]//g' -e 's/[[:space:]][[:space:]]*/-/g'
+}
 
 # This must remain the first validation layer. It enforces the supported
 # Compose version and proves the base + production model independently.
@@ -19,5 +30,52 @@ docker compose \
     -f "$production_overlay" \
     -f "$observability_overlay" \
     config --quiet
+
+case "$preflight_mode" in
+    development)
+        ;;
+    production)
+        command -v curl >/dev/null 2>&1 || {
+            printf '%s\n' 'observability preflight: curl is required in production mode' >&2
+            exit 1
+        }
+        remote_runbook=$(mktemp)
+        trap 'rm -f "$remote_runbook"' EXIT HUP INT TERM
+        curl --fail --location --silent --show-error \
+            --output /dev/null "$canonical_runbook_url"
+        curl --fail --location --silent --show-error \
+            "$canonical_raw_runbook_url" > "$remote_runbook"
+        for runbook_url in $(
+            sed -n 's/^[[:space:]]*runbook_url:[[:space:]]*//p' "$alert_rules"
+        ); do
+            case "$runbook_url" in
+                "$canonical_runbook_url"\#*)
+                    ;;
+                *)
+                    printf 'observability preflight: non-canonical runbook URL: %s\n' \
+                        "$runbook_url" >&2
+                    exit 1
+                    ;;
+            esac
+            anchor=${runbook_url##*#}
+            if ! runbook_anchors "$local_runbook" | grep -F -x "$anchor" >/dev/null; then
+                printf 'observability preflight: local runbook anchor is missing: %s\n' \
+                    "$anchor" >&2
+                exit 1
+            fi
+            if ! runbook_anchors "$remote_runbook" | grep -F -x "$anchor" >/dev/null; then
+                printf 'observability preflight: published runbook anchor is missing: %s\n' \
+                    "$anchor" >&2
+                exit 1
+            fi
+        done
+        rm -f "$remote_runbook"
+        trap - EXIT HUP INT TERM
+        ;;
+    *)
+        printf 'observability preflight: unsupported mode: %s\n' "$preflight_mode" >&2
+        exit 1
+        ;;
+esac
 
 printf '%s\n' 'observability preflight: merged three-file Compose model is valid'

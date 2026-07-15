@@ -72,12 +72,19 @@ services:
   node-exporter:
     image: prom/node-exporter:v1.9.1
     command:
-      - --path.procfs=/host/proc
-      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
     volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
+      - type: bind
+        source: /
+        target: /host/root
+        read_only: true
+        bind:
+          propagation: rslave
+    pid: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     restart: unless-stopped
     networks: [private]
 
