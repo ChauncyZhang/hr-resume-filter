@@ -7,7 +7,7 @@ const COUNT_FIELDS = [
   ["resume_objects", "resumeObjects"], ["temporary_exports", "temporaryExports"],
 ];
 const DELETION_STATUSES = new Set(["requested", "approved", "executing", "completed", "failed"]);
-const OPEN_DELETION_STATUSES = new Set(["requested", "approved", "executing"]);
+const OPEN_DELETION_STATUSES = new Set(["requested", "approved", "executing", "failed"]);
 const ERROR_MESSAGES = {
   authentication_required: "登录状态已失效，请重新登录。",
   csrf_validation_failed: "当前会话已失效，请刷新后重试。",

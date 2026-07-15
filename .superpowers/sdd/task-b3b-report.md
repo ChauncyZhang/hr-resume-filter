@@ -151,12 +151,14 @@ deployment, B2B1, Phase6A, B3A, or protected user files.
 - Read the current server contract in `server/app/governance/api.py` and
   `server/app/governance/deletion_service.py`. The frontend now accepts only
   `requested`, `approved`, `executing`, `completed`, and `failed`; open requests
-  are exactly `requested`, `approved`, and `executing`.
+  are exactly `requested`, `approved`, `executing`, and `failed`. `completed`
+  is terminal and is not classified as open.
 - Candidate and settings status labels and all five filters are synchronized.
   Obsolete filter values are rejected before URL construction, so the frontend
   cannot send `queued` or `processing`.
-- `executing` now blocks duplicate deletion submission in both the controller
-  and button state. Tests prove that no POST is made.
+- All four open states block duplicate deletion submission in both the
+  controller and button state. Tests prove that no POST is made for each state;
+  a separate test proves `completed` does not take the duplicate-open branch.
 - Approval errors now map the server's `self_approval_forbidden`,
   `active_application_exists`, `legal_hold_active`, and
   `invalid_deletion_state_transition` codes to actionable Chinese guidance.
@@ -207,3 +209,47 @@ previously recorded CSRF/authentication blocker remains outside B3B ownership.
 The focused 390 px CSS/static gate and prior unauthenticated 390 px shell check
 remain green; authenticated visual integration is still the stated residual
 risk.
+
+### Final two-finding closure
+
+- Re-checked `create_deletion_request` in the current server service: its
+  existing-request query is `status != "completed"`. The controller and
+  candidate action now therefore classify `requested`, `approved`, `executing`,
+  and `failed` as open while leaving `completed` outside the open set.
+- Added generic, governance-scoped 16 px button overrides for candidate
+  governance, its dialog, the settings deletion queue, request drawer, and
+  approval dialog. These selectors explicitly cover the candidate governance
+  error retry, deletion-queue error retry, queue load-more action, row/detail
+  controls, and existing primary governance actions without changing global
+  typography or 390 px layout rules.
+
+Final RED evidence:
+
+```text
+node --test src/candidateGovernance.test.js src/governanceSettings.test.js
+```
+
+Result before implementation: 36 passed, 3 failed (`failed` still posted, the
+candidate button remained enabled, and generic governance button selectors were
+absent). The `completed` non-open assertion already passed.
+
+Final GREEN evidence:
+
+```text
+node --test src/candidateGovernance.test.js src/governanceSettings.test.js
+```
+
+Result: 39 passed, 0 failed.
+
+```text
+npm.cmd test
+```
+
+Result: 267 passed, 0 failed.
+
+```text
+npm.cmd run build
+```
+
+Result: Vite production build succeeded (1607 modules); the existing chunk-size
+warning remains non-fatal.

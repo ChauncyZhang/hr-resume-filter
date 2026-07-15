@@ -107,17 +107,33 @@ test("deletion request sends exact body and reuses key only after ambiguous fail
   assert.equal(controller.getState().deletionRequest.impact.counts.temporaryExports, 9);
 });
 
-test("executing deletion status blocks a duplicate request before any POST", async () => {
-  const client = clientWith(() => ({
-    data: { deletion_status: "executing", deletion_request_id: null, legal_hold_active: false },
-  }));
+test("requested approved executing and failed block duplicate deletion before any POST", async () => {
+  for (const deletionStatus of ["requested", "approved", "executing", "failed"]) {
+    const client = clientWith(() => ({
+      data: { deletion_status: deletionStatus, deletion_request_id: null, legal_hold_active: false },
+    }));
+    const controller = createCandidateGovernanceController({ client });
+
+    await controller.load(candidateId, "HR 招聘专员");
+
+    assert.equal(await controller.requestDeletion(), false, deletionStatus);
+    assert.equal(client.calls.filter((call) => call.options.method === "POST").length, 0, deletionStatus);
+    assert.match(controller.getState().error, /已有待处理的删除请求/, deletionStatus);
+  }
+});
+
+test("completed is not open and does not block a request attempt as a duplicate", async () => {
+  const client = clientWith((_path, options) => {
+    if (options.method === "POST") throw new ApiError({ status: 409, code: "candidate_deletion_completed" });
+    return { data: { deletion_status: "completed", deletion_request_id: null, legal_hold_active: false } };
+  });
   const controller = createCandidateGovernanceController({ client });
 
   await controller.load(candidateId, "HR 招聘专员");
+  await controller.requestDeletion();
 
-  assert.equal(await controller.requestDeletion(), false);
-  assert.equal(client.calls.filter((call) => call.options.method === "POST").length, 0);
-  assert.match(controller.getState().error, /已有待处理的删除请求/);
+  assert.equal(client.calls.filter((call) => call.options.method === "POST").length, 1);
+  assert.doesNotMatch(controller.getState().error, /已有待处理的删除请求/);
 });
 
 test("hold placement validates trimmed reason then refreshes status and current request", async () => {
@@ -179,7 +195,7 @@ test("candidate detail wires governance states, destructive confirmation and rol
   assert.match(source, /legalHoldVersion/);
   assert.match(source, /data-dialog-initial-focus/);
   assert.match(source, /onKeyDown=\{handleKeyDown\}/);
-  assert.match(source, /\["requested", "approved", "executing"\]/);
+  assert.match(source, /\["requested", "approved", "executing", "failed"\]/);
   assert.match(source, /requested: "待审批"/);
   assert.match(source, /approved: "已批准"/);
   assert.match(source, /executing: "执行中"/);

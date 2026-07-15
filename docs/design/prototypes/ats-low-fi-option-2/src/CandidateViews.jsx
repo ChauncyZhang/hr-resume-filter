@@ -301,7 +301,7 @@ function CandidateGovernance({ candidate, role, onNotify }) {
   const legalHoldId = status?.legalHoldId;
   const legalHoldVersion = status?.legalHoldVersion;
   const releaseDisabled = !legalHoldId || !legalHoldVersion;
-  const duplicateOpen = ["requested", "approved", "executing"].includes(status?.deletionStatus);
+  const duplicateOpen = ["requested", "approved", "executing", "failed"].includes(status?.deletionStatus);
   async function commit() {
     const completed = dialog === "delete" ? await controller.requestDeletion() : dialog === "place" ? await controller.placeLegalHold(reason) : await controller.releaseLegalHold(reason);
     if (completed) { onNotify(dialog === "delete" ? "删除请求已提交审批" : dialog === "place" ? "法律保留已生效" : "法律保留已解除"); setDialog(""); setReason(""); }

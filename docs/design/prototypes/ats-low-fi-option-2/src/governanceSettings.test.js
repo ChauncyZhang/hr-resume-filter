@@ -687,10 +687,10 @@ test("new governance surfaces keep body, queue, detail, counts and actions at 16
     assert.match(styles, new RegExp(`\\.${selector}\\s*\\{[^}]*font-size:\\s*16px`), selector);
   }
   for (const selector of [
-    "candidate-governance \\.button", "governance-dialog \\.button",
+    "candidate-governance button", "governance-dialog button",
     "governance-dialog-body textarea", "deletion-queue-toolbar select",
-    "deletion-request-list > button", "deletion-request-drawer \\.button",
-    "deletion-approval-dialog \\.button",
+    "deletion-queue button", "deletion-request-drawer button",
+    "deletion-approval-dialog button",
   ]) {
     assert.match(styles, new RegExp(`\\.${selector}\\s*\\{[^}]*font-size:\\s*16px\\s*!important`), selector);
   }
