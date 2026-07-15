@@ -40,6 +40,30 @@ def seeded_pipeline(tmp_path,text=b"required: Python\nPython 5 years",filename="
     storage=MemoryPipelineStorage(dict(upload_storage.objects)); scanner=Scanner(); pipeline=ScreeningPipeline(app.state.identity_store.sync_session,storage,scanner,app.state.settings)
     return app,pipeline,storage,scanner,SimpleNamespace(organization_id=next(iter(storage.objects)).split("/")[1],payload={"organization_id":next(iter(storage.objects)).split("/")[1],"screening_item_id":item["id"],"parser_version":"parser-v1"},attempts=1,max_attempts=3),run,item
 
+def test_job_definition_api_snapshot_parses_and_scores_without_safe_error(tmp_path):
+    app,upload_storage,_=app_and_seed(tmp_path)
+    definition={"title":"Platform Engineer","department_id":None,"headcount":2,"priority":"high","hiring_owner_id":None,"description":"Build reliable Python services with SQL.","location":"Shanghai","process_template":"standard","llm_enabled":False,"must_have":["Python","SQL"],"nice_to_have":["FastAPI"],"publish":False}
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        created=client.post("/api/v1/job-definitions",json=definition,headers={**headers,"Idempotency-Key":"real-definition"})
+        assert created.status_code==201
+        job_id=created.json()["data"]["job"]["id"]
+        run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"real-run"}).json()["data"]
+        item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("candidate.txt",b"Python SQL FastAPI 5 years","text/plain")},headers={**headers,"Idempotency-Key":"real-item"}).json()["data"]
+    organization_id=next(iter(upload_storage.objects)).split("/")[1]
+    pipeline=ScreeningPipeline(app.state.identity_store.sync_session,MemoryPipelineStorage(dict(upload_storage.objects)),Scanner(),app.state.settings)
+    parse_job=SimpleNamespace(payload={"organization_id":organization_id,"screening_item_id":item["id"]},attempts=1,max_attempts=3)
+    asyncio.run(pipeline.parse_item(parse_job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"]))
+        score_job=SimpleNamespace(payload={"organization_id":organization_id,"screening_item_id":item["id"],"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
+        assert stored.status=="parsed"
+    asyncio.run(pipeline.score_item(score_job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); result=db.scalar(select(ScreeningResult).where(ScreeningResult.item_id==stored.id))
+        assert stored.status=="scored" and stored.safe_error_code is None
+        assert result.required_hits==["Python","SQL"] and result.bonus_hits==["FastAPI"]
+
 def test_clean_parse_then_score_is_replay_safe_and_never_auto_advances(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path)
     asyncio.run(pipeline.parse_item(job))
@@ -194,3 +218,13 @@ def test_score_handler_rejects_malformed_jd_snapshot_permanently(tmp_path):
         stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); db.get(JobJdVersion,aggregate.jd_version_id).content={"text":["private"]}; db.commit(); score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
     with pytest.raises(PermanentJobError) as raised: asyncio.run(pipeline.score_item(score_job))
     assert raised.value.safe_code=="rule_snapshot_invalid"
+
+def test_score_handler_rejects_conflicting_typed_and_legacy_jd_snapshot_permanently(tmp_path):
+    from server.app.recruiting.models import JobJdVersion
+    app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); db.get(JobJdVersion,aggregate.jd_version_id).content={"description":"Python role","text":"Rust role"}; db.commit(); score_job=SimpleNamespace(payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
+    with pytest.raises(PermanentJobError) as raised: asyncio.run(pipeline.score_item(score_job))
+    assert raised.value.safe_code=="rule_snapshot_invalid"
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); assert stored.status=="failed" and stored.safe_error_code=="rule_snapshot_invalid"

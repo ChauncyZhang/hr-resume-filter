@@ -21,6 +21,27 @@ _RETRYABLE={"scanner_unavailable","scanner_error","storage_unavailable"}
 def _uuid(item_id,name): return uuid.uuid5(uuid.UUID(str(item_id)),name)
 _PROMPT_CONTENT={"system":SCREENING_SYSTEM_PROMPT,"schema_version":"screening-evaluation-v1"}
 _PROMPT_VERSION=1
+_TYPED_JD_KEYS={"description","location","process_template","llm_enabled"}
+_TYPED_RULE_KEYS={"must_have","nice_to_have"}
+_LEGACY_JD_KEYS={"text","jd_text"}
+_LEGACY_RULE_KEYS={"required_terms","bonus_terms"}
+
+def _rule_snapshot(jd_content,rule_content):
+    if not isinstance(jd_content,dict) or not isinstance(rule_content,dict): raise RuleSnapshotError
+    jd_keys=set(jd_content)
+    if "description" in jd_content:
+        if not jd_keys<=_TYPED_JD_KEYS or jd_keys&_LEGACY_JD_KEYS: raise RuleSnapshotError
+        jd_text=jd_content["description"]
+    else:
+        aliases=jd_keys&_LEGACY_JD_KEYS
+        if len(aliases)>1 or jd_keys-aliases: raise RuleSnapshotError
+        jd_text=jd_content[next(iter(aliases))] if aliases else ""
+    rule_keys=set(rule_content)
+    if rule_keys&_TYPED_RULE_KEYS:
+        if not rule_keys<=_TYPED_RULE_KEYS or rule_keys&_LEGACY_RULE_KEYS: raise RuleSnapshotError
+        rule_content={"required_terms":rule_content.get("must_have"),"bonus_terms":rule_content.get("nice_to_have")}
+    return RuleSnapshot.from_content(jd_text,rule_content)
+
 def _ensure_screening_prompt(db,organization_id,created_by,*,content=None,version_number=_PROMPT_VERSION):
     prompt_content=dict(content or _PROMPT_CONTENT); prompt_hash=hashlib.sha256(json.dumps(prompt_content,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     prompt_id=uuid.uuid5(uuid.UUID(str(organization_id)),f"screening-evaluation:{version_number}")
@@ -118,8 +139,7 @@ class ScreeningPipeline:
             item,run,resume,jd,rule=row
             text=resume.parsed_text or ""
             try:
-                if not isinstance(jd.content,dict): raise RuleSnapshotError
-                jd_text=jd.content.get("text",jd.content.get("jd_text","")); snapshot=RuleSnapshot.from_content(jd_text,rule.content)
+                snapshot=_rule_snapshot(jd.content,rule.content)
             except RuleSnapshotError:
                 self._fail_terminal(organization_id,item_id,"rule_snapshot_invalid"); raise PermanentJobError("rule_snapshot_invalid") from None
         try: result=score_resume(text,snapshot)
