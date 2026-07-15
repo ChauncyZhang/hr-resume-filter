@@ -73,7 +73,7 @@ def seeded(databases):
             "application_audit", "resume_audit", "interview_audit", "feedback_audit",
             "screening_item_audit", "file_audit", "note_audit", "membership_audit",
             "malicious_audit", "other_audit", "idempotency", "upload_idempotency",
-            "other_idempotency",
+            "file_idempotency", "other_idempotency",
         )}
         seed_sql = r"""
             INSERT INTO organizations(id, slug, name, status, retention_policy_id, created_at, updated_at)
@@ -121,7 +121,11 @@ def seeded(databases):
                repeat('6',64), 201,
                jsonb_build_object('data', jsonb_build_object(
                  'id', CAST(:screening_item AS text),
-                 'filename', 'private-person.pdf',
+                 'filename', 'private-person.pdf'
+               )), now() + interval '1 day'),
+              (:file_idempotency, :organization, :user, 'legacy.file.import', 'file-related',
+               repeat('5',64), 201,
+               jsonb_build_object('data', jsonb_build_object(
                  'file_object_id', CAST(:file AS text)
                )), now() + interval '1 day'),
               (:other_idempotency, :organization, :user, 'job.create', 'unrelated',
@@ -390,7 +394,6 @@ def test_redaction_clears_full_pii_inventory_and_retains_aggregate_facts(
             "data": {
                 "id": str(seeded["screening_item"]),
                 "filename": "private-person.pdf",
-                "file_object_id": str(seeded["file"]),
             }
         }
 
@@ -517,6 +520,9 @@ def test_redaction_clears_full_pii_inventory_and_retains_aggregate_facts(
         assert connection.scalar(text(
             "SELECT count(*) FROM idempotency_records WHERE id=:other_idempotency"
         ), seeded) == 1
+        assert connection.scalar(text(
+            "SELECT count(*) FROM idempotency_records WHERE id=:file_idempotency"
+        ), seeded) == 0
         remaining_idempotency_payloads = connection.scalars(text("""
             SELECT response_json::text
             FROM idempotency_records
