@@ -2,6 +2,7 @@ import asyncio
 import io
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -836,6 +837,7 @@ def test_terminal_callback_matches_exact_tenant_request_version_and_executing(tm
 def test_worker_and_governance_terminal_logs_never_include_payload_or_pii(
     tmp_path,
 ) -> None:
+    from server.app.core.logging import JsonFormatter
     from server.app.governance.terminal import finalize_deletion_dead_letter
     from server.app.worker.main import Worker
 
@@ -877,6 +879,7 @@ def test_worker_and_governance_terminal_logs_never_include_payload_or_pii(
         attempts=1,
         trace_id="safe-trace-id",
     )
+    sensitive_values = (*sensitive_values, repr(malicious_job.payload))
 
     async def fail_with_sensitive_exception(_job):
         raise RuntimeError(
@@ -893,12 +896,15 @@ def test_worker_and_governance_terminal_logs_never_include_payload_or_pii(
         worker_id="safe-worker-id",
     )
     records = []
+    formatted_records = []
 
     class CaptureHandler(logging.Handler):
         def emit(self, record):
             records.append(record)
+            formatted_records.append(self.format(record))
 
     capture = CaptureHandler()
+    capture.setFormatter(JsonFormatter())
     worker_logger = logging.getLogger("server.app.worker.main")
     terminal_logger = logging.getLogger("server.app.governance.terminal")
     worker_logger.addHandler(capture)
@@ -912,8 +918,34 @@ def test_worker_and_governance_terminal_logs_never_include_payload_or_pii(
         (malicious_job.id, "safe-worker-id", "handler_failed", True)
     ]
     assert records
-    for record in records:
-        rendered = f"{record.getMessage()} {getattr(record, 'context', {})!r}"
+
+    try:
+        raise RuntimeError(" ".join(sensitive_values))
+    except RuntimeError:
+        sensitive_exc_info = sys.exc_info()
+    malicious_record = logging.LogRecord(
+        name="server.app.worker.main",
+        level=logging.ERROR,
+        pathname=filename,
+        lineno=916,
+        msg="worker_item_failed",
+        args=(),
+        exc_info=sensitive_exc_info,
+    )
+    malicious_record.exc_text = "sensitive traceback " + " ".join(sensitive_values)
+    malicious_record.context = dict(getattr(records[0], "context", {}))
+    malicious_record.filename = filename
+    malicious_record.object_key = object_key
+    malicious_record.candidate_text = candidate_text
+    malicious_record.secret = secret
+    malicious_record.payload = malicious_job.payload
+    capture.handle(malicious_record)
+
+    assert malicious_record.exc_info is not None
+    assert malicious_record.exc_text
+    assert all(hasattr(malicious_record, key) for key in malicious_job.payload)
+    assert len(formatted_records) == len(records)
+    for record, rendered in zip(records, formatted_records, strict=True):
         assert all(value not in rendered for value in sensitive_values)
         context = getattr(record, "context", {})
         assert set(context) <= {
@@ -926,6 +958,7 @@ def test_worker_and_governance_terminal_logs_never_include_payload_or_pii(
         }
 
     records.clear()
+    formatted_records.clear()
     terminal_job = _job(organization_id, request_id, 2)
     terminal_job.filename = filename
     terminal_job.object_key = object_key
