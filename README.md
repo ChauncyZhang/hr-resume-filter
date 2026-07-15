@@ -171,15 +171,17 @@ dist/hr-resume-filter-windows.zip
 
 把这个 zip 发给 HR，HR 解压后双击 `Windows用户点我启动.bat` 即可，不需要安装 Python。
 
-## Linux 服务器部署
+## 生产运维入口
 
-服务器部署文档见：
+运维人员统一从以下 canonical 文档开始：
 
-```text
-app/deploy/linux/README.md
-```
+- [生产部署、升级与回滚](deploy/production-operations-runbook.md)
+- [备份与恢复](deploy/backup-recovery-runbook.md)
+- [监控、告警与排障](deploy/observability/runbook.md)
 
-推荐使用 systemd 启动服务，再通过 Nginx 做反向代理和访问控制。
+当前仓库的本地测试和 Compose 拓扑检查只属于代码门禁，不能证明生产环境可用。上线前仍必须按上述 runbook 在目标 Linux 主机、真实域名和 TLS 链路、真正异地的备份目的端以及实际告警接收端完成环境验收和恢复演练。
+
+当前 Phase 6C 仅提供 fail-closed 的运维基础，不是 production ready；环境验收和 runbook 中的发布阻塞项未全部关闭前，不得开放生产流量。
 
 ## 命令行筛选
 

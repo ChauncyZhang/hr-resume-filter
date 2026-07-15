@@ -2,6 +2,20 @@
 
 Python 3.12 is required. The existing `app/web_app.py` remains a separate local tool.
 
+## Production operations entry point
+
+Use these canonical runbooks for production operations:
+
+- [Deployment, upgrade, and rollback](../deploy/production-operations-runbook.md)
+- [Backup and recovery](../deploy/backup-recovery-runbook.md)
+- [Observability, alerting, and triage](../deploy/observability/runbook.md)
+
+The local backend and topology gates below validate code and static deployment contracts only.
+Environment acceptance must still run against the target Linux host, the real DNS/TLS domain, a
+genuinely off-host backup destination with a complete restore drill, and the actual alert receiver.
+This Phase 6C foundation is fail-closed and is not production ready; do not open production traffic
+until every runbook blocker and environment gate has passed.
+
 ## Local tests
 
 The reproducible test path uses the project's Python 3.12 Docker target:
