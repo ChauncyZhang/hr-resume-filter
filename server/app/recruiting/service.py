@@ -11,6 +11,7 @@ from server.app.governance.retention import (
     lock_candidate_retention_facts,
     recalculate_candidate_retention,
 )
+from server.app.screening.rules import RuleSnapshot,RuleSnapshotError
 
 
 class InvalidStateTransition(Exception): pass
@@ -20,6 +21,16 @@ class ActiveApplicationExists(Exception): pass
 class TicketInvalid(Exception): pass
 class InvalidAggregateRelationship(Exception): pass
 class CandidateUnavailable(InvalidStateTransition): pass
+
+
+def _job_definition_contents(command):
+    try:
+        jd_content={key:command[key] for key in ("description","location","process_template","llm_enabled")}
+        rule_content={key:command[key] for key in ("must_have","nice_to_have")}
+    except (KeyError,TypeError) as error:
+        raise RuleSnapshotError from error
+    RuleSnapshot.from_storage(jd_content,rule_content)
+    return jd_content,rule_content
 
 
 def lock_active_candidate(db, organization_id, candidate_id):
@@ -201,6 +212,7 @@ def create_job_definition_record(db, organization_id, actor_user_id, command, *,
     from server.app.identity.models import AuditLog, Job, JobCollaborator
     from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
 
+    jd_content,rule_content=_job_definition_contents(command)
     job = Job(
         organization_id=organization_id,
         owner_id=actor_user_id,
@@ -213,14 +225,14 @@ def create_job_definition_record(db, organization_id, actor_user_id, command, *,
         organization_id=organization_id,
         job_id=job.id,
         version_number=1,
-        content={key: command[key] for key in ("description", "location", "process_template", "llm_enabled")},
+        content=jd_content,
         created_by=actor_user_id,
     )
     rules = ScreeningRuleVersion(
         organization_id=organization_id,
         job_id=job.id,
         version_number=1,
-        content={key: command[key] for key in ("must_have", "nice_to_have")},
+        content=rule_content,
         created_by=actor_user_id,
     )
     db.add_all([
@@ -239,6 +251,7 @@ def replace_job_definition_record(db, organization_id, job_id, actor_user_id, co
     from server.app.identity.models import AuditLog, Job
     from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
 
+    jd_content,rule_content=_job_definition_contents(command)
     job = lock_job_for_version_write(db, organization_id, job_id)
     if job is None or job.version != expected_version:
         raise ResourceVersionConflict
@@ -253,8 +266,8 @@ def replace_job_definition_record(db, organization_id, job_id, actor_user_id, co
     job.updated_at = datetime.now(timezone.utc)
     jd_number = (db.scalar(select(func.max(JobJdVersion.version_number)).where(JobJdVersion.organization_id == organization_id, JobJdVersion.job_id == job_id)) or 0) + 1
     rule_number = (db.scalar(select(func.max(ScreeningRuleVersion.version_number)).where(ScreeningRuleVersion.organization_id == organization_id, ScreeningRuleVersion.job_id == job_id)) or 0) + 1
-    jd = JobJdVersion(organization_id=organization_id, job_id=job_id, version_number=jd_number, content={key: command[key] for key in ("description", "location", "process_template", "llm_enabled")}, created_by=actor_user_id)
-    rules = ScreeningRuleVersion(organization_id=organization_id, job_id=job_id, version_number=rule_number, content={key: command[key] for key in ("must_have", "nice_to_have")}, created_by=actor_user_id)
+    jd = JobJdVersion(organization_id=organization_id, job_id=job_id, version_number=jd_number, content=jd_content, created_by=actor_user_id)
+    rules = ScreeningRuleVersion(organization_id=organization_id, job_id=job_id, version_number=rule_number, content=rule_content, created_by=actor_user_id)
     db.add_all([jd, rules])
     db.flush()
     safe_metadata = {"job_id": str(job.id), "job_version": job.version, "jd_version_number": jd_number, "rule_version_number": rule_number, "published": command["publish"]}

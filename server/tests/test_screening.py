@@ -52,7 +52,14 @@ def test_rule_snapshot_overrides_are_immutable_validated_and_change_results() ->
     second=RuleSnapshot.from_content("required: Python",{"required_terms":["Rust"],"bonus_terms":[]})
     assert score_resume("Python Docker 5 years",first).score > score_resume("Python Docker 5 years",second).score
     assert first.required_terms==("Python",) and first.bonus_terms==("Docker",)
-    for malformed in ({"required_terms":"Python"},{"required_terms":["x"*101]},{"unknown":[]}):
+    for malformed in (
+        {"required_terms":"Python","bonus_terms":[]},
+        {"required_terms":["x"*101],"bonus_terms":[]},
+        {"required_terms":[],"bonus_terms":[],"unknown":[]},
+        {"required_terms":[]},
+        {"required_terms":None,"bonus_terms":[]},
+        {"must_have":[],"nice_to_have":[],"required_terms":[],"bonus_terms":[]},
+    ):
         with pytest.raises(RuleSnapshotError): RuleSnapshot.from_content("required: Python",malformed)
 
 

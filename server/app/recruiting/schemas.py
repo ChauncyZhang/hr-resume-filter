@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from server.app.screening.rules import MAX_JD_TEXT_CHARS,MAX_RULE_TERM_CHARS,MAX_RULE_TERMS
 
 
 class ApiModel(BaseModel):
@@ -67,7 +68,7 @@ class JobMeta(ApiModel):
     status_counts: dict[str, int]
 
 
-RuleItem = Annotated[str, Field(min_length=1, max_length=500)]
+RuleItem = Annotated[str, Field(min_length=1, max_length=MAX_RULE_TERM_CHARS)]
 
 
 class JobDefinitionCommand(ApiModel):
@@ -76,12 +77,12 @@ class JobDefinitionCommand(ApiModel):
     headcount: int = Field(ge=1, le=1000)
     priority: Literal["high", "normal", "low"]
     hiring_owner_id: UUID | None = None
-    description: str = Field(min_length=1, max_length=50_000)
+    description: str = Field(min_length=1, max_length=MAX_JD_TEXT_CHARS)
     location: str = Field(max_length=200)
     process_template: str = Field(min_length=1, max_length=100)
     llm_enabled: bool
-    must_have: list[RuleItem] = Field(max_length=100)
-    nice_to_have: list[RuleItem] = Field(max_length=100)
+    must_have: list[RuleItem] = Field(max_length=MAX_RULE_TERMS)
+    nice_to_have: list[RuleItem] = Field(max_length=MAX_RULE_TERMS)
     publish: bool
 
     @field_validator("title", "description", "process_template")

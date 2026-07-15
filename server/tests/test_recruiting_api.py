@@ -1279,12 +1279,12 @@ def test_job_definition_rejects_unknown_fields_and_all_size_boundaries(tmp_path)
         job_definition_payload(description="x" * 50_001),
         job_definition_payload(location="x" * 201),
         job_definition_payload(process_template="x" * 101),
-        job_definition_payload(must_have=["x" * 501]),
-        job_definition_payload(nice_to_have=["x"] * 101),
+        job_definition_payload(must_have=["x" * 101]),
+        job_definition_payload(nice_to_have=["x"] * 51),
         job_definition_payload(headcount=0),
         job_definition_payload(headcount=1001),
     ]
-    valid_boundary = job_definition_payload(title="x" * 200, description="x" * 50_000, location="x" * 200, process_template="x" * 100, must_have=["x" * 500], nice_to_have=["x"] * 100, headcount=1000)
+    valid_boundary = job_definition_payload(title="x" * 200, description="x" * 50_000, location="x" * 200, process_template="x" * 100, must_have=["x" * 100], nice_to_have=["x"] * 50, headcount=1000)
     with TestClient(app) as client:
         headers = login(client, "admin@example.test")
         rejected = [client.post("/api/v1/job-definitions", json=payload, headers={**headers, "Idempotency-Key": f"invalid-{index}"}) for index, payload in enumerate(invalid_payloads)]
@@ -1293,7 +1293,7 @@ def test_job_definition_rejects_unknown_fields_and_all_size_boundaries(tmp_path)
     assert accepted.status_code == 201
 
 
-def test_job_definition_legacy_content_cannot_override_version_identity(tmp_path) -> None:
+def test_job_definition_content_with_injected_version_identity_fails_closed(tmp_path) -> None:
     app = make_app(tmp_path)
     admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
     with app.state.identity_store.sync_session() as db:
@@ -1302,15 +1302,13 @@ def test_job_definition_legacy_content_cannot_override_version_identity(tmp_path
         db.add(job); db.flush()
         jd = JobJdVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"id": "attacker-jd", "version_number": 999, "description": "Safe", "location": "Remote", "process_template": "standard", "llm_enabled": False})
         rules = ScreeningRuleVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"id": "attacker-rules", "version_number": 999, "must_have": [], "nice_to_have": []})
-        db.add_all([jd, rules]); db.commit(); job_id, jd_id, rules_id = str(job.id), str(jd.id), str(rules.id)
+        db.add_all([jd, rules]); db.commit(); job_id = str(job.id)
     with TestClient(app) as client:
         login(client, "admin@example.test")
         response = client.get(f"/api/v1/job-definitions/{job_id}")
-    assert response.status_code == 200
-    assert response.json()["data"]["jd"]["id"] == jd_id
-    assert response.json()["data"]["jd"]["version_number"] == 1
-    assert response.json()["data"]["rules"]["id"] == rules_id
-    assert response.json()["data"]["rules"]["version_number"] == 1
+    assert response.status_code == 409
+    assert response.json()["code"] == "job_definition_incompatible"
+    assert "attacker-jd" not in response.text and "attacker-rules" not in response.text
 
 
 def test_job_definition_normalizes_text_only_legacy_content(tmp_path) -> None:
@@ -1321,7 +1319,7 @@ def test_job_definition_normalizes_text_only_legacy_content(tmp_path) -> None:
         job = Job(organization_id=admin.organization_id, title="Legacy text", owner_id=admin.id)
         db.add(job); db.flush()
         jd = JobJdVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"text": "old shape"})
-        rules = ScreeningRuleVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={})
+        rules = ScreeningRuleVersion(organization_id=admin.organization_id, job_id=job.id, version_number=1, created_by=admin.id, content={"required_terms": [], "bonus_terms": []})
         db.add_all([jd, rules]); db.commit(); job_id, jd_id, rules_id = str(job.id), str(jd.id), str(rules.id)
     with TestClient(app) as client:
         login(client, "admin@example.test")
@@ -1345,7 +1343,7 @@ def test_job_definition_normalizes_text_only_legacy_content(tmp_path) -> None:
         stored_jd = db.get(JobJdVersion, UUID(jd_id))
         stored_rules = db.get(ScreeningRuleVersion, UUID(rules_id))
         assert stored_jd.content == {"text": "old shape"}
-        assert stored_rules.content == {}
+        assert stored_rules.content == {"required_terms": [], "bonus_terms": []}
         assert db.scalar(select(func.count()).select_from(JobJdVersion).where(JobJdVersion.job_id == UUID(job_id))) == 1
         assert db.scalar(select(func.count()).select_from(ScreeningRuleVersion).where(ScreeningRuleVersion.job_id == UUID(job_id))) == 1
 

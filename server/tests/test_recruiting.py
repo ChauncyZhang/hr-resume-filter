@@ -20,10 +20,12 @@ from server.app.recruiting.service import (
     transition_application_record,
     transition_job_record,
     consume_download_ticket_record,
+    create_job_definition_record,
     create_application_record,
     issue_download_ticket_record,
     persisted_idempotent,
 )
+from server.app.screening.rules import RuleSnapshotError
 
 
 class FixedClock:
@@ -152,6 +154,12 @@ def test_candidate_schema_has_no_job_or_stage_and_all_recruiting_tables_are_mapp
     required = {"job_jd_versions", "screening_rule_versions", "candidates", "candidate_contacts", "file_objects", "resumes", "applications", "application_stage_events", "candidate_notes", "candidate_events", "download_tickets", "idempotency_records"}
     assert required <= set(Base.metadata.tables)
     assert any("stage in" in str(constraint.sqltext) for constraint in Application.__table__.constraints if hasattr(constraint, "sqltext"))
+
+
+def test_job_definition_service_rejects_unscorable_rules_before_writing():
+    command={"title":"Role","department_id":None,"headcount":1,"priority":"normal","hiring_owner_id":None,"description":"JD","location":"","process_template":"standard","llm_enabled":False,"must_have":["x"*101],"nice_to_have":[],"publish":False}
+    with pytest.raises(RuleSnapshotError):
+        create_job_definition_record(None,UUID(int=1),UUID(int=2),command,trace_id="trace")
 
 
 def test_cursor_is_opaque_tenant_and_sort_bound_and_rejects_tampering():

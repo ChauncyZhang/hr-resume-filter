@@ -24,6 +24,7 @@ from server.app.recruiting.models import (
     DownloadTicket, JobJdVersion, Resume, ScreeningRuleVersion,
 )
 from server.app.screening.models import ScreeningResult
+from server.app.screening.rules import RuleSnapshotError,normalize_rule_content
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.http import content_disposition
 from server.app.recruiting.storage import MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, StorageObjectTooLarge, StorageReadFailed
@@ -238,10 +239,9 @@ def _job_jd_definition(jd: JobJdVersion) -> dict[str, Any]:
 
 
 def _screening_rules_definition(rules: ScreeningRuleVersion) -> dict[str, Any]:
-    content = rules.content
-    if isinstance(content, dict) and not content:
-        content = {"must_have": [], "nice_to_have": []}
-    elif not isinstance(content, dict):
+    try:
+        content = normalize_rule_content(rules.content)
+    except RuleSnapshotError:
         content = {}
     return {"id": str(rules.id), "version_number": rules.version_number, **{key: content.get(key) for key in ("must_have", "nice_to_have")}}
 

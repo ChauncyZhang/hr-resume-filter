@@ -3,6 +3,41 @@ from dataclasses import dataclass
 from collections.abc import Iterable,Mapping
 
 ENGINE_VERSION = "rule-v1"
+MAX_JD_TEXT_CHARS = 50_000
+MAX_RULE_TERMS = 50
+MAX_RULE_TERM_CHARS = 100
+TYPED_RULE_KEYS = frozenset({"must_have", "nice_to_have"})
+LEGACY_RULE_KEYS = frozenset({"required_terms", "bonus_terms"})
+_TYPED_JD_KEYS = frozenset({"description", "location", "process_template", "llm_enabled"})
+
+
+def normalize_rule_content(content: object) -> dict[str,list[str]]:
+    if not isinstance(content,Mapping): raise RuleSnapshotError
+    keys=set(content)
+    if keys==TYPED_RULE_KEYS:
+        required_name,bonus_name="must_have","nice_to_have"
+    elif keys==LEGACY_RULE_KEYS:
+        required_name,bonus_name="required_terms","bonus_terms"
+    else:
+        raise RuleSnapshotError
+    def terms(name):
+        value=content[name]
+        if not isinstance(value,list) or len(value)>MAX_RULE_TERMS or any(not isinstance(term,str) or not 1<=len(term.strip())<=MAX_RULE_TERM_CHARS for term in value): raise RuleSnapshotError
+        return [term.strip() for term in value]
+    return {"must_have":terms(required_name),"nice_to_have":terms(bonus_name)}
+
+
+def _jd_text(content: object) -> str:
+    if not isinstance(content,Mapping): raise RuleSnapshotError
+    keys=set(content)
+    if "description" in content and keys<=_TYPED_JD_KEYS:
+        value=content["description"]
+    elif keys in ({"text"},{"jd_text"}):
+        value=content[next(iter(keys))]
+    else:
+        raise RuleSnapshotError
+    if not isinstance(value,str) or not 1<=len(value.strip())<=MAX_JD_TEXT_CHARS: raise RuleSnapshotError
+    return value.strip()
 
 @dataclass(frozen=True)
 class RuleSnapshot:
@@ -11,14 +46,13 @@ class RuleSnapshot:
     bonus_terms: tuple[str,...]|None=None
     @classmethod
     def from_content(cls,jd_text:str,content:object):
-        if not isinstance(jd_text,str) or len(jd_text)>500_000: raise RuleSnapshotError
-        if not isinstance(content,Mapping) or not set(content)<={"required_terms","bonus_terms"}: raise RuleSnapshotError
-        def terms(name):
-            value=content.get(name)
-            if value is None: return None
-            if not isinstance(value,list) or len(value)>50 or any(not isinstance(term,str) or not 1<=len(term.strip())<=100 for term in value): raise RuleSnapshotError
-            return tuple(_unique(term.strip() for term in value))
-        return cls(jd_text,terms("required_terms"),terms("bonus_terms"))
+        if not isinstance(jd_text,str) or not 1<=len(jd_text.strip())<=MAX_JD_TEXT_CHARS or not isinstance(content,Mapping) or set(content)!=LEGACY_RULE_KEYS: raise RuleSnapshotError
+        normalized=normalize_rule_content(content)
+        return cls(jd_text.strip(),tuple(normalized["must_have"]),tuple(normalized["nice_to_have"]))
+    @classmethod
+    def from_storage(cls,jd_content:object,rule_content:object):
+        normalized=normalize_rule_content(rule_content)
+        return cls(_jd_text(jd_content),tuple(normalized["must_have"]),tuple(normalized["nice_to_have"]))
 
 class RuleSnapshotError(ValueError): pass
 
