@@ -214,6 +214,7 @@ test("maps candidate, rule, LLM, risk, and application fields while retaining ru
     error: "provider_rate_limited",
     application_stage: "screening",
     application_version: 4,
+    llmStatus: "failed",
     retryable: true,
     llmRetryable: true,
   });
@@ -231,6 +232,8 @@ test("marks rule failures failed and completed rule/LLM combinations successful"
   assert.equal(files[0].error, "parse_failed");
   assert.equal(files[1].ruleScore, 80);
   assert.equal(files[1].llmScore, 76);
+  assert.equal(files[2].llmStatus, "skipped");
+  assert.equal(files[3].llmStatus, "not_requested");
 });
 
 test("malformed optional result fields normalize to safe null and empty display values", () => {
@@ -400,8 +403,13 @@ test("retry uses its endpoint and a fresh idempotency key each time", async () =
 test("bulk advance posts selected item versions with a fresh key and abort signal", async () => {
   const signal = new AbortController().signal;
   const client = createClient([
-    { data: { applied_count: 1, already_applied_count: 1 } },
+    { data: { applied_count: 1, already_applied_count: 1, applications: [
+      { item_id: "item/1", version: 4, result: "applied" },
+      { item_id: "item-2", version: 8, result: "already_applied" },
+      { item_id: "unsafe", version: "9", result: "applied" },
+    ] } },
     { data: { applied_count: 0, already_applied_count: 2 } },
+    { data: { applied_count: 1, already_applied_count: 0 } },
   ]);
   let key = 0;
   const controller = createScreeningController({ client, createIdempotencyKey: () => `bulk-${++key}` });
@@ -410,8 +418,13 @@ test("bulk advance posts selected item versions with a fresh key and abort signa
     { item_id: "item-2", expected_application_version: 7 },
   ];
 
-  assert.deepEqual(await controller.bulkAction("run/1", items, { signal }), { applied: 1, already_applied: 1 });
+  assert.deepEqual(await controller.bulkAction("run/1", items, { signal }), {
+    applied: 1,
+    already_applied: 1,
+    undo_items: [{ item_id: "item/1", expected_application_version: 4 }],
+  });
   await controller.bulkAction("run/1", items, { signal });
+  await controller.undoBulkAction("run/1", [{ item_id: "item/1", expected_application_version: 4 }], { signal });
 
   assert.deepEqual(client.calls, [
     {
@@ -429,6 +442,15 @@ test("bulk advance posts selected item versions with a fresh key and abort signa
         method: "POST",
         body: { command: "advance_to_review", items },
         idempotencyKey: "bulk-2",
+        signal,
+      },
+    },
+    {
+      path: "/api/v1/screening-runs/run%2F1/bulk-actions",
+      options: {
+        method: "POST",
+        body: { command: "undo_advance_to_new", items: [{ item_id: "item/1", expected_application_version: 4 }] },
+        idempotencyKey: "bulk-3",
         signal,
       },
     },

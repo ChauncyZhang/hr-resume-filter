@@ -1116,8 +1116,8 @@ def applications(candidate_id: UUID, request: Request):
     if isinstance(principal, JSONResponse): return principal
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate(db, principal, candidate_id) is None: return _denied(request)
-        rows = db.scalars(select(Application).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.candidate_id == candidate_id, _job_scope(principal)).order_by(Application.created_at.desc())).all()
-        return {"data": [_application_data(row) for row in rows], "meta": {"count": len(rows)}}
+        rows = db.execute(select(Application, Job.title).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.candidate_id == candidate_id, _job_scope(principal)).order_by(Application.created_at.desc())).all()
+        return {"data": [{**_application_data(application), "job_title": job_title} for application, job_title in rows], "meta": {"count": len(rows)}}
 
 
 @router.post("/jobs/{job_id}/applications", status_code=201, response_model=ApplicationResource)

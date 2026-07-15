@@ -241,7 +241,7 @@ def test_production_nginx_contract_is_https_only_and_keeps_metrics_private() -> 
     assert "ssl_protocols TLSv1.2 TLSv1.3" in template
     assert "ssl_certificate /etc/nginx/tls/tls.crt" in template
     assert "ssl_certificate_key /etc/nginx/tls/tls.key" in template
-    assert "client_max_body_size 10m" in template
+    assert "client_max_body_size 11m" in template
     assert "proxy_pass http://api:8000" in template
     assert "proxy_set_header X-Trace-ID $http_x_trace_id" in template
     assert "try_files $uri $uri/ /index.html" in template

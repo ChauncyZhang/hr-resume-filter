@@ -167,6 +167,10 @@ class ApplicationOut(ApiModel):
     updated_at: str
 
 
+class ApplicationHistoryOut(ApplicationOut):
+    job_title: str
+
+
 class VersionOut(ApiModel):
     id: str
     version_number: int
@@ -276,7 +280,7 @@ class JobCollection(ApiModel): data: list[JobListOut]; meta: JobMeta
 class CandidateResource(ApiModel): data: CandidateOut
 class CandidateCollection(ApiModel): data: list[CandidateListOut]; meta: CandidateMeta
 class ApplicationResource(ApiModel): data: ApplicationOut
-class ApplicationCollection(ApiModel): data: list[ApplicationOut]; meta: Meta
+class ApplicationCollection(ApiModel): data: list[ApplicationHistoryOut]; meta: Meta
 class VersionResource(ApiModel): data: VersionOut
 class VersionCollection(ApiModel): data: list[VersionOut]; meta: Meta
 class NoteResource(ApiModel): data: NoteOut

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
 const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+const interviewSource = readFileSync(new URL("./InterviewViews.jsx", import.meta.url), "utf8");
 
 test("schedule candidate loading follows every server cursor", () => {
   assert.match(appSource, /let cursor = ""/);
@@ -16,4 +17,14 @@ test("interview pagination appends the next server page without replacing existi
   assert.match(appSource, /append \? \[\.\.\.current\.records, \.\.\.page\.records\]/);
   assert.match(appSource, /cursor: interviewState\.nextCursor/);
   assert.match(appSource, /onLoadMore/);
+});
+
+test("candidate detail scheduling preserves a server-backed candidate id", () => {
+  assert.match(appSource, /setScheduleCandidateId\(candidate\?\.id \|\| candidate\?\.candidateId \|\| null\)/);
+});
+
+test("schedule form hydrates an asynchronously loaded candidate without replacing a user selection", () => {
+  assert.match(interviewSource, /const loadedCandidate = candidates\.find/);
+  assert.match(interviewSource, /current\.candidateId \? current/);
+  assert.match(interviewSource, /position: current\.position \|\| loadedCandidate\.position/);
 });

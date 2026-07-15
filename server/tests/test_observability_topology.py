@@ -124,6 +124,15 @@ def test_three_compose_files_publish_only_the_https_proxy(tmp_path: Path) -> Non
     assert "no-new-privileges:true" in node["security_opt"]
     assert node["pid"] == "host"
     assert "--path.rootfs=/host/root" in node["command"]
+    assert "--collector.textfile.directory=/var/lib/node_exporter/textfile_collector" in node["command"]
+    textfile_mounts = [
+        volume
+        for volume in node["volumes"]
+        if volume["target"] == "/var/lib/node_exporter/textfile_collector"
+    ]
+    assert len(textfile_mounts) == 1
+    assert textfile_mounts[0]["source"] == "/var/lib/ux09-backup/metrics"
+    assert textfile_mounts[0]["read_only"] is True
     runbook = RUNBOOK.read_text(encoding="utf-8")
     assert "production Linux host filesystems" in runbook
     assert "Docker Desktop Linux VM" in runbook
@@ -159,6 +168,9 @@ def test_node_exporter_runtime_exposes_host_filesystem_series(
         str(OBSERVABILITY_COMPOSE),
     ]
     environment = _compose_environment(tmp_path)
+    backup_state = tmp_path / "backup-state"
+    (backup_state / "metrics").mkdir(parents=True)
+    environment["BACKUP_STATE_DIR"] = str(backup_state)
     started = subprocess.run(
         [
             *compose,

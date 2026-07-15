@@ -2,7 +2,7 @@
 
 ## Status and safety boundary
 
-This is the canonical Phase 6C foundation runbook. It defines executable
+This is the canonical Phase 6C runbook. It defines executable
 contracts for paired PostgreSQL and business-object restore points, independent
 ledger archives, pruning, isolated restore, and evidence. It is not production
 ready until an off-host destination is provisioned, least-privilege identities
@@ -12,11 +12,11 @@ complete real restore drill proves the 24-hour RPO and 4-hour RTO.
 Never run restore or drill commands against the `ux09` Compose project or its
 volumes. The guard requires `DISPOSABLE_RECOVERY_CONFIRMED=1`, a project named
 `ux09-backup-drill-<unique>`, and volumes whose names begin with that exact
-project name. The foundation traffic-gate command is permanently closed and
-exits with safety code 78. It cannot create an open marker from caller JSON,
-mock output, unsigned evidence, or replayed evidence. A future reviewed change
-may implement the released signed B2B3 protocol; this foundation contains no
-open transition.
+project name. The traffic-gate command is permanently closed: it removes any
+stale open marker and, after validating signed replay-resistant B2B3 evidence,
+writes only traffic-closed evidence. Missing, caller-authored, unsigned,
+misbound, or replayed evidence exits with safety code 78. This repository
+contains no production traffic-open transition.
 
 ## Architecture and trust boundaries
 
@@ -174,12 +174,39 @@ remote state and escalate to provider-backed investigation; do not bypass the
 lease with a new run ID. Exit 75 must never be worked around with
 list-then-write or manual overwrite.
 
-Schedule ledger archive followed by paired backup at least every 12 hours. A
-systemd timer should use `OnCalendar=*-*-* 00,12:00:00`,
-`Persistent=true`, randomized delay, and an overlap-preventing lock. Alert on
-the user-impacting symptom that no valid complete restore point has been
-published within 18 hours; page before the 24-hour RPO is exhausted. Do not
-infer freshness from process success or a dump file alone.
+Schedule ledger archive followed by paired backup at least every 12 hours. On
+the approved Linux host, render and verify the supplied units, then enable the
+timer only after a successful canary:
+
+```sh
+UX09_DEPLOY_ROOT=/opt/ux09 \
+BACKUP_SYSTEMD_ENV_FILE=/etc/ux09/backup.env \
+deploy/backup/render-systemd-units.sh
+systemctl daemon-reload
+systemctl start ux09-backup.service
+systemctl enable --now ux09-backup.timer
+systemctl list-timers ux09-backup.timer
+```
+
+The renderer requires a regular, non-symlink environment file with mode 0600
+or stricter and one link. It verifies the units with `systemd-analyze`, uses
+`OnCalendar=*-*-* 00,12:00:00`, `Persistent=true`, randomized delay, and the
+coordinator's non-blocking `fcntl` lock. The coordinator advances freshness
+only after fetching and validating the exact remote complete group and at least
+two valid restore points. Every counted business restore point must also have
+its independently stored ledger group fetched and revalidated for signature,
+manifest hash, run ID, and cutoff binding. Alert after 18 hours and page after
+the 24-hour RPO. Do not infer freshness from process success or a dump file
+alone.
+
+The scheduler writes `/var/lib/ux09-backup/pending-run.json` before the first
+remote operation. Any failure preserves that file and the matching `runs/`
+workspace; exit 75/76 during either publish stage marks the state
+`reconciliation_required`. Later timer deliveries fail closed while the file
+exists. Stop the timer, reconcile the exact recorded ledger or business run ID,
+fetch and validate the resulting complete group, archive the non-PII incident
+evidence, and only then remove `pending-run.json` and its matching workspace.
+Never clear it merely to make the next timer run.
 
 ## Complete-group-only prune
 
@@ -258,15 +285,17 @@ The drill sequence is strict:
    intentionally does not implement or fake either interface.
 6. Require B2B3 evidence for tombstones, absent objects, safe audit counts,
    generation, repeat idempotency, tamper failure, and checkpoint reclaim.
-7. Stop: this foundation cannot open traffic. `traffic-gate.sh` always removes
-   a stale open marker and exits 78 regardless of supplied JSON. After the real
-   signed, replay-resistant B2B3 protocol is released, implement and review its
-   integration in a later slice, then run HTTPS readiness/read-only smoke and
-   prove `failure_at - backup_cutoff <= 24 hours` and total RTO `<= 4 hours`.
+7. Run `traffic-gate.sh` with the independently signed B2B3 evidence and verify
+   that it removes any stale open marker and writes the bound traffic-closed
+   drill evidence. It exits 78 for missing, invalid, replayed, or misbound
+   evidence. It never creates an open marker. Then run HTTPS
+   readiness/read-only smoke while traffic remains closed and prove
+   `failure_at - backup_cutoff <= 24 hours` and total RTO `<= 4 hours`.
 
 Until step 7 completes, do not publish ports, remove the traffic-closed marker,
-or route production traffic. `drill.sh` deliberately fails closed while the
-real B2B3 integration is unavailable.
+or route production traffic. A successful drill still requires the released
+real B2B3 implementations and independent signing identity; repository tests
+and caller-authored evidence do not satisfy that requirement.
 
 ## Full-host recovery
 

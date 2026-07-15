@@ -75,6 +75,20 @@ test("server LLM retry is offered only when the backend marks it retryable", () 
   ]), []);
 });
 
+test("server rules-only success explains the deterministic LLM degradation", () => {
+  const message = helpers.serverIssueMessage({ status: "success", llmStatus: "skipped" });
+
+  assert.match(message, /LLM 未启用/);
+  assert.match(message, /规则评分已保留/);
+});
+
+test("server malware rejection is explicit and never offers retry", () => {
+  const message = helpers.serverIssueMessage({ status: "failed", error: "malware_detected", retryable: false });
+
+  assert.match(message, /恶意文件/);
+  assert.match(message, /已拒绝/);
+});
+
 test("server task metadata is explicitly labeled as a local record", () => {
   const line = helpers.taskMetadataLine({ id: "run-1", source: "BOSS 直聘", creator: "张小北", createdAt: "刚刚", serverBacked: true });
 
@@ -116,6 +130,17 @@ test("bulk failures expose safe messages without echoing server details", () => 
   assert.equal(helpers.advanceErrorMessage(failure), "推进失败，请稍后重试。");
   assert.doesNotMatch(helpers.advanceErrorMessage(conflict), /alice|version|8/);
   assert.doesNotMatch(helpers.advanceErrorMessage(failure), /database|internal/);
+});
+
+test("bulk undo action is explicit and conflict messages never echo server details", () => {
+  assert.deepEqual(helpers.bulkUndoActionState([], false), { visible: false, disabled: false, label: "撤销批量推进" });
+  assert.deepEqual(helpers.bulkUndoActionState([{ item_id: "item-1", expected_application_version: 4 }], false), { visible: true, disabled: false, label: "撤销批量推进" });
+  assert.deepEqual(helpers.bulkUndoActionState([{ item_id: "item-1", expected_application_version: 4 }], true), { visible: true, disabled: true, label: "撤销中" });
+  assert.equal(helpers.undoSuccessMessage({ applied: 2 }), "已撤销 2 位候选人的本次批量推进，服务端结果已刷新。");
+  const conflict = Object.assign(new Error("alice@example.com changed at version 9"), { status: 409 });
+  assert.equal(helpers.undoErrorMessage(conflict), "无法撤销：候选人状态已变化，已刷新服务端结果。");
+  assert.doesNotMatch(helpers.undoErrorMessage(conflict), /alice|version|9/);
+  assert.equal(helpers.undoErrorMessage(new Error("database internal.example")), "撤销失败，请稍后重试。");
 });
 
 test("cancelled tasks never describe progress as completed", () => {

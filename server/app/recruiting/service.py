@@ -173,6 +173,30 @@ def transition_application_record(db, organization_id, application_id, target, *
     return _apply_application_transition(db, application, target, actor_user_id=actor_user_id, trace_id=trace_id, reason_code=reason_code, reason_text=reason_text)
 
 
+def undo_bulk_advance_record(db, application, *, expected_version, actor_user_id, trace_id, run_id, item_id):
+    from server.app.identity.models import AuditLog
+    from server.app.recruiting.models import ApplicationStageEvent
+
+    if application.stage != "review" or application.version != expected_version:
+        raise ResourceVersionConflict
+    application.stage = "new"
+    application.version += 1
+    application.updated_at = datetime.now(timezone.utc)
+    payload = {
+        "from_stage": "review",
+        "to_stage": "new",
+        "undo": True,
+        "run_id": str(run_id),
+        "item_id": str(item_id),
+        "undone_application_version": expected_version,
+    }
+    db.add(ApplicationStageEvent(organization_id=application.organization_id, application_id=application.id, actor_user_id=actor_user_id, event_type="application.bulk_advance_undone", payload=payload))
+    db.add(AuditLog(organization_id=application.organization_id, actor_user_id=actor_user_id, event_type="application.bulk_advance_undone", outcome="success", resource_type="application", resource_id=application.id, trace_id=trace_id, metadata_json={"application_id":str(application.id),"run_id":str(run_id),"item_id":str(item_id),"undone_application_version":expected_version}))
+    db.flush()
+    recalculate_candidate_retention(db, application.organization_id, application.candidate_id)
+    return application
+
+
 def transition_job_record(db, job_id, target, *, expected_version, actor_user_id, trace_id):
     from server.app.identity.models import AuditLog, Job
 

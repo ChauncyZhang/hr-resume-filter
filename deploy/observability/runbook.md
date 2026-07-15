@@ -183,12 +183,38 @@ database exhausts connection slots.
 Check the private MinIO endpoint and metrics policy. Do not publish the MinIO
 metrics endpoint or use root credentials for scraping.
 
+### BackupRestorePointFreshnessWarning
+
+Confirm `ux09_backup_valid_restore_points >= 2`, inspect the latest scheduler
+and publisher status, and reconcile any commit-unknown run without deleting its
+lease. Run a read-only remote validation of the newest complete group. Restore
+the 12-hour schedule only after the cause is known and one canary succeeds.
+
+### BackupRestorePointFreshnessCritical
+
+Treat this as an RPO incident. Stop destructive prune, preserve remote groups
+and leases, confirm the approved off-host destination is reachable, and prepare
+an isolated restore drill. Do not reset the timestamp or manufacture a success
+metric from a local dump.
+
+### BackupRestorePointSignalMissing
+
+Check `ux09-backup.timer`, the last oneshot service result, the configured
+backup state directory, `backup.prom`, and node-exporter's read-only textfile
+mount. Missing or malformed evidence is fail-closed and must not be replaced by
+a hand-written metric.
+
+### BackupRestorePointRedundancyCritical
+
+Stop prune and verify the remote catalog. At least two remotely validated
+complete restore points are required before the scheduler advances freshness.
+
 ## Deferred integrations
 
-Backup freshness alerts are disabled until Phase 6C supplies and validates the
-backup evidence collector. Missing backup metrics must not page as critical.
-Phase 6C must add restore-aware evidence semantics, alert tests, and an operator
-procedure before enabling this signal.
+Backup freshness collection and alert rules are included, but production
+enablement remains an environment gate: the target Linux host must prove the
+systemd timer, `backup.prom` textfile scrape, warning/critical trigger and
+recovery, and delivery through the approved Alertmanager receiver.
 
 Container-level metrics are also deferred. The default overlay intentionally
 does not run cAdvisor or mount the Docker socket, `/var/run`, or Docker storage.

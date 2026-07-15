@@ -1,9 +1,11 @@
 import asyncio,uuid
+from pathlib import Path
 from fastapi.testclient import TestClient
 from sqlalchemy import func,select
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
 from server.app.recruiting.models import Application,ApplicationStageEvent,FileObject
+from server.app.recruiting.service import transition_application_record
 from server.app.identity.models import AuditLog
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.actions import retry_screening_item
@@ -77,10 +79,66 @@ def test_bulk_advance_is_atomic_versioned_and_does_not_duplicate_evidence(tmp_pa
     payload={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version}]}
     with TestClient(app) as client:
         headers=login(client,"admin@example.test"); first=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk"}); assert first.status_code==200 and first.json()["data"]["applied_count"]==1
+        assert first.json()["data"]["applications"]==[{"id":str(application_id),"item_id":item["id"],"stage":"review","version":version+1,"result":"applied"}]
         replay=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk"}); assert replay.json()==first.json()
         again=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk-new"}); assert again.status_code==200 and again.json()["data"]["already_applied_count"]==1
+        cannot_undo_already=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"undo-already"})
+        assert cannot_undo_already.status_code==409
     with app.state.identity_store.sync_session() as db:
         assert db.get(Application,application_id).stage=="review" and db.scalar(select(func.count(ApplicationStageEvent.id)))==1 and db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.stage_changed"))==1
+
+def test_bulk_advance_can_be_immediately_undone_with_append_only_evidence_and_replay(tmp_path):
+    app,run,item=scored_item(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
+    advance={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version}]}
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        advanced=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=advance,headers={**headers,"Idempotency-Key":"advance-for-undo"})
+        undo_item={"item_id":advanced.json()["data"]["applications"][0]["item_id"],"expected_application_version":version+1}
+        undo=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[undo_item]},headers={**headers,"Idempotency-Key":"undo"})
+        assert undo.status_code==200
+        assert undo.json()["data"]=={"command":"undo_advance_to_new","applied_count":1,"already_applied_count":0,"applications":[{"id":str(application_id),"item_id":item["id"],"stage":"new","version":version+2,"result":"applied"}]}
+        replay=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[undo_item]},headers={**headers,"Idempotency-Key":"undo"})
+        assert replay.json()==undo.json()
+    with app.state.identity_store.sync_session() as db:
+        application=db.get(Application,application_id)
+        events=list(db.scalars(select(ApplicationStageEvent).where(ApplicationStageEvent.application_id==application_id).order_by(ApplicationStageEvent.created_at,ApplicationStageEvent.id)))
+        assert application.stage=="new" and application.version==version+2
+        assert [(event.event_type,event.payload["from_stage"],event.payload["to_stage"]) for event in events]==[("application.stage_changed","new","review"),("application.bulk_advance_undone","review","new")]
+        assert events[-1].payload["undo"] is True and events[-1].payload["item_id"]==item["id"]
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.bulk_advanced"))==1
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.bulk_advance_undone"))==1
+
+def test_bulk_undo_rejects_non_bulk_review_and_changed_state(tmp_path):
+    app,run,item=scored_item(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
+        transition_application_record(db,application.organization_id,application.id,"review",expected_version=version,actor_user_id=application.owner_id,trace_id="normal-review"); db.commit()
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        arbitrary=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"arbitrary-undo"})
+        assert arbitrary.status_code==409
+
+    other=tmp_path/"changed"; other.mkdir(); app,run,item=scored_item(other)
+    with app.state.identity_store.sync_session() as db:
+        application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"advance-changed"})
+        with app.state.identity_store.sync_session() as db:
+            application=db.get(Application,application_id)
+            transition_application_record(db,application.organization_id,application.id,"contact",expected_version=version+1,actor_user_id=application.owner_id,trace_id="contact"); db.commit()
+        conflict=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"stale-undo"})
+        assert conflict.status_code==409
+    with app.state.identity_store.sync_session() as db:
+        assert db.get(Application,application_id).stage=="contact"
+        assert db.scalar(select(func.count(ApplicationStageEvent.id)).where(ApplicationStageEvent.event_type=="application.bulk_advance_undone"))==0
+
+def test_bulk_undo_does_not_request_write_locks_on_append_only_evidence():
+    source=Path("server/app/screening/actions.py").read_text(encoding="utf-8")
+    provenance=source.split('if payload.command=="undo_advance_to_new":',1)[1].split('if payload.command=="reject"',1)[0]
+    assert ".with_for_update()" not in provenance
 
 def test_bulk_reject_validation_and_all_or_nothing_stale_version(tmp_path):
     app,run,item=scored_item(tmp_path)

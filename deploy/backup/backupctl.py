@@ -27,6 +27,7 @@ import tarfile
 import tempfile
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
+from uuid import UUID, uuid4
 
 
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -39,6 +40,7 @@ BACKUP_IMAGE_RE = re.compile(
     r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
 )
 BACKUP_IMAGE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SAFE_ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{2,63}$")
 ALLOWED_REMOTE_SCHEMES = {"s3", "s3+https", "azure", "gcs"}
 CHILD_BASE_ENV_ALLOWLIST = {
     "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP", "HOME",
@@ -663,10 +665,129 @@ def validate_drill_preflight(
     }
 
 
-def require_traffic_open_evidence(_restore: Mapping[str, Any], _b2b3: Mapping[str, Any] | None) -> bool:
-    raise SecurityContractError(
-        "traffic-open is disabled until the real signed B2B3 evidence protocol is available"
-    )
+def validate_released_b2b3_commands(cli_path: Path, worker_path: Path) -> None:
+    for label, path in (("B2B3 CLI", cli_path), ("B2B3 Worker", worker_path)):
+        if not path.is_absolute():
+            raise ValueError(f"released {label} path must be absolute")
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"released {label} must be a regular non-symlink file")
+        if metadata.st_nlink != 1:
+            raise ValueError(f"released {label} hardlinks or shared inodes are forbidden")
+        if not metadata.st_mode & 0o111:
+            raise ValueError(f"released {label} must be executable")
+
+
+def _restore_binding(restore: Mapping[str, Any]) -> dict[str, str]:
+    expected = {
+        "backup_run_id",
+        "recovery_generation_id",
+        "restore_id",
+        "backup_manifest_sha256",
+        "ledger_manifest_sha256",
+    }
+    if (
+        restore.get("schema_version") != 1
+        or restore.get("state") != "restored_traffic_closed"
+        or restore.get("traffic_open") is not False
+        or not expected.issubset(restore)
+    ):
+        raise ValueError("restore evidence is not a completed traffic-closed restore")
+    binding = {key: str(restore[key]) for key in expected}
+    validate_run_id(binding["backup_run_id"])
+    validate_run_id(binding["recovery_generation_id"])
+    try:
+        UUID(binding["restore_id"])
+    except ValueError:
+        raise ValueError("restore evidence restore id is invalid") from None
+    _require_sha256(binding["backup_manifest_sha256"], "backup manifest hash")
+    _require_sha256(binding["ledger_manifest_sha256"], "ledger manifest hash")
+    return binding
+
+
+def validate_b2b3_evidence(
+    restore_path: Path,
+    evidence_path: Path,
+    signature_path: Path,
+    verify_key_path: Path,
+) -> Mapping[str, Any]:
+    validate_secret_files([verify_key_path])
+    verify_public_key_signature(evidence_path, verify_key_path, signature_path)
+    restore = _require_mapping(_load_json(restore_path), "restore evidence")
+    evidence = _require_mapping(_load_json(evidence_path), "B2B3 evidence")
+    binding = _restore_binding(restore)
+    expected_fields = {
+        "schema_version",
+        "status",
+        *binding,
+        "traffic_open",
+        "checks",
+        "counts",
+    }
+    if set(evidence) != expected_fields or evidence.get("schema_version") != 1:
+        raise ValueError("B2B3 evidence schema is invalid")
+    if evidence.get("status") != "complete" or evidence.get("traffic_open") is not False:
+        raise ValueError("B2B3 evidence is not complete and traffic-closed")
+    if any(evidence.get(key) != value for key, value in binding.items()):
+        raise ValueError("B2B3 evidence run/generation/manifest binding is invalid")
+    checks = _require_mapping(evidence.get("checks"), "B2B3 checks")
+    expected_checks = {
+        "objects_absent",
+        "database_redacted",
+        "ledger_consistent",
+        "recovery_completed",
+    }
+    if set(checks) != expected_checks or any(checks[key] is not True for key in expected_checks):
+        raise ValueError("B2B3 re-delete checks are incomplete")
+    counts = _require_mapping(evidence.get("counts"), "B2B3 counts")
+    if set(counts) != {"prepared_redeletions", "completed_redeletions", "deleted_objects"}:
+        raise ValueError("B2B3 evidence counts schema is invalid")
+    values = tuple(counts[key] for key in ("prepared_redeletions", "completed_redeletions", "deleted_objects"))
+    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in values):
+        raise ValueError("B2B3 evidence counts must be positive integers")
+    if counts["prepared_redeletions"] != counts["completed_redeletions"]:
+        raise ValueError("B2B3 recovery completion count is inconsistent")
+    return evidence
+
+
+def require_traffic_open_evidence(
+    restore: Mapping[str, Any], b2b3: Mapping[str, Any] | None
+) -> bool:
+    if b2b3 is None:
+        raise SecurityContractError("verified B2B3 evidence is unavailable")
+    binding = _restore_binding(restore)
+    if any(b2b3.get(key) != value for key, value in binding.items()):
+        raise SecurityContractError("verified B2B3 evidence binding is unavailable")
+    if b2b3.get("status") != "complete" or b2b3.get("traffic_open") is not False:
+        raise SecurityContractError("verified B2B3 evidence is unavailable")
+    return False
+
+
+def write_drill_failure_evidence(
+    output_path: Path, restore: Mapping[str, Any], safe_error_code: str
+) -> Mapping[str, Any]:
+    if not SAFE_ERROR_CODE_RE.fullmatch(safe_error_code):
+        raise ValueError("drill failure code is unsafe")
+    binding = _restore_binding(restore)
+    evidence = {
+        "schema_version": 1,
+        "state": "b2b3_failed_traffic_closed",
+        **binding,
+        "safe_error_code": safe_error_code,
+        "traffic_open": False,
+    }
+    _atomic_write_json(output_path, evidence)
+    return evidence
+
+
+def _traffic_closed_evidence(restore: Mapping[str, Any]) -> Mapping[str, Any]:
+    return {
+        "schema_version": 1,
+        "state": "b2b3_verified_traffic_closed",
+        **_restore_binding(restore),
+        "traffic_open": False,
+        "production_traffic_decision": "external_environment_required",
+    }
 
 
 def begin_closed_recovery(
@@ -893,6 +1014,36 @@ def verify_hmac_signature(payload_path: Path, key_path: Path, signature_path: Pa
         raise ValueError("manifest signature verification failed")
 
 
+def verify_public_key_signature(
+    payload_path: Path, public_key_path: Path, signature_path: Path
+) -> None:
+    try:
+        completed = subprocess.run(
+            [
+                "openssl",
+                "pkeyutl",
+                "-verify",
+                "-rawin",
+                "-pubin",
+                "-inkey",
+                str(public_key_path),
+                "-sigfile",
+                str(signature_path),
+                "-in",
+                str(payload_path),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_sanitized_child_environment(),
+        )
+    except OSError:
+        raise ValueError("B2B3 public-key signature verifier is unavailable") from None
+    if completed.returncode != 0:
+        raise ValueError("B2B3 public-key signature verification failed")
+
+
 def _validate_business_inventory(path: Path) -> tuple[int, str]:
     inventory = _load_json(path)
     if not isinstance(inventory, Mapping) or inventory.get("schema_version") != 1:
@@ -997,6 +1148,7 @@ def catalog_from_groups(
                 "valid": True,
                 "backup_window_days": manifest["retention"]["backup_window_days"],
                 "complete_order": complete_order,
+                "ledger_archive": manifest["ledger_archive"],
             }
         )
     if not catalog:
@@ -1024,6 +1176,10 @@ def command_guard_disposable(_: argparse.Namespace) -> None:
 
 
 def command_drill_preflight(_: argparse.Namespace) -> None:
+    validate_released_b2b3_commands(
+        Path(_require_env("B2B3_CLI_COMMAND")),
+        Path(_require_env("B2B3_WORKER_COMMAND")),
+    )
     catalog = _load_json(Path(_require_env("BACKUP_CATALOG_FILE")))
     if not isinstance(catalog, list):
         raise ValueError("backup catalog must be an array")
@@ -1106,9 +1262,19 @@ def command_traffic_gate(args: argparse.Namespace) -> None:
     if marker.is_symlink():
         raise SecurityContractError("traffic-open marker symlinks are forbidden")
     marker.unlink(missing_ok=True)
-    raise SecurityContractError(
-        "traffic-open is disabled until the real signed B2B3 evidence protocol is available"
-    )
+    try:
+        evidence = validate_b2b3_evidence(
+            Path(args.restore_evidence),
+            Path(args.b2b3_evidence),
+            Path(args.b2b3_signature),
+            Path(args.b2b3_verify_key),
+        )
+        restore = _require_mapping(_load_json(Path(args.restore_evidence)), "restore evidence")
+        require_traffic_open_evidence(restore, evidence)
+        _atomic_write_json(Path(args.closed_evidence), _traffic_closed_evidence(restore))
+    except (OSError, ValueError, KeyError, TypeError):
+        raise SecurityContractError("verified B2B3 evidence is unavailable; traffic remains closed") from None
+    print("B2B3 evidence verified; traffic remains closed pending external environment acceptance")
 
 
 def command_backup(_: argparse.Namespace) -> None:
@@ -1284,6 +1450,10 @@ def command_restore(_: argparse.Namespace) -> None:
     command_guard_disposable(argparse.Namespace())
     run_id = validate_run_id(_require_env("RESTORE_BACKUP_RUN_ID"))
     generation_id = validate_run_id(_require_env("RESTORE_GENERATION_ID"))
+    try:
+        restore_id = str(UUID(generation_id))
+    except ValueError:
+        raise ValueError("RESTORE_GENERATION_ID must be the B2B3 restore UUID") from None
     evidence_path = Path(_require_env("RESTORE_EVIDENCE_FILE"))
     closed_marker_path = Path(_require_env("TRAFFIC_CLOSED_MARKER_FILE"))
     open_marker_path = Path(_require_env("TRAFFIC_OPEN_MARKER_FILE"))
@@ -1392,8 +1562,11 @@ def command_restore(_: argparse.Namespace) -> None:
                 "state": "restored_traffic_closed",
                 "backup_run_id": run_id,
                 "recovery_generation_id": generation_id,
+                "restore_id": restore_id,
+                "backup_cutoff_utc": str(manifest["backup_cutoff_utc"]),
+                "backup_manifest_sha256": _sha256_file(workspace / "manifest.json"),
+                "ledger_manifest_sha256": _sha256_file(ledger_group / "ledger-manifest.json"),
                 "traffic_open": False,
-                "b2b3_status": "pending_real_cli_and_worker_protocol",
                 "gates": {"database": True, "business_objects": True, "ledger_restored_first": ledger_verified},
             }
             _write_json(evidence_path, evidence)
@@ -1479,13 +1652,114 @@ def command_ledger_archive(_: argparse.Namespace) -> None:
         receipt.unlink(missing_ok=True)
 
 
+def run_b2b3_protocol(
+    restore_path: Path,
+    evidence_path: Path,
+    signature_path: Path,
+    verify_key_path: Path,
+    closed_evidence_path: Path,
+) -> Mapping[str, Any]:
+    restore = _require_mapping(_load_json(restore_path), "restore evidence")
+    binding = _restore_binding(restore)
+    try:
+        validate_released_b2b3_commands(
+            Path(_require_env("B2B3_CLI_COMMAND")),
+            Path(_require_env("B2B3_WORKER_COMMAND")),
+        )
+    except (OSError, ValueError):
+        write_drill_failure_evidence(
+            closed_evidence_path, restore, "b2b3_release_preflight_failed"
+        )
+        raise ValueError("released B2B3 preflight failed; traffic remains closed") from None
+    try:
+        validate_secret_files([verify_key_path])
+        for path in (evidence_path, signature_path):
+            if path.is_symlink():
+                raise SecurityContractError("B2B3 evidence paths cannot be symlinks")
+            path.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        write_drill_failure_evidence(
+            closed_evidence_path, restore, "b2b3_evidence_preflight_failed"
+        )
+        raise ValueError("B2B3 evidence preflight failed; traffic remains closed") from None
+    child_environment = _sanitized_child_environment(
+        runtime_values={
+            "B2B3_BACKUP_RUN_ID": binding["backup_run_id"],
+            "B2B3_RECOVERY_GENERATION_ID": binding["recovery_generation_id"],
+            "B2B3_RESTORE_ID": binding["restore_id"],
+        }
+    )
+    try:
+        cli = _client(
+            "B2B3_CLI_COMMAND",
+            "--restore-id",
+            binding["restore_id"],
+            "--restored-at",
+            str(restore["backup_cutoff_utc"]),
+            capture=True,
+            environment=child_environment,
+        )
+        prepared_matches = re.findall(r"^recovery_prepared=([0-9]+)$", cli.stdout, re.MULTILINE)
+        if len(prepared_matches) != 1 or int(prepared_matches[0]) <= 0:
+            raise ValueError("B2B3 CLI did not prepare a real recovery")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        write_drill_failure_evidence(closed_evidence_path, restore, "b2b3_cli_failed")
+        raise ValueError("released B2B3 CLI failed; traffic remains closed") from None
+    prepared = int(prepared_matches[0])
+    try:
+        _client(
+            "B2B3_WORKER_COMMAND",
+            "--restore-id",
+            binding["restore_id"],
+            "--backup-run-id",
+            binding["backup_run_id"],
+            "--generation-id",
+            binding["recovery_generation_id"],
+            "--backup-manifest-sha256",
+            binding["backup_manifest_sha256"],
+            "--ledger-manifest-sha256",
+            binding["ledger_manifest_sha256"],
+            "--evidence",
+            str(evidence_path),
+            "--signature",
+            str(signature_path),
+            environment=child_environment,
+        )
+        evidence = validate_b2b3_evidence(
+            restore_path, evidence_path, signature_path, verify_key_path
+        )
+        if evidence["counts"]["prepared_redeletions"] != prepared:
+            raise ValueError("B2B3 CLI and Worker recovery counts are inconsistent")
+        require_traffic_open_evidence(restore, evidence)
+        _atomic_write_json(closed_evidence_path, _traffic_closed_evidence(restore))
+        return evidence
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        write_drill_failure_evidence(closed_evidence_path, restore, "b2b3_worker_or_evidence_failed")
+        raise ValueError("released B2B3 Worker or evidence verification failed; traffic remains closed") from None
+
+
 def command_drill(_: argparse.Namespace) -> None:
     command_drill_preflight(argparse.Namespace())
-    _require_env("B2B3_CLI_COMMAND")
-    _require_env("B2B3_WORKER_COMMAND")
-    raise ValueError(
-        "Phase 6C foundation exposes B2B3_CLI_COMMAND and B2B3_WORKER_COMMAND but does not implement B2B3; "
-        "the complete real restore drill and traffic-open gate remain unavailable"
+    catalog = _load_json(Path(_require_env("BACKUP_CATALOG_FILE")))
+    if not isinstance(catalog, list):
+        raise ValueError("backup catalog must be an array")
+    latest = max(
+        (item for item in catalog if item.get("complete") is True and item.get("valid") is True),
+        key=lambda item: int(item["complete_order"]),
+    )
+    os.environ.setdefault("RESTORE_BACKUP_RUN_ID", validate_run_id(str(latest["backup_run_id"])))
+    os.environ.setdefault("RESTORE_GENERATION_ID", str(uuid4()))
+    command_restore(argparse.Namespace())
+    evidence = run_b2b3_protocol(
+        Path(_require_env("RESTORE_EVIDENCE_FILE")),
+        Path(_require_env("B2B3_EVIDENCE_FILE")),
+        Path(_require_env("B2B3_EVIDENCE_SIGNATURE_FILE")),
+        Path(_require_env("B2B3_EVIDENCE_VERIFY_KEY_FILE")),
+        Path(_require_env("DRILL_EVIDENCE_FILE")),
+    )
+    print(
+        "restore re-delete verified with traffic closed: "
+        f"completed_redeletions={evidence['counts']['completed_redeletions']}"
     )
 
 
@@ -1529,7 +1803,10 @@ def _parser() -> argparse.ArgumentParser:
     traffic = subparsers.add_parser("traffic-gate")
     traffic.add_argument("restore_evidence")
     traffic.add_argument("b2b3_evidence")
+    traffic.add_argument("b2b3_signature")
+    traffic.add_argument("b2b3_verify_key")
     traffic.add_argument("marker")
+    traffic.add_argument("closed_evidence")
     traffic.set_defaults(handler=command_traffic_gate)
     for name, handler in (
         ("backup", command_backup),

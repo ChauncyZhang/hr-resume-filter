@@ -1179,10 +1179,260 @@ def test_restore_and_drill_require_disposable_project_and_volumes(
     )
 
 
-def test_traffic_open_is_unreachable_before_signed_b2b3_protocol() -> None:
+def _signed_b2b3_evidence(tmp_path: Path, backupctl) -> tuple[Path, Path, Path, Path, dict]:
+    restore = {
+        "schema_version": 1,
+        "state": "restored_traffic_closed",
+        "backup_run_id": "business-run-safe1",
+        "recovery_generation_id": "00000000-0000-4000-8000-000000000001",
+        "restore_id": "00000000-0000-4000-8000-000000000001",
+        "backup_cutoff_utc": "2026-07-15T00:00:00Z",
+        "backup_manifest_sha256": "a" * 64,
+        "ledger_manifest_sha256": "b" * 64,
+        "traffic_open": False,
+    }
+    evidence = {
+        "schema_version": 1,
+        "status": "complete",
+        "backup_run_id": restore["backup_run_id"],
+        "recovery_generation_id": restore["recovery_generation_id"],
+        "restore_id": restore["restore_id"],
+        "backup_manifest_sha256": restore["backup_manifest_sha256"],
+        "ledger_manifest_sha256": restore["ledger_manifest_sha256"],
+        "traffic_open": False,
+        "checks": {
+            "objects_absent": True,
+            "database_redacted": True,
+            "ledger_consistent": True,
+            "recovery_completed": True,
+        },
+        "counts": {
+            "prepared_redeletions": 1,
+            "completed_redeletions": 1,
+            "deleted_objects": 2,
+        },
+    }
+    restore_path = tmp_path / "restore.json"
+    evidence_path = tmp_path / "b2b3.json"
+    signature_path = tmp_path / "b2b3.sig"
+    private_key_path = tmp_path / "receiver-private.pem"
+    key_path = tmp_path / "b2b3-verify-public.pem"
+    restore_path.write_bytes(backupctl._canonical_json(restore))
+    evidence_path.write_bytes(backupctl._canonical_json(evidence))
+    subprocess.run(
+        ["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private_key_path)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["openssl", "pkey", "-in", str(private_key_path), "-pubout", "-out", str(key_path)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "pkeyutl",
+            "-sign",
+            "-rawin",
+            "-inkey",
+            str(private_key_path),
+            "-in",
+            str(evidence_path),
+            "-out",
+            str(signature_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    key_path.chmod(0o400)
+    private_key_path.unlink()
+    return restore_path, evidence_path, signature_path, key_path, evidence
+
+
+def test_signed_b2b3_evidence_proves_redelete_and_is_bound_to_restore(tmp_path: Path) -> None:
     backupctl = _load_backupctl()
-    with pytest.raises(backupctl.SecurityContractError, match="disabled|unavailable"):
-        backupctl.require_traffic_open_evidence({}, {})
+    restore_path, evidence_path, signature_path, key_path, evidence = _signed_b2b3_evidence(
+        tmp_path, backupctl
+    )
+
+    assert backupctl.validate_b2b3_evidence(
+        restore_path, evidence_path, signature_path, key_path
+    ) == evidence
+    assert backupctl.require_traffic_open_evidence(
+        json.loads(restore_path.read_text(encoding="utf-8")), evidence
+    ) is False
+
+    tampered = {**evidence, "backup_run_id": "business-run-other1"}
+    evidence_path.write_bytes(backupctl._canonical_json(tampered))
+    with pytest.raises(ValueError, match="signature"):
+        backupctl.validate_b2b3_evidence(
+            restore_path, evidence_path, signature_path, key_path
+        )
+
+
+def test_traffic_gate_verifies_b2b3_but_only_writes_closed_evidence(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    restore_path, evidence_path, signature_path, key_path, _ = _signed_b2b3_evidence(
+        tmp_path, backupctl
+    )
+    open_marker = tmp_path / "TRAFFIC_OPEN"
+    closed_evidence = tmp_path / "traffic-closed.json"
+    open_marker.write_text("stale", encoding="ascii")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(BACKUPCTL),
+            "traffic-gate",
+            str(restore_path),
+            str(evidence_path),
+            str(signature_path),
+            str(key_path),
+            str(open_marker),
+            str(closed_evidence),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not open_marker.exists()
+    assert json.loads(closed_evidence.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "state": "b2b3_verified_traffic_closed",
+        "backup_run_id": "business-run-safe1",
+        "recovery_generation_id": "00000000-0000-4000-8000-000000000001",
+        "restore_id": "00000000-0000-4000-8000-000000000001",
+        "backup_manifest_sha256": "a" * 64,
+        "ledger_manifest_sha256": "b" * 64,
+        "traffic_open": False,
+        "production_traffic_decision": "external_environment_required",
+    }
+
+
+def test_drill_failure_evidence_is_safe_bound_and_traffic_closed(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    restore_path, _, _, _, _ = _signed_b2b3_evidence(tmp_path, backupctl)
+    output = tmp_path / "drill-failed.json"
+    backupctl.write_drill_failure_evidence(
+        output,
+        json.loads(restore_path.read_text(encoding="utf-8")),
+        "b2b3_worker_failed",
+    )
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["safe_error_code"] == "b2b3_worker_failed"
+    assert document["traffic_open"] is False
+    assert document["backup_run_id"] == "business-run-safe1"
+    assert document["recovery_generation_id"] == "00000000-0000-4000-8000-000000000001"
+    assert set(document) == {
+        "schema_version",
+        "state",
+        "backup_run_id",
+        "recovery_generation_id",
+        "restore_id",
+        "backup_manifest_sha256",
+        "ledger_manifest_sha256",
+        "safe_error_code",
+        "traffic_open",
+    }
+
+
+def test_missing_released_b2b3_cli_fails_in_preflight_with_safe_closed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backupctl = _load_backupctl()
+    restore_path, evidence_path, signature_path, key_path, _ = _signed_b2b3_evidence(
+        tmp_path, backupctl
+    )
+    evidence_path.unlink()
+    signature_path.unlink()
+    closed = tmp_path / "drill-evidence.json"
+    monkeypatch.setenv("B2B3_CLI_COMMAND", str(tmp_path / "missing-real-cli"))
+    monkeypatch.setenv("B2B3_WORKER_COMMAND", str(tmp_path / "missing-real-worker"))
+
+    with pytest.raises(ValueError, match="preflight|traffic remains closed"):
+        backupctl.run_b2b3_protocol(
+            restore_path, evidence_path, signature_path, key_path, closed
+        )
+
+    failure = json.loads(closed.read_text(encoding="utf-8"))
+    assert failure["state"] == "b2b3_failed_traffic_closed"
+    assert failure["safe_error_code"] == "b2b3_release_preflight_failed"
+    assert failure["traffic_open"] is False
+    assert "missing-real-cli" not in closed.read_text(encoding="utf-8")
+
+
+def test_missing_b2b3_verify_key_still_records_safe_closed_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backupctl = _load_backupctl()
+    restore_path, evidence_path, signature_path, key_path, _ = _signed_b2b3_evidence(
+        tmp_path, backupctl
+    )
+    if os.name == "nt":
+        key_path.chmod(0o600)
+    key_path.unlink()
+    closed = tmp_path / "drill-evidence.json"
+    cli = tmp_path / "released-cli"
+    worker = tmp_path / "released-worker"
+    for path in (cli, worker):
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+        path.chmod(0o555)
+    monkeypatch.setenv("B2B3_CLI_COMMAND", str(cli))
+    monkeypatch.setenv("B2B3_WORKER_COMMAND", str(worker))
+    if os.name == "nt":
+        monkeypatch.setattr(
+            backupctl, "validate_released_b2b3_commands", lambda *_: None
+        )
+
+    with pytest.raises(ValueError, match="preflight|traffic remains closed"):
+        backupctl.run_b2b3_protocol(
+            restore_path, evidence_path, signature_path, key_path, closed
+        )
+
+    failure = json.loads(closed.read_text(encoding="utf-8"))
+    assert failure["safe_error_code"] == "b2b3_evidence_preflight_failed"
+    assert failure["traffic_open"] is False
+
+
+def test_restore_evidence_binds_real_b2b3_inputs_without_pending_placeholder() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    restore = source.split("def command_restore", 1)[1].split("def command_ledger_archive", 1)[0]
+    assert 'UUID(generation_id)' in restore
+    assert '"restore_id": restore_id' in restore
+    assert '"backup_manifest_sha256": _sha256_file(workspace / "manifest.json")' in restore
+    assert '"ledger_manifest_sha256": _sha256_file(ledger_group / "ledger-manifest.json")' in restore
+    assert "pending_real_cli_and_worker_protocol" not in restore
+
+
+def test_drill_runs_restore_then_released_cli_worker_and_verifies_signed_evidence() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    drill = source.split("def command_drill(", 1)[1].split("def _parser", 1)[0]
+    assert drill.index("command_restore") < drill.index("run_b2b3_protocol")
+    assert "B2B3_CLI_COMMAND" in source
+    assert "B2B3_WORKER_COMMAND" in source
+    assert "validate_b2b3_evidence" in source
+    assert "does not implement B2B3" not in drill
+
+
+@pytest.mark.skipif(os.name == "nt", reason="released executable mode contract requires Linux")
+def test_released_b2b3_commands_fail_closed_unless_exact_regular_executables(
+    tmp_path: Path,
+) -> None:
+    backupctl = _load_backupctl()
+    cli = tmp_path / "b2b3-cli"
+    worker = tmp_path / "b2b3-worker"
+    cli.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    worker.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    cli.chmod(0o555)
+    worker.chmod(0o555)
+
+    backupctl.validate_released_b2b3_commands(cli, worker)
+    worker.chmod(0o444)
+    with pytest.raises(ValueError, match="executable|released"):
+        backupctl.validate_released_b2b3_commands(cli, worker)
 
 
 def test_traffic_gate_rejects_handwritten_replayed_and_unbound_evidence_without_marker(tmp_path: Path) -> None:
@@ -1199,13 +1449,23 @@ def test_traffic_gate_rejects_handwritten_replayed_and_unbound_evidence_without_
         b2b3_path.write_text(json.dumps(b2b3), encoding="utf-8")
         marker.write_text("stale-open", encoding="ascii")
         result = subprocess.run(
-            [sys.executable, str(BACKUPCTL), "traffic-gate", str(restore_path), str(b2b3_path), str(marker)],
+            [
+                sys.executable,
+                str(BACKUPCTL),
+                "traffic-gate",
+                str(restore_path),
+                str(b2b3_path),
+                str(tmp_path / f"missing-{index}.sig"),
+                str(tmp_path / f"missing-{index}.key"),
+                str(marker),
+                str(tmp_path / f"closed-{index}.json"),
+            ],
             capture_output=True,
             text=True,
             check=False,
         )
         assert result.returncode == 78
-        assert "disabled" in result.stderr.lower() or "unavailable" in result.stderr.lower()
+        assert "signature" in result.stderr.lower() or "evidence" in result.stderr.lower()
         assert not marker.exists()
 
 
@@ -1494,6 +1754,7 @@ def test_backup_image_is_digest_pinned_and_contains_versioned_toolchain() -> Non
     for required in ("postgres:16.9", "minio/mc:RELEASE.2025-07-21T05-28-08Z", "rclone/rclone:1.70.3"):
         assert required in dockerfile
     assert "COPY *.py *.sh /opt/ux09-backup/" in dockerfile
+    assert re.search(r"\bopenssl=[0-9][^\s]*", dockerfile)
 
 
 def test_destination_adapter_refuses_to_overwrite_existing_run_id() -> None:
@@ -1687,9 +1948,20 @@ def test_s3_publisher_real_disposable_minio_two_process_race(tmp_path: Path) -> 
         docker("network", "rm", network, check=False)
 
 
-def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> None:
+def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service(tmp_path: Path) -> None:
+    released_cli = tmp_path / "b2b3-cli"
+    released_worker = tmp_path / "b2b3-worker"
+    released_cli.write_text("release fixture", encoding="ascii")
+    released_worker.write_text("release fixture", encoding="ascii")
     environment = os.environ.copy()
-    environment.update({"BACKUP_IMAGE": "registry.example.test/ux09-backup", "BACKUP_IMAGE_DIGEST": "sha256:" + "a" * 64})
+    environment.update(
+        {
+            "BACKUP_IMAGE": "registry.example.test/ux09-backup",
+            "BACKUP_IMAGE_DIGEST": "sha256:" + "a" * 64,
+            "B2B3_CLI_RELEASE_FILE": str(released_cli),
+            "B2B3_WORKER_RELEASE_FILE": str(released_worker),
+        }
+    )
     result = subprocess.run(
         ["docker", "compose", "-f", str(DRILL_COMPOSE), "config", "--format", "json"],
         cwd=ROOT,
@@ -1703,7 +1975,14 @@ def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> No
     assert model["name"].startswith("ux09-backup-drill-")
     assert set(model["services"]) == {"backup-tool", "minio", "postgres"}
     assert not any(service.get("ports") for service in model["services"].values())
-    assert all(network.get("internal") is True for network in model["networks"].values())
+    assert model["networks"]["recovery"]["internal"] is True
+    assert model["networks"]["offhost-egress"].get("internal", False) is False
+    assert set(model["services"]["postgres"]["networks"]) == {"recovery"}
+    assert set(model["services"]["minio"]["networks"]) == {"recovery"}
+    assert set(model["services"]["backup-tool"]["networks"]) == {
+        "offhost-egress",
+        "recovery",
+    }
     rendered = result.stdout.lower()
     assert "ux09_postgres-data" not in rendered
     assert "ux09_minio-data" not in rendered
@@ -1712,6 +1991,22 @@ def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> No
     assert tool_environment["BACKUP_IMAGE"] == "registry.example.test/ux09-backup"
     assert tool_environment["BACKUP_IMAGE_DIGEST"] == "sha256:" + "a" * 64
     assert tool_environment["BACKUP_CATALOG_FILE"] == "/work/verified-backup-catalog.json"
+    assert tool_environment["B2B3_CLI_COMMAND"] == "/released/b2b3-cli"
+    assert tool_environment["B2B3_WORKER_COMMAND"] == "/released/b2b3-worker"
+    tool_volumes = model["services"]["backup-tool"]["volumes"]
+    release_mounts = {
+        volume["target"]: volume
+        for volume in tool_volumes
+        if volume["target"].startswith("/released/")
+    }
+    assert set(release_mounts) == {"/released/b2b3-cli", "/released/b2b3-worker"}
+    assert all(volume["type"] == "bind" for volume in release_mounts.values())
+    assert all(volume["read_only"] is True for volume in release_mounts.values())
+    assert "b2b3_evidence_signing_key" not in model.get("secrets", {})
+    assert all(
+        secret["source"] != "b2b3_evidence_signing_key"
+        for secret in model["services"]["backup-tool"]["secrets"]
+    )
     raw_compose = DRILL_COMPOSE.read_text(encoding="utf-8")
     assert "ux09-backup:phase6c-foundation" not in raw_compose
     assert "${BACKUP_IMAGE:?" in raw_compose

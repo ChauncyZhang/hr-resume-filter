@@ -60,7 +60,27 @@ services:
       BACKUP_MANIFEST_SIGNING_KEY_FILE: /run/secrets/backup_manifest_signing_key
       LEDGER_MANIFEST_SIGNING_KEY_FILE: /run/secrets/ledger_manifest_signing_key
       LEDGER_SIGNING_KEY_HISTORY_FILE: /run/secrets/ledger_signing_key_history
+      B2B3_EVIDENCE_VERIFY_KEY_FILE: /run/secrets/b2b3_evidence_verify_key
+      B2B3_CLI_COMMAND: /released/b2b3-cli
+      B2B3_WORKER_COMMAND: /released/b2b3-worker
+      APPLICATION_HOST: ${APPLICATION_HOST:-recovery.invalid}
+      BACKUP_DESTINATION: ${BACKUP_DESTINATION:-s3://offhost.invalid/ux09-business}
+      LEDGER_ARCHIVE_DESTINATION: ${LEDGER_ARCHIVE_DESTINATION:-s3://ledger.invalid/ux09-ledger}
+      BUSINESS_BUCKETS: ${BUSINESS_BUCKETS:-resumes}
+      MINIO_ALIAS: ${MINIO_ALIAS:-recovery}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${RECOVERY_PGUSER:-ux09_recovery_owner}
+      PGDATABASE: ${RECOVERY_PGDATABASE:-ux09_recovery}
+      RESTORE_STAGING_ROOT: /work/restore
+      BACKUP_DESTINATION_CLIENT: ${BACKUP_DESTINATION_CLIENT:-/released/backup-destination-client}
+      LEDGER_ARCHIVE_CLIENT: ${LEDGER_ARCHIVE_CLIENT:-/released/ledger-archive-client}
+      LEDGER_RESTORE_PROOF_CLIENT: ${LEDGER_RESTORE_PROOF_CLIENT:-/released/ledger-restore-proof-client}
+      BUSINESS_RESTORE_CLIENT: ${BUSINESS_RESTORE_CLIENT:-/opt/ux09-backup/minio-business.sh}
       RESTORE_EVIDENCE_FILE: /work/restore-evidence.json
+      B2B3_EVIDENCE_FILE: /work/b2b3-evidence.json
+      B2B3_EVIDENCE_SIGNATURE_FILE: /work/b2b3-evidence.sig
+      DRILL_EVIDENCE_FILE: /work/drill-evidence.json
       TRAFFIC_CLOSED_MARKER_FILE: /work/TRAFFIC_CLOSED
       TRAFFIC_OPEN_MARKER_FILE: /work/TRAFFIC_OPEN
     secrets:
@@ -99,10 +119,27 @@ services:
         uid: "10001"
         gid: "10001"
         mode: 0400
+      - source: b2b3_evidence_verify_key
+        target: b2b3_evidence_verify_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
     volumes:
       - type: volume
         source: recovery-work
         target: /work
+      - type: bind
+        source: ${B2B3_CLI_RELEASE_FILE:?Set B2B3_CLI_RELEASE_FILE to the released B2B3 CLI executable}
+        target: /released/b2b3-cli
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${B2B3_WORKER_RELEASE_FILE:?Set B2B3_WORKER_RELEASE_FILE to the released B2B3 Worker executable}
+        target: /released/b2b3-worker
+        read_only: true
+        bind:
+          create_host_path: false
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,11 +150,12 @@ services:
       - /tmp:mode=0700
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    networks: [recovery]
+    networks: [recovery, offhost-egress]
 
 networks:
   recovery:
     internal: true
+  offhost-egress:
 
 volumes:
   recovery-postgres-data:
@@ -148,3 +186,5 @@ secrets:
     file: ${LEDGER_MANIFEST_SIGNING_KEY_FILE:-./backup/secrets/ledger-manifest-signing-key}
   ledger_signing_key_history:
     file: ${LEDGER_SIGNING_KEY_HISTORY_FILE:-./backup/secrets/ledger-signing-key-history.json}
+  b2b3_evidence_verify_key:
+    file: ${B2B3_EVIDENCE_VERIFY_KEY_FILE:-./backup/secrets/b2b3-evidence-verify-key}

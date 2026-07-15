@@ -293,6 +293,18 @@ def test_admin_happy_path_preconditions_idempotency_and_private_download(tmp_pat
         assert created.json() == replay.json()
         conflict = client.post(f"/api/v1/jobs/{job_id}/applications", json={**application_payload, "source": "other"}, headers=app_headers)
         assert conflict.status_code == 409 and conflict.json()["code"] == "idempotency_conflict"
+        history = client.get(f"/api/v1/candidates/{candidate_id}/applications")
+        assert history.status_code == 200
+        history_item = history.json()["data"][0]
+        assert history.json()["meta"]["count"] == 1
+        assert {key: history_item[key] for key in ("id", "job_id", "stage", "source", "source_application_id", "job_title")} == {
+            "id": created.json()["data"]["id"],
+            "job_id": job_id,
+            "stage": "new",
+            "source": "manual",
+            "source_application_id": None,
+            "job_title": "Senior Engineer",
+        }
 
         preview = client.get(f"/api/v1/resumes/{resume_id}/preview")
         assert preview.status_code == 200 and preview.headers["cache-control"] == "no-store"

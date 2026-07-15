@@ -133,3 +133,30 @@ groups:
         annotations:
           summary: Private MinIO capacity metrics are unavailable
           runbook_url: https://github.com/ChauncyZhang/hr-resume-filter/blob/main/deploy/observability/runbook.md#miniometricsunavailable
+
+  - name: ux09-backup-freshness
+    rules:
+      - record: ux09_backup_last_success_age_seconds
+        expr: clamp_min(time() - ux09_backup_last_valid_restore_point_unixtime_seconds, 0)
+      - alert: BackupRestorePointFreshnessWarning
+        expr: ux09_backup_last_success_age_seconds > ux09_backup_freshness_warning_threshold_seconds and ux09_backup_last_success_age_seconds <= ux09_backup_rpo_page_threshold_seconds
+        labels: {severity: warning}
+        annotations:
+          summary: Latest validated restore point is older than 18 hours
+      - alert: BackupRestorePointFreshnessCritical
+        expr: ux09_backup_last_success_age_seconds > ux09_backup_rpo_page_threshold_seconds
+        labels: {severity: critical}
+        annotations:
+          summary: Latest validated restore point has breached the 24 hour RPO
+      - alert: BackupRestorePointSignalMissing
+        expr: absent(ux09_backup_last_valid_restore_point_unixtime_seconds) or absent(ux09_backup_valid_restore_points) or absent(ux09_backup_freshness_warning_threshold_seconds) or absent(ux09_backup_rpo_page_threshold_seconds)
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Backup restore-point freshness evidence is missing
+      - alert: BackupRestorePointRedundancyCritical
+        expr: ux09_backup_valid_restore_points < 2
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Fewer than two remotely validated restore points remain

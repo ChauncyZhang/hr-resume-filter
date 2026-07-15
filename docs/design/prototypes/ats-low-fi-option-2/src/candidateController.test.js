@@ -191,9 +191,9 @@ test("candidate review loads the exact selected application when the same candid
         contacts: [{ kind: "phone", value: "138****2468" }, { kind: "email", value: "lij***@mail.com" }],
       });
       if (path === `/api/v1/candidates/${candidateId}/applications`) return response([
-        { id: "application-other", candidate_id: candidateId, job_id: "job-2", resume_id: "resume-2", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: null, version: 4, updated_at: "2026-07-12T09:00:00+00:00" },
-        { id: "application-older", candidate_id: candidateId, job_id: jobId, resume_id: "resume-old", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: "暂不合适：历史申请", version: 5, updated_at: "2026-07-12T10:00:00+00:00" },
-        { id: "application-1", candidate_id: candidateId, job_id: jobId, resume_id: "resume-1", owner_id: "user-1", stage: "review", source: "本地上传", human_conclusion: "需要补充：确认到岗时间", version: 2, updated_at: "2026-07-13T09:00:00+00:00" },
+        { id: "application-other", candidate_id: candidateId, job_id: "job-2", job_title: "平台工程师", resume_id: "resume-2", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: null, version: 4, updated_at: "2026-07-12T09:00:00+00:00" },
+        { id: "application-older", candidate_id: candidateId, job_id: jobId, job_title: "AI 工程师", resume_id: "resume-old", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: "暂不合适：历史申请", version: 5, updated_at: "2026-07-12T10:00:00+00:00" },
+        { id: "application-1", candidate_id: candidateId, job_id: jobId, job_title: "AI 工程师", resume_id: "resume-1", owner_id: "user-1", stage: "review", source: "本地上传", human_conclusion: "需要补充：确认到岗时间", version: 2, updated_at: "2026-07-13T09:00:00+00:00" },
       ]);
       if (path === `/api/v1/candidates/${candidateId}/resumes`) return response([
         { id: "resume-old", candidate_id: candidateId, version_number: 1, created_at: "2026-07-12T08:00:00+00:00" },
@@ -231,6 +231,11 @@ test("candidate review loads the exact selected application when the same candid
   assert.equal(review.timeline[0].actor, "张小北");
   assert.equal(review.timeline[1].action, "更新职位申请");
   assert.equal(review.ruleScore, 81);
+  assert.deepEqual(review.applications.map((item) => [item.id, item.position, item.state]), [
+    ["application-other", "平台工程师", "已淘汰"],
+    ["application-older", "AI 工程师", "已淘汰"],
+    ["application-1", "AI 工程师", "待复核"],
+  ]);
 });
 
 test("normalization refuses cross-job fallback and preserves masked contacts only", () => {

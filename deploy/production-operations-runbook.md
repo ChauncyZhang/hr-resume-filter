@@ -2,15 +2,16 @@
 
 ## Readiness status
 
-This canonical operations runbook describes the Phase 6C foundation operating
-contract. It does not declare Phase 6C or the service production ready. Launch
-still requires provider-specific off-host storage, reviewed identities,
-production preflight/provisioning integration after shared-file release,
+This canonical operations runbook describes the Phase 6C operating contract.
+It does not declare the service production ready. Launch still requires
+provider-specific off-host storage, reviewed identities, production
+preflight/provisioning integration after shared-file release,
 provider-specific validation of the bundled S3-compatible atomic publisher,
-the real B2B3 CLI and B2B3 Worker signed evidence protocol, and a complete real
-restore drill. The local disposable MinIO race proves process concurrency only;
-it is not an off-host deployment. The foundation traffic gate always exits 78
-and cannot open traffic.
+the released real B2B3 CLI and B2B3 Worker, and a complete real restore drill.
+The local disposable MinIO race proves process concurrency only; it is not an
+off-host deployment. The traffic gate can verify signed, replay-resistant B2B3
+evidence, but deliberately emits traffic-closed evidence and cannot open
+production traffic. The production traffic decision remains external.
 
 ## Preflight and launch
 

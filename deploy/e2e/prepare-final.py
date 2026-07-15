@@ -47,19 +47,24 @@ def prepare_database() -> None:
         if "recruiting_admin" not in {role.role for role in admin.roles}:
             admin.roles.append(UserRole(role="recruiting_admin"))
 
-        interviewer_email = synthetic_email("E2E_INTERVIEWER_EMAIL")
-        interviewer = db.scalar(select(User).options(selectinload(User.roles)).where(User.organization_id == admin.organization_id, User.normalized_email == interviewer_email.casefold()))
-        if interviewer is None:
-            interviewer = User(
-                organization_id=admin.organization_id,
-                email=interviewer_email,
-                normalized_email=interviewer_email.casefold(),
-                display_name="Final E2E Interviewer",
-                password_hash=PasswordService().hash(required("E2E_INTERVIEWER_PASSWORD")),
-                status=UserStatus.ACTIVE,
-            )
-            interviewer.roles.append(UserRole(role="interviewer"))
-            db.add(interviewer)
+        for email_name, password_name, display_name, role in (
+            ("E2E_INTERVIEWER_EMAIL", "E2E_INTERVIEWER_PASSWORD", "Final E2E Interviewer", "interviewer"),
+            ("E2E_UNASSIGNED_INTERVIEWER_EMAIL", "E2E_UNASSIGNED_INTERVIEWER_PASSWORD", "Final E2E Unassigned Interviewer", "interviewer"),
+            ("E2E_RECRUITER_EMAIL", "E2E_RECRUITER_PASSWORD", "Final E2E Recruiter", "recruiter"),
+        ):
+            user_email = synthetic_email(email_name)
+            user = db.scalar(select(User).options(selectinload(User.roles)).where(User.organization_id == admin.organization_id, User.normalized_email == user_email.casefold()))
+            if user is None:
+                user = User(
+                    organization_id=admin.organization_id,
+                    email=user_email,
+                    normalized_email=user_email.casefold(),
+                    display_name=display_name,
+                    password_hash=PasswordService().hash(required(password_name)),
+                    status=UserStatus.ACTIVE,
+                )
+                user.roles.append(UserRole(role=role))
+                db.add(user)
 
         title = required("E2E_JOB_TITLE")
         job = db.scalar(select(Job).where(Job.organization_id == admin.organization_id, Job.title == title))

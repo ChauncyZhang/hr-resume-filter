@@ -105,7 +105,9 @@ export function candidateReviewContext(file, task) {
 
 export function serverIssueMessage(file) {
   if (file.status === "partial") return file.llmRetryable ? "LLM 评估未完成，规则结果已保留；可使用下方“重试 LLM”操作。" : "LLM 评估未完成，规则结果已保留；当前没有可用的 LLM 重试操作。";
+  if (file.status === "failed" && file.error === "malware_detected") return "检测到恶意文件，已拒绝并从隔离区删除。";
   if (file.status === "failed") return file.retryable ? "文件处理失败，可使用下方“重新解析”操作。" : "文件处理失败，当前没有可用的重试操作。";
+  if (file.llmStatus === "skipped" || file.llmStatus === "not_requested") return "LLM 未启用，规则评分已保留；请由招聘团队完成人工复核。";
   return file.risk || "—";
 }
 
@@ -157,6 +159,24 @@ export function advanceErrorMessage(error) {
   return error?.status === 409
     ? "推进未完成，候选人状态可能已变化；正在刷新服务端结果，请重新选择。"
     : "推进失败，请稍后重试。";
+}
+
+export function bulkUndoActionState(items, submitting) {
+  return {
+    visible: Array.isArray(items) && items.length > 0,
+    disabled: submitting === true,
+    label: submitting ? "撤销中" : "撤销批量推进",
+  };
+}
+
+export function undoSuccessMessage(result) {
+  return `已撤销 ${safeActionCount(result?.applied)} 位候选人的本次批量推进，服务端结果已刷新。`;
+}
+
+export function undoErrorMessage(error) {
+  return error?.status === 409
+    ? "无法撤销：候选人状态已变化，已刷新服务端结果。"
+    : "撤销失败，请稍后重试。";
 }
 
 export function progressSummary(task, currentFile = "") {
@@ -352,6 +372,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
   const [pollError, setPollError] = useState("");
   const [bulkError, setBulkError] = useState("");
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  const [undoItems, setUndoItems] = useState([]);
   const [pollAttempt, setPollAttempt] = useState(0);
   const [retryingIds, setRetryingIds] = useState([]);
   const pollingRef = useRef(null);
@@ -366,6 +387,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     setSelected(nextViewState.selected);
     setBulkError("");
     setBulkSubmitting(false);
+    setUndoItems([]);
     bulkAbortRef.current?.abort();
     bulkAbortRef.current = null;
     retryingRef.current.clear();
@@ -430,6 +452,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
   const currentFile = task.files[task.completed]?.name || (task.serverBacked && total === 0 ? "正在获取服务端任务" : "全部文件已处理");
   const selectableIds = filtered.filter((file) => isAdvanceSelectable(file, task.serverBacked)).map((file) => file.id);
   const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.includes(id));
+  const undoAction = bulkUndoActionState(undoItems, bulkSubmitting);
 
   useEffect(() => {
     setSelected((current) => current.filter((id) => task.files.some((file) => file.id === id && isAdvanceSelectable(file, task.serverBacked))));
@@ -479,12 +502,41 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
       const result = await controller.bulkAction(task.id, items, { signal: abortController.signal });
       if (abortController.signal.aborted) return;
       setSelected([]);
+      setUndoItems(result.undo_items);
       onNotify(advanceSuccessMessage(result));
       setPollAttempt((value) => value + 1);
     } catch (error) {
       if (abortController.signal.aborted || error?.name === "AbortError") return;
       setBulkError(advanceErrorMessage(error));
       if (error?.status === 409) setPollAttempt((value) => value + 1);
+    } finally {
+      if (bulkAbortRef.current === abortController) {
+        bulkAbortRef.current = null;
+        setBulkSubmitting(false);
+      }
+    }
+  }
+
+  async function undoBulkAdvance() {
+    if (bulkSubmitting || undoItems.length === 0) return;
+    const abortController = new AbortController();
+    bulkAbortRef.current?.abort();
+    bulkAbortRef.current = abortController;
+    setBulkSubmitting(true);
+    setBulkError("");
+    try {
+      const result = await controller.undoBulkAction(task.id, undoItems, { signal: abortController.signal });
+      if (abortController.signal.aborted) return;
+      setUndoItems([]);
+      setPollAttempt((value) => value + 1);
+      onNotify(undoSuccessMessage(result));
+    } catch (error) {
+      if (abortController.signal.aborted || error?.name === "AbortError") return;
+      setBulkError(undoErrorMessage(error));
+      if (error?.status === 409) {
+        setUndoItems([]);
+        setPollAttempt((value) => value + 1);
+      }
     } finally {
       if (bulkAbortRef.current === abortController) {
         bulkAbortRef.current = null;
@@ -515,6 +567,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
         <div className="result-status-tabs">{["全部", "处理中", "成功", "部分成功", "失败"].map((item) => <button key={item} type="button" className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item}<span>{counts[item]}</span></button>)}</div>
 
         {task.serverBacked && selected.length > 0 && <div className="bulk-action-bar"><strong>已选择 {selected.length} 项</strong><button type="button" disabled={bulkSubmitting} onClick={advanceToReview}><UserRoundCheck size={15} />{bulkSubmitting ? "推进中" : "推进到待复核"}</button><button type="button" disabled={bulkSubmitting} aria-label="清除选择" onClick={() => setSelected([])}><X size={16} /></button></div>}
+        {undoAction.visible && <div className="bulk-action-bar"><strong>本次批量推进可立即撤销</strong><button type="button" disabled={undoAction.disabled} onClick={undoBulkAdvance}><RotateCcw size={15} />{undoAction.label}</button></div>}
         {bulkError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{bulkError}</span></div>}
 
         <div className="screening-table">

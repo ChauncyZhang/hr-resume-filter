@@ -78,6 +78,7 @@ function normalizeFile(item) {
     error,
     application_stage: safeString(item?.application_stage) || null,
     application_version: Number.isInteger(item?.application_version) ? item.application_version : null,
+    llmStatus: safeString(item?.llm_status),
     retryable: item?.retryable === true,
     llmRetryable: item?.llm_retryable === true,
   };
@@ -213,6 +214,27 @@ export function createScreeningController({
     return {
       applied: safeCount(data?.applied_count),
       already_applied: safeCount(data?.already_applied_count),
+      undo_items: Array.isArray(data?.applications) ? data.applications
+        .filter((application) => isRecord(application)
+          && application.result === "applied"
+          && safeString(application.item_id)
+          && Number.isInteger(application.version)
+          && application.version > 0)
+        .map((application) => ({ item_id: application.item_id, expected_application_version: application.version })) : [],
+    };
+  }
+
+  async function undoBulkAction(runId, items, { signal } = {}) {
+    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/bulk-actions`, {
+      method: "POST",
+      body: { command: "undo_advance_to_new", items },
+      idempotencyKey: createIdempotencyKey(),
+      ...withSignal(signal),
+    });
+    const data = resourceData(response);
+    return {
+      applied: safeCount(data?.applied_count),
+      already_applied: safeCount(data?.already_applied_count),
     };
   }
 
@@ -239,7 +261,7 @@ export function createScreeningController({
     }
   }
 
-  return { listJobs, createRun, uploadFiles, startRun, getRun, getItems, retryItem, bulkAction, pollRun };
+  return { listJobs, createRun, uploadFiles, startRun, getRun, getItems, retryItem, bulkAction, undoBulkAction, pollRun };
 }
 
 export const screeningController = createScreeningController();

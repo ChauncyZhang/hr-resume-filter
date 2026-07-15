@@ -3,5 +3,5 @@
 app
 docs
 server/.venv
-server/**/__pycache__
-server/**/*.pyc
+**/__pycache__
+**/*.pyc

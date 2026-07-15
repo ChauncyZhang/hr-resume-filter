@@ -75,6 +75,10 @@ try {
     $env:E2E_ADMIN_PASSWORD = "Admin-$([Guid]::NewGuid().ToString('N'))"
     $env:E2E_INTERVIEWER_EMAIL = "interviewer-$RunToken@example.test"
     $env:E2E_INTERVIEWER_PASSWORD = "Interviewer-$([Guid]::NewGuid().ToString('N'))"
+    $env:E2E_UNASSIGNED_INTERVIEWER_EMAIL = "unassigned-$RunToken@example.test"
+    $env:E2E_UNASSIGNED_INTERVIEWER_PASSWORD = "Unassigned-$([Guid]::NewGuid().ToString('N'))"
+    $env:E2E_RECRUITER_EMAIL = "recruiter-$RunToken@example.test"
+    $env:E2E_RECRUITER_PASSWORD = "Recruiter-$([Guid]::NewGuid().ToString('N'))"
     $env:E2E_JOB_TITLE = "Final E2E Source $RunToken"
     $env:E2E_PROJECT_NAME = $ProjectName
     $env:E2E_BROWSER_PROFILE = $ProfilePath

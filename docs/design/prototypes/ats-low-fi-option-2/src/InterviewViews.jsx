@@ -186,6 +186,17 @@ function ScheduleInterview({ record, candidateId, candidates, participantOptions
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [form, setForm] = useState(() => ({ candidateId: record?.candidateId || fallback?.candidateId || fallback?.id || "", position: record?.position || fallback?.position || "", round: record?.round || "一面", method: record?.method || "视频面试", timezone: record?.timezone || "Asia/Shanghai", date: record?.date || "", time: record?.time || "10:00", duration: record?.duration || 60, interviewerIds: record?.interviewerIds || participantOptions.slice(0, 1).map((item) => item.id), location: record?.location === "未填写" ? "" : record?.location || "", candidateMessage: "您好，诚邀您参加本次面试，请提前 5 分钟进入会议。", interviewerMessage: "您有一场新的面试任务，请提前查看候选人材料与职位重点。" }));
+  useEffect(() => {
+    if (record || !candidateId) return;
+    const loadedCandidate = candidates.find((item) => item.id === candidateId || item.candidateId === candidateId);
+    if (!loadedCandidate) return;
+    const loadedCandidateId = loadedCandidate.candidateId || loadedCandidate.id;
+    setForm((current) => current.candidateId ? current : {
+      ...current,
+      candidateId: loadedCandidateId,
+      position: current.position || loadedCandidate.position || "",
+    });
+  }, [candidateId, candidates, record]);
   const candidate = candidates.find((item) => item.id === form.candidateId || item.candidateId === form.candidateId) || fallback;
   const candidateOptions = candidate && !candidates.some((item) => (item.candidateId || item.id) === (candidate.candidateId || candidate.id)) ? [candidate, ...candidates] : candidates;
   const selectedInterviewers = participantOptions.filter((item) => form.interviewerIds.includes(item.id));

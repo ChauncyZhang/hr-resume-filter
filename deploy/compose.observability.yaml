@@ -74,6 +74,7 @@ services:
     command:
       - --path.rootfs=/host/root
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+      - --collector.textfile.directory=/var/lib/node_exporter/textfile_collector
     volumes:
       - type: bind
         source: /
@@ -81,6 +82,12 @@ services:
         read_only: true
         bind:
           propagation: rslave
+      - type: bind
+        source: ${BACKUP_STATE_DIR:-/var/lib/ux09-backup}/metrics
+        target: /var/lib/node_exporter/textfile_collector
+        read_only: true
+        bind:
+          create_host_path: false
     pid: host
     read_only: true
     cap_drop: [ALL]

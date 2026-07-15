@@ -142,7 +142,8 @@ function selectApplication(applications, candidateId, context) {
 
 export function normalizeCandidateReview({ candidate, applications, resumes, notes, timeline, context }) {
   const candidateId = safeString(candidate?.id);
-  const application = selectApplication(applications, candidateId, context);
+  const candidateApplications = safeArray(applications).filter((item) => item?.candidate_id === candidateId);
+  const application = selectApplication(candidateApplications, candidateId, context);
   const resume = application
     ? safeArray(resumes).find((item) => item?.id === application.resume_id) || null
     : null;
@@ -180,13 +181,13 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
     tags: [],
     notes: safeArray(notes).map((item) => ({ id: safeString(item?.id), body: safeString(item?.body), authorId: safeString(item?.author_id), createdAt: safeString(item?.created_at) })).filter((item) => item.id && item.body),
     timeline: safeArray(timeline).map((item) => normalizeTimelineEvent(item, context.actor)).filter((item) => item.id),
-    applications: application ? [{
-      id: application.id,
-      position: safeString(context.position, "当前职位"),
-      state: API_TO_UI_STAGE[application.stage] || "未知阶段",
-      created: displayDateTime(application.updated_at),
-      source: safeString(application.source, "未记录"),
-    }] : [],
+    applications: candidateApplications.map((item) => ({
+      id: item.id,
+      position: safeString(item.job_title, item.job_id === context.jobId ? safeString(context.position, "当前职位") : "职位名称未提供"),
+      state: API_TO_UI_STAGE[item.stage] || "未知阶段",
+      created: displayDateTime(item.updated_at),
+      source: safeString(item.source, "未记录"),
+    })),
     interviews: [],
     application,
     resume,

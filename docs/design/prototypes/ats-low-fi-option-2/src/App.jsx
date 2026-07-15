@@ -626,7 +626,7 @@ function AuthenticatedApp({ session, onLogout, screeningController, candidateCon
     setActiveNav("面试");
     setInterviewMode("schedule");
     setSelectedInterviewId(interview?.id || null);
-    setScheduleCandidateId(candidate?.id || null);
+    setScheduleCandidateId(candidate?.id || candidate?.candidateId || null);
   }
 
   function openFeedbackInterview(interviewOrId) {

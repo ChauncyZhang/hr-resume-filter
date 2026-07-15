@@ -15,13 +15,13 @@ class RetryOut(ApiModel): item:ItemOut; run:RunOut
 class RetryResource(ApiModel): data:RetryOut
 class BulkItem(ApiModel): item_id:UUID; expected_application_version:int=Field(ge=1)
 class BulkAction(ApiModel):
-    command:Literal["advance_to_review","reject"]; items:list[BulkItem]=Field(min_length=1,max_length=100); reason_code:str|None=Field(default=None,pattern=r"^[a-z][a-z0-9_]{0,63}$"); reason_text:str|None=Field(default=None,max_length=1000)
+    command:Literal["advance_to_review","undo_advance_to_new","reject"]; items:list[BulkItem]=Field(min_length=1,max_length=100); reason_code:str|None=Field(default=None,pattern=r"^[a-z][a-z0-9_]{0,63}$"); reason_text:str|None=Field(default=None,max_length=1000)
     @model_validator(mode="after")
     def validate_action(self):
         if len({item.item_id for item in self.items})!=len(self.items): raise ValueError("duplicate item IDs")
         if self.command=="reject" and not self.reason_code: raise ValueError("rejection reason required")
         if self.command!="reject" and (self.reason_code is not None or self.reason_text is not None): raise ValueError("reason is only valid for rejection")
         return self
-class BulkApplicationOut(ApiModel): id:str; stage:str; version:int; result:Literal["applied","already_applied"]
+class BulkApplicationOut(ApiModel): id:str; item_id:str; stage:str; version:int; result:Literal["applied","already_applied"]
 class BulkOut(ApiModel): command:str; applied_count:int; already_applied_count:int; applications:list[BulkApplicationOut]
 class BulkResource(ApiModel): data:BulkOut

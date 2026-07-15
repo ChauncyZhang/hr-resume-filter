@@ -5,8 +5,8 @@ from server.app.identity.models import AuditLog
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
-from server.app.recruiting.models import Application,Candidate,FileObject,Resume
-from server.app.recruiting.service import transition_application_record
+from server.app.recruiting.models import Application,ApplicationStageEvent,Candidate,FileObject,Resume
+from server.app.recruiting.service import transition_application_record,undo_bulk_advance_record
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.rules import ENGINE_VERSION
@@ -116,14 +116,27 @@ def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
     if any(application_candidates.get(application_id)!=candidate_id for application_id,candidate_id in expected_relationships.values()): raise ScreeningBulkConflict
     by_id={application.id:application for application in applications}; decisions=[]
     for item in rows:
-        application=by_id[item.application_id]; expected=requested[item.id]; target="review" if payload.command=="advance_to_review" else "rejected"
-        if application.stage==target and application.version==expected+1: decisions.append((application,"already_applied",target)); continue
+        application=by_id[item.application_id]; expected=requested[item.id]
+        target="review" if payload.command=="advance_to_review" else "new" if payload.command=="undo_advance_to_new" else "rejected"
+        if payload.command!="undo_advance_to_new" and application.stage==target and application.version==expected+1: decisions.append((item,application,"already_applied",target)); continue
         if application.version!=expected: raise ScreeningBulkConflict
         if payload.command=="advance_to_review" and application.stage!="new": raise ScreeningBulkConflict
+        if payload.command=="undo_advance_to_new":
+            latest_event=db.scalar(select(ApplicationStageEvent).where(ApplicationStageEvent.organization_id==organization_id,ApplicationStageEvent.application_id==application.id).order_by(ApplicationStageEvent.created_at.desc(),ApplicationStageEvent.id.desc()).limit(1))
+            advance_audits=list(db.scalars(select(AuditLog).where(AuditLog.organization_id==organization_id,AuditLog.resource_type=="application",AuditLog.resource_id==application.id,AuditLog.event_type.in_(("application.bulk_advanced","application.bulk_advance_already_applied"))).order_by(AuditLog.created_at.desc(),AuditLog.id.desc())))
+            relevant_audits=[audit for audit in advance_audits if audit.metadata_json.get("run_id")==str(run_id) and audit.metadata_json.get("item_id")==str(item.id)]
+            has_provenance=bool(relevant_audits and relevant_audits[0].event_type=="application.bulk_advanced" and relevant_audits[0].metadata_json.get("application_version")==expected)
+            if application.stage!="review" or latest_event is None or latest_event.event_type!="application.stage_changed" or latest_event.payload.get("from_stage")!="new" or latest_event.payload.get("to_stage")!="review" or not has_provenance: raise ScreeningBulkConflict
         if payload.command=="reject" and application.stage in {"hired","rejected","withdrawn"}: raise ScreeningBulkConflict
-        decisions.append((application,"applied",target))
+        decisions.append((item,application,"applied",target))
     output=[]
-    for application,result,target in decisions:
-        if result=="applied": application=transition_application_record(db,organization_id,application.id,target,expected_version=application.version,actor_user_id=actor_user_id,trace_id=trace_id,reason_code=payload.reason_code,reason_text=payload.reason_text)
-        output.append({"id":str(application.id),"stage":application.stage,"version":application.version,"result":result})
+    for item,application,result,target in decisions:
+        if result=="applied" and payload.command=="undo_advance_to_new":
+            application=undo_bulk_advance_record(db,application,expected_version=application.version,actor_user_id=actor_user_id,trace_id=trace_id,run_id=run_id,item_id=item.id)
+        elif result=="applied":
+            application=transition_application_record(db,organization_id,application.id,target,expected_version=application.version,actor_user_id=actor_user_id,trace_id=trace_id,reason_code=payload.reason_code,reason_text=payload.reason_text)
+            if payload.command=="advance_to_review": db.add(AuditLog(organization_id=organization_id,actor_user_id=actor_user_id,event_type="application.bulk_advanced",outcome="success",resource_type="application",resource_id=application.id,trace_id=trace_id,metadata_json={"application_id":str(application.id),"run_id":str(run_id),"item_id":str(item.id),"application_version":application.version}))
+        elif payload.command=="advance_to_review":
+            db.add(AuditLog(organization_id=organization_id,actor_user_id=actor_user_id,event_type="application.bulk_advance_already_applied",outcome="success",resource_type="application",resource_id=application.id,trace_id=trace_id,metadata_json={"application_id":str(application.id),"run_id":str(run_id),"item_id":str(item.id),"application_version":application.version}))
+        output.append({"id":str(application.id),"item_id":str(item.id),"stage":application.stage,"version":application.version,"result":result})
     db.flush(); return {"command":payload.command,"applied_count":sum(item["result"]=="applied" for item in output),"already_applied_count":sum(item["result"]=="already_applied" for item in output),"applications":output}
