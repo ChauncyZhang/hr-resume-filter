@@ -117,14 +117,13 @@ def seeded(databases):
                jsonb_build_object('data', jsonb_build_object(
                  'id', CAST(:application AS text), 'candidate_id', CAST(:candidate AS text)
                )), now() + interval '1 day'),
-              (:upload_idempotency, :organization, :user, 'screening.upload', 'upload-related',
+              (:upload_idempotency, :organization, :user, 'screening.item.upload', 'upload-related',
                repeat('6',64), 201,
-               jsonb_build_object('data', jsonb_build_object('items', jsonb_build_array(
-                 jsonb_build_object(
-                   'item_id', CAST(:screening_item AS text),
-                   'filename', 'private-person.pdf'
-                 )
-               ))), now() + interval '1 day'),
+               jsonb_build_object('data', jsonb_build_object(
+                 'id', CAST(:screening_item AS text),
+                 'filename', 'private-person.pdf',
+                 'file_object_id', CAST(:file AS text)
+               )), now() + interval '1 day'),
               (:other_idempotency, :organization, :user, 'job.create', 'unrelated',
                repeat('8',64), 201, '{"data":{"id":"unrelated"}}', now() + interval '1 day');
             INSERT INTO application_stage_events(id, organization_id, application_id, actor_user_id, event_type, payload)
@@ -380,6 +379,21 @@ def test_redaction_clears_full_pii_inventory_and_retains_aggregate_facts(
 ) -> None:
     from server.app.governance.deletion_service import execute_database_redaction
 
+    with databases["owner"].connect() as connection:
+        upload_record = connection.execute(text("""
+            SELECT operation, response_json
+            FROM idempotency_records
+            WHERE id=:upload_idempotency
+        """), seeded).one()
+        assert upload_record.operation == "screening.item.upload"
+        assert upload_record.response_json == {
+            "data": {
+                "id": str(seeded["screening_item"]),
+                "filename": "private-person.pdf",
+                "file_object_id": str(seeded["file"]),
+            }
+        }
+
     with databases["app"].begin() as connection:
         connection.execute(text("""
             INSERT INTO audit_logs(
@@ -503,6 +517,14 @@ def test_redaction_clears_full_pii_inventory_and_retains_aggregate_facts(
         assert connection.scalar(text(
             "SELECT count(*) FROM idempotency_records WHERE id=:other_idempotency"
         ), seeded) == 1
+        remaining_idempotency_payloads = connection.scalars(text("""
+            SELECT response_json::text
+            FROM idempotency_records
+            WHERE organization_id=:organization
+        """), seeded).all()
+        assert all("private-person.pdf" not in payload for payload in remaining_idempotency_payloads)
+        assert all(str(seeded["screening_item"]) not in payload for payload in remaining_idempotency_payloads)
+        assert all(str(seeded["file"]) not in payload for payload in remaining_idempotency_payloads)
 
     with databases["governance"].begin() as connection:
         connection.execute(text("SET LOCAL TIME ZONE 'Asia/Shanghai'"))

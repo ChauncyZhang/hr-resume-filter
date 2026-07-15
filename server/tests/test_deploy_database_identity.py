@@ -206,6 +206,84 @@ def test_minio_provisioning_rejects_placeholder_or_drifted_configuration_before_
     assert all(value not in result.stderr for value in overrides.values())
 
 
+@pytest.mark.parametrize(
+    "prefix_name",
+    [
+        "GOVERNANCE_RESUME_PREFIX",
+        "GOVERNANCE_EXPORT_PREFIX",
+        "GOVERNANCE_LEDGER_PREFIX",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_prefix",
+    [
+        "/clean/",
+        "../clean/",
+        "clean/../",
+        "clean//",
+        "./clean/",
+        "clean\\nested/",
+        "clean/\x01/",
+        "https://storage.test/clean/",
+        "clean/?query/",
+        "clean/#fragment/",
+    ],
+)
+def test_minio_provisioning_rejects_unsafe_object_prefixes_before_network_without_leak(
+    tmp_path: Path, prefix_name: str, invalid_prefix: str
+) -> None:
+    called = tmp_path / "mc-called"
+    fake_mc = tmp_path / "mc"
+    fake_mc.write_text(
+        '#!/bin/sh\nprintf called >"$FAKE_MC_CALLED"\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_mc.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", "deploy/minio/provision.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=_minio_environment(
+            **{
+                prefix_name: invalid_prefix,
+                "FAKE_MC_CALLED": str(called),
+                "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            }
+        ),
+    )
+
+    assert result.returncode != 0
+    assert "invalid object prefix" in result.stderr
+    assert invalid_prefix not in result.stderr
+    assert not called.exists()
+
+
+def test_minio_provisioning_accepts_canonical_relative_object_prefixes(
+    tmp_path: Path,
+) -> None:
+    fake_mc = tmp_path / "mc"
+    fake_mc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_mc.chmod(0o755)
+
+    result = subprocess.run(
+        ["sh", "deploy/minio/provision.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=_minio_environment(
+            GOVERNANCE_RESUME_PREFIX="clean/",
+            GOVERNANCE_EXPORT_PREFIX="exports/",
+            PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+        ),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_minio_provisioning_rejects_checked_in_example_credentials_without_leak() -> None:
     example = {}
     for line in (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8").splitlines():

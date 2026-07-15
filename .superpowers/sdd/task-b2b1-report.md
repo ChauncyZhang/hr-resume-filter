@@ -72,7 +72,7 @@ All credential values used below were disposable local values supplied through e
 ### Remediation and GREEN evidence
 
 - Audit redaction now constructs a per-row transaction-local plan. The trigger accepts only the exact planned resource nulling and allowlisted metadata-key subtraction, and additionally requires both direct executor membership and execution as the redaction routine's `SECURITY DEFINER` owner; direct updates fail even with a forged exact plan. Resource IDs are matched by type, so a `job` UUID collision remains untouched while candidate, resume, file object, application, screening item/result, note, interview, feedback, and talent membership links are removed. Metadata coverage includes real `item_id`, `note_id`, `membership_id`, `source_application_id`, file-object, and prior keys.
-- Candidate-linked idempotency discovery includes resume, file-object, application, screening-item/result, note, membership, interview, and feedback IDs. A real upload-shaped cached response containing the original filename and screening `item_id` is deleted while an unrelated cache row remains.
+- Candidate-linked idempotency discovery includes resume, file-object, application, screening-item/result, note, membership, interview, and feedback IDs. A cached `screening.item.upload` response using the production `data.id` shape and containing the original filename plus file-object ID is deleted while an unrelated cache row remains.
 - Production application/governance settings and MinIO provisioning reject exact or suffixed `change-me*`, `placeholder*`, and `replace-me*` examples without rendering the rejected value. Production requires `GOVERNANCE_EXPORT_BUCKET == OBJECT_STORAGE_BUCKET` and exact `exports/`; every prefix must be non-empty, relative, and end in `/`.
 - Retired MinIO user lookup continues only for the explicit `The specified user does not exist` result. Fake-mc authentication failure exits safely without echoing the key or CLI output. A fresh real MinIO instance with non-placeholder credentials passed initial provisioning twice, rotation twice, old-key denial, restoration twice, and policy denial.
 - PostgreSQL provisioning revokes executor `ADMIN OPTION` before its ordinary grant. The real role test starts with `admin_option=true`, converges it to false, and proves the governance login cannot delegate the executor role.
@@ -80,6 +80,12 @@ All credential values used below were disposable local values supplied through e
 - Real PostgreSQL: `python -m pytest server/tests/test_governance_deletion_migration.py server/tests/test_governance_redaction_postgres.py -q` -> `24 passed in 131.32s`.
 - Real MinIO with rotation variables, denial checks, and a synchronized two-client conditional-create race: `python -m pytest server/tests/test_governance_minio.py -q` -> `10 passed in 2.02s`.
 - The real race produced identical receipts from both writers and one immutable ledger object; no race residual remains.
+
+### Final prefix and upload-shape review
+
+- MinIO provisioning now rejects absolute prefixes, dot segments, empty segments, backslashes, control characters, URI-like values, queries, and fragments before the first network call. Canonical `clean/`, `exports/`, and `deletions/` relative prefixes remain accepted.
+- The upload idempotency regression uses the real `screening.item.upload` operation and `data.id` response shape, includes both the original filename and file-object ID, and proves that no linked filename, screening-item ID, or file-object ID remains after redaction.
+- Controller verification: `server/tests/test_deploy_database_identity.py` passed `53` tests; the focused real PostgreSQL PII/redaction test passed; `bash -n deploy/minio/provision.sh` and `git diff --check` passed.
 
 ### Exact layered backend gate
 

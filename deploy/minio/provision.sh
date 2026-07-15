@@ -29,6 +29,20 @@ do
   esac
 done
 
+for prefix in "$GOVERNANCE_RESUME_PREFIX" "$GOVERNANCE_EXPORT_PREFIX" \
+  "$GOVERNANCE_LEDGER_PREFIX"
+do
+  case "$prefix" in
+    ""|*[!/]) echo "object prefixes must be non-empty and end with /" >&2; exit 1 ;;
+  esac
+  case "$prefix" in
+    /*|*//*|./*|../*|*/./*|*/../*|*[!A-Za-z0-9_./-]*)
+      echo "invalid object prefix" >&2
+      exit 1
+      ;;
+  esac
+done
+
 if [ "$GOVERNANCE_EXPORT_BUCKET" != "$OBJECT_STORAGE_BUCKET" ]; then
   echo "governance export bucket must match object storage bucket" >&2
   exit 1
@@ -75,16 +89,6 @@ for bucket in "$OBJECT_STORAGE_BUCKET" "$GOVERNANCE_RESUME_BUCKET" \
 do
   case "$bucket" in
     *[!A-Za-z0-9.-]*) echo "invalid bucket name" >&2; exit 1 ;;
-  esac
-done
-for prefix in "$GOVERNANCE_RESUME_PREFIX" "$GOVERNANCE_EXPORT_PREFIX" \
-  "$GOVERNANCE_LEDGER_PREFIX"
-do
-  case "$prefix" in
-    ""|*[!\/]) echo "object prefixes must be non-empty and end with /" >&2; exit 1 ;;
-  esac
-  case "$prefix" in
-    *[!A-Za-z0-9_./-]*) echo "invalid object prefix" >&2; exit 1 ;;
   esac
 done
 
