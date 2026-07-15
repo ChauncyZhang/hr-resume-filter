@@ -20,6 +20,11 @@ import {
   X,
 } from "lucide-react";
 import { mergeCandidateRecords } from "./candidateController.js";
+import {
+  JOB_EDIT_CONFLICT_REFRESHED_MESSAGE,
+  getJobFormActions,
+  getJobSaveSuccessMessage,
+} from "./jobController.js";
 import { commitJobMutation, getJobDefinitionErrors, retryJobRefresh } from "./jobWorkspaceState.js";
 
 // Legacy workflow scenarios still import this fixture. The authenticated job
@@ -120,8 +125,8 @@ function JobDialog({ onClose, onDiscard, onSave, saving }) {
   return <div className="job-confirm-backdrop" role="presentation" onMouseDown={onClose}><section className="job-confirm" role="dialog" aria-modal="true" aria-label="保存未完成的职位" onMouseDown={(event) => event.stopPropagation()}><header><CircleAlert size={21} /><h3>职位尚未保存</h3></header><p>你填写的内容还没有保存。可以先保存为草稿，或者放弃本次修改。</p><footer><button className="button secondary" type="button" onClick={onClose} disabled={saving}>继续编辑</button><button className="button danger-text" type="button" onClick={onDiscard} disabled={saving}>放弃修改</button><button className="button primary" type="button" onClick={onSave} disabled={saving}>保存草稿</button></footer></section></div>;
 }
 
-function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
-  const canPublish = !initialJob || initialJob.status === "草稿";
+function JobForm({ initialJob, departments, owners, onBack, onSubmit, onRetryConflictRefresh }) {
+  const actions = getJobFormActions(initialJob);
   const [values, setValues] = useState({
     name: initialJob?.name || "",
     departmentId: initialJob?.departmentId || "",
@@ -139,6 +144,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState("");
+  const [conflictRefreshFailed, setConflictRefreshFailed] = useState(false);
   const submitErrorRef = useRef(null);
   const [confirmExit, setConfirmExit] = useState(false);
 
@@ -149,7 +155,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   function change(field, value) {
     setValues((current) => ({ ...current, [field]: value }));
     setDirty(true);
-    setSubmitError("");
+    if (!conflictRefreshFailed) setSubmitError("");
     setErrors((current) => ({ ...current, [field]: "" }));
   }
 
@@ -164,10 +170,28 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
     setSaving(true);
     setSubmitError("");
     try {
-      await onSubmit(values, publish);
+      const outcome = await onSubmit(values, publish);
+      if (outcome?.status === "conflict") {
+        setSubmitError(outcome.error);
+        setConflictRefreshFailed(outcome.retryable);
+        return;
+      }
+      setConflictRefreshFailed(false);
       setDirty(false);
     } catch (error) {
-      setSubmitError(error?.status === 409 ? "职位已被其他人更新。请保留当前内容，刷新职位后核对并重试。" : "职位保存失败，请检查网络后重试。当前表单内容已保留。");
+      setSubmitError("职位保存失败，请检查网络后重试。当前表单内容已保留。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function retryConflictRefresh() {
+    if (saving || !onRetryConflictRefresh) return;
+    setSaving(true);
+    try {
+      const outcome = await onRetryConflictRefresh(values);
+      setSubmitError(outcome.error);
+      setConflictRefreshFailed(outcome.retryable);
     } finally {
       setSaving(false);
     }
@@ -177,8 +201,8 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   return (
     <div className="job-page job-form-page">
       <button className="back-link" type="button" onClick={() => dirty ? setConfirmExit(true) : onBack()} disabled={saving}><ArrowLeft size={17} />返回职位列表</button>
-      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div>{canPublish && <button className="button secondary" type="button" onClick={() => submit(false)} disabled={saving}>{saving ? "正在保存…" : "保存草稿"}</button>}<button className="button primary" type="button" onClick={() => submit(canPublish)} disabled={saving}>{saving ? "正在保存…" : canPublish ? "保存并发布" : "保存修改"}</button></div></div>
-      {submitError && <div ref={submitErrorRef} tabIndex="-1" className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span></div>}
+      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div>{actions.secondary && <button className="button secondary" type="button" onClick={() => submit(actions.secondary.publish)} disabled={saving}>{saving ? "正在保存…" : actions.secondary.label}</button>}<button className="button primary" type="button" onClick={() => submit(actions.primary.publish)} disabled={saving}>{saving ? "正在保存…" : actions.primary.label}</button></div></div>
+      {submitError && <div ref={submitErrorRef} tabIndex="-1" className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span>{conflictRefreshFailed && <button type="button" onClick={retryConflictRefresh} disabled={saving}>{saving ? "正在刷新…" : "重试刷新"}</button>}</div>}
       <fieldset className="job-form-fieldset" disabled={saving}>
         <div className="job-form-layout">
           <div className="job-form-sections">
@@ -327,15 +351,27 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
 
   async function saveDefinition(values, publish) {
     const existing = selectedJob?.formMode === "edit" ? selectedJob : null;
-    const result = await commitJobMutation(async () => {
-      const saved = await jobController.saveDefinition(values, { job: existing, publish });
-      return existing ? jobController.mergeDefinition(saved, existing, listState) : saved;
-    }, onRefreshJobMutation);
+    let result;
+    try {
+      result = await commitJobMutation(async () => {
+        const saved = await jobController.saveDefinition(values, { job: existing, publish });
+        return existing ? jobController.mergeDefinition(saved, existing, listState) : saved;
+      }, onRefreshJobMutation);
+    } catch (error) {
+      if (error?.status !== 409 || !existing) throw error;
+      const recovery = await jobController.refreshEditBaseline(existing, values, { metadata: listState });
+      if (!recovery.retryable) setSelectedJob(recovery.job);
+      return {
+        status: "conflict",
+        error: recovery.error || JOB_EDIT_CONFLICT_REFRESHED_MESSAGE,
+        retryable: recovery.retryable,
+      };
+    }
     const complete = result.record;
     const refreshError = result.refreshError ? "已保存，但最新数据加载失败，请重试读取。" : "";
     setSelectedJob(complete);
     setRefreshState({ error: refreshError, retrying: false, kind: "saved" });
-    onNotify(refreshError || (existing ? "职位修改已保存" : publish ? "职位已发布" : "职位已保存为草稿"));
+    onNotify(refreshError || getJobSaveSuccessMessage(existing, publish));
     if (existing || publish || refreshError) {
       setDetailState({ status: "ready", job: complete, candidates: detailState.candidates || { status: "ready", records: [], nextCursor: null, filters: { q: "", stage: "全部阶段" }, error: "" } });
       skipNextDetailLoadRef.current = true;
@@ -343,6 +379,19 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     } else {
       setMode("list");
     }
+    return { status: "saved" };
+  }
+
+  async function retryEditConflictRefresh(values) {
+    const existing = selectedJob?.formMode === "edit" ? selectedJob : null;
+    if (!existing) return { status: "conflict", error: JOB_EDIT_CONFLICT_REFRESHED_MESSAGE, retryable: false };
+    const recovery = await jobController.refreshEditBaseline(existing, values, { metadata: listState });
+    if (!recovery.retryable) setSelectedJob(recovery.job);
+    return {
+      status: "conflict",
+      error: recovery.error || JOB_EDIT_CONFLICT_REFRESHED_MESSAGE,
+      retryable: recovery.retryable,
+    };
   }
 
   async function transition(target) {
@@ -379,7 +428,7 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     }));
   }
 
-  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={listState.departments} owners={listState.owners} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} />;
+  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={listState.departments} owners={listState.owners} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} />;
   if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} refreshState={refreshState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onRetryRefresh={retryMutationRefresh} onLoadCandidates={loadCandidates} onTransition={transition} />;
   return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
 }

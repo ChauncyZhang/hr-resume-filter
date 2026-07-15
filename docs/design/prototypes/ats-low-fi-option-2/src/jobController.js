@@ -28,6 +28,23 @@ const JOB_TRANSITIONS = new Map([
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+export const JOB_EDIT_CONFLICT_REFRESHED_MESSAGE = "职位已被其他人更新。当前表单内容已保留，已加载最新版本，请核对后再次保存。";
+export const JOB_EDIT_CONFLICT_REFRESH_ERROR = "职位已被其他人更新。当前表单内容已保留，但最新版本加载失败，请重试刷新。";
+
+export function getJobFormActions(job) {
+  const secondary = { label: "保存草稿", publish: false };
+  if (!job) return { secondary, primary: { label: "发布职位", publish: true } };
+  if (job.status === "草稿" || job.status === "draft") {
+    return { secondary, primary: { label: "保存并发布", publish: true } };
+  }
+  return { secondary: null, primary: { label: "保存修改", publish: false } };
+}
+
+export function getJobSaveSuccessMessage(job, publish) {
+  if (publish) return "职位已发布";
+  return job ? "职位修改已保存" : "职位已保存为草稿";
+}
+
 function safeString(value) {
   return typeof value === "string" ? value : "";
 }
@@ -270,6 +287,23 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     return normalizeDefinition(result);
   }
 
+  async function refreshEditBaseline(job, values, { metadata = {}, signal } = {}) {
+    try {
+      const id = requireJobId(job?.id);
+      const resource = await client.request(`/api/v1/job-definitions/${id}`, requestOptions(signal));
+      const latest = normalizeDefinition(resource);
+      return {
+        job: { ...mergeDefinition(null, latest, metadata), formMode: job?.formMode },
+        values,
+        error: "",
+        retryable: false,
+      };
+    } catch (error) {
+      if (error?.name === "AbortError") throw error;
+      return { job, values, error: JOB_EDIT_CONFLICT_REFRESH_ERROR, retryable: true };
+    }
+  }
+
   async function transition(job, targetUiStatus, { signal } = {}) {
     const id = requireJobId(job?.id);
     const version = safeVersion(job?.version);
@@ -289,7 +323,7 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     return normalizeJob(result?.data);
   }
 
-  return { listJobs, loadDefinition, saveDefinition, transition, mergeDefinition };
+  return { listJobs, loadDefinition, saveDefinition, refreshEditBaseline, transition, mergeDefinition };
 }
 
 export const jobController = createJobController();

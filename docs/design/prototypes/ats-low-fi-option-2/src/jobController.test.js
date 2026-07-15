@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ApiError } from "./apiClient.js";
-import jobController, { createJobController } from "./jobController.js";
+import jobController, {
+  JOB_EDIT_CONFLICT_REFRESH_ERROR,
+  createJobController,
+  getJobFormActions,
+  getJobSaveSuccessMessage,
+} from "./jobController.js";
 
 const JOB_ID = "11111111-1111-4111-8111-111111111111";
 const DEPARTMENT_ID = "22222222-2222-4222-8222-222222222222";
@@ -74,6 +79,45 @@ function queuedClient(responses) {
 test("exports the job controller factory and default controller", () => {
   assert.equal(typeof createJobController, "function");
   assert.equal(typeof jobController.listJobs, "function");
+});
+
+test("job form actions execute the correct publish payload for create and every editable status", async () => {
+  const cases = [
+    { job: null, expected: { secondary: { label: "保存草稿", publish: false }, primary: { label: "发布职位", publish: true } } },
+    { job: { id: JOB_ID, version: 7, status: "草稿" }, expected: { secondary: { label: "保存草稿", publish: false }, primary: { label: "保存并发布", publish: true } } },
+    { job: { id: JOB_ID, version: 7, status: "招聘中" }, expected: { secondary: null, primary: { label: "保存修改", publish: false } } },
+    { job: { id: JOB_ID, version: 7, status: "已暂停" }, expected: { secondary: null, primary: { label: "保存修改", publish: false } } },
+    { job: { id: JOB_ID, version: 7, status: "已关闭" }, expected: { secondary: null, primary: { label: "保存修改", publish: false } } },
+  ];
+  const actionCount = cases.reduce((count, { expected }) => count + (expected.secondary ? 2 : 1), 0);
+  const { client, calls } = queuedClient(Array.from({ length: actionCount }, () => definitionResource()));
+  const controller = createJobController({ client, idempotencyKey: () => "job-form-action" });
+  const values = { name: "平台工程师", priority: "中" };
+
+  for (const { job, expected } of cases) {
+    const actions = getJobFormActions(job);
+    assert.deepEqual(actions, expected);
+    for (const action of [actions.secondary, actions.primary].filter(Boolean)) {
+      await controller.saveDefinition(values, { job, publish: action.publish });
+    }
+  }
+
+  assert.deepEqual(calls.map(({ options }) => ({
+    method: options.method,
+    publish: options.body.publish,
+    ifMatch: options.ifMatch,
+  })), [
+    { method: "POST", publish: false, ifMatch: undefined },
+    { method: "POST", publish: true, ifMatch: undefined },
+    { method: "PUT", publish: false, ifMatch: '"7"' },
+    { method: "PUT", publish: true, ifMatch: '"7"' },
+    { method: "PUT", publish: false, ifMatch: '"7"' },
+    { method: "PUT", publish: false, ifMatch: '"7"' },
+    { method: "PUT", publish: false, ifMatch: '"7"' },
+  ]);
+  assert.equal(getJobSaveSuccessMessage(null, true), "职位已发布");
+  assert.equal(getJobSaveSuccessMessage(cases[1].job, true), "职位已发布");
+  assert.equal(getJobSaveSuccessMessage(cases[2].job, false), "职位修改已保存");
 });
 
 test("listJobs encodes supplied filters and fully normalizes records and facets", async () => {
@@ -385,6 +429,64 @@ test("saveDefinition maps the complete UI form for draft, publish, and versioned
   assert.equal(published.status, "招聘中");
   assert.equal(updated.version, 8);
   assert.equal(updated.jd, "建设可靠的招聘平台。");
+});
+
+test("409 recovery preserves form values, refreshes the version baseline, and retries with the new If-Match", async () => {
+  const conflict = new ApiError({ status: 409, code: "resource_version_conflict" });
+  const { client, calls } = queuedClient([
+    conflict,
+    definitionResource({ job: { status: "open", version: 8 } }),
+    definitionResource({ job: { status: "open", version: 9 } }),
+  ]);
+  const keys = ["stale-save", "retry-save"];
+  const controller = createJobController({ client, idempotencyKey: () => keys.shift() });
+  const values = { name: "用户尚未提交的职位名称", priority: "中", location: "远程" };
+  const staleJob = { id: JOB_ID, version: 7, status: "招聘中", formMode: "edit" };
+
+  await assert.rejects(
+    () => controller.saveDefinition(values, { job: staleJob, publish: false }),
+    (error) => error === conflict,
+  );
+  const recovered = await controller.refreshEditBaseline(staleJob, values);
+
+  assert.equal(recovered.values, values);
+  assert.equal(recovered.job.version, 8);
+  assert.equal(recovered.job.formMode, "edit");
+  assert.equal(recovered.error, "");
+  assert.equal(recovered.retryable, false);
+
+  const saved = await controller.saveDefinition(recovered.values, { job: recovered.job, publish: false });
+
+  assert.equal(saved.version, 9);
+  assert.deepEqual(calls.map(({ path, options }) => ({ path, method: options.method, ifMatch: options.ifMatch })), [
+    { path: `/api/v1/job-definitions/${JOB_ID}`, method: "PUT", ifMatch: '"7"' },
+    { path: `/api/v1/job-definitions/${JOB_ID}`, method: undefined, ifMatch: undefined },
+    { path: `/api/v1/job-definitions/${JOB_ID}`, method: "PUT", ifMatch: '"8"' },
+  ]);
+});
+
+test("failed conflict refresh preserves the form and stale baseline with a stable retryable error", async () => {
+  const refreshFailure = new Error("network details must not reach the UI");
+  const { client } = queuedClient([
+    refreshFailure,
+    definitionResource({ job: { status: "open", version: 8 } }),
+  ]);
+  const controller = createJobController({ client });
+  const values = { name: "保留的表单", priority: "中" };
+  const staleJob = { id: JOB_ID, version: 7, status: "招聘中", formMode: "edit" };
+
+  const failed = await controller.refreshEditBaseline(staleJob, values);
+
+  assert.equal(failed.values, values);
+  assert.equal(failed.job, staleJob);
+  assert.equal(failed.error, JOB_EDIT_CONFLICT_REFRESH_ERROR);
+  assert.equal(failed.retryable, true);
+  assert.doesNotMatch(failed.error, /network details/);
+
+  const retried = await controller.refreshEditBaseline(failed.job, failed.values);
+  assert.equal(retried.values, values);
+  assert.equal(retried.job.version, 8);
+  assert.equal(retried.error, "");
 });
 
 test("definition update submits explicit unassigned department and owner as null", async () => {

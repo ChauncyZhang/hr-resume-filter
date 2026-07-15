@@ -112,23 +112,6 @@ test("exit dialog closes before draft save so a failed save error remains visibl
   assert.match(source, /ref=\{submitErrorRef\}[^>]*tabIndex="-1"/);
 });
 
-test("job form publishes new or draft jobs but saves open job edits without republishing", async () => {
-  const source = await readFile(new URL("./JobViews.jsx", import.meta.url), "utf8");
-
-  assert.match(source, /const canPublish = !initialJob \|\| initialJob\.status === "草稿"/);
-  assert.match(source, /onClick=\{\(\) => submit\(canPublish\)\}/);
-  assert.match(source, /canPublish \? "保存并发布" : "保存修改"/);
-  assert.match(source, /onNotify\(refreshError \|\| \(existing \? "职位修改已保存"/);
-  assert.match(source, /if \(existing \|\| publish \|\| refreshError\)/);
-});
-
-test("stale job edit conflicts preserve the form and explain how to recover", async () => {
-  const source = await readFile(new URL("./JobViews.jsx", import.meta.url), "utf8");
-
-  assert.match(source, /error\?\.status === 409 \? "职位已被其他人更新。请保留当前内容，刷新职位后核对并重试。"/);
-  assert.doesNotMatch(source, /catch \(error\)[\s\S]{0,300}setValues\(/);
-});
-
 test("create success remains committed when refresh fails and retry performs reads only", async () => {
   let mutationCalls = 0;
   let readCalls = 0;
