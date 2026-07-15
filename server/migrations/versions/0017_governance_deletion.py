@@ -239,6 +239,10 @@ def upgrade() -> None:
         AS $$
         DECLARE
           authorized boolean;
+          audit_plan jsonb;
+          row_plan jsonb;
+          metadata_keys text[];
+          clear_resource_id boolean;
         BEGIN
           SELECT EXISTS (
             SELECT 1
@@ -249,6 +253,14 @@ def upgrade() -> None:
               ON granted_role.oid = membership.roleid
             WHERE member_role.rolname = session_user
               AND granted_role.rolname = 'ux09_governance_executor'
+              AND current_user = pg_catalog.pg_get_userbyid(
+                (
+                  SELECT procedure.proowner
+                  FROM pg_catalog.pg_proc procedure
+                  WHERE procedure.oid =
+                    'public.redact_candidate_data(uuid,uuid,uuid)'::pg_catalog.regprocedure
+                )
+              )
           ) INTO authorized;
           IF NOT authorized OR TG_OP <> 'UPDATE' THEN
             RAISE EXCEPTION 'audit_logs are append-only' USING ERRCODE = '55000';
@@ -257,30 +269,60 @@ def upgrade() -> None:
           IF TG_TABLE_NAME = 'audit_logs'
              OR TG_TABLE_NAME ~ '^audit_logs_[0-9]{4}_[0-9]{2}$'
              OR TG_TABLE_NAME = 'audit_logs_default' THEN
-            IF (to_jsonb(NEW) - ARRAY['resource_id', 'metadata_json'])
-                 IS DISTINCT FROM
-               (to_jsonb(OLD) - ARRAY['resource_id', 'metadata_json'])
+            BEGIN
+              audit_plan := COALESCE(
+                pg_catalog.current_setting('ux09.audit_redaction_plan', true)::jsonb,
+                '{}'::jsonb
+              );
+            EXCEPTION WHEN OTHERS THEN
+              RAISE EXCEPTION 'audit_logs are append-only' USING ERRCODE = '55000';
+            END;
+            row_plan := audit_plan -> (OLD.id::text);
+            IF row_plan IS NULL THEN
+              RAISE EXCEPTION 'audit_logs are append-only' USING ERRCODE = '55000';
+            END IF;
+            clear_resource_id := COALESCE(
+              (row_plan->>'clear_resource_id')::boolean, false
+            );
+            SELECT COALESCE(array_agg(value ORDER BY value), '{}'::text[])
+              INTO metadata_keys
+            FROM jsonb_array_elements_text(
+              COALESCE(row_plan->'metadata_keys', '[]'::jsonb)
+            ) AS planned_key(value);
+
+            IF EXISTS (
+              SELECT 1 FROM unnest(metadata_keys) AS planned_key(value)
+              WHERE value <> ALL(ARRAY[
+                'candidate_id', 'subject_id', 'left_candidate_id',
+                'right_candidate_id', 'resume_id', 'file_object_id',
+                'application_id', 'source_application_id', 'item_id',
+                'screening_item_id', 'screening_result_id', 'interview_id',
+                'feedback_id', 'note_id', 'membership_id'
+              ]::text[])
+            )
+               OR (to_jsonb(NEW) - ARRAY['resource_id', 'metadata_json'])
+                    IS DISTINCT FROM
+                  (to_jsonb(OLD) - ARRAY['resource_id', 'metadata_json'])
                OR NEW.metadata_json IS DISTINCT FROM
-                  (OLD.metadata_json - ARRAY[
-                    'candidate_id', 'subject_id', 'left_candidate_id',
-                    'right_candidate_id', 'resume_id', 'file_object_id',
-                    'application_id', 'screening_result_id', 'interview_id',
-                    'feedback_id'
-                  ])
-               OR NOT (
-                 NEW.resource_id IS NOT DISTINCT FROM OLD.resource_id
-                 OR (
-                   NEW.resource_id IS NULL
-                   AND OLD.resource_id IS NOT NULL
-                   AND OLD.resource_type IN (
+                  (OLD.metadata_json - metadata_keys)
+               OR NEW.resource_id IS DISTINCT FROM (
+                    CASE WHEN clear_resource_id THEN NULL ELSE OLD.resource_id END
+                  )
+               OR (
+                 clear_resource_id
+                 AND (
+                   OLD.resource_id IS NULL
+                   OR OLD.resource_type NOT IN (
                      'candidate', 'resume', 'file_object', 'application',
-                     'screening_result', 'interview', 'interview_feedback'
+                     'screening_item', 'screening_result', 'interview',
+                     'interview_feedback', 'candidate_note',
+                     'talent_pool_membership'
                    )
                  )
                )
                OR (
-                 NEW.resource_id IS NOT DISTINCT FROM OLD.resource_id
-                 AND NEW.metadata_json IS NOT DISTINCT FROM OLD.metadata_json
+                 NOT clear_resource_id
+                 AND cardinality(metadata_keys) = 0
                ) THEN
               RAISE EXCEPTION 'audit_logs are append-only' USING ERRCODE = '55000';
             END IF;
@@ -581,9 +623,13 @@ def upgrade() -> None:
           resume_ids uuid[];
           file_ids uuid[];
           application_ids uuid[];
+          screening_item_ids uuid[];
           screening_result_ids uuid[];
           interview_ids uuid[];
           feedback_ids uuid[];
+          note_ids uuid[];
+          membership_ids uuid[];
+          audit_redaction_plan jsonb;
           redaction_time timestamptz;
           checksum_payload text;
         BEGIN
@@ -640,9 +686,8 @@ def upgrade() -> None:
             END IF;
           END IF;
 
-            SELECT COALESCE(array_agg(id ORDER BY id), '{}'::uuid[]),
-                   COALESCE(array_agg(file_object_id ORDER BY file_object_id), '{}'::uuid[])
-              INTO resume_ids, file_ids
+            SELECT COALESCE(array_agg(id ORDER BY id), '{}'::uuid[])
+              INTO resume_ids
             FROM public.resumes
             WHERE organization_id = p_organization_id
               AND candidate_id = p_candidate_id;
@@ -651,14 +696,33 @@ def upgrade() -> None:
             FROM public.applications
             WHERE organization_id = p_organization_id
               AND candidate_id = p_candidate_id;
+            SELECT COALESCE(array_agg(id ORDER BY id), '{}'::uuid[])
+              INTO screening_item_ids
+            FROM public.screening_items
+            WHERE organization_id = p_organization_id
+              AND (
+                candidate_id = p_candidate_id
+                OR resume_id = ANY(resume_ids)
+                OR application_id = ANY(application_ids)
+              );
+            SELECT COALESCE(array_agg(linked_file_id ORDER BY linked_file_id), '{}'::uuid[])
+              INTO file_ids
+            FROM (
+              SELECT file_object_id AS linked_file_id
+              FROM public.resumes
+              WHERE organization_id = p_organization_id
+                AND id = ANY(resume_ids)
+              UNION
+              SELECT file_object_id AS linked_file_id
+              FROM public.screening_items
+              WHERE organization_id = p_organization_id
+                AND id = ANY(screening_item_ids)
+            ) linked_files;
             SELECT COALESCE(array_agg(sr.id ORDER BY sr.id), '{}'::uuid[])
               INTO screening_result_ids
             FROM public.screening_results sr
-            JOIN public.screening_items si
-              ON si.organization_id = sr.organization_id
-             AND si.id = sr.item_id
-            WHERE si.organization_id = p_organization_id
-              AND si.candidate_id = p_candidate_id;
+            WHERE sr.organization_id = p_organization_id
+              AND sr.item_id = ANY(screening_item_ids);
             SELECT COALESCE(array_agg(i.id ORDER BY i.id), '{}'::uuid[])
               INTO interview_ids
             FROM public.interviews i
@@ -669,6 +733,16 @@ def upgrade() -> None:
             FROM public.interview_feedbacks f
             WHERE f.organization_id = p_organization_id
               AND f.interview_id = ANY(interview_ids);
+            SELECT COALESCE(array_agg(id ORDER BY id), '{}'::uuid[])
+              INTO note_ids
+            FROM public.candidate_notes
+            WHERE organization_id = p_organization_id
+              AND candidate_id = p_candidate_id;
+            SELECT COALESCE(array_agg(id ORDER BY id), '{}'::uuid[])
+              INTO membership_ids
+            FROM public.talent_pool_memberships
+            WHERE organization_id = p_organization_id
+              AND candidate_id = p_candidate_id;
 
             DELETE FROM public.candidate_contacts
             WHERE organization_id = p_organization_id AND candidate_id = p_candidate_id;
@@ -751,54 +825,100 @@ def upgrade() -> None:
                 OR response_json::text LIKE ANY (
                   SELECT '%' || linked_id::text || '%'
                   FROM unnest(
-                    resume_ids || application_ids || screening_result_ids ||
-                    interview_ids || feedback_ids
+                    resume_ids || file_ids || application_ids || screening_item_ids ||
+                    screening_result_ids || interview_ids || feedback_ids ||
+                    note_ids || membership_ids
                   ) linked_id
                 )
               );
-            UPDATE public.audit_logs
+            WITH audit_candidates AS (
+              SELECT
+                audit.id,
+                (
+                  (audit.resource_type = 'candidate' AND audit.resource_id = p_candidate_id)
+                  OR (audit.resource_type = 'resume' AND audit.resource_id = ANY(resume_ids))
+                  OR (audit.resource_type = 'file_object' AND audit.resource_id = ANY(file_ids))
+                  OR (audit.resource_type = 'application' AND audit.resource_id = ANY(application_ids))
+                  OR (audit.resource_type = 'screening_item' AND audit.resource_id = ANY(screening_item_ids))
+                  OR (audit.resource_type = 'screening_result' AND audit.resource_id = ANY(screening_result_ids))
+                  OR (audit.resource_type = 'interview' AND audit.resource_id = ANY(interview_ids))
+                  OR (audit.resource_type = 'interview_feedback' AND audit.resource_id = ANY(feedback_ids))
+                  OR (audit.resource_type = 'candidate_note' AND audit.resource_id = ANY(note_ids))
+                  OR (audit.resource_type = 'talent_pool_membership' AND audit.resource_id = ANY(membership_ids))
+                ) AS clear_resource_id,
+                array_remove(ARRAY[
+                  CASE WHEN audit.metadata_json->>'candidate_id' = p_candidate_id::text THEN 'candidate_id' END,
+                  CASE WHEN audit.metadata_json->>'subject_id' = p_candidate_id::text THEN 'subject_id' END,
+                  CASE WHEN audit.metadata_json->>'left_candidate_id' = p_candidate_id::text THEN 'left_candidate_id' END,
+                  CASE WHEN audit.metadata_json->>'right_candidate_id' = p_candidate_id::text THEN 'right_candidate_id' END,
+                  CASE WHEN audit.metadata_json->>'resume_id' IN (
+                    SELECT linked_id::text FROM unnest(resume_ids) linked_id
+                  ) THEN 'resume_id' END,
+                  CASE WHEN audit.metadata_json->>'file_object_id' IN (
+                    SELECT linked_id::text FROM unnest(file_ids) linked_id
+                  ) THEN 'file_object_id' END,
+                  CASE WHEN audit.metadata_json->>'application_id' IN (
+                    SELECT linked_id::text FROM unnest(application_ids) linked_id
+                  ) THEN 'application_id' END,
+                  CASE WHEN audit.metadata_json->>'source_application_id' IN (
+                    SELECT linked_id::text FROM unnest(application_ids) linked_id
+                  ) THEN 'source_application_id' END,
+                  CASE WHEN audit.metadata_json->>'item_id' IN (
+                    SELECT linked_id::text FROM unnest(screening_item_ids) linked_id
+                  ) THEN 'item_id' END,
+                  CASE WHEN audit.metadata_json->>'screening_item_id' IN (
+                    SELECT linked_id::text FROM unnest(screening_item_ids) linked_id
+                  ) THEN 'screening_item_id' END,
+                  CASE WHEN audit.metadata_json->>'screening_result_id' IN (
+                    SELECT linked_id::text FROM unnest(screening_result_ids) linked_id
+                  ) THEN 'screening_result_id' END,
+                  CASE WHEN audit.metadata_json->>'interview_id' IN (
+                    SELECT linked_id::text FROM unnest(interview_ids) linked_id
+                  ) THEN 'interview_id' END,
+                  CASE WHEN audit.metadata_json->>'feedback_id' IN (
+                    SELECT linked_id::text FROM unnest(feedback_ids) linked_id
+                  ) THEN 'feedback_id' END,
+                  CASE WHEN audit.metadata_json->>'note_id' IN (
+                    SELECT linked_id::text FROM unnest(note_ids) linked_id
+                  ) THEN 'note_id' END,
+                  CASE WHEN audit.metadata_json->>'membership_id' IN (
+                    SELECT linked_id::text FROM unnest(membership_ids) linked_id
+                  ) THEN 'membership_id' END
+                ], NULL) AS metadata_keys
+              FROM public.audit_logs audit
+              WHERE audit.organization_id = p_organization_id
+            ), planned AS (
+              SELECT id, clear_resource_id, metadata_keys
+              FROM audit_candidates
+              WHERE clear_resource_id OR cardinality(metadata_keys) > 0
+            )
+            SELECT COALESCE(
+              jsonb_object_agg(
+                id::text,
+                jsonb_build_object(
+                  'clear_resource_id', clear_resource_id,
+                  'metadata_keys', to_jsonb(metadata_keys)
+                )
+              ),
+              '{}'::jsonb
+            ) INTO audit_redaction_plan
+            FROM planned;
+
+            PERFORM pg_catalog.set_config(
+              'ux09.audit_redaction_plan', audit_redaction_plan::text, true
+            );
+            UPDATE public.audit_logs audit
             SET resource_id = CASE
-                  WHEN resource_id = p_candidate_id
-                    OR resource_id = ANY(
-                      resume_ids || file_ids || application_ids ||
-                      screening_result_ids || interview_ids || feedback_ids
-                    )
-                    THEN NULL ELSE resource_id END,
-                metadata_json = metadata_json - ARRAY[
-                  'candidate_id', 'subject_id', 'left_candidate_id', 'right_candidate_id',
-                  'resume_id', 'file_object_id', 'application_id',
-                  'screening_result_id', 'interview_id', 'feedback_id'
-                ]
-            WHERE organization_id = p_organization_id
-              AND (
-                resource_id = p_candidate_id
-                OR resource_id = ANY(
-                  resume_ids || file_ids || application_ids ||
-                  screening_result_ids || interview_ids || feedback_ids
+                  WHEN (audit_redaction_plan->(audit.id::text)->>'clear_resource_id')::boolean
+                    THEN NULL ELSE audit.resource_id END,
+                metadata_json = audit.metadata_json - ARRAY(
+                  SELECT jsonb_array_elements_text(
+                    audit_redaction_plan->(audit.id::text)->'metadata_keys'
+                  )
                 )
-                OR metadata_json->>'candidate_id' = p_candidate_id::text
-                OR metadata_json->>'subject_id' = p_candidate_id::text
-                OR metadata_json->>'left_candidate_id' = p_candidate_id::text
-                OR metadata_json->>'right_candidate_id' = p_candidate_id::text
-                OR metadata_json->>'resume_id' IN (
-                  SELECT linked_id::text FROM unnest(resume_ids) linked_id
-                )
-                OR metadata_json->>'file_object_id' IN (
-                  SELECT linked_id::text FROM unnest(file_ids) linked_id
-                )
-                OR metadata_json->>'application_id' IN (
-                  SELECT linked_id::text FROM unnest(application_ids) linked_id
-                )
-                OR metadata_json->>'screening_result_id' IN (
-                  SELECT linked_id::text FROM unnest(screening_result_ids) linked_id
-                )
-                OR metadata_json->>'interview_id' IN (
-                  SELECT linked_id::text FROM unnest(interview_ids) linked_id
-                )
-                OR metadata_json->>'feedback_id' IN (
-                  SELECT linked_id::text FROM unnest(feedback_ids) linked_id
-                )
-              );
+            WHERE audit.organization_id = p_organization_id
+              AND audit_redaction_plan ? audit.id::text;
+            PERFORM pg_catalog.set_config('ux09.audit_redaction_plan', '{}', true);
 
           IF candidate_row.deleted_at IS NULL THEN
             redaction_time := statement_timestamp();

@@ -43,7 +43,8 @@ sequence privileges and inherits only the fixed, no-login `ux09_governance_execu
 which can execute `redact_candidate_data(uuid, uuid, uuid)`. Keep the owner, application, and
 governance usernames and passwords pairwise distinct. The provisioning script rejects shared
 values, removes stale inbound/outbound governance memberships, and reconciles all three roles
-idempotently after migrations.
+idempotently after migrations. Reconciliation also removes any inherited `ADMIN OPTION` before
+restoring the single ordinary executor membership, so the governance login cannot delegate it.
 
 The API container receives none of the governance database, object-deletion, ledger, or signing
 settings. The general worker continues to use `DATABASE_URL` for normal queue work and receives a
@@ -65,6 +66,9 @@ cannot read or write objects. The ledger credential can list/read/write only its
 cannot delete or access resume/export objects. Report exports use the ordinary object bucket under
 `exports/`, so `GOVERNANCE_EXPORT_BUCKET` must match `OBJECT_STORAGE_BUCKET` and the deletion
 prefix must remain `exports/` unless the report storage contract changes with it.
+All configured governance prefixes are non-empty relative paths ending in `/`. Retired MinIO
+users are ignored only when `mc` explicitly reports that the user does not exist; authentication,
+network, or CLI failures stop provisioning without printing the retired key or command output.
 
 `server.app.governance.storage` provides the delete-only adapter and canonical signed ledger v1.
 Ledger writes verify an existing object before accepting idempotent re-entry; malformed, tampered,
@@ -77,6 +81,22 @@ Validate the example topology without starting services:
 ```powershell
 docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet
 ```
+
+The backend verification gate is deliberately layered because the test image does not contain a
+Docker CLI. Run the backend suite inside the PostgreSQL-enabled test container with exactly:
+
+```text
+python -m pytest server/tests --ignore=server/tests/test_production_topology.py --ignore=server/tests/test_observability_topology.py -q
+```
+
+Run both Docker/Compose topology files on the host, where the Docker CLI is available:
+
+```powershell
+python -m pytest server/tests/test_production_topology.py server/tests/test_observability_topology.py -q
+```
+
+These two commands form the complete gate; do not describe the container command alone as the
+standard full backend suite.
 
 Only Nginx publishes a host port. Development uses HTTP on `http://localhost:8080`.
 
@@ -101,7 +121,8 @@ network deadline provides the finite bound required for worker process shutdown.
 Set `APP_ENVIRONMENT=production`, distinct non-placeholder PostgreSQL owner and application
 passwords, distinct MinIO
 access and secret keys, and explicit HTTPS CORS origins. Startup rejects placeholders and
-wildcard CORS. Buckets are private and must be provisioned separately; the application never
+wildcard CORS. Credential values beginning with `change-me`, `placeholder`, or `replace-me`
+(including suffixed example values) are rejected without echoing the value. Buckets are private and must be provisioned separately; the application never
 enables anonymous/public access. Rotate secrets through the deployment environment, not Git.
 
 Rotate governance credentials through the deployment secret store. Stop the governance deletion

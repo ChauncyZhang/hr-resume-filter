@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier
 from uuid import uuid4
 
 import pytest
@@ -235,6 +237,10 @@ def test_real_minio_separate_credentials_enforce_cross_policy_denials() -> None:
     ):
         root.put_object(bucket, key, io.BytesIO(b"private"), 7)
 
+    for bucket, key in ((resume_bucket, resume_key), (export_bucket, export_key)):
+        with pytest.raises(S3Error, match="AccessDenied"):
+            delete_client.get_object(bucket, key)
+
     deleter = DeleteOnlyObjectAdapter(delete_client)
     deleter.delete(resume_bucket, resume_key)
     deleter.delete(resume_bucket, resume_key)
@@ -256,6 +262,48 @@ def test_real_minio_separate_credentials_enforce_cross_policy_denials() -> None:
         ledger_client.remove_object(ledger_bucket, receipt.object_key)
     with pytest.raises(S3Error, match="AccessDenied"):
         ledger_client.get_object(resume_bucket, forbidden_resume_key)
+
+
+@pytestmark_minio
+def test_real_minio_conditional_ledger_create_is_race_safe() -> None:
+    from server.app.governance.storage import SignedLedgerAdapter
+
+    endpoint = os.environ["GOVERNANCE_MINIO_ENDPOINT"]
+    ledger_bucket = os.environ["GOVERNANCE_LEDGER_BUCKET"]
+    barrier = Barrier(2)
+
+    class BarrierMinio(Minio):
+        def _execute(self, method, bucket_name=None, object_name=None, **kwargs):
+            if method == "PUT" and kwargs.get("headers", {}).get("If-None-Match") == "*":
+                barrier.wait(timeout=10)
+            return super()._execute(method, bucket_name, object_name, **kwargs)
+
+    def adapter() -> SignedLedgerAdapter:
+        client = BarrierMinio(
+            endpoint,
+            access_key=os.environ["GOVERNANCE_LEDGER_ACCESS_KEY"],
+            secret_key=os.environ["GOVERNANCE_LEDGER_SECRET_KEY"],
+            secure=False,
+        )
+        return SignedLedgerAdapter(client, ledger_bucket, "deletions/", SIGNING_KEY)
+
+    entry = ledger_entry()
+    first = adapter()
+    second = adapter()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        receipts = list(executor.map(lambda item: item.write(entry), (first, second)))
+
+    assert receipts[0] == receipts[1]
+    root = Minio(
+        endpoint,
+        access_key=os.environ["MINIO_SMOKE_ROOT_ACCESS_KEY"],
+        secret_key=os.environ["MINIO_SMOKE_ROOT_SECRET_KEY"],
+        secure=False,
+    )
+    try:
+        assert root.stat_object(ledger_bucket, receipts[0].object_key).size > 0
+    finally:
+        root.remove_object(ledger_bucket, receipts[0].object_key)
 
 
 @pytest.mark.skipif(

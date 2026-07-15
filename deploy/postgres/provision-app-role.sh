@@ -77,6 +77,17 @@ SELECT 'CREATE ROLE ux09_governance_executor NOLOGIN NOSUPERUSER NOCREATEDB NOCR
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ux09_governance_executor')
 \gexec
 ALTER ROLE ux09_governance_executor WITH NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+SELECT format(
+  'REVOKE ADMIN OPTION FOR ux09_governance_executor FROM %I',
+  :'governance_user'
+)
+FROM pg_auth_members membership
+JOIN pg_roles granted_role ON granted_role.oid = membership.roleid
+JOIN pg_roles member_role ON member_role.oid = membership.member
+WHERE granted_role.rolname = 'ux09_governance_executor'
+  AND member_role.rolname = :'governance_user'
+  AND membership.admin_option
+\gexec
 SELECT format('GRANT ux09_governance_executor TO %I', :'governance_user')
 \gexec
 

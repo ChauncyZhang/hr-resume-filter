@@ -69,9 +69,11 @@ def seeded(databases):
             "organization", "user", "candidate", "other_candidate", "job", "jd", "rule",
             "file", "resume", "application", "screening_run", "screening_item",
             "screening_result", "llm_config", "prompt", "invocation", "evaluation",
-            "queue", "interview", "feedback", "pool", "request", "audit",
+            "queue", "interview", "feedback", "pool", "membership", "note", "request", "audit",
             "application_audit", "resume_audit", "interview_audit", "feedback_audit",
-            "other_audit", "idempotency", "other_idempotency",
+            "screening_item_audit", "file_audit", "note_audit", "membership_audit",
+            "malicious_audit", "other_audit", "idempotency", "upload_idempotency",
+            "other_idempotency",
         )}
         seed_sql = r"""
             INSERT INTO organizations(id, slug, name, status, retention_policy_id, created_at, updated_at)
@@ -115,13 +117,21 @@ def seeded(databases):
                jsonb_build_object('data', jsonb_build_object(
                  'id', CAST(:application AS text), 'candidate_id', CAST(:candidate AS text)
                )), now() + interval '1 day'),
+              (:upload_idempotency, :organization, :user, 'screening.upload', 'upload-related',
+               repeat('6',64), 201,
+               jsonb_build_object('data', jsonb_build_object('items', jsonb_build_array(
+                 jsonb_build_object(
+                   'item_id', CAST(:screening_item AS text),
+                   'filename', 'private-person.pdf'
+                 )
+               ))), now() + interval '1 day'),
               (:other_idempotency, :organization, :user, 'job.create', 'unrelated',
                repeat('8',64), 201, '{"data":{"id":"unrelated"}}', now() + interval '1 day');
             INSERT INTO application_stage_events(id, organization_id, application_id, actor_user_id, event_type, payload)
             VALUES (gen_random_uuid(), :organization, :application, :user, 'application.stage_changed',
                     '{"reason"\:"private reason","candidate_id"\:"private"}');
             INSERT INTO candidate_notes(id, organization_id, candidate_id, actor_user_id, event_type, payload)
-            VALUES (gen_random_uuid(), :organization, :candidate, :user, 'candidate.note_added', '{"content"\:"private note"}');
+            VALUES (:note, :organization, :candidate, :user, 'candidate.note_added', '{"content"\:"private note"}');
             INSERT INTO candidate_events(id, organization_id, candidate_id, actor_user_id, event_type, payload)
             VALUES (gen_random_uuid(), :organization, :candidate, :user, 'candidate.updated', '{"address"\:"private address"}');
             INSERT INTO download_tickets(id, organization_id, token_hash, user_id, resume_id, expires_at)
@@ -193,7 +203,7 @@ def seeded(databases):
             INSERT INTO talent_pool_memberships(id, organization_id, pool_id, candidate_id, source_application_id,
                                                 owner_id, suitable_roles, tags, reason, retention_until,
                                                 status, version)
-            VALUES (gen_random_uuid(), :organization, :pool, :candidate, :application, :user, '["private role"]',
+            VALUES (:membership, :organization, :pool, :candidate, :application, :user, '["private role"]',
                     '["private tag"]', 'private reason', now() + interval '1 year', 'active', 1);
             INSERT INTO deletion_requests(id, organization_id, candidate_id, status, version, reason_code,
                                           requested_by, requested_at, approved_by, approved_at,
@@ -221,6 +231,31 @@ def seeded(databases):
                    (:feedback_audit, :organization, :user, 'interview', 'feedback.updated', 'success',
                     'interview_feedback', :feedback, 'trace-feedback',
                     jsonb_build_object('feedback_id', CAST(:feedback AS text), 'safe_error_code', 'none'), now()),
+                   (:screening_item_audit, :organization, :user, 'recruiting', 'screening.item_accepted', 'success',
+                    'screening_item', :screening_item, 'trace-screening-item',
+                    jsonb_build_object(
+                      'item_id', CAST(:screening_item AS text),
+                      'file_object_id', CAST(:file AS text),
+                      'safe_error_code', 'none'
+                    ), now()),
+                   (:file_audit, :organization, :user, 'recruiting', 'resume.uploaded', 'success',
+                    'file_object', :file, 'trace-file',
+                    jsonb_build_object('file_object_id', CAST(:file AS text), 'safe_error_code', 'none'), now()),
+                   (:note_audit, :organization, :user, 'recruiting', 'candidate.note_added', 'success',
+                    'candidate', :candidate, 'trace-note',
+                    jsonb_build_object(
+                      'candidate_id', CAST(:candidate AS text),
+                      'note_id', CAST(:note AS text),
+                      'safe_error_code', 'none'
+                    ), now()),
+                   (:membership_audit, :organization, :user, 'recruiting', 'talent_pool.member_added', 'success',
+                    'talent_pool_membership', :membership, 'trace-membership',
+                    jsonb_build_object(
+                      'membership_id', CAST(:membership AS text),
+                      'candidate_id', CAST(:candidate AS text),
+                      'source_application_id', CAST(:application AS text),
+                      'safe_error_code', 'none'
+                    ), now()),
                    (:other_audit, :organization, :user, 'recruiting', 'job.updated', 'success',
                     'job', :job, 'trace-other', '{"new_version"\:2}', now());
         """
@@ -278,6 +313,9 @@ def test_provisioning_removes_legacy_governance_role_paths(databases) -> None:
             "GRANT ux09_governance_executor TO ux09_app, ux09_owner, "
             "ux09_legacy_governance_member"
         ))
+        connection.execute(text(
+            "GRANT ux09_governance_executor TO ux09_governance WITH ADMIN OPTION"
+        ))
         connection.execute(text("GRANT ux09_unrelated_role TO ux09_governance"))
         connection.execute(text("GRANT ux09_governance TO ux09_app"))
         connection.execute(text("GRANT ux09_unrelated_role TO ux09_governance_executor"))
@@ -315,6 +353,18 @@ def test_provisioning_removes_legacy_governance_role_paths(databases) -> None:
                   OR member_role.rolname='ux09_governance_executor'
             """))
             assert unauthorized_paths == 0
+            assert connection.scalar(text("""
+                SELECT membership.admin_option
+                FROM pg_auth_members membership
+                JOIN pg_roles granted_role ON granted_role.oid=membership.roleid
+                JOIN pg_roles member_role ON member_role.oid=membership.member
+                WHERE granted_role.rolname='ux09_governance_executor'
+                  AND member_role.rolname='ux09_governance'
+            """)) is False
+        with databases["governance"].connect() as connection, pytest.raises(DBAPIError):
+            connection.execute(text(
+                "GRANT ux09_governance_executor TO ux09_legacy_governance_member"
+            ))
     finally:
         with owner.begin() as connection:
             connection.execute(text(
@@ -330,6 +380,17 @@ def test_redaction_clears_full_pii_inventory_and_retains_aggregate_facts(
 ) -> None:
     from server.app.governance.deletion_service import execute_database_redaction
 
+    with databases["app"].begin() as connection:
+        connection.execute(text("""
+            INSERT INTO audit_logs(
+              id, organization_id, actor_user_id, category, event_type, outcome,
+              resource_type, resource_id, trace_id, metadata_json, created_at
+            ) VALUES (
+              :malicious_audit, :organization, :user, 'recruiting', 'job.updated',
+              'success', 'job', :candidate, 'trace-malicious',
+              jsonb_build_object('new_version', 99), now()
+            )
+        """), seeded)
     with databases["governance"].begin() as connection:
         result = execute_database_redaction(
             connection,
@@ -416,17 +477,28 @@ def test_redaction_clears_full_pii_inventory_and_retains_aggregate_facts(
             "SELECT resource_id, metadata_json FROM audit_logs WHERE id=:other_audit"
         ), seeded).one()
         assert other_audit == (seeded["job"], {"new_version": 2})
+        malicious_audit = connection.execute(text(
+            "SELECT resource_type, resource_id, metadata_json "
+            "FROM audit_logs WHERE id=:malicious_audit"
+        ), seeded).one()
+        assert malicious_audit == ("job", seeded["candidate"], {"new_version": 99})
         linked_audit = connection.execute(text("""
             SELECT id, resource_id, metadata_json
             FROM audit_logs
-            WHERE id IN (:application_audit, :resume_audit, :interview_audit, :feedback_audit)
+            WHERE id IN (
+              :application_audit, :resume_audit, :interview_audit, :feedback_audit,
+              :screening_item_audit, :file_audit, :note_audit, :membership_audit
+            )
             ORDER BY id
         """), seeded).all()
-        assert len(linked_audit) == 4
+        assert len(linked_audit) == 8
         assert all(row.resource_id is None for row in linked_audit)
         assert all(row.metadata_json == {"safe_error_code": "none"} for row in linked_audit)
         assert connection.scalar(text(
             "SELECT count(*) FROM idempotency_records WHERE id=:idempotency"
+        ), seeded) == 0
+        assert connection.scalar(text(
+            "SELECT count(*) FROM idempotency_records WHERE id=:upload_idempotency"
         ), seeded) == 0
         assert connection.scalar(text(
             "SELECT count(*) FROM idempotency_records WHERE id=:other_idempotency"
@@ -552,6 +624,14 @@ def test_tombstone_retry_recleans_restored_candidate_pii(databases, seeded) -> N
             "SELECT round_name, location FROM interviews WHERE id=:interview"
         ), seeded).one() == ("deleted", None)
         assert connection.scalar(text(
+            "SELECT input_sha256 FROM llm_invocations WHERE id=:invocation"
+        ), seeded) == hashlib.sha256(
+            f"deleted:{seeded['invocation']}".encode("utf-8")
+        ).hexdigest()
+        assert connection.scalar(text(
+            "SELECT notes FROM interview_feedbacks WHERE id=:feedback"
+        ), seeded) is None
+        assert connection.scalar(text(
             "SELECT resource_id FROM audit_logs WHERE id=:application_audit"
         ), seeded) is None
         assert connection.scalar(text(
@@ -622,5 +702,47 @@ def test_app_and_owner_cannot_emulate_audit_redaction(databases, seeded) -> None
                 WHERE id=:audit
             """), seeded)
     assert _scalar(
-        databases["owner"], "SELECT count(*) FROM audit_logs WHERE resource_id=:id", id=seeded["candidate"]
+        databases["owner"],
+        "SELECT count(*) FROM audit_logs WHERE id=:audit AND resource_id=:candidate",
+        audit=seeded["audit"],
+        candidate=seeded["candidate"],
+    ) == 1
+
+
+def test_executor_cannot_redact_audit_without_routine_plan(databases, seeded) -> None:
+    with databases["owner"].begin() as connection:
+        connection.execute(text(
+            "GRANT SELECT, UPDATE ON ALL TABLES IN SCHEMA public TO ux09_governance"
+        ))
+    try:
+        with databases["governance"].begin() as connection, pytest.raises(DBAPIError):
+            connection.execute(text("""
+                SELECT set_config(
+                  'ux09.audit_redaction_plan',
+                  jsonb_build_object(
+                    CAST(:audit AS text),
+                    jsonb_build_object(
+                      'clear_resource_id', true,
+                      'metadata_keys', jsonb_build_array('candidate_id')
+                    )
+                  )::text,
+                  true
+                )
+            """), seeded)
+            connection.execute(text("""
+                UPDATE audit_logs
+                SET resource_id=NULL, metadata_json=metadata_json-'candidate_id'
+                WHERE id=:audit
+            """), seeded)
+    finally:
+        with databases["owner"].begin() as connection:
+            connection.execute(text(
+                "REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ux09_governance"
+            ))
+
+    assert _scalar(
+        databases["owner"],
+        "SELECT count(*) FROM audit_logs WHERE id=:audit AND resource_id=:candidate",
+        audit=seeded["audit"],
+        candidate=seeded["candidate"],
     ) == 1

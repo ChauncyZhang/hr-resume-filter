@@ -36,6 +36,23 @@ def test_production_rejects_placeholder_secrets(field: str, value: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("database_url", "postgresql+asyncpg://app:replace-me-prod@postgres/app"),
+        ("object_storage_access_key", "change-me-production-access"),
+        ("object_storage_secret_key", "placeholder-production-secret"),
+    ],
+)
+def test_production_rejects_prefixed_example_credentials_without_leak(
+    field: str, value: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        production_settings(**{field: value})
+
+    assert value not in str(error.value)
+
+
+@pytest.mark.parametrize(
     "database_url",
     [
         "postgresql+asyncpg://app@postgres/app",
@@ -123,6 +140,7 @@ def governance_settings(**overrides: object):
         "delete_secret_key": "delete-secret-8e4b6c",
         "resume_bucket": "resumes",
         "resume_prefix": "clean/",
+        "object_storage_bucket": "resumes",
         "export_bucket": "resumes",
         "export_prefix": "exports/",
         "ledger_access_key": "governance-ledger-4a8d",
@@ -166,6 +184,26 @@ def test_production_governance_settings_reject_missing_or_placeholder_credential
         governance_settings(**{field: value})
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("database_url", "postgresql+psycopg://ux09_governance:change-me-prod@postgres/ux09"),
+        ("delete_access_key", "placeholder-delete-access"),
+        ("delete_secret_key", "replace-me-delete-secret"),
+        ("ledger_access_key", "change-me-ledger-access"),
+        ("ledger_secret_key", "placeholder-ledger-secret"),
+        ("signing_key", "replace-me-signing-key-with-padding-123456"),
+    ],
+)
+def test_production_governance_settings_reject_prefixed_example_credentials_without_leak(
+    field: str, value: str
+) -> None:
+    with pytest.raises(ValidationError) as error:
+        governance_settings(**{field: value})
+
+    assert value not in str(error.value)
+
+
 def test_governance_settings_reject_shared_credentials() -> None:
     settings = governance_settings()
 
@@ -201,6 +239,23 @@ def test_governance_export_defaults_match_report_storage_contract() -> None:
 
     assert GovernanceSettings.model_fields["export_bucket"].default == "resumes"
     assert GovernanceSettings.model_fields["export_prefix"].default == "exports/"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"export_bucket": "exports"},
+        {"export_prefix": "temporary/"},
+        {"resume_prefix": "clean"},
+        {"ledger_prefix": "deletions"},
+        {"resume_prefix": ""},
+    ],
+)
+def test_production_governance_settings_reject_storage_contract_drift(
+    overrides: dict[str, str]
+) -> None:
+    with pytest.raises(ValidationError):
+        governance_settings(**overrides)
 
 
 def test_governance_settings_validate_separation_from_ordinary_runtime() -> None:

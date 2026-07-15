@@ -109,6 +109,28 @@ def test_minio_provisioning_rejects_reused_identities_and_secrets() -> None:
     assert "PREVIOUS_GOVERNANCE_LEDGER_ACCESS_KEY" in script
 
 
+def _minio_environment(**overrides: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "MINIO_ROOT_USER": "root-access",
+        "MINIO_ROOT_PASSWORD": "root-secret",
+        "APP_OBJECT_STORAGE_ACCESS_KEY": "app-access",
+        "APP_OBJECT_STORAGE_SECRET_KEY": "app-secret",
+        "OBJECT_STORAGE_BUCKET": "resumes",
+        "GOVERNANCE_DELETE_ACCESS_KEY": "delete-access",
+        "GOVERNANCE_DELETE_SECRET_KEY": "delete-secret",
+        "GOVERNANCE_RESUME_BUCKET": "resumes",
+        "GOVERNANCE_RESUME_PREFIX": "clean/",
+        "GOVERNANCE_EXPORT_BUCKET": "resumes",
+        "GOVERNANCE_EXPORT_PREFIX": "exports/",
+        "GOVERNANCE_LEDGER_ACCESS_KEY": "ledger-access",
+        "GOVERNANCE_LEDGER_SECRET_KEY": "ledger-secret",
+        "GOVERNANCE_LEDGER_BUCKET": "governance-ledger",
+        "GOVERNANCE_LEDGER_PREFIX": "deletions/",
+        **overrides,
+    }
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -129,25 +151,110 @@ def test_minio_provisioning_rejects_reused_identities_and_secrets() -> None:
 def test_minio_provisioning_fails_before_network_on_reused_credentials(
     overrides: dict[str, str], message: str
 ) -> None:
-    environment = {
-        **os.environ,
-        "MINIO_ROOT_USER": "root-access",
-        "MINIO_ROOT_PASSWORD": "root-secret",
-        "APP_OBJECT_STORAGE_ACCESS_KEY": "app-access",
-        "APP_OBJECT_STORAGE_SECRET_KEY": "app-secret",
-        "OBJECT_STORAGE_BUCKET": "resumes",
-        "GOVERNANCE_DELETE_ACCESS_KEY": "delete-access",
-        "GOVERNANCE_DELETE_SECRET_KEY": "delete-secret",
-        "GOVERNANCE_RESUME_BUCKET": "resumes",
-        "GOVERNANCE_RESUME_PREFIX": "clean/",
-        "GOVERNANCE_EXPORT_BUCKET": "resumes",
-        "GOVERNANCE_EXPORT_PREFIX": "exports/",
-        "GOVERNANCE_LEDGER_ACCESS_KEY": "ledger-access",
-        "GOVERNANCE_LEDGER_SECRET_KEY": "ledger-secret",
-        "GOVERNANCE_LEDGER_BUCKET": "governance-ledger",
-        "GOVERNANCE_LEDGER_PREFIX": "deletions/",
-        **overrides,
-    }
+    result = subprocess.run(
+        ["sh", "deploy/minio/provision.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=_minio_environment(**overrides),
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"GOVERNANCE_DELETE_ACCESS_KEY": "change-me-delete-prod"},
+            "MinIO credentials must not use example placeholders",
+        ),
+        (
+            {"GOVERNANCE_LEDGER_SECRET_KEY": "placeholder-ledger-prod"},
+            "MinIO credentials must not use example placeholders",
+        ),
+        (
+            {"GOVERNANCE_EXPORT_BUCKET": "exports"},
+            "governance export bucket must match object storage bucket",
+        ),
+        (
+            {"GOVERNANCE_EXPORT_PREFIX": "temporary/"},
+            "governance export prefix must be exports/",
+        ),
+        (
+            {"GOVERNANCE_RESUME_PREFIX": "clean"},
+            "object prefixes must be non-empty and end with /",
+        ),
+    ],
+)
+def test_minio_provisioning_rejects_placeholder_or_drifted_configuration_before_network(
+    overrides: dict[str, str], message: str
+) -> None:
+    result = subprocess.run(
+        ["sh", "deploy/minio/provision.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env=_minio_environment(**overrides),
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert all(value not in result.stderr for value in overrides.values())
+
+
+def test_minio_provisioning_rejects_checked_in_example_credentials_without_leak() -> None:
+    example = {}
+    for line in (ROOT / "deploy" / ".env.example").read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            name, value = line.split("=", 1)
+            example[name] = value
+
+    result = subprocess.run(
+        ["sh", "deploy/minio/provision.sh"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env={**os.environ, **example},
+    )
+
+    assert result.returncode != 0
+    assert "MinIO credentials must not use example placeholders" in result.stderr
+    assert "change-me-delete-secret" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_returncode"),
+    [
+        ("The specified user does not exist", 0),
+        ("Access denied while contacting MinIO", 1),
+    ],
+)
+def test_minio_retired_user_lookup_only_ignores_explicit_not_found(
+    tmp_path: Path, message: str, expected_returncode: int
+) -> None:
+    fake_mc = tmp_path / "mc"
+    fake_mc.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1 $2 $3\" = \"admin user info\" ]; then\n"
+        "  printf '%s\\n' \"$FAKE_MC_INFO_MESSAGE\" >&2\n"
+        "  exit 1\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_mc.chmod(0o755)
+    retired_key = "retired-delete-access"
+    environment = _minio_environment(
+        PREVIOUS_GOVERNANCE_DELETE_ACCESS_KEY=retired_key,
+        FAKE_MC_INFO_MESSAGE=message,
+        PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+    )
+
     result = subprocess.run(
         ["sh", "deploy/minio/provision.sh"],
         check=False,
@@ -157,8 +264,11 @@ def test_minio_provisioning_fails_before_network_on_reused_credentials(
         env=environment,
     )
 
-    assert result.returncode != 0
-    assert message in result.stderr
+    assert result.returncode == expected_returncode
+    if expected_returncode:
+        assert "unable to verify retired MinIO user state" in result.stderr
+        assert retired_key not in result.stderr
+        assert message not in result.stderr
 
 
 @pytest.mark.parametrize(

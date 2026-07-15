@@ -2,7 +2,7 @@
 
 ## Status and commits
 
-- Status: complete; all eight security-review findings are closed with focused regression and live PostgreSQL/MinIO evidence.
+- Status: complete; the original eight findings and the final six Important findings plus quality/Minor gaps are closed with focused regression and live PostgreSQL/MinIO evidence.
 - Implementation commit: `662c919 feat(governance): add secure deletion execution foundation`.
 - This report is committed separately after the implementation commit.
 - Scope remained B2B1-only. No deletion/retention/recovery handler registration, request transitions, recovery CLI, frontend work, B2B2, or B2B3 behavior was added.
@@ -38,8 +38,7 @@ All credential values used below were disposable local values supplied through e
 - `docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet` with disposable required environment -> passed.
 - `sh -n deploy/postgres/provision-app-role.sh` and `sh -n deploy/minio/provision.sh` -> passed.
 - `python -m compileall -q server/app server/migrations` in the rebuilt test image -> passed.
-- Host `python -m pytest server/tests/test_production_topology.py -q` with the concurrent Phase6B-required observability environment -> `9 passed in 5.08s`.
-- Container backend full suite, excluding only the Docker-CLI-dependent topology file as agreed -> `689 passed, 2 skipped in 1003.62s`, exit 0. The host topology gate covers the excluded file.
+- Historical pre-e20 B2B1 baseline: container backend suite excluding the then-only Docker-CLI-dependent production topology file -> `689 passed, 2 skipped in 1003.62s`, exit 0; host production topology -> `9 passed`.
 - Staged `git diff --cached --check` -> passed.
 - Staged private-key/provider-token pattern scan and governance log-sink scan -> passed.
 
@@ -61,6 +60,43 @@ All credential values used below were disposable local values supplied through e
 7. MinIO identity reuse/rotation: closed. Pairwise key/secret reuse and retired-key conflicts fail closed; real two-way rotation proves retired keys fail and repeated policy/user provisioning succeeds.
 8. Signing-key strength: closed. Production requires at least 32 UTF-8 bytes, no whitespace/placeholders, and minimum character diversity; boundary tests cover rejection and valid behavior.
 
+## Final review remediation
+
+### RED evidence
+
+- `python -m pytest server/tests/test_settings.py server/tests/test_deploy_database_identity.py -q` -> `13 failed, 65 passed`; failures proved suffixed example credentials, export drift, missing trailing slashes, and retired-user lookup errors reached or passed provisioning.
+- Real PostgreSQL regression with an app-inserted legal `resource_type='job'` row whose `resource_id` happened to equal the candidate UUID -> redaction failed and rolled back. A pre-provisioned executor membership retained `admin_option=true` after provisioning.
+- A direct governance-role update with an exact forged `ux09.audit_redaction_plan` was accepted, proving that a transaction-local custom GUC cannot itself be an authorization boundary.
+- Existing tombstone retry assertions did not prove the restored LLM input hash and feedback notes were re-cleared. Delete-only MinIO coverage did not explicitly deny reads of otherwise deletable `clean/` and `exports/` objects.
+
+### Remediation and GREEN evidence
+
+- Audit redaction now constructs a per-row transaction-local plan. The trigger accepts only the exact planned resource nulling and allowlisted metadata-key subtraction, and additionally requires both direct executor membership and execution as the redaction routine's `SECURITY DEFINER` owner; direct updates fail even with a forged exact plan. Resource IDs are matched by type, so a `job` UUID collision remains untouched while candidate, resume, file object, application, screening item/result, note, interview, feedback, and talent membership links are removed. Metadata coverage includes real `item_id`, `note_id`, `membership_id`, `source_application_id`, file-object, and prior keys.
+- Candidate-linked idempotency discovery includes resume, file-object, application, screening-item/result, note, membership, interview, and feedback IDs. A real upload-shaped cached response containing the original filename and screening `item_id` is deleted while an unrelated cache row remains.
+- Production application/governance settings and MinIO provisioning reject exact or suffixed `change-me*`, `placeholder*`, and `replace-me*` examples without rendering the rejected value. Production requires `GOVERNANCE_EXPORT_BUCKET == OBJECT_STORAGE_BUCKET` and exact `exports/`; every prefix must be non-empty, relative, and end in `/`.
+- Retired MinIO user lookup continues only for the explicit `The specified user does not exist` result. Fake-mc authentication failure exits safely without echoing the key or CLI output. A fresh real MinIO instance with non-placeholder credentials passed initial provisioning twice, rotation twice, old-key denial, restoration twice, and policy denial.
+- PostgreSQL provisioning revokes executor `ADMIN OPTION` before its ordinary grant. The real role test starts with `admin_option=true`, converges it to false, and proves the governance login cannot delegate the executor role.
+- `python -m pytest server/tests/test_settings.py server/tests/test_deploy_database_identity.py -q` -> `78 passed in 8.22s`.
+- Real PostgreSQL: `python -m pytest server/tests/test_governance_deletion_migration.py server/tests/test_governance_redaction_postgres.py -q` -> `24 passed in 131.32s`.
+- Real MinIO with rotation variables, denial checks, and a synchronized two-client conditional-create race: `python -m pytest server/tests/test_governance_minio.py -q` -> `10 passed in 2.02s`.
+- The real race produced identical receipts from both writers and one immutable ledger object; no race residual remains.
+
+### Exact layered backend gate
+
+The test container intentionally has no Docker CLI. The reproducible container command is:
+
+```text
+python -m pytest server/tests --ignore=server/tests/test_production_topology.py --ignore=server/tests/test_observability_topology.py -q
+```
+
+The host command covering both Docker/Compose topology files is:
+
+```text
+python -m pytest server/tests/test_production_topology.py server/tests/test_observability_topology.py -q
+```
+
+At current e20 HEAD, the integration run reported `590 passed, 114 skipped` plus three failures, all from `test_observability_topology.py` attempting to invoke the absent container Docker CLI, in `4:47`. The two topology files were independently green on the host: `14 passed`. This report does not describe a standard single-container full-suite command.
+
 ## Files
 
 - Deploy/config: `deploy/.env.example`, `deploy/compose.yaml`, `deploy/minio/provision.sh`, `deploy/postgres/provision-app-role.sh`, `server/Dockerfile`, `server/README.md`.
@@ -74,4 +110,4 @@ All credential values used below were disposable local values supplied through e
 - API runtime does not receive governance DB/delete/ledger/signing credentials; the worker retains ordinary credentials for normal work and receives only the dedicated governance settings.
 - Errors and checksums contain no names, object keys, row identifiers, secret values, or source PII. Ledger fields are strict and recursively tested against the forbidden-field inventory.
 - The migration is an unreleased revision, and downgrade remains fail-closed when governance evidence exists.
-- No unresolved B2B1 code or security concern remains. The two full-suite skips are covered by separately executed live gates where applicable. Concurrent Phase6B WIP was explicitly excluded from B2B1 staging and evidence attribution.
+- No unresolved B2B1 code or security concern remains. The final real MinIO race gate passed. Phase6B commit/WIP and the three protected user files were explicitly excluded from B2B1 staging and evidence attribution.

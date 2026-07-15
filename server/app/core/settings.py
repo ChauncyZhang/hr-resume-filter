@@ -18,10 +18,16 @@ PLACEHOLDERS = {
     "secret",
 }
 PLACEHOLDER_FRAGMENTS = PLACEHOLDERS - {""}
+PLACEHOLDER_PREFIXES = ("change-me", "changeme", "placeholder", "replace-me")
+
+
+def is_example_placeholder(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in PLACEHOLDERS or normalized.startswith(PLACEHOLDER_PREFIXES)
 
 
 class Settings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     environment: Literal["development", "test", "production"] = "development"
     database_url: str = "postgresql+asyncpg://app:change-me@postgres/app"
@@ -89,7 +95,8 @@ class Settings(BaseModel):
             raise ValueError("production database password is required")
         database_password = unquote(database_url.password).strip().lower()
         if (
-            any(value in PLACEHOLDERS for value in credentials)
+            any(is_example_placeholder(value) for value in credentials)
+            or is_example_placeholder(database_password)
             or any(marker in database_password for marker in PLACEHOLDER_FRAGMENTS)
         ):
             raise ValueError("production credentials must not use placeholders")
@@ -165,7 +172,7 @@ class Settings(BaseModel):
 class GovernanceSettings(BaseModel):
     """Worker-only credentials for privileged deletion execution."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     environment: Literal["development", "test", "production"] = "development"
     database_url: SecretStr = SecretStr("")
@@ -175,6 +182,7 @@ class GovernanceSettings(BaseModel):
     delete_secret_key: SecretStr = SecretStr("")
     resume_bucket: str = "resumes"
     resume_prefix: str = "clean/"
+    object_storage_bucket: str = "resumes"
     export_bucket: str = "resumes"
     export_prefix: str = "exports/"
     ledger_access_key: str = ""
@@ -199,13 +207,10 @@ class GovernanceSettings(BaseModel):
         )
         database_password = unquote(database.password)
         if self.environment == "production":
-            normalized = tuple(value.strip().lower() for value in credentials)
             if (
-                any(not value or value in PLACEHOLDERS for value in normalized)
-                or any(
-                    marker in database_password.strip().lower()
-                    for marker in PLACEHOLDER_FRAGMENTS
-                )
+                any(not value or is_example_placeholder(value) for value in credentials)
+                or is_example_placeholder(database_password)
+                or any(marker in database_password.strip().lower() for marker in PLACEHOLDER_FRAGMENTS)
             ):
                 raise ValueError("production governance credentials are required")
             signing_key = self.signing_key.get_secret_value()
@@ -214,12 +219,15 @@ class GovernanceSettings(BaseModel):
                 or signing_key != signing_key.strip()
                 or any(character.isspace() for character in signing_key)
                 or any(
-                    marker in signing_key.lower()
-                    for marker in PLACEHOLDER_FRAGMENTS
+                    marker in signing_key.lower() for marker in PLACEHOLDER_FRAGMENTS
                 )
                 or len(set(signing_key)) < 12
             ):
                 raise ValueError("production ledger signing key must be high entropy")
+            if self.export_bucket != self.object_storage_bucket:
+                raise ValueError("production governance export bucket must match object storage bucket")
+            if self.export_prefix != "exports/":
+                raise ValueError("production governance export prefix must be exports/")
         if self.delete_access_key == self.ledger_access_key:
             raise ValueError("governance access keys must be independent")
         secret_values = (
@@ -233,8 +241,11 @@ class GovernanceSettings(BaseModel):
             for right in secret_values[index + 1 :]
         ):
             raise ValueError("governance secret keys must be independent")
-        if any(not value or value.startswith("/") for value in (self.resume_prefix, self.export_prefix, self.ledger_prefix)):
-            raise ValueError("governance prefixes must be non-empty relative paths")
+        if any(
+            not value or value.startswith("/") or not value.endswith("/")
+            for value in (self.resume_prefix, self.export_prefix, self.ledger_prefix)
+        ):
+            raise ValueError("governance prefixes must be non-empty relative paths ending in /")
         return self
 
     def validate_runtime_separation(
@@ -269,6 +280,7 @@ class GovernanceSettings(BaseModel):
             "GOVERNANCE_DELETE_SECRET_KEY": "delete_secret_key",
             "GOVERNANCE_RESUME_BUCKET": "resume_bucket",
             "GOVERNANCE_RESUME_PREFIX": "resume_prefix",
+            "OBJECT_STORAGE_BUCKET": "object_storage_bucket",
             "GOVERNANCE_EXPORT_BUCKET": "export_bucket",
             "GOVERNANCE_EXPORT_PREFIX": "export_prefix",
             "GOVERNANCE_LEDGER_ACCESS_KEY": "ledger_access_key",
