@@ -43,3 +43,31 @@ docker compose -p <printed-project> -f deploy/compose.yaml -f deploy/e2e/compose
 ```
 
 Production application rollback must retain PostgreSQL and MinIO data, deploy the previous compatible image, and must not run an automatic Alembic downgrade.
+
+## Final UX-09 F-01 through F-06 gate
+
+`run-final.ps1` is the real React/Vite + FastAPI + PostgreSQL + MinIO + ClamAV + Worker browser gate. It runs every named flow at 1280x720 and 390x844, uses only synthetic `example.test` identities, and creates a unique Compose project, host ports, database, buckets, volumes, Chromium profiles, and artifact directory.
+
+From the repository root:
+
+```powershell
+$env:DISPOSABLE_E2E_CONFIRMED = '1'
+PowerShell -ExecutionPolicy Bypass -File deploy/e2e/run-final.ps1
+```
+
+Retain the isolated stack after a failure only when live diagnosis is required:
+
+```powershell
+$env:DISPOSABLE_E2E_CONFIRMED = '1'
+PowerShell -ExecutionPolicy Bypass -File deploy/e2e/run-final.ps1 -KeepOnFailure
+```
+
+Run the focused contract independently:
+
+```powershell
+node --test tests/e2e/final-runner-contract.test.cjs
+```
+
+The final gate is all-or-nothing: any blocked, failed, or partially reached flow produces exit code 2 and must be reported as incomplete, never PASS. Failure evidence is written under `.tmp/e2e-artifacts/<project>/` and includes a trace, screenshot, sanitized DOM/URL, console/page errors, and failed request method/path/status. Tracing is paused while login credentials or resume upload bodies are entered. Artifact directories are untracked and must be scanned before sharing; never commit `.tmp`.
+
+The latest recorded real run remains blocked: F-01 create/publish succeeded but immediate edit returned HTTP 409; desktop F-02 ended with 18/18 non-retryable failures and no candidates; mobile navigation was outside the 390x844 interactive viewport. F-03 through F-06 therefore did not reach their required real prerequisites. See `.superpowers/sdd/task-final-e2e-report.md` for exact evidence and the artifact privacy finding.
