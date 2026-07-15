@@ -41,8 +41,10 @@ def _compose_environment(
         {
             "HTTPS_BIND_ADDRESS": "127.0.0.1",
             "HTTPS_PORT": "443",
-            "OBSERVABILITY_DB_PASSWORD": "synthetic-observer-password",
-            "OBSERVABILITY_DB_USER": "ux09_observer",
+            "QUEUE_METRICS_DB_PASSWORD": "synthetic-queue-metrics-password",
+            "QUEUE_METRICS_DB_USER": "ux09_queue_metrics",
+            "POSTGRES_EXPORTER_DB_PASSWORD": "synthetic-postgres-exporter-password",
+            "POSTGRES_EXPORTER_DB_USER": "ux09_postgres_exporter",
             "TLS_CERTIFICATE_PATH": str(cert_path),
             "TLS_PRIVATE_KEY_PATH": str(key_path),
         }

@@ -1,10 +1,138 @@
 from prometheus_client import generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 import os
+from pathlib import Path
+import subprocess
 import uuid
 
 import pytest
 from psycopg import connect
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+DISPOSABLE_DATABASE_NAME = "ux09_observability_test"
+
+
+class _DatabaseNameConnection:
+    def __init__(self, database_name: str, statements: list[str]) -> None:
+        self.database_name = database_name
+        self.statements = statements
+
+    def __enter__(self):  # type: ignore[no-untyped-def]
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def execute(self, statement: str):  # type: ignore[no-untyped-def]
+        self.statements.append(statement)
+        return self
+
+    def fetchone(self) -> tuple[str]:
+        return (self.database_name,)
+
+
+def _confirm_disposable_database(
+    database_url: str, *, connect_fn=connect  # type: ignore[no-untyped-def]
+) -> None:
+    if os.environ.get("DISPOSABLE_DATABASE_CONFIRMED") != "1":
+        raise RuntimeError("DISPOSABLE_DATABASE_CONFIRMED=1 is required before any DDL")
+    with connect_fn(database_url, autocommit=True) as connection:
+        database_name = connection.execute("SELECT current_database()").fetchone()[0]
+    if database_name != DISPOSABLE_DATABASE_NAME:
+        raise RuntimeError(
+            f"disposable database must be named {DISPOSABLE_DATABASE_NAME}; got {database_name}"
+        )
+
+
+def test_disposable_postgres_guard_rejects_missing_confirmation_without_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DISPOSABLE_DATABASE_CONFIRMED", raising=False)
+    connections: list[str] = []
+
+    with pytest.raises(RuntimeError, match="DISPOSABLE_DATABASE_CONFIRMED=1"):
+        _confirm_disposable_database(
+            "postgresql://owner:secret@postgres/postgres",
+            connect_fn=lambda url, **kwargs: connections.append(url),
+        )
+
+    assert connections == []
+
+
+def test_disposable_postgres_guard_rejects_wrong_database_with_zero_ddl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DISPOSABLE_DATABASE_CONFIRMED", "1")
+    statements: list[str] = []
+
+    with pytest.raises(RuntimeError, match=DISPOSABLE_DATABASE_NAME):
+        _confirm_disposable_database(
+            "postgresql://owner:secret@postgres/production",
+            connect_fn=lambda *args, **kwargs: _DatabaseNameConnection(
+                "production", statements
+            ),
+        )
+
+    assert statements == ["SELECT current_database()"]
+    assert not any(
+        token in statement.upper()
+        for statement in statements
+        for token in ("CREATE ", "ALTER ", "DROP ", "TRUNCATE ", "INSERT ", "UPDATE ", "DELETE ")
+    )
+
+
+def test_snapshot_provider_reads_only_the_safe_aggregate_view() -> None:
+    from server.app.observability.collectors import PostgresQueueSnapshotProvider
+
+    class Cursor:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        def execute(self, statement: str) -> None:
+            self.statements.append(statement)
+
+        def fetchall(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "metric_name": "job_count",
+                    "dimension_a": "screening.parse_item",
+                    "dimension_b": "queued",
+                    "dimension_c": "",
+                    "value": 2.0,
+                },
+                {
+                    "metric_name": "job_attempt",
+                    "dimension_a": "screening.parse_item",
+                    "dimension_b": "failed",
+                    "dimension_c": "parse",
+                    "value": 3.0,
+                },
+                {
+                    "metric_name": "job_attempt_duration",
+                    "dimension_a": "screening.parse_item",
+                    "dimension_b": "failed",
+                    "dimension_c": "parse",
+                    "value": 4.5,
+                },
+            ]
+
+    cursor = Cursor()
+    snapshot = PostgresQueueSnapshotProvider("postgresql://ignored")._snapshot(cursor)
+
+    assert cursor.statements == [
+        "SELECT metric_name, dimension_a, dimension_b, dimension_c, value "
+        "FROM observability.queue_metrics"
+    ]
+    assert snapshot.job_counts == {("screening.parse_item", "queued"): 2}
+    assert snapshot.attempt_stats[("screening.parse_item", "failed", "parse")].count == 3
+    assert (
+        snapshot.attempt_stats[("screening.parse_item", "failed", "parse")].duration_seconds
+        == 4.5
+    )
 
 
 def test_exporter_emits_generic_job_attempt_lease_and_outbox_metrics() -> None:
@@ -63,6 +191,7 @@ def test_real_postgres_snapshot_exports_queue_metrics_without_private_dimensions
     from server.app.observability.collectors import PostgresQueueSnapshotProvider
     from server.app.observability.exporter import build_registry
 
+    _confirm_disposable_database(database_url)
     parse_job = uuid.uuid4()
     canary_type = "alice.canary@example.test"
     with connect(database_url, autocommit=True) as connection:
@@ -104,8 +233,37 @@ def test_real_postgres_snapshot_exports_queue_metrics_without_private_dimensions
                    VALUES ('audit.created', 'queued', now() - interval '1 minute', NULL)"""
             )
 
+    info = conninfo_to_dict(database_url)
+    queue_user = "ux09_queue_metrics_smoke"
+    queue_password = f"queue-{uuid.uuid4().hex}"
+    postgres_user = "ux09_postgres_exporter_smoke"
+    postgres_password = f"postgres-{uuid.uuid4().hex}"
+    provisioning_environment = os.environ.copy()
+    provisioning_environment.update(
+        {
+            "PGHOST": info.get("host", "localhost"),
+            "PGPORT": info.get("port", "5432"),
+            "POSTGRES_DB": info["dbname"],
+            "POSTGRES_USER": info["user"],
+            "POSTGRES_PASSWORD": info["password"],
+            "QUEUE_METRICS_DB_USER": queue_user,
+            "QUEUE_METRICS_DB_PASSWORD": queue_password,
+            "POSTGRES_EXPORTER_DB_USER": postgres_user,
+            "POSTGRES_EXPORTER_DB_PASSWORD": postgres_password,
+        }
+    )
+    provision = subprocess.run(
+        ["sh", str(ROOT / "deploy" / "observability" / "provision-roles.sh")],
+        cwd=ROOT,
+        env=provisioning_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert provision.returncode == 0, provision.stdout + provision.stderr
+    queue_url = make_conninfo(database_url, user=queue_user, password=queue_password)
     payload = generate_latest(
-        build_registry(PostgresQueueSnapshotProvider(database_url))
+        build_registry(PostgresQueueSnapshotProvider(queue_url))
     ).decode("utf-8")
     samples = [
         sample

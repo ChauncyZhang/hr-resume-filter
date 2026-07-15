@@ -3,6 +3,26 @@ services:
     environment:
       MINIO_PROMETHEUS_AUTH_TYPE: public
 
+  observability-role-provision:
+    image: postgres:16.9-alpine
+    environment:
+      PGHOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      QUEUE_METRICS_DB_USER: ${QUEUE_METRICS_DB_USER:?Set QUEUE_METRICS_DB_USER to the queue metrics login}
+      QUEUE_METRICS_DB_PASSWORD: ${QUEUE_METRICS_DB_PASSWORD:?Set QUEUE_METRICS_DB_PASSWORD to the queue metrics password}
+      POSTGRES_EXPORTER_DB_USER: ${POSTGRES_EXPORTER_DB_USER:?Set POSTGRES_EXPORTER_DB_USER to the postgres exporter login}
+      POSTGRES_EXPORTER_DB_PASSWORD: ${POSTGRES_EXPORTER_DB_PASSWORD:?Set POSTGRES_EXPORTER_DB_PASSWORD to the postgres exporter password}
+    volumes:
+      - ./observability/provision-roles.sh:/opt/ux09/provision-observability-roles.sh:ro
+    command: ["sh", "/opt/ux09/provision-observability-roles.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [private]
+
   queue-exporter:
     build:
       context: ..
@@ -10,11 +30,11 @@ services:
       target: runtime
     command: ["python", "-m", "server.app.observability.exporter"]
     environment:
-      OBSERVABILITY_DATABASE_URL: postgresql://${OBSERVABILITY_DB_USER:?Set OBSERVABILITY_DB_USER to the read-only monitoring role}:${OBSERVABILITY_DB_PASSWORD:?Set OBSERVABILITY_DB_PASSWORD to the read-only monitoring password}@postgres:5432/${POSTGRES_DB}
+      OBSERVABILITY_DATABASE_URL: postgresql://${QUEUE_METRICS_DB_USER:?Set QUEUE_METRICS_DB_USER to the queue metrics login}:${QUEUE_METRICS_DB_PASSWORD:?Set QUEUE_METRICS_DB_PASSWORD to the queue metrics password}@postgres:5432/${POSTGRES_DB}
       OBSERVABILITY_EXPORTER_PORT: "9108"
     depends_on:
-      postgres:
-        condition: service_healthy
+      observability-role-provision:
+        condition: service_completed_successfully
     restart: unless-stopped
     read_only: true
     tmpfs: [/tmp]
@@ -54,35 +74,20 @@ services:
     command:
       - --path.procfs=/host/proc
       - --path.sysfs=/host/sys
-      - --path.rootfs=/rootfs
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
-      - /:/rootfs:ro,rslave
-    restart: unless-stopped
-    networks: [private]
-
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.52.1
-    privileged: true
-    read_only: true
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker:/var/lib/docker:ro
-      - /dev/disk:/dev/disk:ro
     restart: unless-stopped
     networks: [private]
 
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.17.1
     environment:
-      DATA_SOURCE_NAME: postgresql://${OBSERVABILITY_DB_USER:?Set OBSERVABILITY_DB_USER to the read-only monitoring role}:${OBSERVABILITY_DB_PASSWORD:?Set OBSERVABILITY_DB_PASSWORD to the read-only monitoring password}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_EXPORTER_DB_USER:?Set POSTGRES_EXPORTER_DB_USER to the postgres exporter login}:${POSTGRES_EXPORTER_DB_PASSWORD:?Set POSTGRES_EXPORTER_DB_PASSWORD to the postgres exporter password}@postgres:5432/${POSTGRES_DB}?sslmode=disable
     depends_on:
-      postgres:
-        condition: service_healthy
+      observability-role-provision:
+        condition: service_completed_successfully
     restart: unless-stopped
     networks: [private]
 

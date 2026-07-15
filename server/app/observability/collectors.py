@@ -244,81 +244,54 @@ class PostgresQueueSnapshotProvider:
         return list(cursor.fetchall())
 
     def _snapshot(self, cursor) -> QueueSnapshot:  # type: ignore[no-untyped-def]
-        job_counts = {
-            (row["type"], row["status"]): int(row["count"])
-            for row in self._rows(
-                cursor,
-                """SELECT type, status, count(*) AS count FROM background_jobs
-                   WHERE type NOT LIKE 'governance.%' GROUP BY type, status""",
-            )
-        }
-        oldest_ready = {
-            row["type"]: float(row["age_seconds"] or 0)
-            for row in self._rows(
-                cursor,
-                """SELECT type,
-                          EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - min(run_after))) AS age_seconds
-                   FROM background_jobs
-                   WHERE type NOT LIKE 'governance.%' AND status = 'queued'
-                     AND run_after <= CURRENT_TIMESTAMP GROUP BY type""",
-            )
-        }
+        rows = self._rows(
+            cursor,
+            "SELECT metric_name, dimension_a, dimension_b, dimension_c, value "
+            "FROM observability.queue_metrics",
+        )
+        job_counts: dict[tuple[str, str], int] = {}
+        oldest_ready: dict[str, float] = {}
+        attempt_values: dict[tuple[str, str, str], dict[str, float]] = {}
+        expired_leases: dict[str, int] = {}
+        dead_letters: dict[str, int] = {}
+        outbox_counts: dict[tuple[str, str], int] = {}
+        oldest_outbox: dict[str, float] = {}
+
+        for row in rows:
+            metric_name = str(row["metric_name"])
+            dimension_a = str(row["dimension_a"] or "")
+            dimension_b = str(row["dimension_b"] or "")
+            dimension_c = str(row["dimension_c"] or "")
+            value = float(row["value"] or 0)
+            if metric_name == "job_count":
+                job_counts[(dimension_a, dimension_b)] = int(value)
+            elif metric_name == "job_oldest_ready_age":
+                oldest_ready[dimension_a] = value
+            elif metric_name in {"job_attempt", "job_attempt_duration"}:
+                key = (dimension_a, dimension_b, dimension_c)
+                values = attempt_values.setdefault(key, {"count": 0, "duration": 0.0})
+                if metric_name == "job_attempt":
+                    values["count"] = int(value)
+                else:
+                    values["duration"] = value
+            elif metric_name == "expired_lease":
+                expired_leases[dimension_a] = int(value)
+            elif metric_name == "job_dead_letter":
+                dead_letters[dimension_a] = int(value)
+            elif metric_name == "outbox_count":
+                outbox_counts[(dimension_a, dimension_b)] = int(value)
+            elif metric_name == "outbox_oldest_ready_age":
+                oldest_outbox[dimension_a] = value
+
         attempt_stats = {
-            (row["type"], row["result"] or "running", row["safe_error_code"] or ""):
-            AttemptStats(int(row["count"]), float(row["duration_seconds"] or 0))
-            for row in self._rows(
-                cursor,
-                """SELECT job.type, attempt.result, attempt.safe_error_code,
-                          count(*) AS count,
-                          coalesce(sum(attempt.duration_ms), 0) / 1000.0 AS duration_seconds
-                   FROM job_attempts AS attempt
-                   JOIN background_jobs AS job ON job.id = attempt.job_id
-                   WHERE job.type NOT LIKE 'governance.%'
-                   GROUP BY job.type, attempt.result, attempt.safe_error_code""",
-            )
-        }
-        expired_job = self._rows(
-            cursor,
-            """SELECT count(*) AS count FROM background_jobs
-               WHERE type NOT LIKE 'governance.%' AND status = 'running'
-                 AND lease_expires_at < CURRENT_TIMESTAMP""",
-        )[0]["count"]
-        expired_outbox = self._rows(
-            cursor,
-            """SELECT count(*) AS count FROM outbox_events
-               WHERE status = 'running' AND lease_expires_at < CURRENT_TIMESTAMP""",
-        )[0]["count"]
-        dead_letters = {
-            row["type"]: int(row["count"])
-            for row in self._rows(
-                cursor,
-                """SELECT type, count(*) AS count FROM background_jobs
-                   WHERE type NOT LIKE 'governance.%' AND status = 'dead_letter'
-                   GROUP BY type""",
-            )
-        }
-        outbox_counts = {
-            (row["topic"], row["status"]): int(row["count"])
-            for row in self._rows(
-                cursor,
-                "SELECT topic, status, count(*) AS count FROM outbox_events GROUP BY topic, status",
-            )
-        }
-        oldest_outbox = {
-            row["topic"]: float(row["age_seconds"] or 0)
-            for row in self._rows(
-                cursor,
-                """SELECT topic,
-                          EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - min(available_at))) AS age_seconds
-                   FROM outbox_events WHERE status = 'queued'
-                     AND available_at <= CURRENT_TIMESTAMP GROUP BY topic""",
-            )
+            key: AttemptStats(int(values["count"]), float(values["duration"]))
+            for key, values in attempt_values.items()
         }
         return QueueSnapshot(
             job_counts=job_counts,
             oldest_ready_age_seconds=oldest_ready,
             attempt_stats=attempt_stats,
-            expired_leases={"job": int(expired_job), "outbox": int(expired_outbox)},
+            expired_leases=expired_leases,
             dead_letters=dead_letters,
             outbox_counts=outbox_counts,
             oldest_outbox_age_seconds=oldest_outbox,
