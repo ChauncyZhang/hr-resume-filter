@@ -1,5 +1,6 @@
 .git
 .superpowers
+.tmp
 app
 docs
 server/.venv

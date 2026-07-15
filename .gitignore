@@ -10,5 +10,6 @@ app/data/config.json
 *.log
 build/
 dist/
+.tmp/
 *.spec
 .worktrees/

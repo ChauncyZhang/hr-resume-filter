@@ -47,7 +47,7 @@ x-app-service: &app-service
 
 services:
   proxy:
-    image: nginx:1.28.0-alpine
+    image: nginx:1.28.0-alpine@sha256:30f1c0d78e0ad60901648be663a710bdadf19e4c10ac6782c235200619158284
     ports:
       - "8080:8080"
     volumes:
@@ -102,7 +102,7 @@ services:
       retries: 3
 
   postgres:
-    image: postgres:16.9-alpine
+    image: postgres:16.9-alpine@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -123,7 +123,7 @@ services:
     networks: [private]
 
   minio:
-    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0
     command: server /data
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
@@ -139,7 +139,7 @@ services:
     networks: [private]
 
   minio-provision:
-    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z@sha256:d249d1fb6966de4d8ad26c04754b545205ff15a62e4fd19ebd0f26fa5baacbc0
     entrypoint: ["/bin/sh", "/provision/provision.sh"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
@@ -168,7 +168,7 @@ services:
     networks: [private]
 
   clamav:
-    image: clamav/clamav:1.4.3
+    image: clamav/clamav:1.4.3@sha256:75fb5fd95fcbe1d7e6d240c369c1572b686ee2c95949d1042b5148de8eddebb4
     healthcheck:
       test: ["CMD", "/usr/local/bin/clamdcheck.sh"]
       interval: 30s
@@ -178,7 +178,8 @@ services:
     networks: [private]
 
   backup:
-    image: postgres:16.9-alpine
+    image: postgres:16.9-alpine@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7
+    profiles: [local-backup]
     environment:
       PGHOST: postgres
       PGDATABASE: ${POSTGRES_DB}

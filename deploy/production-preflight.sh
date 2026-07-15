@@ -7,6 +7,7 @@ script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_directory/.." && pwd)
 base_compose="$repository_root/deploy/compose.yaml"
 production_overlay="$repository_root/deploy/compose.production.yaml"
+release_compose_validator="$repository_root/deploy/release-compose-validator.py"
 compose_env_file=${COMPOSE_ENV_FILE:-"$repository_root/deploy/.env"}
 
 raw_compose_version=$(docker compose version --short 2>/dev/null) || {
@@ -44,12 +45,26 @@ if [ ! -f "$compose_env_file" ]; then
     exit 1
 fi
 
+python_command=
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import json, sys' >/dev/null 2>&1; then
+        python_command=$candidate
+        break
+    fi
+done
+if [ -z "$python_command" ]; then
+    printf '%s\n' 'production preflight: Python 3 is required for release model validation' >&2
+    exit 1
+fi
+
 # The production model is always the base plus the production overlay. Never
 # validate or deploy the base file alone because it publishes development HTTP.
 docker compose \
     --env-file "$compose_env_file" \
     -f "$base_compose" \
     -f "$production_overlay" \
-    config --quiet
+    config --format json \
+    | "$python_command" "$release_compose_validator"
 
 printf '%s\n' 'production preflight: merged production Compose model is valid'

@@ -12,6 +12,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 from uuid import uuid4
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE_COMPOSE = ROOT / "deploy" / "compose.yaml"
@@ -21,6 +23,15 @@ ENV_EXAMPLE = ROOT / "deploy" / ".env.example"
 NGINX_TEMPLATE = ROOT / "deploy" / "nginx" / "production.conf.template"
 SECURITY_HEADERS = ROOT / "deploy" / "nginx" / "snippets" / "security-headers.conf"
 PRODUCTION_PREFLIGHT = ROOT / "deploy" / "production-preflight.sh"
+FRONTEND_DOCKERFILE = ROOT / "deploy" / "nginx" / "Dockerfile"
+FRONTEND_PACKAGE = ROOT / "docs" / "design" / "prototypes" / "ats-low-fi-option-2"
+RELEASE_COMPOSE_VALIDATOR = ROOT / "deploy" / "release-compose-validator.py"
+SERVER_DOCKERFILE = ROOT / "server" / "Dockerfile"
+
+APP_IMAGE = "registry.synthetic.test/ux09-server"
+APP_IMAGE_DIGEST = f"sha256:{'1' * 64}"
+FRONTEND_IMAGE = "registry.synthetic.test/ux09-frontend"
+FRONTEND_IMAGE_DIGEST = f"sha256:{'2' * 64}"
 
 FORBIDDEN_API_ENVIRONMENT = {
     "GOVERNANCE_DATABASE_URL",
@@ -41,6 +52,10 @@ def _compose_environment(
         {
             "HTTPS_BIND_ADDRESS": "127.0.0.1",
             "HTTPS_PORT": "443",
+            "APP_IMAGE": APP_IMAGE,
+            "APP_IMAGE_DIGEST": APP_IMAGE_DIGEST,
+            "FRONTEND_IMAGE": FRONTEND_IMAGE,
+            "FRONTEND_IMAGE_DIGEST": FRONTEND_IMAGE_DIGEST,
             "QUEUE_METRICS_DB_PASSWORD": "synthetic-queue-metrics-password",
             "QUEUE_METRICS_DB_USER": "ux09_queue_metrics",
             "POSTGRES_EXPORTER_DB_PASSWORD": "synthetic-postgres-exporter-password",
@@ -88,6 +103,50 @@ def _merged_compose(cert_path: Path, key_path: Path) -> dict:
     result = _run_compose_config(environment)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
+
+
+def _run_release_compose_validator(model: dict) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python", str(RELEASE_COMPOSE_VALIDATOR)],
+        cwd=ROOT,
+        input=json.dumps(model),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def frontend_release_image() -> str:
+    image = f"ux09-frontend-topology-test:{uuid4().hex[:12]}"
+    built = subprocess.run(
+        [
+            "docker",
+            "build",
+            "--pull=false",
+            "-t",
+            image,
+            "-f",
+            str(FRONTEND_DOCKERFILE),
+            str(FRONTEND_PACKAGE),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    assert built.returncode == 0, built.stdout + built.stderr
+    try:
+        yield image
+    finally:
+        subprocess.run(
+            ["docker", "image", "rm", "-f", image],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 def _generate_certificate(cert_path: Path, key_path: Path) -> None:
@@ -169,6 +228,191 @@ def test_merged_production_topology_has_one_https_host_entry(tmp_path: Path) -> 
     assert port["protocol"] == "tcp"
 
 
+def test_production_services_use_immutable_release_images_without_builds(
+    tmp_path: Path,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+
+    model = _merged_compose(cert_path, key_path)
+    expected_app = f"{APP_IMAGE}@{APP_IMAGE_DIGEST}"
+    expected_frontend = f"{FRONTEND_IMAGE}@{FRONTEND_IMAGE_DIGEST}"
+
+    for service_name in ("api", "worker", "queue-exporter"):
+        service = model["services"][service_name]
+        assert service["image"] == expected_app
+        assert "build" not in service
+
+    proxy = model["services"]["proxy"]
+    assert proxy["image"] == expected_frontend
+    assert "build" not in proxy
+    assert all(
+        volume["target"] != "/usr/share/nginx/html"
+        for volume in proxy.get("volumes", [])
+    )
+
+
+def test_every_merged_production_service_uses_an_immutable_image(
+    tmp_path: Path,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+
+    model = _merged_compose(cert_path, key_path)
+
+    for service_name, service in model["services"].items():
+        assert re.fullmatch(
+            r"[^@\s]+@sha256:[0-9a-f]{64}", service.get("image", "")
+        ), service_name
+        assert "build" not in service, service_name
+
+
+def test_default_production_model_does_not_run_legacy_on_host_backup(
+    tmp_path: Path,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+
+    model = _merged_compose(cert_path, key_path)
+
+    assert "backup" not in model["services"]
+
+
+def test_release_compose_validator_accepts_the_merged_production_model(
+    tmp_path: Path,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+
+    result = _run_release_compose_validator(_merged_compose(cert_path, key_path))
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("service_name", "bad_image"),
+    [
+        ("api", f"{APP_IMAGE}:latest"),
+        ("worker", f"{APP_IMAGE}@sha256:{'a' * 63}"),
+        ("queue-exporter", f"{APP_IMAGE}@sha256:{'A' * 64}"),
+        ("proxy", f"{FRONTEND_IMAGE}@latest"),
+        ("proxy", f"registry.example.test/ux09-frontend@sha256:{'2' * 64}"),
+        ("postgres", "postgres:16.9-alpine"),
+    ],
+)
+def test_release_compose_validator_rejects_mutable_or_malformed_images(
+    tmp_path: Path, service_name: str, bad_image: str,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+    model = _merged_compose(cert_path, key_path)
+    model["services"][service_name]["image"] = bad_image
+
+    result = _run_release_compose_validator(model)
+
+    assert result.returncode != 0
+    assert service_name in result.stderr
+
+
+@pytest.mark.parametrize(
+    "violation", ["build", "static-mount", "legacy-backup", "zero-digest"]
+)
+def test_release_compose_validator_rejects_local_release_bypasses(
+    tmp_path: Path, violation: str,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+    model = _merged_compose(cert_path, key_path)
+    if violation == "build":
+        model["services"]["api"]["build"] = {"context": ".."}
+    elif violation == "static-mount":
+        model["services"]["proxy"].setdefault("volumes", []).append(
+            {"type": "bind", "source": "./nginx/static", "target": "/usr/share/nginx/html"}
+        )
+    elif violation == "legacy-backup":
+        model["services"]["backup"] = {"image": "postgres:16.9-alpine"}
+    else:
+        zero_image = f"{APP_IMAGE}@sha256:{'0' * 64}"
+        for service_name in ("api", "worker", "queue-exporter"):
+            model["services"][service_name]["image"] = zero_image
+
+    result = _run_release_compose_validator(model)
+
+    assert result.returncode != 0
+    assert violation in result.stderr
+
+
+def test_frontend_release_image_contains_real_vite_application(
+    tmp_path: Path, frontend_release_image: str
+) -> None:
+    container_id = ""
+    try:
+        created = subprocess.run(
+            ["docker", "create", frontend_release_image],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert created.returncode == 0, created.stdout + created.stderr
+        container_id = created.stdout.strip()
+        html_root = tmp_path / "html"
+        html_root.mkdir()
+        copied = subprocess.run(
+            [
+                "docker",
+                "cp",
+                f"{container_id}:/usr/share/nginx/html/.",
+                str(html_root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert copied.returncode == 0, copied.stdout + copied.stderr
+        index = (html_root / "index.html").read_text(encoding="utf-8")
+        assert '<div id="root"></div>' in index
+        assert list((html_root / "assets").glob("*.js"))
+        assert "frontend assets mount here" not in index.lower()
+    finally:
+        if container_id:
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+
+@pytest.mark.parametrize("dockerfile", [SERVER_DOCKERFILE, FRONTEND_DOCKERFILE])
+def test_release_dockerfiles_pin_every_base_image_by_digest(dockerfile: Path) -> None:
+    external_images: list[str] = []
+    stages: set[str] = set()
+    for line in dockerfile.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("FROM "):
+            continue
+        parts = line.split()
+        image = parts[1]
+        if image not in stages:
+            external_images.append(image)
+        if len(parts) == 4 and parts[2].upper() == "AS":
+            stages.add(parts[3])
+
+    assert external_images
+    assert all(re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image) for image in external_images)
+
+
 def test_merged_production_topology_mounts_tls_files_without_api_privilege_leak(
     tmp_path: Path,
 ) -> None:
@@ -232,6 +476,30 @@ def test_production_server_name_is_required(tmp_path: Path) -> None:
     assert "SERVER_NAME" in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("APP_IMAGE_DIGEST", "latest"),
+        ("APP_IMAGE_DIGEST", f"sha256:{'a' * 63}"),
+        ("FRONTEND_IMAGE_DIGEST", f"sha256:{'A' * 64}"),
+    ],
+)
+def test_production_preflight_rejects_malformed_release_digest(
+    tmp_path: Path, name: str, value: str,
+) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+    environment = _preflight_environment(cert_path, key_path)
+    environment[name] = value
+
+    result = _run_preflight(environment)
+
+    assert result.returncode != 0
+    assert "sha256" in result.stderr
+
+
 def test_production_nginx_contract_is_https_only_and_keeps_metrics_private() -> None:
     template = NGINX_TEMPLATE.read_text(encoding="utf-8")
     headers = SECURITY_HEADERS.read_text(encoding="utf-8")
@@ -266,11 +534,9 @@ def test_production_nginx_contract_is_https_only_and_keeps_metrics_private() -> 
 
 
 def test_rendered_production_nginx_passes_nginx_t_with_disposable_certificate(
-    tmp_path: Path,
+    tmp_path: Path, frontend_release_image: str,
 ) -> None:
     rendered, cert_path, key_path = _render_nginx(tmp_path)
-    model = _merged_compose(cert_path, key_path)
-    proxy_image = model["services"]["proxy"]["image"]
 
     result = subprocess.run(
         [
@@ -278,7 +544,7 @@ def test_rendered_production_nginx_passes_nginx_t_with_disposable_certificate(
             "run",
             "--rm",
             *_nginx_container_arguments(
-                proxy_image, rendered, cert_path, key_path
+                frontend_release_image, rendered, cert_path, key_path
             ),
             "nginx",
             "-t",
@@ -291,10 +557,10 @@ def test_rendered_production_nginx_passes_nginx_t_with_disposable_certificate(
     assert result.returncode == 0, result.stderr
 
 
-def test_metrics_paths_return_404_from_running_production_nginx(tmp_path: Path) -> None:
+def test_metrics_paths_return_404_from_running_production_nginx(
+    tmp_path: Path, frontend_release_image: str
+) -> None:
     rendered, cert_path, key_path = _render_nginx(tmp_path)
-    model = _merged_compose(cert_path, key_path)
-    proxy_image = model["services"]["proxy"]["image"]
     started = subprocess.run(
         [
             "docker",
@@ -303,7 +569,7 @@ def test_metrics_paths_return_404_from_running_production_nginx(tmp_path: Path) 
             "-p",
             "127.0.0.1::8443",
             *_nginx_container_arguments(
-                proxy_image, rendered, cert_path, key_path
+                frontend_release_image, rendered, cert_path, key_path
             ),
         ],
         cwd=ROOT,
@@ -321,6 +587,32 @@ def test_metrics_paths_return_404_from_running_production_nginx(tmp_path: Path) 
         )
         host_port = int(port_result.stdout.strip().rsplit(":", 1)[1])
         context = ssl._create_unverified_context()
+        root_payload = ""
+        root_status = None
+        for _ in range(30):
+            try:
+                with urlopen(
+                    f"https://127.0.0.1:{host_port}/",
+                    context=context,
+                    timeout=1,
+                ) as response:
+                    root_status = response.status
+                    root_payload = response.read().decode("utf-8")
+                break
+            except URLError:
+                time.sleep(0.1)
+        assert root_status == 200
+        assert '<div id="root"></div>' in root_payload
+        asset_match = re.search(r'<script[^>]+src="([^"]+\.js)"', root_payload)
+        assert asset_match is not None
+        with urlopen(
+            f"https://127.0.0.1:{host_port}{asset_match.group(1)}",
+            context=context,
+            timeout=2,
+        ) as asset_response:
+            assert asset_response.status == 200
+            assert asset_response.read(32)
+
         for path in ("/metrics", "/metrics/child"):
             status = None
             for _ in range(30):

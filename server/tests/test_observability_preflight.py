@@ -40,6 +40,11 @@ printf '%s\n' "$*" >> "$COMPOSE_CALL_LOG"
 if [ "$1" = compose ] && [ "$2" = version ] && [ "$3" = --short ]; then
     printf '%s\n' '2.24.4'
 fi
+case " $* " in
+    *" config --format json "*)
+        printf '%s\n' '{"services":{"api":{"image":"registry.test/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"},"worker":{"image":"registry.test/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"},"queue-exporter":{"image":"registry.test/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"},"proxy":{"image":"registry.test/frontend@sha256:2222222222222222222222222222222222222222222222222222222222222222"}}}'
+        ;;
+esac
 """,
         encoding="utf-8",
     )
@@ -104,6 +109,11 @@ def _run_production_preflight(
 if [ "$1" = compose ] && [ "$2" = version ] && [ "$3" = --short ]; then
     printf '%s\n' '2.24.4'
 fi
+case " $* " in
+    *" config --format json "*)
+        printf '%s\n' '{"services":{"api":{"image":"registry.test/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"},"worker":{"image":"registry.test/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"},"queue-exporter":{"image":"registry.test/app@sha256:1111111111111111111111111111111111111111111111111111111111111111"},"proxy":{"image":"registry.test/frontend@sha256:2222222222222222222222222222222222222222222222222222222222222222"}}}'
+        ;;
+esac
 """,
         encoding="utf-8",
     )

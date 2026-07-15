@@ -7,6 +7,7 @@ production_preflight="$script_directory/production-preflight.sh"
 base_compose="$script_directory/compose.yaml"
 production_overlay="$script_directory/compose.production.yaml"
 observability_overlay="$script_directory/compose.observability.yaml"
+release_compose_validator="$script_directory/release-compose-validator.py"
 compose_env_file=${COMPOSE_ENV_FILE:-"$script_directory/.env"}
 alert_rules="$script_directory/observability/alerts/ux09.rules.yml"
 local_runbook="$script_directory/observability/runbook.md"
@@ -24,12 +25,26 @@ runbook_anchors() {
 # Compose version and proves the base + production model independently.
 sh "$production_preflight"
 
+python_command=
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import json, sys' >/dev/null 2>&1; then
+        python_command=$candidate
+        break
+    fi
+done
+if [ -z "$python_command" ]; then
+    printf '%s\n' 'observability preflight: Python 3 is required for release model validation' >&2
+    exit 1
+fi
+
 docker compose \
     --env-file "$compose_env_file" \
     -f "$base_compose" \
     -f "$production_overlay" \
     -f "$observability_overlay" \
-    config --quiet
+    config --format json \
+    | "$python_command" "$release_compose_validator"
 
 case "$preflight_mode" in
     development)

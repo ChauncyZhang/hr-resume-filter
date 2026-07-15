@@ -24,6 +24,87 @@ the fixed `preflight-drill` plus disposable drill Compose checks from the
 backup-recovery runbook. Preflight must reject an invalid latest restore point,
 an unverified catalog, or any image not resolved as `image@sha256`.
 
+Build and publish all release-owned images from the exact reviewed commit. Set
+the three repositories to approved registry locations before running this
+sequence. `TARGET_PLATFORM` must match the target Linux host.
+
+```sh
+export RELEASE_COMMIT=$(git rev-parse HEAD)
+export TARGET_PLATFORM=linux/amd64
+: "${APP_IMAGE:?Set the application image repository}"
+: "${FRONTEND_IMAGE:?Set the frontend image repository}"
+: "${BACKUP_IMAGE:?Set the backup image repository}"
+
+docker buildx build --platform "$TARGET_PLATFORM" --target runtime \
+  -f server/Dockerfile -t "$APP_IMAGE:$RELEASE_COMMIT" --push .
+docker buildx build --platform "$TARGET_PLATFORM" \
+  -f deploy/nginx/Dockerfile -t "$FRONTEND_IMAGE:$RELEASE_COMMIT" --push \
+  docs/design/prototypes/ats-low-fi-option-2
+docker buildx build --platform "$TARGET_PLATFORM" \
+  -f deploy/backup/Dockerfile -t "$BACKUP_IMAGE:$RELEASE_COMMIT" --push \
+  deploy/backup
+
+export APP_IMAGE_DIGEST=$(docker buildx imagetools inspect \
+  "$APP_IMAGE:$RELEASE_COMMIT" --format '{{.Manifest.Digest}}')
+export FRONTEND_IMAGE_DIGEST=$(docker buildx imagetools inspect \
+  "$FRONTEND_IMAGE:$RELEASE_COMMIT" --format '{{.Manifest.Digest}}')
+export BACKUP_IMAGE_DIGEST=$(docker buildx imagetools inspect \
+  "$BACKUP_IMAGE:$RELEASE_COMMIT" --format '{{.Manifest.Digest}}')
+printf 'app=%s@%s\nfrontend=%s@%s\nbackup=%s@%s\n' \
+  "$APP_IMAGE" "$APP_IMAGE_DIGEST" \
+  "$FRONTEND_IMAGE" "$FRONTEND_IMAGE_DIGEST" \
+  "$BACKUP_IMAGE" "$BACKUP_IMAGE_DIGEST"
+```
+
+Record those repositories and digests in the protected release environment
+and evidence store. Do not use the example registry or all-zero digest from
+`.env.example`. The release preflight parses the final merged Compose model and
+fails if any production service has a mutable/malformed image or local build,
+or if the proxy has a host static-asset override or the legacy on-host-only
+backup is enabled.
+
+On the target Linux host, with external traffic still closed, execute:
+
+```sh
+COMPOSE_ENV_FILE=deploy/.env sh deploy/production-preflight.sh
+COMPOSE_ENV_FILE=deploy/.env sh deploy/observability-preflight.sh
+OBSERVABILITY_PREFLIGHT_MODE=production \
+  COMPOSE_ENV_FILE=deploy/.env \
+  sh deploy/observability-preflight.sh
+
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml \
+  -f deploy/compose.production.yaml \
+  -f deploy/compose.observability.yaml \
+  pull
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml \
+  -f deploy/compose.production.yaml \
+  -f deploy/compose.observability.yaml \
+  up -d --no-build
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml \
+  -f deploy/compose.production.yaml \
+  -f deploy/compose.observability.yaml ps
+python3 deploy/release-runtime-validator.py --env-file deploy/.env
+
+curl --fail --show-error "https://$SERVER_NAME/health/live"
+curl --fail --show-error "https://$SERVER_NAME/health/ready"
+```
+
+From an operator workstation with the frontend package dependencies and
+Chromium installed, run the read-only same-origin browser smoke. It enters no
+credentials and verifies the real React login page, trusted TLS, readiness,
+and that `/api/v1/me` returns unauthenticated JSON rather than SPA HTML.
+
+```sh
+cd docs/design/prototypes/ats-low-fi-option-2
+npm ci
+npx playwright install chromium
+UX09_PRODUCTION_URL="https://$SERVER_NAME/" \
+  node scripts/production-browser-smoke.cjs
+```
+
 Reliability objectives are a 24-hour RPO and 4-hour RTO. Schedule paired backup
 every 12 hours to preserve RPO margin. Launch is blocked until the newest two
 valid complete points are restorable and the latest ledger archive freshness is
@@ -64,6 +145,34 @@ Any future traffic-open implementation requires the separately released signed
 B2B3 protocol and review. Never overwrite
 production volumes in place and never use the disposable drill Compose project
 as a production topology.
+
+For an application-only rollback, first close or reduce external traffic and
+set `APP_IMAGE_DIGEST` and `FRONTEND_IMAGE_DIGEST` in the protected
+`deploy/.env` to the previously recorded compatible values. Preserve the
+forward-migrated database, backup leases, and `/var/lib/ux09-backup/pending-run.json`.
+Then run:
+
+```sh
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml \
+  -f deploy/compose.production.yaml \
+  -f deploy/compose.observability.yaml \
+  pull proxy api worker queue-exporter
+docker compose --env-file deploy/.env \
+  -f deploy/compose.yaml \
+  -f deploy/compose.production.yaml \
+  -f deploy/compose.observability.yaml \
+  up -d --no-build
+python3 deploy/release-runtime-validator.py --env-file deploy/.env
+curl --fail --show-error "https://$SERVER_NAME/health/live"
+curl --fail --show-error "https://$SERVER_NAME/health/ready"
+```
+
+Run the read-only browser smoke again before any independent traffic decision.
+If the previous application image is not proven compatible with the current
+schema, do not downgrade the database or start that image; keep traffic closed
+and recover forward. For integrity loss or host loss, use the isolated/full-host
+ledger-first recovery procedure instead of this image rollback.
 
 ## Credential and signing-key rotation
 
