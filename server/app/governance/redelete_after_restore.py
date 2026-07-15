@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import io
+import secrets
 import sys
 from datetime import datetime, timezone
 from typing import Sequence
 from urllib.parse import unquote, urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
@@ -45,7 +47,7 @@ def _sync_database_url(database_url: str) -> str:
     return database_url.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
 
 
-def _database_identity(engine, database_url: str) -> tuple[str, bool]:
+def _database_identity(engine, database_url: str):
     expected_user = unquote(urlsplit(database_url).username or "")
     try:
         with engine.connect() as connection:
@@ -54,7 +56,12 @@ def _database_identity(engine, database_url: str) -> tuple[str, bool]:
             row = connection.execute(
                 text(
                     "SELECT current_user, "
-                    "pg_has_role(current_user, 'ux09_governance_executor', 'member')"
+                    "pg_has_role(current_user, 'ux09_governance_executor', 'member'), "
+                    "to_regprocedure('public.redact_candidate_data(uuid,uuid,uuid)') "
+                    "IS NOT NULL, "
+                    "COALESCE(has_function_privilege(current_user, "
+                    "to_regprocedure('public.redact_candidate_data(uuid,uuid,uuid)'), "
+                    "'EXECUTE'), false)"
                 )
             ).one()
     except RecoveryError:
@@ -63,22 +70,44 @@ def _database_identity(engine, database_url: str) -> tuple[str, bool]:
         raise RecoveryError("recovery_database_unavailable") from error
     if row[0] != expected_user:
         raise RecoveryError("recovery_database_identity_invalid")
-    return row[0], row[1] is True
+    return row
 
 
 def _validate_application_database_identity(engine, database_url: str) -> None:
-    _, is_executor = _database_identity(engine, database_url)
-    if is_executor:
+    row = _database_identity(engine, database_url)
+    if row[1] is True:
         raise RecoveryError("recovery_database_identity_invalid")
 
 
 def _validate_governance_database_identity(engine, database_url: str) -> None:
-    _, is_executor = _database_identity(engine, database_url)
-    if not is_executor:
+    row = _database_identity(engine, database_url)
+    if len(row) != 4 or row[1:] != (True, True, True):
         raise RecoveryError("recovery_database_identity_invalid")
+    canary = {
+        "organization_id": uuid4(),
+        "request_id": uuid4(),
+        "candidate_id": uuid4(),
+    }
+    try:
+        with engine.connect() as connection:
+            connection.execute(
+                text(
+                    "SELECT * FROM public.redact_candidate_data("
+                    ":organization_id, :request_id, :candidate_id)"
+                ),
+                canary,
+            )
+    except Exception as error:
+        original = getattr(error, "orig", error)
+        sqlstate = getattr(original, "sqlstate", None)
+        if sqlstate == "22023" and "redaction_context_invalid" in str(original):
+            return
+        raise RecoveryError("recovery_database_identity_invalid") from error
+    raise RecoveryError("recovery_database_identity_invalid")
 
 
 def _validate_storage_permissions(
+    canary_client,
     delete_client,
     ledger_client,
     *,
@@ -90,14 +119,58 @@ def _validate_storage_permissions(
     ledger_prefix: str,
 ) -> None:
     try:
-        for client, bucket, prefix in (
-            (delete_client, resume_bucket, resume_prefix),
-            (delete_client, export_bucket, export_prefix),
-            (ledger_client, ledger_bucket, ledger_prefix),
-        ):
-            next(iter(client.list_objects(bucket, prefix=prefix, recursive=True)), None)
+        next(
+            iter(
+                ledger_client.list_objects(
+                    ledger_bucket, prefix=ledger_prefix, recursive=True
+                )
+            ),
+            None,
+        )
     except Exception as error:
         raise RecoveryError("recovery_storage_permission_invalid") from error
+    locations = tuple(
+        dict.fromkeys(
+            (
+                (resume_bucket, resume_prefix),
+                (export_bucket, export_prefix),
+            )
+        )
+    )
+    for bucket, prefix in locations:
+        key = f"{prefix}.governance-delete-canary/{uuid4().hex}"
+        payload = secrets.token_bytes(32)
+        failure = None
+        try:
+            canary_client.put_object(
+                bucket,
+                key,
+                io.BytesIO(payload),
+                len(payload),
+                content_type="application/octet-stream",
+            )
+            delete_client.remove_object(bucket, key)
+            try:
+                canary_client.stat_object(bucket, key)
+            except Exception as error:
+                if getattr(error, "code", None) not in {
+                    "NoSuchKey",
+                    "NoSuchObject",
+                    "NoSuchObjectName",
+                }:
+                    raise
+            else:
+                raise RuntimeError("delete canary remains present")
+        except Exception as error:
+            failure = error
+        finally:
+            try:
+                canary_client.remove_object(bucket, key)
+            except Exception as cleanup_error:
+                if failure is None:
+                    failure = cleanup_error
+        if failure is not None:
+            raise RecoveryError("recovery_storage_permission_invalid") from failure
 
 
 def run(args: argparse.Namespace) -> int:
@@ -114,6 +187,15 @@ def run(args: argparse.Namespace) -> int:
     )
     _validate_governance_database_identity(
         governance_engine, governance_database_url
+    )
+    canary_client = create_storage_client(
+        governance.storage_endpoint,
+        ordinary.object_storage_access_key,
+        ordinary.object_storage_secret_key,
+        secure=governance.storage_secure,
+        connect_timeout_seconds=ordinary.object_storage_connect_timeout_seconds,
+        read_timeout_seconds=ordinary.object_storage_read_timeout_seconds,
+        total_timeout_seconds=ordinary.object_storage_total_timeout_seconds,
     )
     delete_client = create_storage_client(
         governance.storage_endpoint,
@@ -134,6 +216,7 @@ def run(args: argparse.Namespace) -> int:
         total_timeout_seconds=ordinary.object_storage_total_timeout_seconds,
     )
     _validate_storage_permissions(
+        canary_client,
         delete_client,
         ledger_client,
         resume_bucket=governance.resume_bucket,

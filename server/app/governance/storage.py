@@ -487,6 +487,20 @@ class SignedLedgerAdapter:
             f"{entry.deletion_request_id}.json"
         )
 
+    def validate_entry(self, entry: LedgerEntry | LedgerEntryV2) -> None:
+        document = entry.signed_document(self.signing_key)
+        if isinstance(entry, LedgerEntry):
+            if LedgerEntry.verify_document(document, self.signing_key) != entry:
+                raise GovernanceStorageError("ledger_invalid")
+            return
+        if LedgerEntryV2.verify_document(
+            document,
+            self.signing_key,
+            allowed_buckets=set(self.allowed_buckets),
+            allowed_locations=self.allowed_locations,
+        ) != entry:
+            raise GovernanceStorageError("ledger_invalid")
+
     def _encoded(self, entry: LedgerEntry | LedgerEntryV2) -> bytes:
         return _canonical(entry.signed_document(self.signing_key))
 

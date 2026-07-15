@@ -82,6 +82,9 @@ class DeletionJobHandler:
     def _execute(self, organization_id, request_id, request_version, trace_id) -> None:
         if self._sessions is None:
             raise RuntimeError("deletion handler dependencies are unavailable")
+        self._prevalidate_v2_evidence(
+            organization_id, request_id, request_version
+        )
         completed = self._claim(
             organization_id, request_id, request_version, trace_id
         )
@@ -115,6 +118,87 @@ class DeletionJobHandler:
             receipt,
             trace_id,
         )
+
+    def _prevalidate_v2_evidence(
+        self, organization_id, request_id, request_version
+    ) -> None:
+        with self._sessions() as db:
+            request = db.scalar(
+                select(DeletionRequest).where(
+                    DeletionRequest.organization_id == organization_id,
+                    DeletionRequest.id == request_id,
+                    DeletionRequest.version == request_version,
+                )
+            )
+            if request is None or request.status not in {"approved", "executing"}:
+                return
+            try:
+                if request.status == "executing":
+                    artifact_facts = tuple(
+                        LedgerArtifact(
+                            kind=kind,
+                            bucket=(
+                                self._resume_bucket
+                                if kind == "resume_object"
+                                else self._export_bucket
+                            ),
+                            storage_key=storage_key,
+                        )
+                        for kind, storage_key in db.execute(
+                            select(
+                                DeletionArtifact.kind,
+                                DeletionArtifact.storage_key,
+                            )
+                            .where(
+                                DeletionArtifact.organization_id == organization_id,
+                                DeletionArtifact.request_id == request_id,
+                            )
+                            .order_by(
+                                DeletionArtifact.kind,
+                                DeletionArtifact.storage_key,
+                            )
+                        )
+                    )
+                else:
+                    artifact_facts = tuple(
+                        LedgerArtifact(
+                            kind=kind,
+                            bucket=(
+                                self._resume_bucket
+                                if kind == "resume_object"
+                                else self._export_bucket
+                            ),
+                            storage_key=item["storage_key"],
+                        )
+                        for kind, manifest_key in (
+                            ("resume_object", "resume_objects"),
+                            ("report_export_object", "temporary_exports"),
+                        )
+                        for item in request.impact_manifest["objects"][manifest_key]
+                    )
+                artifacts = tuple(sorted(artifact_facts))
+                requested_at = request.requested_at
+                if requested_at.tzinfo is None:
+                    requested_at = requested_at.replace(tzinfo=timezone.utc)
+                entry = LedgerEntryV2(
+                    organization_id=organization_id,
+                    deletion_request_id=request.id,
+                    candidate_id=request.candidate_id,
+                    completed_request_version=request.version,
+                    completed_at=requested_at,
+                    requested_at=requested_at,
+                    reason_code=request.reason_code,
+                    impact_manifest=request.impact_manifest,
+                    manifest_hash=request.manifest_hash,
+                    recovery_generation=request.recovery_generation,
+                    artifacts=artifacts,
+                    database_redaction_checksum="0" * 64,
+                )
+                validate = getattr(self._ledger, "validate_entry", None)
+                if validate is not None:
+                    validate(entry)
+            except (GovernanceStorageError, KeyError, TypeError, ValueError):
+                raise PermanentJobError("deletion_ledger_invalid") from None
 
     def _claim(self, organization_id, request_id, request_version, trace_id) -> bool:
         with self._sessions.begin() as db:

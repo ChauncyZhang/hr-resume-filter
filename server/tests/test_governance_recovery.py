@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import io
+import json
+import os
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from uuid import uuid4
+from threading import Barrier
+from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, func, select, text
+from sqlalchemy.engine import make_url
 
 
 SIGNING_KEY = b"recovery-ledger-signing-key-with-independent-entropy"
@@ -686,6 +691,9 @@ def test_recovery_cli_database_preflight_enforces_separate_app_and_executor_iden
         def one(self):
             return self.row
 
+    class BoundaryError(RuntimeError):
+        sqlstate = "22023"
+
     class Connection:
         dialect = type("Dialect", (), {"name": "postgresql"})()
 
@@ -698,7 +706,9 @@ def test_recovery_cli_database_preflight_enforces_separate_app_and_executor_iden
         def __exit__(self, *_args):
             return None
 
-        def execute(self, _statement):
+        def execute(self, _statement, _parameters=None):
+            if "SELECT * FROM public.redact_candidate_data" in str(_statement):
+                raise BoundaryError("redaction_context_invalid")
             return Result(self.row)
 
     class Engine:
@@ -712,7 +722,7 @@ def test_recovery_cli_database_preflight_enforces_separate_app_and_executor_iden
         Engine(("app", False)), "postgresql+psycopg://app:secret@postgres/app"
     )
     _validate_governance_database_identity(
-        Engine(("governance", True)),
+        Engine(("governance", True, True, True)),
         "postgresql+psycopg://governance:secret@postgres/app",
     )
     with pytest.raises(RecoveryError, match="recovery_database_identity_invalid"):
@@ -721,29 +731,131 @@ def test_recovery_cli_database_preflight_enforces_separate_app_and_executor_iden
         )
     with pytest.raises(RecoveryError, match="recovery_database_identity_invalid"):
         _validate_governance_database_identity(
-            Engine(("governance", False)),
+            Engine(("governance", False, True, True)),
             "postgresql+psycopg://governance:secret@postgres/app",
         )
 
 
-def test_recovery_cli_storage_preflight_consumes_delete_only_list_permissions() -> None:
+def test_governance_database_preflight_requires_execute_privilege_and_boundary_probe() -> None:
+    from server.app.governance.redelete_after_restore import (
+        _validate_governance_database_identity,
+    )
+    from server.app.governance.recovery import RecoveryError
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def one(self):
+            return self.row
+
+    class BoundaryError(RuntimeError):
+        sqlstate = "22023"
+
+    class Connection:
+        dialect = type("Dialect", (), {"name": "postgresql"})()
+
+        def __init__(self, row):
+            self.row = row
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, statement, _parameters=None):
+            sql = str(statement)
+            self.calls.append(sql)
+            if "SELECT * FROM public.redact_candidate_data" in sql:
+                raise BoundaryError("redaction_context_invalid")
+            return Result(self.row)
+
+    class Engine:
+        def __init__(self, row):
+            self.connection = Connection(row)
+
+        def connect(self):
+            return self.connection
+
+    allowed = Engine(("governance", True, True, True))
+    _validate_governance_database_identity(
+        allowed, "postgresql+psycopg://governance:secret@postgres/app"
+    )
+    assert any(
+        "has_function_privilege" in sql for sql in allowed.connection.calls
+    )
+    assert any(
+        "SELECT * FROM public.redact_candidate_data" in sql
+        for sql in allowed.connection.calls
+    )
+
+    denied = Engine(("governance", True, True, False))
+    with pytest.raises(RecoveryError, match="recovery_database_identity_invalid"):
+        _validate_governance_database_identity(
+            denied, "postgresql+psycopg://governance:secret@postgres/app"
+        )
+    assert not any(
+        "SELECT * FROM public.redact_candidate_data" in sql
+        for sql in denied.connection.calls
+    )
+
+
+def test_recovery_cli_storage_preflight_proves_delete_with_scoped_canaries() -> None:
     from server.app.governance.redelete_after_restore import _validate_storage_permissions
     from server.app.governance.recovery import RecoveryError
 
-    class Client:
-        def __init__(self, *, fail=False):
-            self.fail = fail
+    class MissingObject(RuntimeError):
+        code = "NoSuchKey"
+
+    class CanaryClient:
+        def __init__(self):
+            self.objects = {
+                ("resumes", "clean/business.pdf"): b"business",
+                ("exports", "exports/business.csv"): b"business",
+            }
+            self.calls = []
+
+        def put_object(self, bucket, key, body, length, **_kwargs):
+            self.calls.append(("put", bucket, key))
+            self.objects[(bucket, key)] = body.read(length)
+
+        def stat_object(self, bucket, key):
+            self.calls.append(("stat", bucket, key))
+            if (bucket, key) not in self.objects:
+                raise MissingObject("missing")
+            return object()
+
+        def remove_object(self, bucket, key):
+            self.calls.append(("cleanup", bucket, key))
+            self.objects.pop((bucket, key), None)
+
+    class DeleteClient:
+        def __init__(self, canary, *, allowed):
+            self.canary = canary
+            self.allowed = allowed
+            self.calls = []
+
+        def remove_object(self, bucket, key):
+            self.calls.append((bucket, key))
+            if not self.allowed:
+                raise RuntimeError("delete denied")
+            self.canary.objects.pop((bucket, key), None)
+
+    class LedgerClient:
+        def __init__(self):
             self.calls = []
 
         def list_objects(self, bucket, *, prefix, recursive):
             self.calls.append(("list", bucket, prefix, recursive))
-            if self.fail:
-                raise RuntimeError("policy rejected")
             yield object()
 
-    delete = Client()
-    ledger = Client()
+    canary = CanaryClient()
+    delete = DeleteClient(canary, allowed=True)
+    ledger = LedgerClient()
     _validate_storage_permissions(
+        canary,
         delete,
         ledger,
         resume_bucket="resumes",
@@ -753,17 +865,22 @@ def test_recovery_cli_storage_preflight_consumes_delete_only_list_permissions() 
         ledger_bucket="ledger",
         ledger_prefix="deletions/",
     )
-    assert delete.calls == [
-        ("list", "resumes", "clean/", True),
-        ("list", "exports", "exports/", True),
-    ]
+    assert len(delete.calls) == 2
+    assert all("/.governance-delete-canary/" in key for _, key in delete.calls)
+    assert canary.objects == {
+        ("resumes", "clean/business.pdf"): b"business",
+        ("exports", "exports/business.csv"): b"business",
+    }
     assert ledger.calls == [
         ("list", "ledger", "deletions/", True),
     ]
+
+    denied_canary = CanaryClient()
     with pytest.raises(RecoveryError, match="recovery_storage_permission_invalid"):
         _validate_storage_permissions(
-            Client(fail=True),
-            Client(),
+            denied_canary,
+            DeleteClient(denied_canary, allowed=False),
+            LedgerClient(),
             resume_bucket="resumes",
             resume_prefix="clean/",
             export_bucket="exports",
@@ -771,3 +888,326 @@ def test_recovery_cli_storage_preflight_consumes_delete_only_list_permissions() 
             ledger_bucket="ledger",
             ledger_prefix="deletions/",
         )
+    assert denied_canary.objects == {
+        ("resumes", "clean/business.pdf"): b"business",
+        ("exports", "exports/business.csv"): b"business",
+    }
+
+
+def test_candidate_preflight_uses_exact_bounded_pair_queries() -> None:
+    from server.app.governance.recovery import (
+        RECOVERY_CANDIDATE_QUERY_BATCH_SIZE,
+        RecoveryError,
+        _validate_candidate_presence,
+    )
+
+    expected = {
+        (UUID(int=index + 1), UUID(int=index + 10_000))
+        for index in range(RECOVERY_CANDIDATE_QUERY_BATCH_SIZE + 1)
+    }
+
+    class Database:
+        def __init__(self, *, omit_one=False):
+            self.omit_one = omit_one
+            self.chunks = []
+            self.statements = []
+
+        def execute(self, statement):
+            compiled = statement.compile()
+            chunk = next(
+                value
+                for value in compiled.params.values()
+                if isinstance(value, list)
+            )
+            self.chunks.append(tuple(chunk))
+            self.statements.append(str(statement))
+            rows = list(chunk)
+            if self.omit_one and len(self.chunks) == 1:
+                rows = rows[1:]
+            return rows
+
+    database = Database()
+    _validate_candidate_presence(database, expected)
+    assert len(database.chunks) == 2
+    assert max(map(len, database.chunks)) <= RECOVERY_CANDIDATE_QUERY_BATCH_SIZE
+    assert set().union(*(set(chunk) for chunk in database.chunks)) == expected
+    assert all("candidates.organization_id" in sql for sql in database.statements)
+    assert all("candidates.id" in sql for sql in database.statements)
+
+    with pytest.raises(RecoveryError, match="recovery_database_state_invalid"):
+        _validate_candidate_presence(Database(omit_one=True), expected)
+
+
+@pytest.mark.skipif(
+    not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured"
+)
+def test_real_postgres_concurrent_restore_id_is_idempotent_or_conflicts_safely() -> None:
+    from sqlalchemy.orm import sessionmaker
+
+    from server.app.governance.deletion_models import (
+        DeletionRecoveryCheckpoint,
+        DeletionRecoveryRun,
+    )
+    from server.app.governance.recovery import (
+        PreparedLedger,
+        RecoveryCoordinator,
+        RecoveryError,
+    )
+    from server.app.governance.storage import LedgerEntryV2
+    from server.app.queue.models import BackgroundJob
+    from server.tests.test_governance_deletion_migration import _seed_identity
+
+    owner_url = make_url(os.environ["POSTGRES_SMOKE_URL"]).set(
+        drivername="postgresql+psycopg"
+    )
+    database_name = f"ux09_b2b3_concurrency_{uuid4().hex[:12]}"
+    admin_engine = create_engine(owner_url.set(database="postgres"))
+    with admin_engine.connect().execution_options(
+        isolation_level="AUTOCOMMIT"
+    ) as connection:
+        connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+    test_url = owner_url.set(database=database_name)
+    try:
+        subprocess.run(
+            ["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "head"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "DATABASE_URL": test_url.render_as_string(hide_password=False),
+            },
+        )
+        engine = create_engine(test_url)
+        with engine.begin() as connection:
+            ids = _seed_identity(connection)
+        sessions = sessionmaker(engine, expire_on_commit=False)
+        manifest = _manifest(ids["candidate"], candidate_version=1, policy_version=1)
+        entry = LedgerEntryV2(
+            organization_id=ids["org1"],
+            deletion_request_id=uuid4(),
+            candidate_id=ids["candidate"],
+            completed_request_version=2,
+            completed_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+            requested_at=datetime(2026, 7, 14, tzinfo=timezone.utc),
+            reason_code="retention_expired",
+            impact_manifest=manifest,
+            manifest_hash=hashlib.sha256(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            recovery_generation=0,
+            artifacts=(),
+            database_redaction_checksum="c" * 64,
+        )
+        prepared = PreparedLedger("deletions/v2/concurrent.json", "a" * 64, entry)
+
+        def concurrent_results(restore_id, timestamps):
+            barrier = Barrier(2)
+
+            class Ledger:
+                def discover_recovery_ledgers(self, _restored_at, *, maximum):
+                    assert maximum == 10
+                    barrier.wait(timeout=10)
+                    return (prepared,)
+
+            def invoke(restored_at):
+                try:
+                    return (
+                        "ok",
+                        RecoveryCoordinator(
+                            sessions, Ledger(), maximum_ledgers=10
+                        ).prepare(restore_id, restored_at),
+                    )
+                except RecoveryError as error:
+                    return ("error", error.code)
+                except Exception as error:
+                    return ("unexpected", type(error).__name__)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                return list(executor.map(invoke, timestamps))
+
+        same_restore_id = uuid4()
+        same_timestamp = datetime(2026, 7, 14, 12, tzinfo=timezone.utc)
+        assert sorted(concurrent_results(same_restore_id, (same_timestamp, same_timestamp))) == [
+            ("ok", 0),
+            ("ok", 1),
+        ]
+        with sessions() as db:
+            run_ids = tuple(
+                db.scalars(
+                    select(DeletionRecoveryRun.id).where(
+                        DeletionRecoveryRun.restore_id == same_restore_id
+                    )
+                )
+            )
+            assert len(run_ids) == 1
+            assert db.scalar(
+                select(func.count()).select_from(DeletionRecoveryCheckpoint).where(
+                    DeletionRecoveryCheckpoint.run_id.in_(run_ids)
+                )
+            ) == 1
+            assert db.scalar(
+                select(func.count()).select_from(BackgroundJob).where(
+                    BackgroundJob.type == "governance.redelete_after_restore",
+                    BackgroundJob.payload["recovery_run_id"].as_string()
+                    == str(run_ids[0]),
+                )
+            ) == 1
+
+        conflict_restore_id = uuid4()
+        conflict_results = concurrent_results(
+            conflict_restore_id,
+            (
+                datetime(2026, 7, 14, 12, tzinfo=timezone.utc),
+                datetime(2026, 7, 13, 12, tzinfo=timezone.utc),
+            ),
+        )
+        assert sorted(conflict_results) == [
+            ("error", "recovery_restore_conflict"),
+            ("ok", 1),
+        ]
+        with sessions() as db:
+            runs = list(
+                db.scalars(
+                    select(DeletionRecoveryRun).where(
+                        DeletionRecoveryRun.restore_id == conflict_restore_id
+                    )
+                )
+            )
+            assert len(runs) == 1
+            assert db.scalar(
+                select(func.count()).select_from(DeletionRecoveryCheckpoint).where(
+                    DeletionRecoveryCheckpoint.run_id == runs[0].id
+                )
+            ) == 1
+        engine.dispose()
+    finally:
+        with admin_engine.connect().execution_options(
+            isolation_level="AUTOCOMMIT"
+        ) as connection:
+            connection.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :database AND pid <> pg_backend_pid()"
+                ),
+                {"database": database_name},
+            )
+            connection.execute(text(f'DROP DATABASE IF EXISTS "{database_name}"'))
+        admin_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not all(
+        os.getenv(name)
+        for name in (
+            "REAL_RECOVERY_DATABASE_URL",
+            "GOVERNANCE_DATABASE_URL",
+            "GOVERNANCE_MINIO_ENDPOINT",
+            "MINIO_SMOKE_ROOT_ACCESS_KEY",
+            "MINIO_SMOKE_ROOT_SECRET_KEY",
+            "APP_OBJECT_STORAGE_ACCESS_KEY",
+            "APP_OBJECT_STORAGE_SECRET_KEY",
+            "GOVERNANCE_LEDGER_ACCESS_KEY",
+            "GOVERNANCE_LEDGER_SECRET_KEY",
+            "GOVERNANCE_RESUME_BUCKET",
+            "GOVERNANCE_EXPORT_BUCKET",
+            "GOVERNANCE_LEDGER_BUCKET",
+        )
+    ),
+    reason="real recovery capability environment not configured",
+)
+def test_real_pg_minio_wrong_delete_acl_fails_with_zero_business_or_db_mutation() -> None:
+    from minio import Minio
+
+    from server.app.governance.deletion_models import (
+        DeletionRecoveryCheckpoint,
+        DeletionRecoveryRun,
+    )
+    from server.app.governance.redelete_after_restore import (
+        _validate_governance_database_identity,
+        _validate_storage_permissions,
+    )
+    from server.app.governance.recovery import RecoveryError
+    from server.app.queue.models import BackgroundJob
+
+    endpoint = os.environ["GOVERNANCE_MINIO_ENDPOINT"]
+    root = Minio(
+        endpoint,
+        access_key=os.environ["MINIO_SMOKE_ROOT_ACCESS_KEY"],
+        secret_key=os.environ["MINIO_SMOKE_ROOT_SECRET_KEY"],
+        secure=False,
+    )
+    app_client = Minio(
+        endpoint,
+        access_key=os.environ["APP_OBJECT_STORAGE_ACCESS_KEY"],
+        secret_key=os.environ["APP_OBJECT_STORAGE_SECRET_KEY"],
+        secure=False,
+    )
+    ledger_client = Minio(
+        endpoint,
+        access_key=os.environ["GOVERNANCE_LEDGER_ACCESS_KEY"],
+        secret_key=os.environ["GOVERNANCE_LEDGER_SECRET_KEY"],
+        secure=False,
+    )
+    resume_bucket = os.environ["GOVERNANCE_RESUME_BUCKET"]
+    export_bucket = os.environ["GOVERNANCE_EXPORT_BUCKET"]
+    ledger_bucket = os.environ["GOVERNANCE_LEDGER_BUCKET"]
+    business_key = f"clean/review-business-{uuid4().hex}.pdf"
+    root.put_object(resume_bucket, business_key, io.BytesIO(b"business"), 8)
+
+    database_url = os.environ["REAL_RECOVERY_DATABASE_URL"]
+    database_engine = create_engine(database_url)
+    governance_url = os.environ["GOVERNANCE_DATABASE_URL"]
+    governance_engine = create_engine(governance_url)
+
+    def counts():
+        with database_engine.connect() as connection:
+            return (
+                connection.scalar(select(func.count()).select_from(DeletionRecoveryRun)),
+                connection.scalar(
+                    select(func.count()).select_from(DeletionRecoveryCheckpoint)
+                ),
+                connection.scalar(
+                    select(func.count()).select_from(BackgroundJob).where(
+                        BackgroundJob.type == "governance.redelete_after_restore"
+                    )
+                ),
+            )
+
+    try:
+        before = counts()
+        _validate_governance_database_identity(governance_engine, governance_url)
+        with pytest.raises(
+            RecoveryError, match="recovery_storage_permission_invalid"
+        ):
+            _validate_storage_permissions(
+                app_client,
+                ledger_client,
+                ledger_client,
+                resume_bucket=resume_bucket,
+                resume_prefix="clean/",
+                export_bucket=export_bucket,
+                export_prefix="exports/",
+                ledger_bucket=ledger_bucket,
+                ledger_prefix="deletions/",
+            )
+        assert counts() == before
+        assert root.stat_object(resume_bucket, business_key).size == 8
+        assert not list(
+            root.list_objects(
+                resume_bucket,
+                prefix="clean/.governance-delete-canary/",
+                recursive=True,
+            )
+        )
+        assert not list(
+            root.list_objects(
+                export_bucket,
+                prefix="exports/.governance-delete-canary/",
+                recursive=True,
+            )
+        )
+    finally:
+        root.remove_object(resume_bucket, business_key)
+        database_engine.dispose()
+        governance_engine.dispose()

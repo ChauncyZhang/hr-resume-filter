@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, tuple_
 
 from server.app.governance.deletion_models import (
     DeletionArtifact,
@@ -29,6 +29,26 @@ class RecoveryError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+RECOVERY_CANDIDATE_QUERY_BATCH_SIZE = 500
+
+
+def _validate_candidate_presence(
+    db, expected: set[tuple[UUID, UUID]]
+) -> None:
+    ordered = sorted(expected, key=lambda pair: (str(pair[0]), str(pair[1])))
+    present: set[tuple[UUID, UUID]] = set()
+    for offset in range(0, len(ordered), RECOVERY_CANDIDATE_QUERY_BATCH_SIZE):
+        chunk = ordered[offset : offset + RECOVERY_CANDIDATE_QUERY_BATCH_SIZE]
+        rows = db.execute(
+            select(Candidate.organization_id, Candidate.id).where(
+                tuple_(Candidate.organization_id, Candidate.id).in_(chunk)
+            )
+        )
+        present.update((row[0], row[1]) for row in rows)
+    if present != expected:
+        raise RecoveryError("recovery_database_state_invalid")
 
 
 def aware(value: datetime) -> datetime:
@@ -112,17 +132,11 @@ class RecoveryCoordinator:
             present_organizations = set(
                 db.scalars(select(Organization.id).where(Organization.id.in_(organizations)))
             ) if organizations else set()
-            present_candidates = set(
-                db.execute(
-                    select(Candidate.organization_id, Candidate.id).where(
-                        Candidate.organization_id.in_(organizations)
-                    )
-                )
-            ) if organizations else set()
+            _validate_candidate_presence(db, candidates)
             marker_organization_id = db.scalar(
                 select(Organization.id).order_by(Organization.id).limit(1)
             )
-        if present_organizations != organizations or present_candidates & candidates != candidates:
+        if present_organizations != organizations:
             raise RecoveryError("recovery_database_state_invalid")
         if marker_organization_id is None:
             raise RecoveryError("recovery_database_state_invalid")
@@ -133,6 +147,25 @@ class RecoveryCoordinator:
         if not grouped:
             grouped[marker_organization_id] = []
         with self._sessions.begin() as db:
+            if db.get_bind().dialect.name == "postgresql":
+                db.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(:lock_key, 0))"
+                    ),
+                    {"lock_key": f"governance-recovery:{restore_id}"},
+                )
+            concurrent = list(
+                db.scalars(
+                    select(DeletionRecoveryRun).where(
+                        DeletionRecoveryRun.restore_id == restore_id
+                    )
+                )
+            )
+            if concurrent:
+                if any(aware(row.restored_at) != restored_at for row in concurrent):
+                    raise RecoveryError("recovery_restore_conflict")
+                return 0
             queue = QueueRepository(db)
             now = aware(queue.database_now())
             for organization_id, items in sorted(grouped.items(), key=lambda pair: str(pair[0])):

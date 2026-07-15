@@ -57,6 +57,9 @@ The deletion job payload is exactly `organization_id`, `deletion_request_id`, an
 `request_version`. Execution locks Candidate before DeletionRequest, revalidates the approved
 version, legal hold, active applications, candidate version, and private manifest, then commits
 `executing`, exact object checkpoints, and the started audit before any object call.
+Before that first checkpoint mutation, the worker constructs and validates the complete canonical
+v2 ledger evidence, including manifest/count bounds and exact typed bucket/key locations. Invalid
+or oversized evidence fails closed without changing objects, candidates, requests, or checkpoints.
 
 The same Candidate lock is followed by ordered ScreeningItem locks. A matching parse, score, or
 LLM job with a live queue lease makes deletion retry before execution side effects; matching
@@ -134,11 +137,13 @@ docker compose --env-file deploy/.env -f deploy/compose.yaml run --rm worker `
   --restored-at 2026-07-15T00:00:00Z
 ```
 
-The CLI accepts only those two arguments. Before its first durable mutation it validates the
-separate application/governance PostgreSQL identities, scoped list access for the delete and
-ledger storage identities, all bounded v1/v2 ledger pages, signatures, canonical evidence, and
-restored candidate/organization rows. It then creates one durable checkpoint and queue job per
-applicable v2 ledger. Same restore ID/timestamp is a no-op; reusing an ID with another timestamp
+The CLI accepts only those two arguments. Before its first durable recovery mutation it validates
+the separate application/governance PostgreSQL identities, function execute privilege, and the
+actual redaction boundary. It proves delete capability with disposable, scoped non-business
+canaries and validates ledger list access, all bounded v1/v2 ledger pages, signatures, canonical
+evidence, and restored organization plus exact signed organization/candidate pairs in bounded
+queries. It then creates one durable checkpoint and queue job per applicable v2 ledger. Concurrent
+same-ID calls serialize in PostgreSQL: the same timestamp is idempotent, while another timestamp
 fails closed. Workers re-read the exact ledger checksum, repair only minimum non-PII request and
 artifact evidence, delete only signed objects, invoke the frozen redaction routine, and increment
 the request generation once per restore. Configure the discovery ceiling with

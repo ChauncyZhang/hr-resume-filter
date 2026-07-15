@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import io
 import logging
 import os
@@ -6,11 +7,11 @@ import sys
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import event, select
+from sqlalchemy import event, func, select
 
 from server.app.governance.deletion_models import DeletionArtifact, DeletionRequest, LegalHold
 from server.app.governance.deletion_service import DatabaseRedactionResult
@@ -698,6 +699,115 @@ def test_object_checkpoint_resume_precedes_redaction_and_ledger(tmp_path, monkey
     with app.state.identity_store.sync_session() as db:
         request = db.get(DeletionRequest, request_id)
         assert request.recovery_generation == 0
+
+
+def test_v2_evidence_limit_fails_before_any_deletion_mutation(tmp_path, monkeypatch) -> None:
+    from server.app.governance import worker as deletion_worker
+    from server.app.governance.deletion_service import canonical_manifest_hash
+    from server.app.governance.storage import MAX_LEDGER_ARTIFACTS
+    from server.app.governance.worker import DeletionJobHandler
+
+    app = make_app(tmp_path)
+    organization_id, candidate_id, request_id = _approved_request(app)
+    with app.state.identity_store.sync_session.begin() as db:
+        request = db.get(DeletionRequest, request_id)
+        oversized = copy.deepcopy(request.impact_manifest)
+        oversized["objects"]["resume_objects"] = [
+            {
+                "row_id": str(uuid5(NAMESPACE_URL, f"b2b3-preflight-{index}")),
+                "storage_key": f"clean/preflight/{index:04d}.pdf",
+            }
+            for index in range(MAX_LEDGER_ARTIFACTS + 1)
+        ]
+        oversized["counts"]["resume_objects"] = MAX_LEDGER_ARTIFACTS + 1
+        request.impact_manifest = oversized
+        request.manifest_hash = canonical_manifest_hash(oversized)
+
+    monkeypatch.setattr(
+        deletion_worker,
+        "build_private_manifest",
+        lambda *_args, **_kwargs: (copy.deepcopy(oversized), object()),
+    )
+    events = []
+    monkeypatch.setattr(
+        deletion_worker,
+        "execute_database_redaction",
+        lambda *_args, **_kwargs: events.append(("redact",)),
+    )
+    handler = DeletionJobHandler(
+        sessions=app.state.identity_store.sync_session,
+        governance_engine=FakeGovernanceEngine(),
+        object_deleter=RecordingDeleter(events),
+        ledger=RecordingLedger(events),
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+
+    with pytest.raises(Exception) as raised:
+        asyncio.run(handler(_job(organization_id, request_id, 2)))
+
+    assert getattr(raised.value, "safe_code", None) == "deletion_ledger_invalid"
+    assert events == []
+    with app.state.identity_store.sync_session() as db:
+        request = db.get(DeletionRequest, request_id)
+        candidate = db.get(Candidate, candidate_id)
+        assert request.status == "approved"
+        assert candidate.deleted_at is None
+        assert db.scalar(select(func.count()).select_from(DeletionArtifact)) == 0
+
+
+def test_resumed_v2_evidence_mismatch_fails_before_artifact_side_effects(
+    tmp_path, monkeypatch
+) -> None:
+    from server.app.governance import worker as deletion_worker
+    from server.app.governance.worker import DeletionJobHandler
+
+    app = make_app(tmp_path)
+    organization_id, candidate_id, request_id = _approved_request(app)
+    events = []
+    handler = DeletionJobHandler(
+        sessions=app.state.identity_store.sync_session,
+        governance_engine=FakeGovernanceEngine(),
+        object_deleter=RecordingDeleter(events),
+        ledger=RecordingLedger(events),
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+    assert handler._claim(organization_id, request_id, 2, "preflight-setup") is False
+    with app.state.identity_store.sync_session.begin() as db:
+        db.add(
+            DeletionArtifact(
+                organization_id=organization_id,
+                request_id=request_id,
+                kind="resume_object",
+                storage_key="clean/unexpected.pdf",
+            )
+        )
+    monkeypatch.setattr(
+        deletion_worker,
+        "execute_database_redaction",
+        lambda *_args, **_kwargs: DatabaseRedactionResult(
+            "d" * 64, (0, 2, 0, 0, 0, 0, 0, 2, 0)
+        ),
+    )
+
+    with pytest.raises(Exception) as raised:
+        asyncio.run(handler(_job(organization_id, request_id, 2)))
+
+    assert getattr(raised.value, "safe_code", None) == "deletion_ledger_invalid"
+    assert events == []
+    with app.state.identity_store.sync_session() as db:
+        candidate = db.get(Candidate, candidate_id)
+        artifacts = list(
+            db.scalars(
+                select(DeletionArtifact)
+                .where(DeletionArtifact.request_id == request_id)
+                .order_by(DeletionArtifact.storage_key)
+            )
+        )
+        assert candidate.deleted_at is None
+        assert all(artifact.status == "pending" for artifact in artifacts)
+        assert all(artifact.attempts == 0 for artifact in artifacts)
 
 
 def test_crash_after_object_delete_before_checkpoint_commit_recovers_from_not_found(
