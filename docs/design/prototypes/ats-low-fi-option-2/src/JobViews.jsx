@@ -121,6 +121,7 @@ function JobDialog({ onClose, onDiscard, onSave, saving }) {
 }
 
 function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
+  const canPublish = !initialJob || initialJob.status === "草稿";
   const [values, setValues] = useState({
     name: initialJob?.name || "",
     departmentId: initialJob?.departmentId || "",
@@ -176,7 +177,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit }) {
   return (
     <div className="job-page job-form-page">
       <button className="back-link" type="button" onClick={() => dirty ? setConfirmExit(true) : onBack()} disabled={saving}><ArrowLeft size={17} />返回职位列表</button>
-      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div><button className="button secondary" type="button" onClick={() => submit(false)} disabled={saving}>{saving ? "正在保存…" : "保存草稿"}</button><button className="button primary" type="button" onClick={() => submit(true)} disabled={saving}>{saving ? "正在保存…" : initialJob ? "保存并发布" : "发布职位"}</button></div></div>
+      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div>{canPublish && <button className="button secondary" type="button" onClick={() => submit(false)} disabled={saving}>{saving ? "正在保存…" : "保存草稿"}</button>}<button className="button primary" type="button" onClick={() => submit(canPublish)} disabled={saving}>{saving ? "正在保存…" : canPublish ? "保存并发布" : "保存修改"}</button></div></div>
       {submitError && <div ref={submitErrorRef} tabIndex="-1" className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span></div>}
       <fieldset className="job-form-fieldset" disabled={saving}>
         <div className="job-form-layout">
@@ -334,8 +335,8 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     const refreshError = result.refreshError ? "已保存，但最新数据加载失败，请重试读取。" : "";
     setSelectedJob(complete);
     setRefreshState({ error: refreshError, retrying: false, kind: "saved" });
-    onNotify(refreshError || (publish ? (existing ? "职位修改已保存" : "职位已发布") : "职位已保存为草稿"));
-    if (publish || refreshError) {
+    onNotify(refreshError || (existing ? "职位修改已保存" : publish ? "职位已发布" : "职位已保存为草稿"));
+    if (existing || publish || refreshError) {
       setDetailState({ status: "ready", job: complete, candidates: detailState.candidates || { status: "ready", records: [], nextCursor: null, filters: { q: "", stage: "全部阶段" }, error: "" } });
       skipNextDetailLoadRef.current = true;
       setMode("detail");
