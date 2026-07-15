@@ -57,6 +57,19 @@ export function canAddCandidateToTalentPool(candidate) {
   return Boolean(candidate?.serverBacked && candidateId && sourceApplicationId);
 }
 
+export function buildReactivatedCandidateSummary(candidate, application, position) {
+  const candidateId = requireId(application?.candidate_id || candidate?.candidateId || candidate?.id, "talent_candidate_required");
+  return {
+    ...candidate,
+    id: candidateId,
+    candidateId,
+    applicationId: requireId(application?.id, "talent_application_required"),
+    jobId: requireId(application?.job_id, "talent_job_required"),
+    position: safeString(position?.name, candidate?.position),
+    serverBacked: true,
+  };
+}
+
 export function selectServerTalentCandidates(candidates, candidateIds) {
   const requested = new Set(safeArray(candidateIds));
   const selected = [];

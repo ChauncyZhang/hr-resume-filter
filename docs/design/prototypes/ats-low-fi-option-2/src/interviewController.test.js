@@ -322,6 +322,32 @@ test("loads, creates, updates, submits, and amends the current user's feedback",
   ]);
 });
 
+test("ambiguous feedback submission retries reuse one idempotency key", async () => {
+  const unavailable = Object.assign(new Error("response lost"), { status: 0, kind: "unavailable" });
+  const definitive = Object.assign(new Error("invalid state"), { status: 409, code: "invalid_state_transition" });
+  const submitted = {
+    id: FEEDBACK_ID,
+    interview_id: INTERVIEW_ID,
+    author_id: USER_ID,
+    status: "submitted",
+    ratings: {},
+    version: 3,
+  };
+  const { client, calls } = queuedClient([unavailable, { data: submitted }, definitive, { data: submitted }]);
+  const keys = ["ambiguous-key", "definitive-key", "fresh-key"];
+  const controller = createInterviewController({ client, idempotencyKey: () => keys.shift() });
+
+  await assert.rejects(() => controller.submitMyFeedback(INTERVIEW_ID), unavailable);
+  await controller.submitMyFeedback(INTERVIEW_ID);
+  await assert.rejects(() => controller.submitMyFeedback(INTERVIEW_ID), definitive);
+  await controller.submitMyFeedback(INTERVIEW_ID);
+
+  assert.deepEqual(
+    calls.map((call) => call.options.idempotencyKey),
+    ["ambiguous-key", "ambiguous-key", "definitive-key", "fresh-key"],
+  );
+});
+
 test("rejects missing resource identity and version before network I/O", async () => {
   const { client, calls } = queuedClient([]);
   const controller = createInterviewController({ client });

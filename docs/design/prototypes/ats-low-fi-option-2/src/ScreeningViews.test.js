@@ -182,8 +182,8 @@ test("screening view context restores filters and only still-selectable rows", (
   });
 });
 
-test("server candidate detail exposes only connected tabs and reports conflicts safely", () => {
-  assert.deepEqual(candidateHelpers.candidateDetailTabs(true), ["档案与简历", "职位申请", "筛选证据", "时间线"]);
+test("server candidate detail exposes the connected interview path and reports conflicts safely", () => {
+  assert.deepEqual(candidateHelpers.candidateDetailTabs(true), ["档案与简历", "职位申请", "筛选证据", "面试与反馈", "时间线"]);
   assert.match(candidateHelpers.candidateMutationError({ status: 409 }), /其他成员更新/);
   assert.doesNotMatch(candidateHelpers.candidateMutationError(new Error("database internal.example")), /database|internal/);
   assert.equal(candidateHelpers.resumeDisplayName({ original_filename: "真实简历.pdf" }), "真实简历.pdf");

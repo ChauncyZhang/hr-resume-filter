@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { ApiError } from "./apiClient.js";
 import {
+  buildReactivatedCandidateSummary,
   createTalentController,
   canAddCandidateToTalentPool,
   normalizeTalentMembership,
@@ -35,6 +36,28 @@ test("talent pool and membership normalization keeps only the server projection"
   assert.equal(membership.candidate.applications[0].state, "已淘汰");
   assert.equal(membership.candidate.email, "");
   assert.doesNotMatch(JSON.stringify(membership), /must-not-pass/);
+});
+
+test("reactivation success opens the newly created application, not its source", () => {
+  const sourceCandidate = {
+    id: "candidate-1",
+    candidateId: "candidate-1",
+    applicationId: "application-source",
+    jobId: "job-source",
+    position: "历史职位",
+    serverBacked: true,
+  };
+
+  assert.deepEqual(buildReactivatedCandidateSummary(sourceCandidate, {
+    id: "application-new",
+    candidate_id: "candidate-1",
+    job_id: "job-new",
+  }, { name: "新职位" }), {
+    ...sourceCandidate,
+    applicationId: "application-new",
+    jobId: "job-new",
+    position: "新职位",
+  });
 });
 
 

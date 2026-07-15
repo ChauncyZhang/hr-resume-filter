@@ -69,7 +69,7 @@ export function candidateTransitionOptions(stage, serverBacked) {
 
 export function candidateDetailTabs(serverBacked) {
   return serverBacked
-    ? ["档案与简历", "职位申请", "筛选证据", "时间线"]
+    ? ["档案与简历", "职位申请", "筛选证据", "面试与反馈", "时间线"]
     : ["档案与简历", "职位申请", "筛选证据", "面试与反馈", "时间线"];
 }
 

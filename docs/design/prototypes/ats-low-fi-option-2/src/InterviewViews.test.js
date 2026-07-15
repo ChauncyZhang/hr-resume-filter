@@ -10,11 +10,12 @@ assert.ok(helpersSource, "InterviewViews.jsx must expose the feedback draft help
 const {
   clearInterviewFeedbackDraft,
   getFeedbackSubmitError,
+  isAmbiguousFeedbackSubmitError,
   getInterviewFeedbackDraftKey,
   loadInterviewFeedbackDraft,
   resolveInterviewFeedbackDraft,
   saveInterviewFeedbackDraft,
-} = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { clearInterviewFeedbackDraft, getFeedbackSubmitError, getInterviewFeedbackDraftKey, loadInterviewFeedbackDraft, resolveInterviewFeedbackDraft, saveInterviewFeedbackDraft }; })()`);
+} = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { clearInterviewFeedbackDraft, getFeedbackSubmitError, getInterviewFeedbackDraftKey, isAmbiguousFeedbackSubmitError, loadInterviewFeedbackDraft, resolveInterviewFeedbackDraft, saveInterviewFeedbackDraft }; })()`);
 
 function createStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -85,6 +86,12 @@ test("feedback version conflicts explain that the local draft was preserved", ()
     "服务端草稿已在其他页面或设备更新。本机内容已保留，请刷新后核对再提交。",
   );
   assert.equal(getFeedbackSubmitError({ code: "service_unavailable" }), "网络请求失败，表单和本机草稿均已保留。请重试提交。");
+});
+
+test("feedback submit retry distinguishes ambiguous transport failures", () => {
+  assert.equal(isAmbiguousFeedbackSubmitError({ status: 0, kind: "unavailable" }), true);
+  assert.equal(isAmbiguousFeedbackSubmitError({ status: 503 }), true);
+  assert.equal(isAmbiguousFeedbackSubmitError({ status: 409 }), false);
 });
 
 test("schedule workspace loads pending applications from the server without fixture fallback", () => {

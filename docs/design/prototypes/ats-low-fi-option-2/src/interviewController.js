@@ -315,6 +315,8 @@ function normalizeMaterials(value) {
 }
 
 export function createInterviewController({ client = apiClient, idempotencyKey = () => crypto.randomUUID() } = {}) {
+  const pendingFeedbackSubmissions = new Map();
+
   async function list(filters = {}, { signal } = {}) {
     const params = new URLSearchParams();
     if (safeString(filters.from)) params.set("from", filters.from);
@@ -398,10 +400,21 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
 
   async function submitMyFeedback(interviewId, { signal } = {}) {
     const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
-    const response = await client.request(`/api/v1/interviews/${id}/my-feedback/submit`, {
-      method: "POST", idempotencyKey: idempotencyKey(), ...signalOption(signal),
-    });
-    return normalizeFeedback(response?.data);
+    const key = pendingFeedbackSubmissions.get(id) || idempotencyKey();
+    pendingFeedbackSubmissions.set(id, key);
+    try {
+      const response = await client.request(`/api/v1/interviews/${id}/my-feedback/submit`, {
+        method: "POST", idempotencyKey: key, ...signalOption(signal),
+      });
+      pendingFeedbackSubmissions.delete(id);
+      return normalizeFeedback(response?.data);
+    } catch (error) {
+      const status = Number(error?.status);
+      const unavailableTransport = status === 0 && error?.kind === "unavailable";
+      const ambiguous = unavailableTransport || !Number.isFinite(status) || status === 408 || status === 429 || status >= 500;
+      if (!ambiguous) pendingFeedbackSubmissions.delete(id);
+      throw error;
+    }
   }
 
   async function amendFeedback(feedback, form, reason, { signal } = {}) {
