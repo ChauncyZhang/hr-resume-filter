@@ -104,3 +104,68 @@ They are not B2B3 failures and their files are excluded from this commit.
 The commit excludes `.superpowers/sdd/task-1-report.md`,
 `.superpowers/sdd/task-2-report.md`, `app/sample/candidates.csv`, and all other concurrent-agent
 backup/e2e changes.
+
+## Review-fix addendum (2026-07-15)
+
+Status: `DONE_WITH_CONCERNS`
+
+Scoped implementation commit: `7dc3000ace352ed984efb51d006ac3fffca19184`
+
+All four B2B3 review findings are fixed:
+
+- Every new deletion now constructs and validates complete schema-v2 evidence before the first
+  checkpoint, object deletion, or redaction mutation. The validation uses `LedgerEntryV2` itself
+  plus the signed adapter's exact canonical/signature, collection bound, kind, bucket, configured
+  location, and manifest rules. Approved requests derive artifacts from the signed manifest;
+  resumed requests validate the persisted checkpoint set against it. `MAX_LEDGER_ARTIFACTS + 1`
+  and checkpoint/manifest mismatches return `deletion_ledger_invalid` with no new object, database,
+  candidate, request, or checkpoint mutation.
+- The operator CLI now verifies executor membership, function existence, actual
+  `has_function_privilege(..., 'EXECUTE')`, and the frozen redaction boundary before coordinator
+  work. Delete capability is proven with random non-business canaries under dedicated scoped
+  prefixes on the governance MinIO endpoint; the ordinary object identity writes/verifies/cleans
+  them while the delete-only identity must actually remove them. Ledger list access remains a
+  separate proof.
+- Restored candidates are prevalidated only by exact signed `(organization_id, candidate_id)`
+  pairs, sorted and queried in deterministic batches of at most 500. The returned set must equal
+  the signed set exactly; no organization-wide candidate scan remains.
+- PostgreSQL recovery creation takes a transaction-scoped advisory lock keyed by restore ID and
+  re-reads the run before its first insert. Concurrent same-ID/same-timestamp calls return stable
+  idempotent success; different timestamps return `recovery_restore_conflict` without traceback or
+  extra run/checkpoint/job mutation.
+
+### TDD and verification evidence
+
+- RED evidence captured before implementation: oversized and resumed-mismatch deletion tests
+  entered side effects; governance preflight omitted function privilege/boundary execution; storage
+  preflight only listed; exact-pair helper was absent; real concurrent PostgreSQL returned an
+  unexpected `IntegrityError` for the losing caller.
+- `python -m pytest server/tests/test_governance_recovery.py server/tests/test_governance_deletion_worker.py -q`
+  in `ux09-b2b3-test` — `51 passed, 3 skipped in 58.42s`.
+- `python -m pytest server/tests/test_governance_minio.py -q` — `7 passed, 3 skipped in 1.92s`.
+- Real PostgreSQL concurrency test — `1 passed in 12.04s`; it creates a migrated disposable
+  database and proves both same- and different-timestamp races.
+- Real PostgreSQL/MinIO wrong-delete-ACL test — `1 passed in 3.78s`; the dedicated canary fails
+  closed while the business object and recovery run/checkpoint/job counts remain unchanged.
+- Final governance boundary unit test after randomizing the database canary — `1 passed in 2.58s`.
+- `python -m compileall -q -f server/app server/migrations/versions` — passed.
+- Scoped worktree and cached `git diff --check` — passed.
+
+The real-service tests used disposable local PostgreSQL 16.9 and MinIO containers. An initial
+concurrency rerun failed before test execution because the disposable PostgreSQL owner password had
+drifted; resetting that test-only account restored the gate, after which the test passed. No
+backup/E2E suite was rerun.
+
+### Remaining real-environment gates
+
+- The production backup-provider drill, production RPO policy, production-equivalent uninterrupted
+  least-privilege B2B2-to-B2B3 path, alert routing, operator access, and production-volume timing
+  remain release gates exactly as recorded above.
+- No known B2B3 code or focused-test failure remains; the concern status reflects those operational
+  production gates only.
+
+### Final scope
+
+The review-fix implementation contains only `server/README.md`, four governance implementation
+files, and two governance tests. Concurrent frontend/recruiting/screening/backup/E2E work, `.tmp`,
+the three protected files, and all unrelated untracked files were excluded.
