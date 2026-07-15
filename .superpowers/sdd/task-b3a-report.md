@@ -56,3 +56,28 @@ files. No endpoint, deployment, frontend, B2B1, or user-file changes were made.
 The change is response-only and exercised against SQLite through the focused
 API suites. No PostgreSQL-specific behavior or migration changed, so a
 PostgreSQL integration run was not required by the B3A brief.
+
+## Independent review coverage fixes
+
+No implementation changed. The focused governance deletion API tests now also
+prove that:
+
+- a same-tenant hiring manager with a real `job_manager` candidate scope sees
+  an active hold but not its reason, ID, or version;
+- same-tenant system-admin-only and injected unknown-role principals receive a
+  non-enumerating 404;
+- active administrator and recruiter status responses retain
+  `Cache-Control: no-store`;
+- successful candidate-status reads write `candidate_status_read` success
+  audits with empty metadata; and
+- same-tenant and cross-tenant rejections write denied audits containing only
+  `safe_error_code: resource_not_found`.
+
+Verification:
+
+- Focused review scenarios:
+  `docker run --rm --mount "type=bind,source=$PWD,target=/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py::test_legal_hold_release_and_governance_status_redact_reason_by_role server/tests/test_governance_deletion_api.py::test_all_b2a_endpoints_are_non_enumerating_for_known_cross_tenant_ids -q`
+  -> `2 passed in 9.26s`.
+- Required complete file gate:
+  `docker run --rm --mount "type=bind,source=$PWD,target=/opt/ux09" -w /opt/ux09 ux09-server-test python -m pytest server/tests/test_governance_deletion_api.py -q`
+  -> `21 passed in 44.68s`.

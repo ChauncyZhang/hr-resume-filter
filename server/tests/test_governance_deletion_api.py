@@ -507,11 +507,66 @@ def test_removed_resume_stale_refresh_deletes_only_unstarted_artifacts(tmp_path)
         assert db.scalar(select(func.count()).select_from(DeletionArtifact)) == 0
 
 
-def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path) -> None:
+def test_legal_hold_release_and_governance_status_redact_reason_by_role(
+    tmp_path, monkeypatch
+) -> None:
     app = make_app(tmp_path)
     recruiter_id = seed_user(app, "recruiter", "hold-reader@deletion.test")
-    seed_user(app, "recruiting_admin", "hold-admin@deletion.test")
+    admin_id = seed_user(app, "recruiting_admin", "hold-admin@deletion.test")
+    manager_id = seed_user(app, "hiring_manager", "hold-manager@deletion.test")
+    system_id = seed_user(app, "system_admin", "hold-system@deletion.test")
     candidate_id = candidate_for(app, recruiter_id)
+    with app.state.identity_store.sync_session() as db:
+        recruiter_user = db.get(User, recruiter_id)
+        organization_id = recruiter_user.organization_id
+        job = Job(
+            organization_id=organization_id,
+            title="Manager-scoped hold job",
+            owner_id=recruiter_id,
+        )
+        file = FileObject(
+            organization_id=organization_id,
+            storage_key="private/manager-scoped-hold-resume",
+            original_filename="manager-scoped.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            sha256="9" * 64,
+            uploaded_by=recruiter_id,
+        )
+        db.add_all([job, file])
+        db.flush()
+        resume = Resume(
+            organization_id=organization_id,
+            candidate_id=candidate_id,
+            file_object_id=file.id,
+            version_number=1,
+        )
+        db.add(resume)
+        db.flush()
+        db.add_all(
+            [
+                Application(
+                    organization_id=organization_id,
+                    candidate_id=candidate_id,
+                    job_id=job.id,
+                    resume_id=resume.id,
+                    owner_id=recruiter_id,
+                ),
+                JobCollaborator(
+                    organization_id=organization_id,
+                    job_id=job.id,
+                    user_id=manager_id,
+                    access_role="job_manager",
+                ),
+                JobCollaborator(
+                    organization_id=organization_id,
+                    job_id=job.id,
+                    user_id=recruiter_id,
+                    access_role="job_owner",
+                ),
+            ]
+        )
+        db.commit()
     with TestClient(app) as client:
         recruiter = login(client, "hold-reader@deletion.test")
         created = request_deletion(client, recruiter, candidate_id)
@@ -539,6 +594,32 @@ def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path
         admin_status = client.get(f"/api/v1/candidates/{candidate_id}/governance-status", headers=admin)
         recruiter = login(client, "hold-reader@deletion.test")
         recruiter_status = client.get(f"/api/v1/candidates/{candidate_id}/governance-status", headers=recruiter)
+        manager = login(client, "hold-manager@deletion.test")
+        manager_status = client.get(
+            f"/api/v1/candidates/{candidate_id}/governance-status", headers=manager
+        )
+        system = login(client, "hold-system@deletion.test")
+        system_status = client.get(
+            f"/api/v1/candidates/{candidate_id}/governance-status", headers=system
+        )
+        with monkeypatch.context() as context:
+            context.setattr(
+                app.state.identity_service,
+                "principal",
+                lambda token: Principal(
+                    user_id=system_id,
+                    organization_id=organization_id,
+                    roles=frozenset({"unknown_role"}),
+                    active=True,
+                ),
+            )
+            unknown_status = client.get(
+                f"/api/v1/candidates/{candidate_id}/governance-status",
+                headers=system,
+            )
+        assert admin_status.status_code == recruiter_status.status_code == 200
+        assert admin_status.headers["Cache-Control"] == "no-store"
+        assert recruiter_status.headers["Cache-Control"] == "no-store"
         assert admin_status.json()["data"] == {
             "deletion_status": "requested",
             "deletion_request_id": created.json()["data"]["id"],
@@ -551,6 +632,14 @@ def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path
         assert set(recruiter_status.json()["data"]) == {
             "deletion_status", "deletion_request_id", "legal_hold_active"
         }
+        assert manager_status.status_code == 200
+        assert manager_status.json()["data"] == {
+            "deletion_status": "requested",
+            "deletion_request_id": created.json()["data"]["id"],
+            "legal_hold_active": True,
+        }
+        assert_problem(system_status, 404, "resource_not_found")
+        assert_problem(unknown_status, 404, "resource_not_found")
         admin = login(client, "hold-admin@deletion.test")
         assert_problem(
             client.post(
@@ -611,6 +700,30 @@ def test_legal_hold_release_and_governance_status_redact_reason_by_role(tmp_path
     with app.state.identity_store.sync_session() as db:
         assert db.get(LegalHold, UUID(hold_id)).released_at is not None
         events = list(db.scalars(select(AuditLog).where(AuditLog.category == "governance")))
+        status_events = [
+            event
+            for event in events
+            if event.event_type == "governance.candidate_status_read"
+        ]
+        success_status_events = [
+            event for event in status_events if event.outcome == "success"
+        ]
+        denied_status_events = [
+            event for event in status_events if event.outcome == "denied"
+        ]
+        assert len(success_status_events) == 4
+        assert {event.actor_user_id for event in success_status_events} == {
+            admin_id,
+            recruiter_id,
+            manager_id,
+        }
+        assert all(event.metadata_json == {} for event in success_status_events)
+        assert len(denied_status_events) == 2
+        assert {event.actor_user_id for event in denied_status_events} == {system_id}
+        assert all(
+            event.metadata_json == {"safe_error_code": "resource_not_found"}
+            for event in denied_status_events
+        )
         assert any(e.event_type == "governance.legal_hold_placed" and e.outcome == "success" and e.metadata_json == {} for e in events)
         assert any(e.event_type == "governance.legal_hold_released" and e.outcome == "success" and e.metadata_json == {"hold_version": 2} for e in events)
         assert any(e.event_type == "governance.legal_hold_released" and e.outcome == "failure" and e.metadata_json == {"safe_error_code": "precondition_required"} for e in events)
@@ -891,3 +1004,16 @@ def test_all_b2a_endpoints_are_non_enumerating_for_known_cross_tenant_ids(
     with app.state.identity_store.sync_session() as db:
         after = (db.scalar(select(func.count()).select_from(DeletionRequest)), db.scalar(select(func.count()).select_from(LegalHold)), db.scalar(select(func.count()).select_from(BackgroundJob)))
         assert after == before
+        status_events = list(
+            db.scalars(
+                select(AuditLog).where(
+                    AuditLog.event_type == "governance.candidate_status_read"
+                )
+            )
+        )
+        assert len(status_events) == len(local_users) + 1
+        assert all(event.outcome == "denied" for event in status_events)
+        assert all(
+            event.metadata_json == {"safe_error_code": "resource_not_found"}
+            for event in status_events
+        )
