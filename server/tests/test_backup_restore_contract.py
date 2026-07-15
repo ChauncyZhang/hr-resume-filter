@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import hmac
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 
 import pytest
 
@@ -18,6 +24,11 @@ DRILL_COMPOSE = ROOT / "deploy" / "compose.backup-drill.yaml"
 BACKUP_RUNBOOK = ROOT / "deploy" / "backup-recovery-runbook.md"
 OPERATIONS_RUNBOOK = ROOT / "deploy" / "production-operations-runbook.md"
 FOUNDATION_REPORT = ROOT / ".superpowers" / "sdd" / "task-phase6c-report.md"
+REFERENCE_QUERY = """SELECT storage_key FROM file_objects WHERE storage_state <> 'deleted'
+UNION
+SELECT object_key FROM report_exports WHERE object_key IS NOT NULL AND status = 'succeeded'
+ORDER BY 1"""
+REFERENCE_QUERY_FINGERPRINT = hashlib.sha256(REFERENCE_QUERY.encode("utf-8")).hexdigest()
 
 
 def _load_backupctl():
@@ -60,7 +71,15 @@ def _manifest(**overrides):
             "object_count": 7,
             "inventory_sha256": "d" * 64,
         },
-        "reference_validation": {"checked": 7, "mismatches": 0},
+        "reference_validation": {
+            "schema_version": 1,
+            "validator_id": "ux09-reference-validator-v1",
+            "query_fingerprint": REFERENCE_QUERY_FINGERPRINT,
+            "inventory_sha256": "d" * 64,
+            "expected": 7,
+            "checked": 7,
+            "mismatches": 0,
+        },
         "ledger_archive": {
             "archive_run_id": "ledger-20260715T000000Z-e5f6a7b8",
             "cutoff_utc": "2026-07-15T00:00:00Z",
@@ -86,6 +105,7 @@ def _catalog_entry(run_id: str, cutoff: str, **overrides):
         "complete": True,
         "valid": True,
         "backup_window_days": 30,
+        "complete_order": 1,
     }
     item.update(overrides)
     return item
@@ -165,7 +185,7 @@ def test_manifest_rejects_unverified_or_unpaired_restore_points() -> None:
     for broken in (
         _manifest(state="pending"),
         _manifest(database={**_manifest()["database"], "restore_list_entries": 0}),
-        _manifest(reference_validation={"checked": 7, "mismatches": 1}),
+        _manifest(reference_validation={**_manifest()["reference_validation"], "mismatches": 1}),
         _manifest(gates={**_manifest()["gates"], "hashes": False}),
         _manifest(schedule_interval_hours=24),
         _manifest(operator_note="no arbitrary extension fields"),
@@ -214,6 +234,58 @@ def test_atomic_publish_writes_manifest_and_complete_only_after_validation(tmp_p
     assert not staging.exists()
 
 
+def test_atomic_publish_lease_allows_only_one_concurrent_writer(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    published = tmp_path / "published" / _manifest()["backup_run_id"]
+    staging = []
+    for label in ("first", "second"):
+        path = tmp_path / label
+        path.mkdir()
+        (path / "database.dump").write_bytes(label.encode())
+        (path / "business.snapshot").write_bytes(label.encode())
+        (path / "writer").write_text(label, encoding="ascii")
+        staging.append(path)
+
+    def publish(path: Path) -> str:
+        backupctl.atomic_publish_local(path, published, _manifest(), lambda: None)
+        return path.name
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(publish, path) for path in staging]
+    successes = [future.result() for future in futures if future.exception() is None]
+    failures = [future.exception() for future in futures if future.exception() is not None]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], FileExistsError)
+    winner = (published / "writer").read_text(encoding="ascii")
+    assert winner == successes[0]
+    assert (published / "manifest.json").is_file()
+    assert (published / "COMPLETE").is_file()
+
+
+def test_atomic_publisher_receipt_is_strict_and_run_hash_bound(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    receipt = tmp_path / "receipt.json"
+    value = {
+        "schema_version": 1,
+        "status": "committed",
+        "backup_run_id": "business-run-safe1",
+        "complete_sha256": "a" * 64,
+        "lease_id_hash": "b" * 64,
+    }
+    backupctl._write_json(receipt, value)
+    backupctl.validate_publish_receipt(receipt, "business-run-safe1", "a" * 64)
+    for broken in (
+        {**value, "status": "copied"},
+        {**value, "backup_run_id": "business-run-other1"},
+        {**value, "complete_sha256": "c" * 64},
+        {**value, "lease_id_hash": "not-a-hash"},
+    ):
+        backupctl._write_json(receipt, broken)
+        with pytest.raises(ValueError, match="publisher|receipt|bound|hash"):
+            backupctl.validate_publish_receipt(receipt, "business-run-safe1", "a" * 64)
+
+
 @pytest.mark.parametrize(
     ("destination", "app_host", "forbidden_path"),
     [
@@ -235,6 +307,26 @@ def test_off_host_destination_fails_closed_for_app_host_and_data_paths(
     ) == "s3://independent-backup-vault/ux09"
 
 
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "s3://user:password@backup.example.test/ux09",
+        "s3://backup.example.test/ux09?token=value",
+        "s3://backup.example.test/ux09#fragment",
+        "http://backup.example.test/ux09",
+        "ftp://backup.example.test/ux09",
+        "ssh://backup.example.test/ux09",
+        "javascript://backup.example.test/ux09",
+        "s3://backup.example.test/ux09/%2e%2e/data",
+        "s3://backup.example.test/ux09\\..\\data",
+    ],
+)
+def test_destination_uri_rejects_userinfo_query_fragment_and_dangerous_schemes(destination: str) -> None:
+    backupctl = _load_backupctl()
+    with pytest.raises(ValueError, match="scheme|userinfo|query|fragment|destination|path"):
+        backupctl.validate_off_host_destination(destination, "app.example.test", [])
+
+
 def test_secret_files_are_required_distinct_and_never_serialized(tmp_path: Path) -> None:
     backupctl = _load_backupctl()
     secret_files = []
@@ -251,6 +343,7 @@ def test_secret_files_are_required_distinct_and_never_serialized(tmp_path: Path)
     ):
         path = tmp_path / name
         path.write_text(f"synthetic-{name}-credential", encoding="utf-8")
+        path.chmod(0o600)
         secret_files.append(path)
 
     backupctl.validate_secret_files(secret_files)
@@ -262,14 +355,72 @@ def test_secret_files_are_required_distinct_and_never_serialized(tmp_path: Path)
         assert path.read_text(encoding="utf-8") not in serialized
 
 
+def test_secret_files_reject_symlink_hardlink_nonregular_and_wide_permissions(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    original = tmp_path / "secret"
+    original.write_bytes(b"x" * 32)
+    original.chmod(0o600)
+    hardlink = tmp_path / "hardlink"
+    os.link(original, hardlink)
+    with pytest.raises(ValueError, match="hardlink|link|inode"):
+        backupctl.validate_secret_files([original])
+
+    standalone = tmp_path / "standalone"
+    standalone.write_bytes(b"y" * 32)
+    standalone.chmod(0o644)
+    if os.name != "nt":
+        with pytest.raises(ValueError, match="permission"):
+            backupctl.validate_secret_files([standalone])
+
+    with pytest.raises(ValueError, match="regular"):
+        backupctl.validate_secret_files([tmp_path])
+
+    symlink = tmp_path / "symlink"
+    try:
+        symlink.symlink_to(standalone)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    with pytest.raises(ValueError, match="symlink|link"):
+        backupctl.validate_secret_files([symlink])
+
+
+def test_secret_snapshot_uses_private_regular_copies_and_closes_tocotu(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    source = tmp_path / "source"
+    source.write_bytes(b"z" * 32)
+    source.chmod(0o600)
+    private_root = tmp_path / "private"
+    with backupctl.secure_secret_copies([source], private_root) as copies:
+        assert len(copies) == 1
+        copied = copies[0]
+        assert copied.read_bytes() == b"z" * 32
+        assert copied != source
+        if os.name != "nt":
+            assert copied.stat().st_mode & 0o077 == 0
+        assert not copied.is_symlink()
+    assert not private_root.exists()
+
+
+def test_child_environment_exposes_only_private_secret_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    backupctl = _load_backupctl()
+    monkeypatch.setenv("BUSINESS_SOURCE_CONFIG_FILE", "/original/source-secret")
+    monkeypatch.setenv("BACKUP_MANIFEST_SIGNING_KEY_FILE", "/original/signing-secret")
+    monkeypatch.setenv("SAFE_NON_SECRET_SETTING", "retained")
+    environment = backupctl._sanitized_child_environment(PGPASSFILE="/private/secret-0")
+    assert "BUSINESS_SOURCE_CONFIG_FILE" not in environment
+    assert "BACKUP_MANIFEST_SIGNING_KEY_FILE" not in environment
+    assert environment["PGPASSFILE"] == "/private/secret-0"
+    assert environment["SAFE_NON_SECRET_SETTING"] == "retained"
+
+
 def test_prune_deletes_complete_expired_groups_and_preserves_newest_two() -> None:
     backupctl = _load_backupctl()
     catalog = [
-        _catalog_entry("run-1", "2026-05-01T00:00:00Z"),
-        _catalog_entry("run-2", "2026-05-15T00:00:00Z"),
-        _catalog_entry("run-3", "2026-07-01T00:00:00Z"),
-        _catalog_entry("run-4", "2026-07-14T00:00:00Z"),
-        _catalog_entry("pending-old", "2026-04-01T00:00:00Z", complete=False, valid=False),
+        _catalog_entry("run-1", "2026-05-01T00:00:00Z", complete_order=1),
+        _catalog_entry("run-2", "2026-05-15T00:00:00Z", complete_order=2),
+        _catalog_entry("run-3", "2026-07-01T00:00:00Z", complete_order=3),
+        _catalog_entry("run-4", "2026-07-14T00:00:00Z", complete_order=4),
+        _catalog_entry("pending-old", "2026-04-01T00:00:00Z", complete=False, valid=False, complete_order=0),
     ]
     assert backupctl.plan_prune(
         catalog,
@@ -281,9 +432,9 @@ def test_prune_deletes_complete_expired_groups_and_preserves_newest_two() -> Non
 def test_prune_fails_closed_on_policy_mismatch_or_invalid_latest() -> None:
     backupctl = _load_backupctl()
     base = [
-        _catalog_entry("run-1", "2026-05-01T00:00:00Z"),
-        _catalog_entry("run-2", "2026-07-01T00:00:00Z"),
-        _catalog_entry("run-3", "2026-07-14T00:00:00Z"),
+        _catalog_entry("run-1", "2026-05-01T00:00:00Z", complete_order=1),
+        _catalog_entry("run-2", "2026-07-01T00:00:00Z", complete_order=2),
+        _catalog_entry("run-3", "2026-07-14T00:00:00Z", complete_order=3),
     ]
     mismatch = [*base[:-1], {**base[-1], "backup_window_days": 31}]
     invalid_latest = [*base[:-1], {**base[-1], "valid": False}]
@@ -294,6 +445,17 @@ def test_prune_fails_closed_on_policy_mismatch_or_invalid_latest() -> None:
                 retention_days=30,
                 now=datetime(2026, 7, 15, tzinfo=timezone.utc),
             )
+
+
+def test_prune_uses_complete_order_and_never_downgrades_invalid_latest() -> None:
+    backupctl = _load_backupctl()
+    catalog = [
+        _catalog_entry("run-new-by-cutoff", "2026-07-15T00:00:00Z", complete_order=2),
+        _catalog_entry("run-latest-complete", "2026-07-14T00:00:00Z", complete_order=3, valid=False),
+        _catalog_entry("run-old", "2026-05-01T00:00:00Z", complete_order=1),
+    ]
+    with pytest.raises(ValueError, match="latest"):
+        backupctl.plan_prune(catalog, 30, datetime(2026, 7, 16, tzinfo=timezone.utc))
 
 
 def test_ledger_archive_is_separate_and_business_identity_has_no_ledger_mutation() -> None:
@@ -327,8 +489,84 @@ def test_ledger_archive_is_separate_and_business_identity_has_no_ledger_mutation
 
 def test_restore_uses_latest_independent_ledger_not_business_cutoff() -> None:
     source = BACKUPCTL.read_text(encoding="utf-8")
-    assert '"restore-latest"' in source
+    assert '"select-latest-complete"' in source
     assert '"restore-latest-before"' not in source
+
+
+def _write_signed_ledger_group(tmp_path: Path, backupctl, *, cutoff: str = "2026-07-15T01:00:00Z") -> tuple[Path, Path, dict]:
+    group = tmp_path / "ledger-run-safe1"
+    group.mkdir(parents=True)
+    key = tmp_path / "ledger-key"
+    key.write_bytes(b"l" * 32)
+    key.chmod(0o600)
+    archive = group / "ledger.snapshot"
+    archive.write_bytes(b"signed-ledger-archive")
+    manifest = {
+        "schema_version": 1,
+        "archive_run_id": group.name,
+        "cutoff_utc": cutoff,
+        "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "size_bytes": archive.stat().st_size,
+        "entry_count": 2,
+        "signing_key_version": "ledger-v2",
+        "lifecycle_policy_version": "ledger-lifecycle-v1",
+    }
+    manifest_path = group / "ledger-manifest.json"
+    manifest_path.write_bytes(backupctl._canonical_json(manifest))
+    backupctl.write_hmac_signature(manifest_path, key, group / "ledger-manifest.sig")
+    (group / "COMPLETE").write_text(hashlib.sha256(manifest_path.read_bytes()).hexdigest() + "\n", encoding="ascii")
+    return group, key, manifest
+
+
+def test_ledger_consumer_validates_schema_signature_complete_hash_freshness_and_binding(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    group, key, manifest = _write_signed_ledger_group(tmp_path, backupctl)
+    history = {
+        "schema_version": 1,
+        "active_key_version": "ledger-v2",
+        "versions": [{"version": "ledger-v1", "status": "retired"}, {"version": "ledger-v2", "status": "active"}],
+    }
+    validated = backupctl.validate_ledger_archive_group(
+        group, key, history, minimum_cutoff_utc="2026-07-15T00:00:00Z"
+    )
+    assert validated == manifest
+
+    (group / "COMPLETE").write_text("0" * 64 + "\n", encoding="ascii")
+    with pytest.raises(ValueError, match="COMPLETE"):
+        backupctl.validate_ledger_archive_group(group, key, history, minimum_cutoff_utc="2026-07-15T00:00:00Z")
+
+    group, key, _ = _write_signed_ledger_group(tmp_path / "stale", backupctl, cutoff="2026-07-14T00:00:00Z")
+    with pytest.raises(ValueError, match="fresh"):
+        backupctl.validate_ledger_archive_group(group, key, history, minimum_cutoff_utc="2026-07-15T00:00:00Z")
+
+
+def test_ledger_restore_proof_is_signed_and_bound_to_run_and_generation(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    group, key, manifest = _write_signed_ledger_group(tmp_path, backupctl)
+    proof = {
+        "schema_version": 1,
+        "status": "verified",
+        "ledger_archive_run_id": manifest["archive_run_id"],
+        "business_backup_run_id": "business-run-safe1",
+        "recovery_generation_id": "generation-safe1",
+        "archive_sha256": manifest["archive_sha256"],
+        "cutoff_utc": manifest["cutoff_utc"],
+        "restored_entry_count": manifest["entry_count"],
+    }
+    proof_path = tmp_path / "proof.json"
+    proof_path.write_bytes(backupctl._canonical_json(proof))
+    signature = tmp_path / "proof.sig"
+    backupctl.write_hmac_signature(proof_path, key, signature)
+    backupctl.validate_ledger_restore_proof(
+        proof_path, signature, key, manifest, "business-run-safe1", "generation-safe1"
+    )
+    replay = {**proof, "business_backup_run_id": "business-run-old11"}
+    proof_path.write_bytes(backupctl._canonical_json(replay))
+    backupctl.write_hmac_signature(proof_path, key, signature)
+    with pytest.raises(ValueError, match="binding"):
+        backupctl.validate_ledger_restore_proof(
+            proof_path, signature, key, manifest, "business-run-safe1", "generation-safe1"
+        )
 
 
 @pytest.mark.parametrize(
@@ -353,30 +591,217 @@ def test_restore_and_drill_require_disposable_project_and_volumes(
     )
 
 
-def test_traffic_stays_closed_until_real_b2b3_cli_and_worker_evidence() -> None:
+def test_traffic_open_is_unreachable_before_signed_b2b3_protocol() -> None:
     backupctl = _load_backupctl()
-    restore = {
-        "state": "restored",
+    with pytest.raises(backupctl.SecurityContractError, match="disabled|unavailable"):
+        backupctl.require_traffic_open_evidence({}, {})
+
+
+def test_traffic_gate_rejects_handwritten_replayed_and_unbound_evidence_without_marker(tmp_path: Path) -> None:
+    marker = tmp_path / "TRAFFIC_OPEN"
+    cases = [
+        ({"status": "complete", "run_id": "business-run-safe1"}, {"status": "complete"}),
+        ({"status": "restored", "run_id": "business-run-old11"}, {"status": "complete", "run_id": "business-run-old11"}),
+        ({"status": "restored"}, {"status": "complete"}),
+    ]
+    for index, (restore, b2b3) in enumerate(cases):
+        restore_path = tmp_path / f"restore-{index}.json"
+        b2b3_path = tmp_path / f"b2b3-{index}.json"
+        restore_path.write_text(json.dumps(restore), encoding="utf-8")
+        b2b3_path.write_text(json.dumps(b2b3), encoding="utf-8")
+        marker.write_text("stale-open", encoding="ascii")
+        result = subprocess.run(
+            [sys.executable, str(BACKUPCTL), "traffic-gate", str(restore_path), str(b2b3_path), str(marker)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 78
+        assert "disabled" in result.stderr.lower() or "unavailable" in result.stderr.lower()
+        assert not marker.exists()
+
+
+def test_restore_start_atomically_closes_traffic_and_binds_run_generation(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    evidence = tmp_path / "restore-evidence.json"
+    closed = tmp_path / "TRAFFIC_CLOSED"
+    opened = tmp_path / "TRAFFIC_OPEN"
+    opened.write_text("stale", encoding="ascii")
+    backupctl.begin_closed_recovery(
+        evidence, closed, opened, "business-run-safe1", "generation-safe1"
+    )
+    assert not opened.exists()
+    expected = {
+        "schema_version": 1,
+        "state": "restore_started_traffic_closed",
+        "backup_run_id": "business-run-safe1",
+        "recovery_generation_id": "generation-safe1",
         "traffic_open": False,
-        "gates": {"database": True, "business_objects": True, "ledger_restored_first": True},
     }
-    with pytest.raises(ValueError, match="B2B3|traffic"):
-        backupctl.require_traffic_open_evidence(restore, None)
+    assert json.loads(evidence.read_text(encoding="utf-8")) == expected
+    assert json.loads(closed.read_text(encoding="utf-8")) == expected
+    assert not list(tmp_path.glob("*.tmp-*"))
 
-    incomplete = {
-        "status": "complete",
-        "real_cli": True,
-        "real_worker": False,
-        "redelete_verified": True,
-        "idempotency_verified": True,
-        "tamper_failure_verified": True,
-        "checkpoint_reclaim_verified": True,
+
+@pytest.mark.parametrize("fragment", ["/absolute", "../escape", "safe/escape", "..", ".", "C:\\absolute"])
+def test_run_ids_and_joined_paths_reject_absolute_and_traversal(fragment: str, tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    with pytest.raises(ValueError, match="run|fragment|path"):
+        backupctl.validate_run_id(fragment)
+    with pytest.raises(ValueError, match="run|fragment|path"):
+        backupctl.safe_run_path(tmp_path, fragment)
+
+
+def test_joined_path_rejects_existing_symlink_escape(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    outside = tmp_path.parent / "outside-phase6c"
+    outside.mkdir(exist_ok=True)
+    link = tmp_path / "symlink-safe1"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    with pytest.raises(ValueError, match="escape|symlink|path"):
+        backupctl.safe_run_path(tmp_path, "symlink-safe1")
+
+
+def test_reference_proof_requires_pinned_schema_fingerprints_and_exact_counts() -> None:
+    backupctl = _load_backupctl()
+    valid = {
+        "schema_version": 1,
+        "validator_id": backupctl.REFERENCE_VALIDATOR_ID,
+        "query_fingerprint": backupctl.REFERENCE_QUERY_FINGERPRINT,
+        "inventory_sha256": "d" * 64,
+        "expected": 7,
+        "checked": 7,
+        "mismatches": 0,
     }
-    with pytest.raises(ValueError, match="B2B3|traffic"):
-        backupctl.require_traffic_open_evidence(restore, incomplete)
+    backupctl.validate_reference_proof(valid, expected=7, inventory_sha256="d" * 64)
+    backupctl.validate_reference_proof({**valid, "expected": 0, "checked": 0}, expected=0, inventory_sha256="d" * 64)
+    for broken in (
+        {key: value for key, value in valid.items() if key != "expected"},
+        {**valid, "checked": 6},
+        {**valid, "expected": 6, "checked": 6},
+        {**valid, "query_fingerprint": "0" * 64},
+        {**valid, "inventory_sha256": "0" * 64},
+    ):
+        with pytest.raises(ValueError, match="reference|expected|fingerprint|checked"):
+            backupctl.validate_reference_proof(broken, expected=7, inventory_sha256="d" * 64)
 
-    complete = {**incomplete, "real_worker": True}
-    assert backupctl.require_traffic_open_evidence(restore, complete) is True
+
+def test_backup_orchestration_uses_bundled_reference_protocol_and_atomic_publisher() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    backup_section = source.split("def command_backup", 1)[1].split("def command_prune", 1)[0]
+    assert "REFERENCE_VALIDATOR" not in backup_section
+    assert "REFERENCE_QUERY" in backup_section
+    assert "build_reference_proof" in backup_section
+    assert "BACKUP_ATOMIC_PUBLISHER" in backup_section
+    assert "stage-group" not in backup_section
+    assert "publish-group" not in backup_section
+
+
+def test_restore_orchestration_closes_first_and_requires_verified_ledger_proof() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    restore = source.split("def command_restore", 1)[1].split("def command_ledger_archive", 1)[0]
+    assert restore.index("begin_closed_recovery") < restore.index("LEDGER_ARCHIVE_CLIENT")
+    assert "validate_ledger_archive_group" in restore
+    assert "validate_ledger_restore_proof" in restore
+    assert "RESTORE_GENERATION_ID" in restore
+    assert '"ledger_restored_first": ledger_verified' in restore
+    assert '"ledger_restored_first": True' not in restore
+
+
+def test_orchestration_uses_private_secret_snapshots_not_original_paths() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    for command_name, next_name in (
+        ("command_backup", "command_prune"),
+        ("command_prune", "command_restore"),
+        ("command_restore", "command_ledger_archive"),
+        ("command_ledger_archive", "command_drill"),
+    ):
+        section = source.split(f"def {command_name}", 1)[1].split(f"def {next_name}", 1)[0]
+        assert "secure_secret_copies" in section, command_name
+
+
+def test_invalid_catalog_group_fails_closed_without_epoch_downgrade(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    group = tmp_path / "broken-run-safe1"
+    group.mkdir()
+    (group / "manifest.json").write_text("not-json", encoding="utf-8")
+    (group / "COMPLETE").write_text("0" * 64, encoding="ascii")
+    key = tmp_path / "key"
+    key.write_bytes(b"k" * 32)
+    key.chmod(0o600)
+    with pytest.raises(ValueError, match="catalog|manifest|invalid"):
+        backupctl.catalog_from_groups(tmp_path, key, lambda _path: 1)
+    assert "1970-01-01" not in BACKUPCTL.read_text(encoding="utf-8")
+
+
+def _write_complete_business_group(tmp_path: Path, backupctl) -> tuple[Path, Path, dict]:
+    root = tmp_path / "groups"
+    group = root / "business-run-safe1"
+    group.mkdir(parents=True)
+    key = tmp_path / "business-signing-key"
+    key.write_bytes(b"b" * 32)
+    key.chmod(0o600)
+    dump = group / "database.dump"
+    snapshot = group / "business.snapshot"
+    inventory_path = group / "business.inventory.json"
+    dump.write_bytes(b"custom-format-dump")
+    snapshot.write_bytes(b"business-tar-payload")
+    backupctl._write_json(inventory_path, {"schema_version": 1, "objects": []})
+    manifest = _manifest(
+        backup_run_id=group.name,
+        database={
+            "format": "custom",
+            "sha256": hashlib.sha256(dump.read_bytes()).hexdigest(),
+            "size_bytes": dump.stat().st_size,
+            "restore_list_entries": 3,
+        },
+        business_snapshot={
+            "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+            "size_bytes": snapshot.stat().st_size,
+            "object_count": 0,
+            "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+        },
+        reference_validation={
+            "schema_version": 1,
+            "validator_id": "ux09-reference-validator-v1",
+            "query_fingerprint": REFERENCE_QUERY_FINGERPRINT,
+            "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest(),
+            "expected": 0,
+            "checked": 0,
+            "mismatches": 0,
+        },
+    )
+    backupctl._write_json(group / "manifest.json", manifest)
+    backupctl.write_hmac_signature(group / "manifest.json", key, group / "manifest.sig")
+    (group / "COMPLETE").write_text(hashlib.sha256((group / "manifest.json").read_bytes()).hexdigest() + "\n", encoding="ascii")
+    return root, key, manifest
+
+
+@pytest.mark.parametrize("tamper", ["signature", "complete", "dump", "restore-list"])
+def test_prune_catalog_verifies_signature_complete_payload_and_custom_dump(
+    tmp_path: Path, tamper: str
+) -> None:
+    backupctl = _load_backupctl()
+    root, key, manifest = _write_complete_business_group(tmp_path, backupctl)
+    group = root / manifest["backup_run_id"]
+    restore_entries = manifest["database"]["restore_list_entries"]
+    catalog = backupctl.catalog_from_groups(root, key, lambda _path: restore_entries)
+    assert catalog[0]["valid"] is True
+    if tamper == "signature":
+        (group / "manifest.sig").write_text("0" * 64 + "\n", encoding="ascii")
+    elif tamper == "complete":
+        (group / "COMPLETE").write_text("0" * 64 + "\n", encoding="ascii")
+    elif tamper == "dump":
+        (group / "database.dump").write_bytes(b"tampered")
+    with pytest.raises(ValueError, match="catalog|signature|COMPLETE|dump|invalid"):
+        backupctl.catalog_from_groups(
+            root,
+            key,
+            lambda _path: restore_entries + (1 if tamper == "restore-list" else 0),
+        )
 
 
 def test_rpo_rto_evidence_enforces_24h_and_4h_budgets() -> None:
@@ -427,18 +852,22 @@ def test_backup_image_is_digest_pinned_and_contains_versioned_toolchain() -> Non
 
 def test_destination_adapter_refuses_to_overwrite_existing_run_id() -> None:
     source = (BACKUP_DIR / "destination-rclone.sh").read_text(encoding="utf-8")
-    stage = source.split("stage-group)", 1)[1].split(";;", 1)[0]
-    assert '"$complete/COMPLETE"' in stage
-    assert "refusing to overwrite" in stage
+    assert "atomic publisher" in source.lower()
+    assert "stage-group)" not in source or "exit 78" in source
+    assert "publish-group)" not in source or "exit 78" in source
+    assert "BACKUP_ATOMIC_PUBLISHER" in BACKUPCTL.read_text(encoding="utf-8")
 
 
 def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> None:
+    environment = os.environ.copy()
+    environment.update({"BACKUP_IMAGE": "registry.example.test/ux09-backup", "BACKUP_IMAGE_DIGEST": "sha256:" + "a" * 64})
     result = subprocess.run(
         ["docker", "compose", "-f", str(DRILL_COMPOSE), "config", "--format", "json"],
         cwd=ROOT,
         capture_output=True,
         text=True,
         check=False,
+        env=environment,
     )
     assert result.returncode == 0, result.stderr
     model = json.loads(result.stdout)
@@ -449,6 +878,58 @@ def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> No
     rendered = result.stdout.lower()
     assert "ux09_postgres-data" not in rendered
     assert "ux09_minio-data" not in rendered
+    assert model["services"]["backup-tool"]["image"].endswith("@sha256:" + "a" * 64)
+    raw_compose = DRILL_COMPOSE.read_text(encoding="utf-8")
+    assert "ux09-backup:phase6c-foundation" not in raw_compose
+    assert "${BACKUP_IMAGE:?" in raw_compose
+    assert "${BACKUP_IMAGE_DIGEST:?" in raw_compose
+
+
+def _tar_with_member(path: Path, member: tarfile.TarInfo, payload: bytes = b"") -> None:
+    with tarfile.open(path, "w") as archive:
+        archive.addfile(member, io.BytesIO(payload) if member.isreg() else None)
+
+
+@pytest.mark.parametrize("kind", ["absolute", "traversal", "symlink", "hardlink", "fifo", "unexpected", "bucket-root-file"])
+def test_business_snapshot_safe_extract_rejects_malicious_tar_members(tmp_path: Path, kind: str) -> None:
+    backupctl = _load_backupctl()
+    archive = tmp_path / f"{kind}.tar"
+    if kind == "absolute":
+        member = tarfile.TarInfo("/objects/resumes/escape")
+    elif kind == "traversal":
+        member = tarfile.TarInfo("objects/resumes/../../escape")
+    elif kind == "unexpected":
+        member = tarfile.TarInfo("unexpected/resumes/file")
+    elif kind == "bucket-root-file":
+        member = tarfile.TarInfo("objects/resumes")
+    else:
+        member = tarfile.TarInfo("objects/resumes/entry")
+    if kind == "symlink":
+        member.type = tarfile.SYMTYPE
+        member.linkname = "../../escape"
+    elif kind == "hardlink":
+        member.type = tarfile.LNKTYPE
+        member.linkname = "objects/resumes/other"
+    elif kind == "fifo":
+        member.type = tarfile.FIFOTYPE
+    else:
+        member.size = 1
+    _tar_with_member(archive, member, b"x")
+    destination = tmp_path / "extract"
+    with pytest.raises(ValueError, match="tar|member|path|type|bucket"):
+        backupctl.safe_extract_business_snapshot(archive, destination, {"resumes"})
+    assert not (tmp_path / "escape").exists()
+
+
+def test_business_snapshot_safe_extract_accepts_only_approved_regular_tree(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    archive = tmp_path / "valid.tar"
+    member = tarfile.TarInfo("objects/resumes/clean/document.bin")
+    member.size = 4
+    _tar_with_member(archive, member, b"safe")
+    destination = tmp_path / "extract"
+    backupctl.safe_extract_business_snapshot(archive, destination, {"resumes"})
+    assert (destination / "objects" / "resumes" / "clean" / "document.bin").read_bytes() == b"safe"
 
 
 def test_runbooks_and_report_state_foundation_limits_and_real_b2b3_dependency() -> None:

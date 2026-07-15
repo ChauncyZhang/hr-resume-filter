@@ -5,8 +5,10 @@
 This canonical operations runbook describes the Phase 6C foundation operating
 contract. It does not declare Phase 6C or the service production ready. Launch
 still requires provider-specific off-host storage, reviewed identities,
-production preflight/provisioning integration after shared-file release, the
-real B2B3 CLI and B2B3 Worker, and a complete real restore drill.
+production preflight/provisioning integration after shared-file release, a
+trusted destination-native atomic publisher/lease, the real B2B3 CLI and B2B3
+Worker signed evidence protocol, and a complete real restore drill. The
+foundation traffic gate always exits 78 and cannot open traffic.
 
 ## Preflight and launch
 
@@ -21,7 +23,8 @@ Reliability objectives are a 24-hour RPO and 4-hour RTO. Schedule paired backup
 every 12 hours to preserve RPO margin. Launch is blocked until the newest two
 valid complete points are restorable and the latest ledger archive freshness is
 proved. Backups only on the application host, PostgreSQL-only dumps, or a
-traffic gate without B2B3 evidence are launch blockers.
+traffic-open path are launch blockers. Caller JSON, mock output, unsigned or
+replayed B2B3 evidence cannot change the foundation closed state.
 
 Use a progressive rollout: deploy one compatible instance with traffic closed,
 pass migrations/readiness and a read-only smoke, then increase traffic in
@@ -51,7 +54,9 @@ storage/reference checks breach the release budget. Keep migrations forward-only
 
 For suspected data corruption or host loss, close traffic and follow the
 isolated/full-host recovery procedure. Restore into new volumes, restore ledger
-first, run the real B2B3 recovery, and require the traffic gate. Never overwrite
+first, run the real B2B3 recovery, and keep the foundation traffic gate closed.
+Any future traffic-open implementation requires the separately released signed
+B2B3 protocol and review. Never overwrite
 production volumes in place and never use the disposable drill Compose project
 as a production topology.
 
@@ -72,7 +77,8 @@ history contract, manifests, logs, reports, or commits.
 ## Monitoring, alerting, and evidence
 
 Track valid-complete restore-point age, paired dump/snapshot completion,
-reference mismatch count, ledger freshness, prune failures, destination write
+reference mismatch count, ledger freshness and signed restore proofs, prune
+failures, atomic publisher lease/receipt failures, destination write
 failures, drill RPO/RTO, B2B3 gate status, and traffic-gate status. Alert on
 user-impacting symptoms: no valid restore point by 18 hours, projected breach of
 the 24-hour RPO, recovery unable to meet the 4-hour RTO, or traffic exposed

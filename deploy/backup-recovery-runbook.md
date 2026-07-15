@@ -12,8 +12,11 @@ complete real restore drill proves the 24-hour RPO and 4-hour RTO.
 Never run restore or drill commands against the `ux09` Compose project or its
 volumes. The guard requires `DISPOSABLE_RECOVERY_CONFIRMED=1`, a project named
 `ux09-backup-drill-<unique>`, and volumes whose names begin with that exact
-project name. The traffic gate defaults closed and cannot pass on Phase 6C
-restore evidence alone.
+project name. The foundation traffic-gate command is permanently closed and
+exits with safety code 78. It cannot create an open marker from caller JSON,
+mock output, unsigned evidence, or replayed evidence. A future reviewed change
+may implement the released signed B2B3 protocol; this foundation contains no
+open transition.
 
 ## Architecture and trust boundaries
 
@@ -25,11 +28,16 @@ restore evidence alone.
 - `ledger-archive.sh` uses separate source, append, restore, lifecycle, and
   signing-key-history contracts. The business read/append/prune identities must
   have no ledger restore or delete grants.
-- The destination adapter stages a group, publishes data and manifest, then
-  writes `COMPLETE` last. Consumers ignore every group without a valid marker.
+- COMPLETE-last publication requires a destination-native conditional create
+  or trusted external lease. `BACKUP_ATOMIC_PUBLISHER` and
+  `LEDGER_ATOMIC_PUBLISHER` must atomically acquire the run-ID lease, commit the
+  immutable group once, and return a run/hash-bound receipt. The bundled rclone
+  adapter exits 78 for stage/publish because copy cannot prove this contract.
 - PostgreSQL passwords, MinIO aliases, destination credentials, and signing
-  material are protected secret files. Never pass their values in argv, shell
-  tracing, logs, manifests, reports, or tickets.
+  material are protected regular files with one link, no symlink, and mode
+  0600 or stricter. The coordinator opens with no-follow semantics, checks the
+  opened inode, and gives child processes private 0600 copies. Never pass
+  secret values in argv, shell tracing, logs, manifests, reports, or tickets.
 
 Production backups must use a destination URI whose host differs from the
 application host and whose path is outside PostgreSQL and MinIO data volumes.
@@ -70,26 +78,35 @@ endpoint identifiers, run IDs, and local evidence paths.
 - `BUSINESS_SNAPSHOT_CLIENT`: `snapshot --config-file FILE --buckets LIST
   --output PATH --inventory PATH`. Inventory entries contain only a keyed/path
   hash, content hash, and size; raw object keys and filenames are forbidden.
-- `BACKUP_DESTINATION_CLIENT`: `stage-group`, `publish-group`, `abort-group`,
-  `catalog`, `fetch-complete-group`, and `delete-complete-group`.
-- `REFERENCE_VALIDATOR`: validates database object references against the
-  captured inventory and emits only checked/mismatch counts.
-- `LEDGER_ARCHIVE_CLIENT`: `snapshot`, `publish`, and `restore-latest`. Restore
-  always selects the latest valid independent archive, never one bounded by the
-  older business backup cutoff. Its credentials and destination are independent.
+- `BACKUP_ATOMIC_PUBLISHER`: `publish-complete-group --lease-config-file FILE
+  --destination URI --run-id ID --source PATH --receipt PATH`. It must perform
+  cross-process/cross-host conditional creation; exactly one publisher may win
+  a run ID and a loser must not overwrite payload, manifest, or COMPLETE.
+- `BACKUP_DESTINATION_CLIENT`: signed `catalog`, verified
+  `fetch-complete-group`, and complete-group `delete-complete-group` only.
+- Reference validation is bundled and pinned. The coordinator executes the
+  fixed SQL query, binds its trusted expected count and query fingerprint to
+  the independently captured inventory, and requires `checked == expected`
+  with zero mismatches. Zero references require an explicit trusted zero.
+- `LEDGER_ARCHIVE_CLIENT`: `snapshot`, `select-latest-complete`,
+  `fetch-complete-group`, and `restore-verified`. The consumer verifies strict
+  schema, active key version/history, HMAC, COMPLETE, archive hash, run binding,
+  and cutoff freshness. A separate proof client emits a signed proof bound to
+  archive run, business run, and recovery generation; exit zero is not proof.
 - `BUSINESS_RESTORE_CLIENT`: restores the verified snapshot with the temporary
   business restore identity; it has no access to the ledger archive.
 
-`destination-rclone.sh` and `minio-business.sh` are baseline adapters in the
-pinned image. Production enablement must verify provider-specific atomic marker
-semantics, least-privilege policies, TLS, and lifecycle behavior.
+`destination-rclone.sh` is read/catalog/delete only in this foundation and
+`minio-business.sh` prevalidates every tar member before extraction. Production
+enablement requires a separate reviewed atomic publisher/lease implementation,
+least-privilege policies, TLS, and lifecycle behavior.
 
 ## First paired backup
 
 1. Run the independent ledger archive first. Its manifest must record the
-   archive cutoff, entry count, archive hash, lifecycle policy version, and all
-   ledger signing-key versions. The key history has exactly one active version
-   and retained retired versions; replacing one unversioned key is forbidden.
+   archive cutoff, entry count, archive hash, lifecycle policy version, and its
+   active signing-key version. The independent key history retains all versions
+   and has exactly one active version; replacing one unversioned key is forbidden.
 2. Export a retention-policy snapshot from
    `retention_policies.backup_window_days` with its policy version. Supply that
    exact value as `BACKUP_WINDOW_DAYS`; no default is permitted.
@@ -97,8 +114,9 @@ semantics, least-privilege policies, TLS, and lifecycle behavior.
    buckets excluding the live ledger, protected secret-file paths, off-host
    destination, application hostname, and client executable paths.
 4. Run `deploy/backup/backup.sh`. It must finish `pg_restore --list`, dump and
-   snapshot hashes, complete object inventory, and zero reference mismatches
-   before writing `manifest.json` and `COMPLETE`.
+   snapshot hashes, complete object inventory, and the pinned reference proof
+   before atomically writing local manifest/COMPLETE and invoking the external
+   atomic publisher. Missing lease support or an invalid receipt fails closed.
 5. Fetch the published group with a read-only identity and rerun manifest,
    marker, hash, inventory, and `pg_restore --list` validation. Record only the
    non-PII evidence location and result.
@@ -112,8 +130,10 @@ infer freshness from process success or a dump file alone.
 
 ## Complete-group-only prune
 
-Run `prune.sh` only after catalog validation. It fails closed when the latest
-point is incomplete/invalid, any complete point disagrees with the current
+Run `prune.sh` only after catalog validation. The catalog verifies manifest
+HMAC, canonical schema, COMPLETE, payload hashes/sizes, inventory, and the
+custom dump list before ordering by remote COMPLETE metadata. It fails closed
+when the latest point is incomplete/invalid, any complete point disagrees with the current
 `backup_window_days`, the catalog is malformed, or fewer than two valid points
 exist. It ignores incomplete staging groups and deletes only an entire valid
 complete group older than the policy cutoff while preserving the newest two
@@ -148,9 +168,11 @@ The drill sequence is strict:
    objects, create and validate one paired restore point, then add post-cutoff
    canaries.
 2. Complete a real B2B2 deletion and independently preserve its ledger.
-3. Start RTO timing. Restore the latest valid ledger archive first; never roll
-   back the ledger. Then restore PostgreSQL and business objects into the new
-   disposable volumes.
+3. Start RTO timing. Restore verifies the selected business group, chooses the
+   latest complete independent ledger archive, validates its signature, hash,
+   freshness, and requires a signed restore proof before recording
+   `ledger_restored_first=true`. It then restores PostgreSQL and prevalidated
+   business objects into the new disposable volumes.
 4. Verify Alembic head, database permissions, aggregate row/object counts,
    hashes, and references. Recovery evidence still records `traffic_open=false`.
 5. Set `B2B3_CLI_COMMAND` and `B2B3_WORKER_COMMAND` only to the released real
@@ -159,8 +181,10 @@ The drill sequence is strict:
    intentionally does not implement or fake either interface.
 6. Require B2B3 evidence for tombstones, absent objects, safe audit counts,
    generation, repeat idempotency, tamper failure, and checkpoint reclaim.
-7. Start API/Worker/proxy only after `traffic-gate.sh` accepts both restore and
-   B2B3 evidence. Pass HTTPS readiness and read-only smoke, stop RTO timing, and
+7. Stop: this foundation cannot open traffic. `traffic-gate.sh` always removes
+   a stale open marker and exits 78 regardless of supplied JSON. After the real
+   signed, replay-resistant B2B3 protocol is released, implement and review its
+   integration in a later slice, then run HTTPS readiness/read-only smoke and
    prove `failure_at - backup_cutoff <= 24 hours` and total RTO `<= 4 hours`.
 
 Until step 7 completes, do not publish ports, remove the traffic-closed marker,
@@ -172,8 +196,9 @@ real B2B3 integration is unavailable.
 Rebuild the host from approved immutable artifacts, restore networking/TLS/DNS,
 mount only new empty data volumes, and deploy the pinned compatible application
 version with traffic disabled. Restore ledger first, then the selected paired
-group, run all isolated verification and B2B3 gates, and only then authorize a
-progressive traffic rollout. Abort on any identity overlap, marker/hash/schema
+group and run all isolated verification. The foundation stops closed; only a
+future reviewed signed B2B3 traffic protocol may authorize a progressive
+rollout. Abort on any identity overlap, marker/hash/schema
 failure, reference mismatch, permission drift, RPO/RTO breach, or B2B3 gap.
 
 ## Evidence and escalation

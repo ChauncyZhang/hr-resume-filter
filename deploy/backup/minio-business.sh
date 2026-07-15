@@ -42,9 +42,9 @@ case "$operation" in
     tar -cf "$output_path" -C "$temporary" objects
     ;;
   restore)
-    : "${snapshot_path:?snapshot is required}"
-    tar -xf "$snapshot_path" -C "$temporary"
-    for bucket_path in "$temporary"/objects/*; do
+    : "${snapshot_path:?snapshot is required}" "${buckets:?business buckets are required}"
+    python3 /opt/ux09-backup/backupctl.py safe-extract "$snapshot_path" "$temporary/extracted" "$buckets"
+    for bucket_path in "$temporary"/extracted/objects/*; do
       [ -d "$bucket_path" ] || continue
       bucket=${bucket_path##*/}
       case "$bucket" in governance-ledger) printf '%s\n' "ledger bucket is forbidden" >&2; exit 1 ;; esac

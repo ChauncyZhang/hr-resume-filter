@@ -6,14 +6,15 @@ This change is the Phase 6C foundation only. It is not production ready and
 does not claim Phase 6C completion. The independent slice establishes a pinned
 backup toolchain, paired restore-point state machine, off-host and secret-file
 contracts, complete-group-only prune planning, ledger separation, disposable
-restore guards, a default-closed traffic gate, canonical runbooks, and focused
-contract tests.
+restore guards, a permanently disabled foundation traffic gate, canonical
+runbooks, and focused contract tests.
 
 A complete real restore drill still depends on the released real B2B3 CLI and
 B2B3 Worker for prevalidation, recovery checkpoints, recovery generation,
 re-deletion, idempotency, tamper failure, and checkpoint reclaim. This slice
-exposes those command/evidence interfaces and refuses to open traffic when they
-are absent; it does not implement or fake B2B3.
+documents the future command/evidence integration boundary but refuses every
+traffic-open request, including caller JSON, mock, unsigned, missing-run, and
+replayed evidence. It does not implement or fake B2B3.
 
 ## Scope and protected files
 
@@ -28,44 +29,58 @@ unchanged and unstaged.
 
 - PostgreSQL custom-format dump and business MinIO snapshot share one
   `backup_run_id`; `pg_restore --list`, hashes, hashed object inventory, and
-  zero reference mismatches precede manifest and COMPLETE publication.
+  a bundled/pinned exact-count reference proof precede manifest and COMPLETE
+  publication. Explicit trusted zero references are supported.
 - Off-host URI validation rejects local/application-host and PostgreSQL/MinIO
-  data-volume paths. Credentials and signing material are distinct protected
-  files and are absent from argv values, logs, manifests, and evidence.
-- Prune is complete-group-only, fails closed on invalid latest or retention
-  policy mismatch, and preserves at least the newest two valid points.
+  data-volume paths, unsafe URI syntax, and dangerous schemes. Run/generation
+  fragments are validated before safe resolved joins. Credentials and signing
+  material are distinct no-follow, single-inode protected files copied to
+  process-private 0600 paths and absent from argv values, logs, manifests, and
+  evidence.
+- COMPLETE-last publication now requires an external conditional-create/lease
+  publisher and a run/hash-bound receipt. The rclone adapter refuses publishing
+  with safety code 78. The local concurrency reference proves one winner cannot
+  be overwritten by the loser.
+- Prune verifies canonical manifest schema/HMAC, COMPLETE, payload hashes,
+  inventory, and custom dump list; it orders by COMPLETE metadata, fails closed
+  on any invalid catalog/latest or retention mismatch, and preserves at least
+  the newest two valid points.
 - The live ledger is excluded from business snapshots. Archive destination,
   credentials, lifecycle, manifest, restore identity, and signing-key
   version/history contracts are independent; business capabilities cannot
-  restore/delete ledger data.
+  restore/delete ledger data. Restore verifies ledger schema, active key
+  version/history, HMAC, COMPLETE, archive hash, freshness, run binding, and a
+  signed run/generation-bound restore proof; client exit zero is insufficient.
 - Restore and drill reject production projects/volumes and require
-  `DISPOSABLE_RECOVERY_CONFIRMED=1`. Ledger restore is ordered before an older
-  business restore. Traffic remains closed until real B2B3 CLI and B2B3 Worker
-  evidence passes every required gate.
+  `DISPOSABLE_RECOVERY_CONFIRMED=1`. Restore start atomically clears stale open
+  state and binds closed evidence to the current run/generation. MinIO tar
+  members are fully allowlisted before safe extraction. Traffic-open is not an
+  available state transition in this foundation, even if JSON claims B2B3
+  success.
 - The operational contract schedules backup every 12 hours, budgets a 24-hour
   RPO and 4-hour RTO, and excludes object keys, candidate/request IDs,
   filenames, PII, content, credentials, and secrets from public evidence.
 
 ## TDD and verification evidence
 
-The initial focused RED run produced `23 failed`: every failure was the intended
-absence of the new Phase 6C contract surface. The generated-artifact guard then
-failed on the observed `deploy/backup/__pycache__`/`.pyc`, and passed after
-scoped cleanup plus bytecode suppression. A submission review added four
-regressions that first failed for strict schema extensions, missing manifest
-signature verification, cutoff-bounded ledger restore, and run-ID overwrite;
-all four were fixed before final GREEN.
+The independent-review malicious reproductions were added before implementation.
+The first expanded RED run produced `34 failed, 22 passed, 1 skipped`; after the
+security helper layer, six orchestration/configuration tests remained RED. They
+covered the disabled traffic transition, path traversal/symlink escape, lease
+publication race, signed prune catalog, ledger proof binding, secret-file
+TOCTOU, strict reference counts, immutable Compose image, and malicious tar
+members. All non-platform-specific cases are GREEN. Generated-artifact checks
+explicitly reject `deploy/backup/__pycache__`, `.pyc`, and `.pyo` files.
 
 Fresh pre-commit evidence:
 
-- Focused contract suite: `27 passed`.
+- Focused contract suite: `68 passed, 2 skipped` (Windows symlink capability
+  skips; traversal, hardlink, permissions, absolute paths, and tar attacks ran).
 - POSIX `sh -n` for all backup scripts: success.
 - Isolated `docker compose ... config --quiet`: success; no traffic service or
   production volume is present.
-- Digest-pinned image build: success, local image ID
-  `sha256:5b90360b046c774af7081548b7453e164946f2a43b92a26fc177c1e8894e9084`.
-- Runtime versions: Python 3.12.13, PostgreSQL dump/restore 16.9, MinIO Client
-  `RELEASE.2025-07-21T05-28-08Z`, and rclone 1.70.3.
+- Drill Compose requires `${BACKUP_IMAGE:?}@${BACKUP_IMAGE_DIGEST:?}` and has no
+  mutable backup-tool tag or local build fallback.
 - Python syntax, runtime secret scan, PII/secret-value scan, and generated
   artifact scan: success.
 

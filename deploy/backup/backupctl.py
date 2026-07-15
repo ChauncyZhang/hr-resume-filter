@@ -9,23 +9,37 @@ logs, manifests, or evidence documents.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import urlparse
 
 
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{4,127}$")
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{3,126}[A-Za-z0-9])$")
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+ALLOWED_REMOTE_SCHEMES = {"s3", "s3+https", "azure", "gcs"}
+REFERENCE_VALIDATOR_ID = "ux09-reference-validator-v1"
+REFERENCE_QUERY = """SELECT storage_key FROM file_objects WHERE storage_state <> 'deleted'
+UNION
+SELECT object_key FROM report_exports WHERE object_key IS NOT NULL AND status = 'succeeded'
+ORDER BY 1"""
+REFERENCE_QUERY_FINGERPRINT = hashlib.sha256(REFERENCE_QUERY.encode("utf-8")).hexdigest()
 FORBIDDEN_MANIFEST_KEYS = {
     "access_key",
     "candidate_id",
@@ -45,6 +59,65 @@ DEFAULT_FORBIDDEN_DATA_PATHS = (
     "/data/postgres",
     "/data/minio",
 )
+
+
+class SecurityContractError(ValueError):
+    """A safety contract intentionally blocks the requested state transition."""
+
+
+def validate_run_id(value: str) -> str:
+    if not isinstance(value, str) or not RUN_ID_RE.fullmatch(value):
+        raise ValueError("run or generation fragment is invalid")
+    return value
+
+
+def safe_run_path(root: Path, fragment: str, *, prefix: str = "") -> Path:
+    validate_run_id(fragment)
+    root_resolved = root.resolve()
+    candidate = (root_resolved / f"{prefix}{fragment}").resolve(strict=False)
+    try:
+        common = Path(os.path.commonpath([str(root_resolved), str(candidate)]))
+    except ValueError as error:
+        raise ValueError("joined run path escapes its root") from error
+    if common != root_resolved:
+        raise ValueError("joined run path escapes its root")
+    unresolved = root_resolved / f"{prefix}{fragment}"
+    if unresolved.is_symlink() or (unresolved.exists() and candidate != unresolved.absolute()):
+        raise ValueError("joined run path resolves through a symlink")
+    return candidate
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
+    _atomic_write_bytes(path, _canonical_json(value))
 
 
 def _parse_utc(value: str) -> datetime:
@@ -109,8 +182,7 @@ def validate_backup_manifest(manifest: Mapping[str, Any]) -> None:
         raise ValueError("manifest contains fields outside the non-PII schema allowlist")
     if root["schema_version"] != 1 or root["state"] != "complete":
         raise ValueError("manifest is not a complete schema version 1 restore point")
-    if not isinstance(root["backup_run_id"], str) or not RUN_ID_RE.fullmatch(root["backup_run_id"]):
-        raise ValueError("invalid backup_run_id")
+    validate_run_id(root["backup_run_id"])
     _parse_utc(root["backup_cutoff_utc"])
     if root["schedule_interval_hours"] != 12:
         raise ValueError("backup schedule must be exactly 12 hours")
@@ -141,16 +213,21 @@ def validate_backup_manifest(manifest: Mapping[str, Any]) -> None:
     _require_sha256(business.get("inventory_sha256"), "business_snapshot.inventory_sha256")
 
     references = _require_mapping(root["reference_validation"], "reference_validation")
-    if set(references) != {"checked", "mismatches"}:
+    if set(references) != {
+        "schema_version", "validator_id", "query_fingerprint", "inventory_sha256",
+        "expected", "checked", "mismatches",
+    }:
         raise ValueError("reference evidence contains fields outside the schema allowlist")
-    if int(references.get("checked", -1)) < 0 or int(references.get("mismatches", -1)) != 0:
-        raise ValueError("reference validation must finish with zero mismatches")
+    validate_reference_proof(
+        references,
+        expected=references.get("expected"),
+        inventory_sha256=str(business["inventory_sha256"]),
+    )
 
     ledger = _require_mapping(root["ledger_archive"], "ledger_archive")
     if set(ledger) != {"archive_run_id", "cutoff_utc", "manifest_sha256", "signing_key_versions"}:
         raise ValueError("ledger evidence contains fields outside the schema allowlist")
-    if not RUN_ID_RE.fullmatch(str(ledger.get("archive_run_id", ""))):
-        raise ValueError("ledger archive run id is invalid")
+    validate_run_id(str(ledger.get("archive_run_id", "")))
     _parse_utc(str(ledger.get("cutoff_utc", "")))
     _require_sha256(ledger.get("manifest_sha256"), "ledger_archive.manifest_sha256")
     versions = ledger.get("signing_key_versions")
@@ -179,25 +256,45 @@ def atomic_publish_local(
     final_validator: Callable[[], None],
 ) -> None:
     """Reference implementation for atomic directory publication in tests/drills."""
-    if not staging.is_dir() or published.exists():
-        raise ValueError("staging must exist and published destination must not exist")
+    if not staging.is_dir():
+        raise ValueError("staging must exist")
     final_validator()
     validate_backup_manifest(manifest)
     payload = _canonical_json(manifest)
     manifest_tmp = staging / ".manifest.json.tmp"
     complete_tmp = staging / ".COMPLETE.tmp"
-    manifest_tmp.write_bytes(payload)
-    complete_tmp.write_text(hashlib.sha256(payload).hexdigest() + "\n", encoding="ascii")
+    _atomic_write_bytes(manifest_tmp, payload)
+    _atomic_write_bytes(complete_tmp, (hashlib.sha256(payload).hexdigest() + "\n").encode("ascii"))
     os.replace(manifest_tmp, staging / "manifest.json")
     os.replace(complete_tmp, staging / "COMPLETE")
     published.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(staging, published)
+    lease_directory = published.parent / ".leases"
+    lease_directory.mkdir(mode=0o700, exist_ok=True)
+    validate_run_id(str(manifest["backup_run_id"]))
+    lease = safe_run_path(lease_directory, str(manifest["backup_run_id"]), prefix="lease-")
+    descriptor = os.open(lease, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(descriptor, (str(manifest["backup_run_id"]) + "\n").encode("ascii"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    _fsync_directory(lease_directory)
+    if published.exists():
+        raise FileExistsError("atomic publication destination already exists")
+    os.rename(staging, published)
+    _fsync_directory(published.parent)
 
 
 def validate_off_host_destination(destination: str, application_host: str, forbidden_paths: Iterable[str]) -> str:
     parsed = urlparse(destination)
-    if parsed.scheme.lower() in LOCAL_DESTINATION_SCHEMES or not parsed.netloc:
-        raise ValueError("backup destination must be an explicit off-host URI")
+    if parsed.scheme.lower() not in ALLOWED_REMOTE_SCHEMES or not parsed.netloc:
+        raise ValueError("backup destination scheme is not approved for off-host storage")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("backup destination userinfo is forbidden")
+    if parsed.query or parsed.fragment:
+        raise ValueError("backup destination query and fragment are forbidden")
+    if "%" in parsed.path or "\\" in parsed.path:
+        raise ValueError("backup destination path encoding is ambiguous or unsafe")
     host = (parsed.hostname or "").lower().rstrip(".")
     app_host = application_host.lower().rstrip(".")
     if host in LOCAL_DESTINATION_HOSTS or (app_host and host == app_host):
@@ -213,14 +310,80 @@ def validate_off_host_destination(destination: str, application_host: str, forbi
 def validate_secret_files(paths: Sequence[Path]) -> None:
     if not paths:
         raise ValueError("secret files are required")
-    resolved = [path.resolve() for path in paths]
-    if len(set(resolved)) != len(resolved):
-        raise ValueError("all backup, prune, restore, ledger, and signing secret files must be distinct")
-    for path in resolved:
-        if not path.is_file() or path.stat().st_size <= 0:
-            raise ValueError(f"secret file is missing or empty: {path}")
-        if os.name != "nt" and path.stat().st_mode & 0o077:
-            raise ValueError(f"secret file permissions must be 0600 or stricter: {path}")
+    identities: set[tuple[int, int]] = set()
+    for path in paths:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("secret file symlinks are forbidden")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("secret path must be a regular file")
+        if metadata.st_nlink != 1:
+            raise ValueError("secret file hardlinks or shared inodes are forbidden")
+        if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise ValueError("secret file permissions must be 0600 or stricter")
+        if metadata.st_size <= 0:
+            raise ValueError("secret file is empty")
+        identity = (metadata.st_dev, metadata.st_ino)
+        if identity in identities:
+            raise ValueError("all secret files must use distinct inodes")
+        identities.add(identity)
+
+
+@contextmanager
+def secure_secret_copies(paths: Sequence[Path], private_root: Path):
+    validate_secret_files(paths)
+    private_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    copies: list[Path] = []
+    opened: list[int] = []
+    try:
+        for index, path in enumerate(paths):
+            before = path.lstat()
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            opened.append(descriptor)
+            after = os.fstat(descriptor)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or not stat.S_ISREG(after.st_mode):
+                raise ValueError("secret file changed during secure open")
+            target = private_root / f"secret-{index}"
+            output = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
+            try:
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    os.write(output, chunk)
+                os.fsync(output)
+            finally:
+                os.close(output)
+            target.chmod(0o600)
+            copies.append(target)
+        _fsync_directory(private_root)
+        yield copies
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+        shutil.rmtree(private_root, ignore_errors=True)
+
+
+def validate_reference_proof(proof: Mapping[str, Any], *, expected: int, inventory_sha256: str) -> None:
+    fields = {
+        "schema_version", "validator_id", "query_fingerprint", "inventory_sha256",
+        "expected", "checked", "mismatches",
+    }
+    if set(proof) != fields or proof.get("schema_version") != 1:
+        raise ValueError("reference proof schema is invalid")
+    if proof.get("validator_id") != REFERENCE_VALIDATOR_ID:
+        raise ValueError("reference validator identity is not pinned")
+    if proof.get("query_fingerprint") != REFERENCE_QUERY_FINGERPRINT:
+        raise ValueError("reference query fingerprint is invalid")
+    if proof.get("inventory_sha256") != inventory_sha256:
+        raise ValueError("reference inventory fingerprint is invalid")
+    if not isinstance(expected, int) or expected < 0:
+        raise ValueError("trusted reference expected count is invalid")
+    if proof.get("expected") != expected or proof.get("checked") != expected:
+        raise ValueError("reference checked count must equal trusted expected count")
+    if proof.get("mismatches") != 0:
+        raise ValueError("reference validation found mismatches")
 
 
 def plan_prune(catalog: Sequence[Mapping[str, Any]], retention_days: int, now: datetime) -> list[str]:
@@ -228,8 +391,11 @@ def plan_prune(catalog: Sequence[Mapping[str, Any]], retention_days: int, now: d
         raise ValueError("retention policy and timezone-aware current time are required")
     if not catalog:
         raise ValueError("cannot prune an empty backup catalog")
-    ordered = sorted(catalog, key=lambda item: _parse_utc(str(item.get("backup_cutoff_utc", ""))))
-    latest = ordered[-1]
+    complete_orders = [item.get("complete_order") for item in catalog if item.get("complete") is True]
+    if any(not isinstance(value, int) or value < 1 for value in complete_orders) or len(set(complete_orders)) != len(complete_orders):
+        raise ValueError("remote COMPLETE order is missing, invalid, or duplicated")
+    ordered = sorted(catalog, key=lambda item: int(item.get("complete_order", 0)))
+    latest = max((item for item in ordered if item.get("complete") is True), key=lambda item: int(item["complete_order"]))
     if latest.get("complete") is not True or latest.get("valid") is not True:
         raise ValueError("latest backup is incomplete or invalid; prune fails closed")
     complete = [item for item in ordered if item.get("complete") is True]
@@ -243,8 +409,7 @@ def plan_prune(catalog: Sequence[Mapping[str, Any]], retention_days: int, now: d
     deletions = []
     for item in valid:
         run_id = str(item.get("backup_run_id", ""))
-        if not RUN_ID_RE.fullmatch(run_id):
-            raise ValueError("invalid backup_run_id in catalog")
+        validate_run_id(run_id)
         if run_id not in protected and _parse_utc(str(item["backup_cutoff_utc"])) < cutoff:
             deletions.append(run_id)
     return deletions
@@ -278,6 +443,85 @@ def validate_ledger_boundary(
     _scan_manifest(key_history)
 
 
+def validate_ledger_archive_group(
+    group: Path,
+    signing_key: Path,
+    key_history: Mapping[str, Any],
+    *,
+    minimum_cutoff_utc: str,
+) -> Mapping[str, Any]:
+    validate_run_id(group.name)
+    validate_ledger_boundary(
+        business_buckets=[],
+        ledger_bucket="ledger",
+        business_capabilities=set(),
+        business_destination="s3://business.invalid/archive",
+        ledger_destination="s3://ledger.invalid/archive",
+        key_history=key_history,
+    )
+    expected_fields = {
+        "schema_version", "archive_run_id", "cutoff_utc", "archive_sha256",
+        "size_bytes", "entry_count", "signing_key_version", "lifecycle_policy_version",
+    }
+    manifest_path = group / "ledger-manifest.json"
+    signature_path = group / "ledger-manifest.sig"
+    complete_path = group / "COMPLETE"
+    archive_path = group / "ledger.snapshot"
+    manifest = _require_mapping(_load_json(manifest_path), "ledger archive manifest")
+    if set(manifest) != expected_fields or manifest.get("schema_version") != 1:
+        raise ValueError("ledger archive manifest schema is invalid")
+    if manifest.get("archive_run_id") != group.name:
+        raise ValueError("ledger archive run binding is invalid")
+    validate_run_id(str(manifest["archive_run_id"]))
+    if manifest.get("signing_key_version") != key_history.get("active_key_version"):
+        raise ValueError("ledger signing key version is not active")
+    verify_hmac_signature(manifest_path, signing_key, signature_path)
+    complete = complete_path.read_text(encoding="ascii").strip()
+    if complete != hashlib.sha256(manifest_path.read_bytes()).hexdigest():
+        raise ValueError("ledger COMPLETE marker does not match manifest")
+    _require_sha256(manifest.get("archive_sha256"), "ledger archive hash")
+    if not archive_path.is_file() or archive_path.stat().st_size != manifest.get("size_bytes"):
+        raise ValueError("ledger archive size does not match manifest")
+    if _sha256_file(archive_path) != manifest.get("archive_sha256"):
+        raise ValueError("ledger archive hash does not match manifest")
+    if not isinstance(manifest.get("entry_count"), int) or manifest["entry_count"] < 0:
+        raise ValueError("ledger archive entry count is invalid")
+    cutoff = _parse_utc(str(manifest.get("cutoff_utc", "")))
+    if cutoff < _parse_utc(minimum_cutoff_utc):
+        raise ValueError("ledger archive is not fresh enough for recovery")
+    return manifest
+
+
+def validate_ledger_restore_proof(
+    proof_path: Path,
+    signature_path: Path,
+    signing_key: Path,
+    archive_manifest: Mapping[str, Any],
+    business_run_id: str,
+    generation_id: str,
+) -> None:
+    validate_run_id(business_run_id)
+    validate_run_id(generation_id)
+    verify_hmac_signature(proof_path, signing_key, signature_path)
+    proof = _require_mapping(_load_json(proof_path), "ledger restore proof")
+    fields = {
+        "schema_version", "status", "ledger_archive_run_id", "business_backup_run_id",
+        "recovery_generation_id", "archive_sha256", "cutoff_utc", "restored_entry_count",
+    }
+    if set(proof) != fields or proof.get("schema_version") != 1 or proof.get("status") != "verified":
+        raise ValueError("ledger restore proof schema is invalid")
+    expected = {
+        "ledger_archive_run_id": archive_manifest.get("archive_run_id"),
+        "business_backup_run_id": business_run_id,
+        "recovery_generation_id": generation_id,
+        "archive_sha256": archive_manifest.get("archive_sha256"),
+        "cutoff_utc": archive_manifest.get("cutoff_utc"),
+        "restored_entry_count": archive_manifest.get("entry_count"),
+    }
+    if any(proof.get(key) != value for key, value in expected.items()):
+        raise ValueError("ledger restore proof run/generation/archive binding is invalid")
+
+
 def validate_disposable_recovery(project: str, volumes: Sequence[str], confirmed: str) -> None:
     if confirmed != "1":
         raise ValueError("disposable recovery requires DISPOSABLE_RECOVERY_CONFIRMED=1")
@@ -289,25 +533,89 @@ def validate_disposable_recovery(project: str, volumes: Sequence[str], confirmed
         raise ValueError("production volumes are forbidden")
 
 
-def require_traffic_open_evidence(restore: Mapping[str, Any], b2b3: Mapping[str, Any] | None) -> bool:
-    restore_gates = restore.get("gates") if isinstance(restore, Mapping) else None
-    if restore.get("state") != "restored" or restore.get("traffic_open") is not False:
-        raise ValueError("restore evidence must leave traffic closed")
-    if not isinstance(restore_gates, Mapping) or not all(
-        restore_gates.get(name) is True for name in ("database", "business_objects", "ledger_restored_first")
-    ):
-        raise ValueError("restore gates are incomplete; traffic remains closed")
-    required = (
-        "real_cli",
-        "real_worker",
-        "redelete_verified",
-        "idempotency_verified",
-        "tamper_failure_verified",
-        "checkpoint_reclaim_verified",
+def require_traffic_open_evidence(_restore: Mapping[str, Any], _b2b3: Mapping[str, Any] | None) -> bool:
+    raise SecurityContractError(
+        "traffic-open is disabled until the real signed B2B3 evidence protocol is available"
     )
-    if not isinstance(b2b3, Mapping) or b2b3.get("status") != "complete" or not all(b2b3.get(name) is True for name in required):
-        raise ValueError("real B2B3 CLI and Worker recovery evidence is incomplete; traffic remains closed")
-    return True
+
+
+def begin_closed_recovery(
+    evidence_path: Path,
+    closed_marker_path: Path,
+    open_marker_path: Path,
+    backup_run_id: str,
+    generation_id: str,
+) -> Mapping[str, Any]:
+    validate_run_id(backup_run_id)
+    validate_run_id(generation_id)
+    if open_marker_path.is_symlink():
+        raise ValueError("traffic-open marker path cannot be a symlink")
+    open_marker_path.unlink(missing_ok=True)
+    state = {
+        "schema_version": 1,
+        "state": "restore_started_traffic_closed",
+        "backup_run_id": backup_run_id,
+        "recovery_generation_id": generation_id,
+        "traffic_open": False,
+    }
+    _atomic_write_json(evidence_path, state)
+    _atomic_write_json(closed_marker_path, state)
+    return state
+
+
+def safe_extract_business_snapshot(archive_path: Path, destination: Path, approved_buckets: set[str]) -> None:
+    if not approved_buckets or any(not BUCKET_RE.fullmatch(bucket) for bucket in approved_buckets):
+        raise ValueError("approved business bucket set is invalid")
+    if destination.exists():
+        raise ValueError("tar extraction destination must not already exist")
+    with tarfile.open(archive_path, "r:*") as archive:
+        members = archive.getmembers()
+        for member in members:
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError("tar member path is absolute or traverses")
+            if not path.parts or path.parts[0] != "objects":
+                raise ValueError("tar member has unexpected top-level path")
+            if len(path.parts) == 1:
+                if not member.isdir():
+                    raise ValueError("tar objects root must be a directory")
+                continue
+            if path.parts[1] not in approved_buckets:
+                raise ValueError("tar member bucket is not approved")
+            if len(path.parts) == 2 and not member.isdir():
+                raise ValueError("tar bucket root must be a directory")
+            if not (member.isdir() or member.isreg()):
+                raise ValueError("tar member type is forbidden")
+        destination.mkdir(mode=0o700, parents=True)
+        for member in members:
+            path = PurePosixPath(member.name)
+            target = destination.joinpath(*path.parts)
+            target_resolved = target.resolve(strict=False)
+            if Path(os.path.commonpath([str(destination.resolve()), str(target_resolved)])) != destination.resolve():
+                raise ValueError("tar member path escapes destination")
+            if member.isdir():
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if target.is_symlink():
+                    raise ValueError("tar directory resolved through symlink")
+                continue
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError("tar regular member has no payload")
+            descriptor = os.open(
+                target,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    os.write(descriptor, chunk)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
 
 def build_drill_evidence(
@@ -348,8 +656,7 @@ def _load_json(path: Path) -> Any:
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_canonical_json(value))
+    _atomic_write_json(path, value)
 
 
 def _require_env(name: str) -> str:
@@ -363,21 +670,51 @@ def _secret_paths(*names: str) -> list[Path]:
     return [Path(_require_env(name)) for name in names]
 
 
-def _run(command: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def _private_secret_root(root: Path, purpose: str) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    root_resolved = root.resolve()
+    candidate = (root_resolved / f".{purpose}-secrets-{os.getpid()}-{secrets.token_hex(8)}").resolve(strict=False)
+    if Path(os.path.commonpath([str(root_resolved), str(candidate)])) != root_resolved:
+        raise ValueError("private secret path escapes its root")
+    return candidate
+
+
+def _sanitized_child_environment(**overrides: str) -> dict[str, str]:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.endswith("_FILE") and not name.endswith("_CONFIG_FILE")
+    }
+    environment.update(overrides)
+    return environment
+
+
+def _run(
+    command: Sequence[str],
+    *,
+    capture: bool = False,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(command),
         check=True,
         text=True,
         stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
+        env=dict(environment) if environment is not None else None,
     )
 
 
-def _client(env_name: str, *arguments: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def _client(
+    env_name: str,
+    *arguments: str,
+    capture: bool = False,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     executable = _require_env(env_name)
     if any(character.isspace() for character in executable):
         raise ValueError(f"{env_name} must be one executable path, not a shell command")
-    return _run([executable, *arguments], capture=capture)
+    return _run([executable, *arguments], capture=capture, environment=environment)
 
 
 def _sha256_file(path: Path) -> str:
@@ -393,7 +730,7 @@ def write_hmac_signature(payload_path: Path, key_path: Path, output_path: Path) 
     if len(key) < 32:
         raise ValueError("manifest signing key must contain at least 32 bytes")
     signature = hmac.new(key, payload_path.read_bytes(), hashlib.sha256).hexdigest()
-    output_path.write_text(signature + "\n", encoding="ascii")
+    _atomic_write_bytes(output_path, (signature + "\n").encode("ascii"))
 
 
 def verify_hmac_signature(payload_path: Path, key_path: Path, signature_path: Path) -> None:
@@ -425,6 +762,112 @@ def _validate_business_inventory(path: Path) -> tuple[int, str]:
     return len(objects), _sha256_file(path)
 
 
+def build_reference_proof(database_keys: Sequence[str], inventory: Mapping[str, Any]) -> Mapping[str, Any]:
+    objects = inventory.get("objects") if isinstance(inventory, Mapping) else None
+    if not isinstance(objects, list):
+        raise ValueError("business inventory must enumerate objects")
+    inventory_hashes = {str(item.get("key_hash", "")) for item in objects if isinstance(item, Mapping)}
+    if len(inventory_hashes) != len(objects) or any(not SHA256_RE.fullmatch(value) for value in inventory_hashes):
+        raise ValueError("business inventory key hashes are invalid or duplicated")
+    normalized_keys = sorted(set(database_keys))
+    if len(normalized_keys) != len(database_keys) or any(not key for key in normalized_keys):
+        raise ValueError("pinned reference query returned empty or duplicate keys")
+    database_hashes = {hashlib.sha256(key.encode("utf-8")).hexdigest() for key in normalized_keys}
+    expected = len(normalized_keys)
+    return {
+        "schema_version": 1,
+        "validator_id": REFERENCE_VALIDATOR_ID,
+        "query_fingerprint": REFERENCE_QUERY_FINGERPRINT,
+        "inventory_sha256": hashlib.sha256(_canonical_json(inventory)).hexdigest(),
+        "expected": expected,
+        "checked": expected,
+        "mismatches": len(database_hashes.symmetric_difference(inventory_hashes)),
+    }
+
+
+def validate_complete_backup_group(
+    group: Path,
+    signing_key: Path,
+    restore_lister: Callable[[Path], int],
+) -> Mapping[str, Any]:
+    validate_run_id(group.name)
+    if group.is_symlink() or not group.is_dir():
+        raise ValueError("backup group must be a non-symlink directory")
+    manifest_path = group / "manifest.json"
+    signature_path = group / "manifest.sig"
+    complete_path = group / "COMPLETE"
+    manifest = _require_mapping(_load_json(manifest_path), "backup manifest")
+    validate_backup_manifest(manifest)
+    if manifest.get("backup_run_id") != group.name:
+        raise ValueError("backup manifest run binding is invalid")
+    if manifest_path.read_bytes() != _canonical_json(manifest):
+        raise ValueError("backup manifest is not canonical")
+    verify_hmac_signature(manifest_path, signing_key, signature_path)
+    complete = complete_path.read_text(encoding="ascii").strip()
+    if complete != _sha256_file(manifest_path):
+        raise ValueError("backup COMPLETE marker does not match manifest")
+
+    dump = group / "database.dump"
+    snapshot = group / "business.snapshot"
+    inventory = group / "business.inventory.json"
+    if not all(path.is_file() and not path.is_symlink() for path in (dump, snapshot, inventory)):
+        raise ValueError("backup payload is missing or is a symlink")
+    if dump.stat().st_size != manifest["database"]["size_bytes"] or _sha256_file(dump) != manifest["database"]["sha256"]:
+        raise ValueError("database dump size or hash is invalid")
+    if snapshot.stat().st_size != manifest["business_snapshot"]["size_bytes"] or _sha256_file(snapshot) != manifest["business_snapshot"]["sha256"]:
+        raise ValueError("business snapshot size or hash is invalid")
+    object_count, inventory_hash = _validate_business_inventory(inventory)
+    if inventory_hash != manifest["business_snapshot"]["inventory_sha256"] or object_count != manifest["business_snapshot"]["object_count"]:
+        raise ValueError("business inventory is invalid")
+    listed_entries = restore_lister(dump)
+    if listed_entries != manifest["database"]["restore_list_entries"]:
+        raise ValueError("pg_restore list evidence does not match the custom dump")
+    return manifest
+
+
+def catalog_from_groups(
+    root: Path,
+    signing_key: Path,
+    restore_lister: Callable[[Path], int],
+) -> list[Mapping[str, Any]]:
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError("catalog root must be a non-symlink directory")
+    catalog: list[Mapping[str, Any]] = []
+    for group in sorted(path for path in root.iterdir() if path.name not in {".incomplete", ".leases"}):
+        if not group.is_dir() or group.is_symlink():
+            raise ValueError(f"invalid catalog entry: {group.name}")
+        try:
+            manifest = validate_complete_backup_group(group, signing_key, restore_lister)
+            complete_order = (group / "COMPLETE").stat().st_mtime_ns
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            raise ValueError(f"invalid catalog backup group: {group.name}") from error
+        catalog.append(
+            {
+                "backup_run_id": manifest["backup_run_id"],
+                "backup_cutoff_utc": manifest["backup_cutoff_utc"],
+                "complete": True,
+                "valid": True,
+                "backup_window_days": manifest["retention"]["backup_window_days"],
+                "complete_order": complete_order,
+            }
+        )
+    if not catalog:
+        raise ValueError("catalog has no complete backup groups")
+    return catalog
+
+
+def validate_publish_receipt(path: Path, run_id: str, complete_sha256: str) -> Mapping[str, Any]:
+    receipt = _require_mapping(_load_json(path), "atomic publisher receipt")
+    expected_fields = {"schema_version", "status", "backup_run_id", "complete_sha256", "lease_id_hash"}
+    if set(receipt) != expected_fields or receipt.get("schema_version") != 1 or receipt.get("status") != "committed":
+        raise ValueError("atomic publisher receipt schema is invalid")
+    validate_run_id(str(receipt.get("backup_run_id", "")))
+    if receipt.get("backup_run_id") != run_id or receipt.get("complete_sha256") != complete_sha256:
+        raise ValueError("atomic publisher receipt is not bound to this complete group")
+    _require_sha256(receipt.get("lease_id_hash"), "atomic publisher lease id hash")
+    return receipt
+
+
 def command_guard_disposable(_: argparse.Namespace) -> None:
     volumes = [item for item in _require_env("RECOVERY_VOLUME_NAMES").split(",") if item]
     validate_disposable_recovery(
@@ -434,6 +877,15 @@ def command_guard_disposable(_: argparse.Namespace) -> None:
 
 def command_validate_manifest(args: argparse.Namespace) -> None:
     validate_backup_manifest(_load_json(Path(args.path)))
+
+
+def command_validate_run_id(args: argparse.Namespace) -> None:
+    validate_run_id(args.value)
+
+
+def command_safe_extract(args: argparse.Namespace) -> None:
+    buckets = {bucket for bucket in args.buckets.split(",") if bucket}
+    safe_extract_business_snapshot(Path(args.archive), Path(args.destination), buckets)
 
 
 def command_prune_plan(args: argparse.Namespace) -> None:
@@ -463,184 +915,156 @@ def command_inventory(args: argparse.Namespace) -> None:
 
 def command_catalog_local(args: argparse.Namespace) -> None:
     root = Path(args.root)
-    catalog = []
-    if not root.is_dir():
-        raise ValueError("catalog root must be a directory")
-    for manifest_path in sorted(root.rglob("manifest.json")):
-        group = manifest_path.parent
-        try:
-            manifest = _load_json(manifest_path)
-            complete = (group / "COMPLETE").is_file()
-            valid = False
-            if complete:
-                marker = (group / "COMPLETE").read_text(encoding="ascii").strip()
-                valid = marker == hashlib.sha256(_canonical_json(manifest)).hexdigest()
-                if valid:
-                    validate_backup_manifest(manifest)
-                    dump = group / "database.dump"
-                    snapshot = group / "business.snapshot"
-                    inventory = group / "business.inventory.json"
-                    valid = (
-                        dump.is_file()
-                        and snapshot.is_file()
-                        and inventory.is_file()
-                        and _sha256_file(dump) == manifest["database"]["sha256"]
-                        and _sha256_file(snapshot) == manifest["business_snapshot"]["sha256"]
-                        and _sha256_file(inventory) == manifest["business_snapshot"]["inventory_sha256"]
-                    )
-                    if valid:
-                        object_count, _ = _validate_business_inventory(inventory)
-                        valid = object_count == manifest["business_snapshot"]["object_count"]
-                    if valid:
-                        listed = _run([os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--list", str(dump)], capture=True)
-                        entries = sum(1 for line in listed.stdout.splitlines() if line and not line.startswith(";"))
-                        valid = entries == manifest["database"]["restore_list_entries"]
-            catalog.append(
-                {
-                    "backup_run_id": str(manifest.get("backup_run_id", group.name)),
-                    "backup_cutoff_utc": str(manifest.get("backup_cutoff_utc", "")),
-                    "complete": complete,
-                    "valid": valid,
-                    "backup_window_days": manifest.get("retention", {}).get("backup_window_days"),
-                }
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            catalog.append(
-                {
-                    "backup_run_id": group.name,
-                    "backup_cutoff_utc": "1970-01-01T00:00:00Z",
-                    "complete": (group / "COMPLETE").is_file(),
-                    "valid": False,
-                    "backup_window_days": None,
-                }
-            )
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.output).write_text(json.dumps(catalog, sort_keys=True) + "\n", encoding="utf-8")
+    signing_key = Path(args.signing_key)
+
+    def restore_lister(dump: Path) -> int:
+        listed = _run([os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--list", str(dump)], capture=True)
+        return sum(1 for line in listed.stdout.splitlines() if line and not line.startswith(";"))
+
+    catalog = catalog_from_groups(root, signing_key, restore_lister)
+    _atomic_write_bytes(Path(args.output), (json.dumps(catalog, sort_keys=True) + "\n").encode("utf-8"))
 
 
 def command_traffic_gate(args: argparse.Namespace) -> None:
-    restore = _load_json(Path(args.restore_evidence))
-    b2b3 = _load_json(Path(args.b2b3_evidence))
-    require_traffic_open_evidence(restore, b2b3)
     marker = Path(args.marker)
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text("B2B3_COMPLETE_TRAFFIC_MAY_OPEN\n", encoding="ascii")
+    if marker.is_symlink():
+        raise SecurityContractError("traffic-open marker symlinks are forbidden")
+    marker.unlink(missing_ok=True)
+    raise SecurityContractError(
+        "traffic-open is disabled until the real signed B2B3 evidence protocol is available"
+    )
 
 
 def command_backup(_: argparse.Namespace) -> None:
-    run_id = _require_env("BACKUP_RUN_ID")
-    if not RUN_ID_RE.fullmatch(run_id):
-        raise ValueError("BACKUP_RUN_ID is invalid")
+    run_id = validate_run_id(_require_env("BACKUP_RUN_ID"))
     destination = validate_off_host_destination(
         _require_env("BACKUP_DESTINATION"),
         _require_env("APPLICATION_HOST"),
         os.environ.get("FORBIDDEN_DATA_PATHS", "").split(os.pathsep),
     )
-    pgpass, source_config, destination_config, signing_key = _secret_paths(
+    secret_paths = _secret_paths(
         "PGPASSFILE", "BUSINESS_SOURCE_CONFIG_FILE", "BACKUP_DESTINATION_CONFIG_FILE", "BACKUP_MANIFEST_SIGNING_KEY_FILE"
     )
-    validate_secret_files([pgpass, source_config, destination_config, signing_key])
     ledger_manifest_path = Path(_require_env("LEDGER_ARCHIVE_MANIFEST_FILE"))
+    ledger_history = _load_json(Path(_require_env("LEDGER_SIGNING_KEY_HISTORY_FILE")))
     staging_root = Path(_require_env("BACKUP_STAGING_ROOT"))
-    staging = staging_root / f".pending-{run_id}"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    staging = safe_run_path(staging_root, run_id, prefix=".pending-")
+    receipt = safe_run_path(staging_root, run_id, prefix=".publisher-receipt-")
+    private_root = safe_run_path(staging_root, run_id, prefix=".secrets-")
     if staging.exists():
         raise ValueError("backup staging run already exists")
     staging.mkdir(parents=True, mode=0o700)
     try:
-        dump = staging / "database.dump"
-        restore_list = staging / "database.restore-list"
-        snapshot = staging / "business.snapshot"
-        inventory = staging / "business.inventory.json"
-        references_path = staging / "reference-validation.json"
-        _run([
-            os.environ.get("PG_DUMP_BIN", "pg_dump"), "--format=custom", "--file", str(dump),
-            "--host", _require_env("PGHOST"), "--port", os.environ.get("PGPORT", "5432"),
-            "--username", _require_env("PGUSER"), "--dbname", _require_env("PGDATABASE"), "--no-password",
-        ])
-        if not dump.is_file() or dump.stat().st_size <= 0:
-            raise ValueError("pg_dump produced an empty custom-format dump")
-        listed = _run([os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--list", str(dump)], capture=True)
-        restore_list.write_text(listed.stdout, encoding="utf-8")
-        list_entries = sum(1 for line in listed.stdout.splitlines() if line and not line.startswith(";"))
-        if list_entries <= 0:
-            raise ValueError("pg_restore --list produced no archive entries")
-        buckets = [item for item in _require_env("BUSINESS_BUCKETS").split(",") if item]
-        ledger_bucket = _require_env("LEDGER_BUCKET")
-        if ledger_bucket in buckets:
-            raise ValueError("ledger bucket is forbidden in business snapshot")
-        _client(
-            "BUSINESS_SNAPSHOT_CLIENT", "snapshot", "--config-file", str(source_config), "--buckets", ",".join(buckets),
-            "--output", str(snapshot), "--inventory", str(inventory),
-        )
-        if not snapshot.is_file() or snapshot.stat().st_size <= 0:
-            raise ValueError("business snapshot is empty")
-        object_count, inventory_hash = _validate_business_inventory(inventory)
-        _client(
-            "REFERENCE_VALIDATOR", "validate", "--inventory", str(inventory), "--result", str(references_path)
-        )
-        references = _require_mapping(_load_json(references_path), "reference validation")
-        if int(references.get("mismatches", -1)) != 0:
-            raise ValueError("reference validation failed")
-        ledger = _require_mapping(_load_json(ledger_manifest_path), "ledger archive manifest")
-        manifest = {
-            "schema_version": 1,
-            "backup_run_id": run_id,
-            "state": "complete",
-            "backup_cutoff_utc": _require_env("BACKUP_CUTOFF_UTC"),
-            "schedule_interval_hours": 12,
-            "toolchain": {
-                "image": _require_env("BACKUP_IMAGE"),
-                "image_digest": _require_env("BACKUP_IMAGE_DIGEST"),
-                "postgres": "16.9",
-                "minio_client": "RELEASE.2025-07-21T05-28-08Z",
-                "destination_client": "rclone-1.70.3",
-            },
-            "database": {
-                "format": "custom", "sha256": _sha256_file(dump), "size_bytes": dump.stat().st_size,
-                "restore_list_entries": list_entries,
-            },
-            "business_snapshot": {
-                "sha256": _sha256_file(snapshot), "size_bytes": snapshot.stat().st_size,
-                "object_count": object_count, "inventory_sha256": inventory_hash,
-            },
-            "reference_validation": {"checked": int(references.get("checked", 0)), "mismatches": 0},
-            "ledger_archive": {
-                "archive_run_id": ledger["archive_run_id"], "cutoff_utc": ledger["cutoff_utc"],
-                "manifest_sha256": _sha256_file(ledger_manifest_path),
-                "signing_key_versions": ledger["signing_key_versions"],
-            },
-            "retention": {
-                "backup_window_days": int(_require_env("BACKUP_WINDOW_DAYS")),
-                "policy_version": _require_env("RETENTION_POLICY_VERSION"),
-            },
-            "gates": {"pg_restore_list": True, "hashes": True, "object_inventory": True, "references": True},
-        }
-        validate_backup_manifest(manifest)
-        payload = _canonical_json(manifest)
-        (staging / "manifest.json").write_bytes(payload)
-        write_hmac_signature(staging / "manifest.json", signing_key, staging / "manifest.sig")
-        (staging / "COMPLETE").write_text(hashlib.sha256(payload).hexdigest() + "\n", encoding="ascii")
-        try:
-            _client(
-                "BACKUP_DESTINATION_CLIENT", "stage-group", "--config-file", str(destination_config),
-                "--destination", destination, "--run-id", run_id, "--source", str(staging),
+        with secure_secret_copies(secret_paths, private_root) as private:
+            pgpass, source_config, publisher_config, signing_key = private
+            child_environment = _sanitized_child_environment(PGPASSFILE=str(pgpass))
+            dump = staging / "database.dump"
+            snapshot = staging / "business.snapshot"
+            inventory = staging / "business.inventory.json"
+            _run([
+                os.environ.get("PG_DUMP_BIN", "pg_dump"), "--format=custom", "--file", str(dump),
+                "--host", _require_env("PGHOST"), "--port", os.environ.get("PGPORT", "5432"),
+                "--username", _require_env("PGUSER"), "--dbname", _require_env("PGDATABASE"), "--no-password",
+            ], environment=child_environment)
+            if not dump.is_file() or dump.stat().st_size <= 0:
+                raise ValueError("pg_dump produced an empty custom-format dump")
+            listed = _run(
+                [os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--list", str(dump)],
+                capture=True,
+                environment=child_environment,
+            )
+            list_entries = sum(1 for line in listed.stdout.splitlines() if line and not line.startswith(";"))
+            if list_entries <= 0:
+                raise ValueError("pg_restore --list produced no archive entries")
+            buckets = [item for item in _require_env("BUSINESS_BUCKETS").split(",") if item]
+            ledger_bucket = _require_env("LEDGER_BUCKET")
+            ledger_destination = validate_off_host_destination(
+                _require_env("LEDGER_ARCHIVE_DESTINATION"),
+                _require_env("APPLICATION_HOST"),
+                os.environ.get("FORBIDDEN_DATA_PATHS", "").split(os.pathsep),
+            )
+            validate_ledger_boundary(
+                business_buckets=buckets,
+                ledger_bucket=ledger_bucket,
+                business_capabilities={"business:read", "destination:append"},
+                business_destination=destination,
+                ledger_destination=ledger_destination,
+                key_history=ledger_history,
             )
             _client(
-                "BACKUP_DESTINATION_CLIENT", "publish-group", "--config-file", str(destination_config),
-                "--destination", destination, "--run-id", run_id,
+                "BUSINESS_SNAPSHOT_CLIENT", "snapshot", "--config-file", str(source_config),
+                "--buckets", ",".join(buckets), "--output", str(snapshot), "--inventory", str(inventory),
+                environment=child_environment,
             )
-        except Exception:
-            try:
-                _client(
-                    "BACKUP_DESTINATION_CLIENT", "abort-group", "--config-file", str(destination_config),
-                    "--destination", destination, "--run-id", run_id,
-                )
-            except Exception:
-                pass
-            raise
+            if not snapshot.is_file() or snapshot.stat().st_size <= 0:
+                raise ValueError("business snapshot is empty")
+            object_count, inventory_hash = _validate_business_inventory(inventory)
+            inventory_value = _require_mapping(_load_json(inventory), "business inventory")
+            queried = _run([
+                os.environ.get("PSQL_BIN", "psql"), "--no-align", "--tuples-only", "--quiet",
+                "--set", "ON_ERROR_STOP=1", "--host", _require_env("PGHOST"),
+                "--port", os.environ.get("PGPORT", "5432"), "--username", _require_env("PGUSER"),
+                "--dbname", _require_env("PGDATABASE"), "--command", REFERENCE_QUERY,
+            ], capture=True, environment=child_environment)
+            database_keys = [line for line in queried.stdout.splitlines() if line]
+            references = build_reference_proof(database_keys, inventory_value)
+            validate_reference_proof(references, expected=len(database_keys), inventory_sha256=inventory_hash)
+
+            ledger = _require_mapping(_load_json(ledger_manifest_path), "ledger archive manifest")
+            ledger_run_id = validate_run_id(str(ledger.get("archive_run_id", "")))
+            ledger_cutoff = str(ledger.get("cutoff_utc", ""))
+            _parse_utc(ledger_cutoff)
+            versions = [item.get("version") for item in ledger_history.get("versions", []) if isinstance(item, Mapping)]
+            manifest = {
+                "schema_version": 1,
+                "backup_run_id": run_id,
+                "state": "complete",
+                "backup_cutoff_utc": _require_env("BACKUP_CUTOFF_UTC"),
+                "schedule_interval_hours": 12,
+                "toolchain": {
+                    "image": _require_env("BACKUP_IMAGE"),
+                    "image_digest": _require_env("BACKUP_IMAGE_DIGEST"),
+                    "postgres": "16.9",
+                    "minio_client": "RELEASE.2025-07-21T05-28-08Z",
+                    "destination_client": "external-atomic-publisher-v1",
+                },
+                "database": {
+                    "format": "custom", "sha256": _sha256_file(dump), "size_bytes": dump.stat().st_size,
+                    "restore_list_entries": list_entries,
+                },
+                "business_snapshot": {
+                    "sha256": _sha256_file(snapshot), "size_bytes": snapshot.stat().st_size,
+                    "object_count": object_count, "inventory_sha256": inventory_hash,
+                },
+                "reference_validation": references,
+                "ledger_archive": {
+                    "archive_run_id": ledger_run_id, "cutoff_utc": ledger_cutoff,
+                    "manifest_sha256": _sha256_file(ledger_manifest_path),
+                    "signing_key_versions": versions,
+                },
+                "retention": {
+                    "backup_window_days": int(_require_env("BACKUP_WINDOW_DAYS")),
+                    "policy_version": _require_env("RETENTION_POLICY_VERSION"),
+                },
+                "gates": {"pg_restore_list": True, "hashes": True, "object_inventory": True, "references": True},
+            }
+            validate_backup_manifest(manifest)
+            payload = _canonical_json(manifest)
+            _atomic_write_bytes(staging / "manifest.json", payload)
+            write_hmac_signature(staging / "manifest.json", signing_key, staging / "manifest.sig")
+            complete_sha256 = hashlib.sha256(payload).hexdigest()
+            _atomic_write_bytes(staging / "COMPLETE", (complete_sha256 + "\n").encode("ascii"))
+            _client(
+                "BACKUP_ATOMIC_PUBLISHER", "publish-complete-group", "--lease-config-file", str(publisher_config),
+                "--destination", destination, "--run-id", run_id, "--source", str(staging), "--receipt", str(receipt),
+                environment=child_environment,
+            )
+            validate_publish_receipt(receipt, run_id, complete_sha256)
         print(f"backup complete: run_id={run_id}")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        receipt.unlink(missing_ok=True)
 
 
 def command_prune(_: argparse.Namespace) -> None:
@@ -648,27 +1072,40 @@ def command_prune(_: argparse.Namespace) -> None:
         _require_env("BACKUP_DESTINATION"), _require_env("APPLICATION_HOST"),
         os.environ.get("FORBIDDEN_DATA_PATHS", "").split(os.pathsep),
     )
-    prune_config = Path(_require_env("BACKUP_PRUNE_CONFIG_FILE"))
-    validate_secret_files([prune_config])
+    secrets_to_copy = _secret_paths("BACKUP_PRUNE_CONFIG_FILE", "BACKUP_MANIFEST_SIGNING_KEY_FILE")
     catalog_path = Path(_require_env("BACKUP_CATALOG_FILE"))
-    _client(
-        "BACKUP_DESTINATION_CLIENT", "catalog", "--config-file", str(prune_config),
-        "--destination", destination, "--output", str(catalog_path),
-    )
-    catalog = _load_json(catalog_path)
-    if not isinstance(catalog, list):
-        raise ValueError("backup catalog must be an array")
-    deletions = plan_prune(catalog, int(_require_env("BACKUP_WINDOW_DAYS")), datetime.now(timezone.utc))
-    for run_id in deletions:
+    private_root = _private_secret_root(catalog_path.parent, "prune")
+    with secure_secret_copies(secrets_to_copy, private_root) as private:
+        prune_config, signing_key = private
+        child_environment = _sanitized_child_environment()
         _client(
-            "BACKUP_DESTINATION_CLIENT", "delete-complete-group", "--config-file", str(prune_config),
-            "--destination", destination, "--run-id", run_id,
+            "BACKUP_DESTINATION_CLIENT", "catalog", "--config-file", str(prune_config),
+            "--signing-key-file", str(signing_key), "--destination", destination, "--output", str(catalog_path),
+            environment=child_environment,
         )
+        catalog = _load_json(catalog_path)
+        if not isinstance(catalog, list):
+            raise ValueError("backup catalog must be an array")
+        deletions = plan_prune(catalog, int(_require_env("BACKUP_WINDOW_DAYS")), datetime.now(timezone.utc))
+        for run_id in deletions:
+            validate_run_id(run_id)
+            _client(
+                "BACKUP_DESTINATION_CLIENT", "delete-complete-group", "--config-file", str(prune_config),
+                "--destination", destination, "--run-id", run_id,
+                environment=child_environment,
+            )
     print(f"prune complete: deleted_groups={len(deletions)}")
 
 
 def command_restore(_: argparse.Namespace) -> None:
     command_guard_disposable(argparse.Namespace())
+    run_id = validate_run_id(_require_env("RESTORE_BACKUP_RUN_ID"))
+    generation_id = validate_run_id(_require_env("RESTORE_GENERATION_ID"))
+    evidence_path = Path(_require_env("RESTORE_EVIDENCE_FILE"))
+    closed_marker_path = Path(_require_env("TRAFFIC_CLOSED_MARKER_FILE"))
+    open_marker_path = Path(_require_env("TRAFFIC_OPEN_MARKER_FILE"))
+    begin_closed_recovery(evidence_path, closed_marker_path, open_marker_path, run_id, generation_id)
+
     business_destination = validate_off_host_destination(
         _require_env("BACKUP_DESTINATION"), _require_env("APPLICATION_HOST"),
         os.environ.get("FORBIDDEN_DATA_PATHS", "").split(os.pathsep),
@@ -679,59 +1116,101 @@ def command_restore(_: argparse.Namespace) -> None:
     )
     if business_destination.rstrip("/") == ledger_destination.rstrip("/"):
         raise ValueError("ledger and business restore destinations must be independent")
-    pgpass, business_restore, destination_restore, ledger_restore, manifest_signing_key = _secret_paths(
+    secret_paths = _secret_paths(
         "PGPASSFILE", "BUSINESS_RESTORE_CONFIG_FILE", "BACKUP_RESTORE_CONFIG_FILE", "LEDGER_RESTORE_CONFIG_FILE",
-        "BACKUP_MANIFEST_SIGNING_KEY_FILE",
+        "BACKUP_MANIFEST_SIGNING_KEY_FILE", "LEDGER_MANIFEST_SIGNING_KEY_FILE",
     )
-    validate_secret_files([pgpass, business_restore, destination_restore, ledger_restore, manifest_signing_key])
-    run_id = _require_env("RESTORE_BACKUP_RUN_ID")
-    workspace = Path(_require_env("RESTORE_STAGING_ROOT")) / run_id
+    staging_root = Path(_require_env("RESTORE_STAGING_ROOT"))
+    staging_root.mkdir(parents=True, exist_ok=True)
+    workspace = safe_run_path(staging_root, run_id)
+    private_root = safe_run_path(staging_root, generation_id, prefix=".restore-secrets-")
     if workspace.exists():
         raise ValueError("restore staging path already exists")
     workspace.mkdir(parents=True, mode=0o700)
     try:
-        _client(
-            "LEDGER_ARCHIVE_CLIENT", "restore-latest", "--config-file", str(ledger_restore),
-            "--destination", ledger_destination,
-        )
-        _client(
-            "BACKUP_DESTINATION_CLIENT", "fetch-complete-group", "--config-file", str(destination_restore),
-            "--destination", business_destination, "--run-id", run_id, "--output", str(workspace),
-        )
-        manifest = _load_json(workspace / "manifest.json")
-        validate_backup_manifest(manifest)
-        verify_hmac_signature(
-            workspace / "manifest.json", manifest_signing_key, workspace / "manifest.sig"
-        )
-        marker = (workspace / "COMPLETE").read_text(encoding="ascii").strip()
-        if marker != hashlib.sha256(_canonical_json(manifest)).hexdigest():
-            raise ValueError("COMPLETE marker does not match manifest")
-        dump = workspace / "database.dump"
-        snapshot = workspace / "business.snapshot"
-        if _sha256_file(dump) != manifest["database"]["sha256"] or _sha256_file(snapshot) != manifest["business_snapshot"]["sha256"]:
-            raise ValueError("restore-point hashes do not match manifest")
-        inventory = workspace / "business.inventory.json"
-        object_count, inventory_hash = _validate_business_inventory(inventory)
-        if inventory_hash != manifest["business_snapshot"]["inventory_sha256"] or object_count != manifest["business_snapshot"]["object_count"]:
-            raise ValueError("business inventory does not match manifest")
-        _run([os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--list", str(dump)])
-        _run([
-            os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--exit-on-error", "--clean", "--if-exists",
-            "--no-owner", "--host", _require_env("PGHOST"), "--port", os.environ.get("PGPORT", "5432"),
-            "--username", _require_env("PGUSER"), "--dbname", _require_env("PGDATABASE"), str(dump),
-        ])
-        _client(
-            "BUSINESS_RESTORE_CLIENT", "restore", "--config-file", str(business_restore),
-            "--snapshot", str(snapshot),
-        )
-        evidence = {
-            "schema_version": 1,
-            "state": "restored",
-            "traffic_open": False,
-            "b2b3_status": "pending_external_cli_and_worker",
-            "gates": {"database": True, "business_objects": True, "ledger_restored_first": True},
-        }
-        _write_json(Path(_require_env("RESTORE_EVIDENCE_FILE")), evidence)
+        with secure_secret_copies(secret_paths, private_root) as private:
+            pgpass, business_restore, destination_restore, ledger_restore, manifest_signing_key, ledger_signing_key = private
+            child_environment = _sanitized_child_environment(PGPASSFILE=str(pgpass))
+            _client(
+                "BACKUP_DESTINATION_CLIENT", "fetch-complete-group", "--config-file", str(destination_restore),
+                "--destination", business_destination, "--run-id", run_id, "--output", str(workspace),
+                environment=child_environment,
+            )
+
+            def restore_lister(dump_path: Path) -> int:
+                listed = _run(
+                    [os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--list", str(dump_path)],
+                    capture=True,
+                    environment=child_environment,
+                )
+                return sum(1 for line in listed.stdout.splitlines() if line and not line.startswith(";"))
+
+            manifest = validate_complete_backup_group(workspace, manifest_signing_key, restore_lister)
+            selection_path = workspace / "ledger-selection.json"
+            _client(
+                "LEDGER_ARCHIVE_CLIENT", "select-latest-complete", "--config-file", str(ledger_restore),
+                "--destination", ledger_destination, "--output", str(selection_path),
+                environment=child_environment,
+            )
+            selection = _require_mapping(_load_json(selection_path), "ledger archive selection")
+            if set(selection) != {"schema_version", "archive_run_id"} or selection.get("schema_version") != 1:
+                raise ValueError("ledger archive selection schema is invalid")
+            ledger_run_id = validate_run_id(str(selection.get("archive_run_id", "")))
+            ledger_group = safe_run_path(workspace, ledger_run_id)
+            _client(
+                "LEDGER_ARCHIVE_CLIENT", "fetch-complete-group", "--config-file", str(ledger_restore),
+                "--destination", ledger_destination, "--run-id", ledger_run_id, "--output", str(ledger_group),
+                environment=child_environment,
+            )
+            key_history = _load_json(Path(_require_env("LEDGER_SIGNING_KEY_HISTORY_FILE")))
+            ledger_manifest = validate_ledger_archive_group(
+                ledger_group,
+                ledger_signing_key,
+                key_history,
+                minimum_cutoff_utc=str(manifest["backup_cutoff_utc"]),
+            )
+            _client(
+                "LEDGER_ARCHIVE_CLIENT", "restore-verified", "--config-file", str(ledger_restore),
+                "--archive", str(ledger_group / "ledger.snapshot"), "--run-id", ledger_run_id,
+                "--generation-id", generation_id,
+                environment=child_environment,
+            )
+            proof_path = workspace / "ledger-restore-proof.json"
+            proof_signature_path = workspace / "ledger-restore-proof.sig"
+            _client(
+                "LEDGER_RESTORE_PROOF_CLIENT", "attest-restored-archive", "--config-file", str(ledger_restore),
+                "--archive-run-id", ledger_run_id, "--business-run-id", run_id,
+                "--generation-id", generation_id, "--proof", str(proof_path), "--signature", str(proof_signature_path),
+                environment=child_environment,
+            )
+            validate_ledger_restore_proof(
+                proof_path, proof_signature_path, ledger_signing_key, ledger_manifest, run_id, generation_id
+            )
+            ledger_verified = True
+
+            dump = workspace / "database.dump"
+            snapshot = workspace / "business.snapshot"
+            _run([
+                os.environ.get("PG_RESTORE_BIN", "pg_restore"), "--exit-on-error", "--clean", "--if-exists",
+                "--no-owner", "--host", _require_env("PGHOST"), "--port", os.environ.get("PGPORT", "5432"),
+                "--username", _require_env("PGUSER"), "--dbname", _require_env("PGDATABASE"), str(dump),
+            ], environment=child_environment)
+            _client(
+                "BUSINESS_RESTORE_CLIENT", "restore", "--config-file", str(business_restore),
+                "--snapshot", str(snapshot), "--buckets", _require_env("BUSINESS_BUCKETS"),
+                environment=child_environment,
+            )
+            evidence = {
+                "schema_version": 1,
+                "state": "restored_traffic_closed",
+                "backup_run_id": run_id,
+                "recovery_generation_id": generation_id,
+                "traffic_open": False,
+                "b2b3_status": "pending_real_cli_and_worker_protocol",
+                "gates": {"database": True, "business_objects": True, "ledger_restored_first": ledger_verified},
+            }
+            _write_json(evidence_path, evidence)
+            _write_json(closed_marker_path, evidence)
         print(f"restore complete with traffic closed: run_id={run_id}")
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
@@ -742,10 +1221,9 @@ def command_ledger_archive(_: argparse.Namespace) -> None:
         _require_env("LEDGER_ARCHIVE_DESTINATION"), _require_env("APPLICATION_HOST"),
         os.environ.get("FORBIDDEN_DATA_PATHS", "").split(os.pathsep),
     )
-    source, append, signing_key = _secret_paths(
+    secret_paths = _secret_paths(
         "LEDGER_SOURCE_CONFIG_FILE", "LEDGER_ARCHIVE_CONFIG_FILE", "LEDGER_MANIFEST_SIGNING_KEY_FILE"
     )
-    validate_secret_files([source, append, signing_key])
     history = _load_json(Path(_require_env("LEDGER_SIGNING_KEY_HISTORY_FILE")))
     validate_ledger_boundary(
         business_buckets=[item for item in _require_env("BUSINESS_BUCKETS").split(",") if item],
@@ -755,45 +1233,60 @@ def command_ledger_archive(_: argparse.Namespace) -> None:
         ledger_destination=destination,
         key_history=history,
     )
-    archive_run_id = _require_env("LEDGER_ARCHIVE_RUN_ID")
-    work = Path(_require_env("LEDGER_STAGING_ROOT")) / f".pending-{archive_run_id}"
+    archive_run_id = validate_run_id(_require_env("LEDGER_ARCHIVE_RUN_ID"))
+    staging_root = Path(_require_env("LEDGER_STAGING_ROOT"))
+    staging_root.mkdir(parents=True, exist_ok=True)
+    work = safe_run_path(staging_root, archive_run_id, prefix=".pending-")
+    receipt = safe_run_path(staging_root, archive_run_id, prefix=".publisher-receipt-")
+    private_root = safe_run_path(staging_root, archive_run_id, prefix=".secrets-")
+    if work.exists():
+        raise ValueError("ledger staging run already exists")
     work.mkdir(parents=True, mode=0o700)
     try:
-        archive = work / "ledger.snapshot"
-        summary = work / "ledger-summary.json"
-        _client(
-            "LEDGER_ARCHIVE_CLIENT", "snapshot", "--config-file", str(source), "--bucket", _require_env("LEDGER_BUCKET"),
-            "--output", str(archive), "--summary", str(summary),
-        )
-        if not archive.is_file() or archive.stat().st_size <= 0:
-            raise ValueError("ledger archive is empty")
-        summary_value = _require_mapping(_load_json(summary), "ledger summary")
-        manifest = {
-            "schema_version": 1,
-            "archive_run_id": archive_run_id,
-            "cutoff_utc": _require_env("LEDGER_ARCHIVE_CUTOFF_UTC"),
-            "archive_sha256": _sha256_file(archive),
-            "size_bytes": archive.stat().st_size,
-            "entry_count": int(summary_value.get("entry_count", -1)),
-            "signing_key_versions": [item["version"] for item in history["versions"]],
-            "signing_key_version": history["active_key_version"],
-            "lifecycle_policy_version": _require_env("LEDGER_LIFECYCLE_POLICY_VERSION"),
-        }
-        if manifest["entry_count"] < 0:
-            raise ValueError("ledger archive entry count is invalid")
-        _scan_manifest(manifest)
-        _write_json(work / "ledger-manifest.json", manifest)
-        write_hmac_signature(work / "ledger-manifest.json", signing_key, work / "ledger-manifest.sig")
-        (work / "COMPLETE").write_text(_sha256_file(work / "ledger-manifest.json") + "\n", encoding="ascii")
-        _client(
-            "LEDGER_ARCHIVE_CLIENT", "publish", "--config-file", str(append), "--destination", destination,
-            "--run-id", archive_run_id, "--source", str(work),
-        )
-        output = Path(_require_env("LEDGER_ARCHIVE_MANIFEST_FILE"))
-        _write_json(output, manifest)
+        with secure_secret_copies(secret_paths, private_root) as private:
+            source, publisher_config, signing_key = private
+            child_environment = _sanitized_child_environment()
+            archive = work / "ledger.snapshot"
+            summary = work / "ledger-summary.json"
+            _client(
+                "LEDGER_ARCHIVE_CLIENT", "snapshot", "--config-file", str(source),
+                "--bucket", _require_env("LEDGER_BUCKET"), "--output", str(archive), "--summary", str(summary),
+                environment=child_environment,
+            )
+            if not archive.is_file() or archive.stat().st_size <= 0:
+                raise ValueError("ledger archive is empty")
+            summary_value = _require_mapping(_load_json(summary), "ledger summary")
+            manifest = {
+                "schema_version": 1,
+                "archive_run_id": archive_run_id,
+                "cutoff_utc": _require_env("LEDGER_ARCHIVE_CUTOFF_UTC"),
+                "archive_sha256": _sha256_file(archive),
+                "size_bytes": archive.stat().st_size,
+                "entry_count": int(summary_value.get("entry_count", -1)),
+                "signing_key_version": history["active_key_version"],
+                "lifecycle_policy_version": _require_env("LEDGER_LIFECYCLE_POLICY_VERSION"),
+            }
+            if manifest["entry_count"] < 0:
+                raise ValueError("ledger archive entry count is invalid")
+            _parse_utc(str(manifest["cutoff_utc"]))
+            _scan_manifest(manifest)
+            _write_json(work / "ledger-manifest.json", manifest)
+            write_hmac_signature(work / "ledger-manifest.json", signing_key, work / "ledger-manifest.sig")
+            complete_sha256 = _sha256_file(work / "ledger-manifest.json")
+            _atomic_write_bytes(work / "COMPLETE", (complete_sha256 + "\n").encode("ascii"))
+            _client(
+                "LEDGER_ATOMIC_PUBLISHER", "publish-complete-group", "--lease-config-file", str(publisher_config),
+                "--destination", destination, "--run-id", archive_run_id, "--source", str(work),
+                "--receipt", str(receipt),
+                environment=child_environment,
+            )
+            validate_publish_receipt(receipt, archive_run_id, complete_sha256)
+            output = Path(_require_env("LEDGER_ARCHIVE_MANIFEST_FILE"))
+            _write_json(output, manifest)
         print(f"ledger archive complete: run_id={archive_run_id}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        receipt.unlink(missing_ok=True)
 
 
 def command_drill(_: argparse.Namespace) -> None:
@@ -812,6 +1305,14 @@ def _parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-manifest")
     validate.add_argument("path")
     validate.set_defaults(handler=command_validate_manifest)
+    run_id = subparsers.add_parser("validate-run-id")
+    run_id.add_argument("value")
+    run_id.set_defaults(handler=command_validate_run_id)
+    safe_extract = subparsers.add_parser("safe-extract")
+    safe_extract.add_argument("archive")
+    safe_extract.add_argument("destination")
+    safe_extract.add_argument("buckets")
+    safe_extract.set_defaults(handler=command_safe_extract)
     prune_plan = subparsers.add_parser("prune-plan")
     prune_plan.add_argument("catalog")
     prune_plan.add_argument("retention_days", type=int)
@@ -823,6 +1324,7 @@ def _parser() -> argparse.ArgumentParser:
     catalog = subparsers.add_parser("catalog-local")
     catalog.add_argument("root")
     catalog.add_argument("output")
+    catalog.add_argument("signing_key")
     catalog.set_defaults(handler=command_catalog_local)
     disposable = subparsers.add_parser("guard-disposable")
     disposable.set_defaults(handler=command_guard_disposable)
@@ -847,6 +1349,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         args.handler(args)
+    except SecurityContractError as error:
+        print(f"backup security contract failed closed: {error}", file=sys.stderr)
+        return 78
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError) as error:
         print(f"backup contract failed closed: {error}", file=sys.stderr)
         return 1

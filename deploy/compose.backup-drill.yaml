@@ -42,10 +42,7 @@ services:
     networks: [recovery]
 
   backup-tool:
-    image: ux09-backup:phase6c-foundation
-    build:
-      context: ./backup
-      dockerfile: Dockerfile
+    image: "${BACKUP_IMAGE:?Set BACKUP_IMAGE to the backup repository}@${BACKUP_IMAGE_DIGEST:?Set BACKUP_IMAGE_DIGEST to sha256 digest}"
     entrypoint: ["/bin/sh", "-c"]
     command: ["trap : TERM INT; sleep infinity & wait"]
     environment:
@@ -57,6 +54,11 @@ services:
       BACKUP_RESTORE_CONFIG_FILE: /run/secrets/backup_restore_config
       LEDGER_RESTORE_CONFIG_FILE: /run/secrets/ledger_restore_config
       BACKUP_MANIFEST_SIGNING_KEY_FILE: /run/secrets/backup_manifest_signing_key
+      LEDGER_MANIFEST_SIGNING_KEY_FILE: /run/secrets/ledger_manifest_signing_key
+      LEDGER_SIGNING_KEY_HISTORY_FILE: /run/secrets/ledger_signing_key_history
+      RESTORE_EVIDENCE_FILE: /work/restore-evidence.json
+      TRAFFIC_CLOSED_MARKER_FILE: /work/TRAFFIC_CLOSED
+      TRAFFIC_OPEN_MARKER_FILE: /work/TRAFFIC_OPEN
     secrets:
       - source: recovery_pgpass
         target: recovery_pgpass
@@ -80,6 +82,16 @@ services:
         mode: 0400
       - source: backup_manifest_signing_key
         target: backup_manifest_signing_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: ledger_manifest_signing_key
+        target: ledger_manifest_signing_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: ledger_signing_key_history
+        target: ledger_signing_key_history
         uid: "10001"
         gid: "10001"
         mode: 0400
@@ -128,3 +140,7 @@ secrets:
     file: ${LEDGER_RESTORE_CONFIG_FILE:-./backup/secrets/ledger-restore-config}
   backup_manifest_signing_key:
     file: ${BACKUP_MANIFEST_SIGNING_KEY_FILE:-./backup/secrets/backup-manifest-signing-key}
+  ledger_manifest_signing_key:
+    file: ${LEDGER_MANIFEST_SIGNING_KEY_FILE:-./backup/secrets/ledger-manifest-signing-key}
+  ledger_signing_key_history:
+    file: ${LEDGER_SIGNING_KEY_HISTORY_FILE:-./backup/secrets/ledger-signing-key-history.json}
