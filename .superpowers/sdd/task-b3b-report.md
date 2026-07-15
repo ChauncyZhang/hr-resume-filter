@@ -37,8 +37,7 @@ local real-backend stack could not enter an authenticated session.
   window. Open requests disable duplicate submission.
 - Recruiting administrators can place and release holds. Both reasons require
   1..1000 non-whitespace characters; approved deletion receives an explicit
-  queued-deletion warning. Release remains disabled without B3A's hold ID and
-  version.
+  execution warning. Release remains disabled without B3A's hold ID and version.
 - Settings > Audit and Data Governance contains the existing-IA deletion queue,
   status filtering, cursor pagination, loading/empty/error/retry states, and a
   request-only detail drawer. It never joins or links candidate names.
@@ -110,7 +109,7 @@ Complete frontend suite:
 npm.cmd test
 ```
 
-Result: 263 passed, 0 failed.
+Result: 266 passed, 0 failed.
 
 Production build:
 
@@ -143,3 +142,68 @@ The remaining frontend risk is limited to authenticated visual/integration
 behavior against a newly seeded real stack. Controller contracts, role denial,
 focus behavior, complete frontend regression, production compilation, and the
 reachable 390 px shell were verified independently.
+
+## Independent review remediation
+
+The B3B review findings were remediated on 2026-07-15 without changing backend,
+deployment, B2B1, Phase6A, B3A, or protected user files.
+
+- Read the current server contract in `server/app/governance/api.py` and
+  `server/app/governance/deletion_service.py`. The frontend now accepts only
+  `requested`, `approved`, `executing`, `completed`, and `failed`; open requests
+  are exactly `requested`, `approved`, and `executing`.
+- Candidate and settings status labels and all five filters are synchronized.
+  Obsolete filter values are rejected before URL construction, so the frontend
+  cannot send `queued` or `processing`.
+- `executing` now blocks duplicate deletion submission in both the controller
+  and button state. Tests prove that no POST is made.
+- Approval errors now map the server's `self_approval_forbidden`,
+  `active_application_exists`, `legal_hold_active`, and
+  `invalid_deletion_state_transition` codes to actionable Chinese guidance.
+  Raw server detail remains excluded.
+- Only B3B governance surfaces received 16 px rules: candidate governance,
+  confirmation dialog, queue rows, request drawer/detail, impact counts, and
+  their action buttons. Scoped `!important` overrides are limited to governance
+  controls that must beat the existing app-shell 14 px control rule. Existing
+  390 px one-column/full-width rules remain scoped to those surfaces; a static
+  regression test checks the relevant selectors and overflow guards.
+
+Review-remediation RED evidence:
+
+```text
+node --test src/candidateGovernance.test.js src/governanceSettings.test.js
+```
+
+Result before implementation: 31 passed, 7 failed for obsolete status
+normalization/sending, missing `executing` duplicate prevention, missing server
+error mappings, stale UI filters, and missing scoped 16 px rules. A follow-up
+candidate-label test then failed before the detail mapping was added. Final CSS
+cascade review strengthened the test and produced 28 passes / 2 expected
+failures before scoped control overrides and approval-dialog styling were added.
+
+Review-remediation GREEN evidence:
+
+```text
+node --test src/candidateGovernance.test.js src/governanceSettings.test.js
+```
+
+Result: 38 passed, 0 failed.
+
+```text
+npm.cmd test
+```
+
+Result: 266 passed, 0 failed.
+
+```text
+npm.cmd run build
+```
+
+Result: Vite production build succeeded (1607 modules). The existing chunk-size
+warning remains non-fatal.
+
+The authenticated real-backend browser gate was not repeated because the
+previously recorded CSRF/authentication blocker remains outside B3B ownership.
+The focused 390 px CSS/static gate and prior unauthenticated 390 px shell check
+remain green; authenticated visual integration is still the stated residual
+risk.

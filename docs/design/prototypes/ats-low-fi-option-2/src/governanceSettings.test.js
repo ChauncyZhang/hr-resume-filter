@@ -201,6 +201,21 @@ test("audit and retention independently expose denied and safe retryable error s
   assert.equal(getGovernanceErrorMessage({ code: "unexpected", detail: "secret" }).includes("secret"), false);
 });
 
+test("deletion approval errors map real server codes to safe actionable guidance", () => {
+  const expectedGuidance = new Map([
+    ["self_approval_forbidden", /其他系统管理员审批/],
+    ["active_application_exists", /先结束相关申请/],
+    ["legal_hold_active", /确认并解除/],
+    ["invalid_deletion_state_transition", /刷新请求后核对最新状态/],
+  ]);
+
+  for (const [code, expected] of expectedGuidance) {
+    const message = getGovernanceErrorMessage({ code, detail: `private detail for ${code}` });
+    assert.match(message, expected, code);
+    assert.doesNotMatch(message, /private detail|raw detail/i, code);
+  }
+});
+
 test("audit and retention latest-operation generations do not abort each other", async () => {
   requireFunction(createGovernanceSettingsController, "createGovernanceSettingsController");
   const audit = deferred();
@@ -638,13 +653,50 @@ test("Settings UI uses the real governance controller and safe SET-04 projection
   assert.match(source, /approveDeletionRequest/);
   assert.match(source, /删除请求审批/);
   assert.match(source, /候选人版本/);
+  assert.match(source, /<option value="requested">待审批<\/option>/);
+  assert.match(source, /<option value="approved">已批准<\/option>/);
+  assert.match(source, /<option value="executing">执行中<\/option>/);
+  assert.match(source, /<option value="completed">已完成<\/option>/);
+  assert.match(source, /<option value="failed">失败<\/option>/);
+  assert.match(source, /title === "确认批准删除请求" \? "deletion-approval-dialog"/);
+  assert.doesNotMatch(source, /queued|processing/);
   assert.doesNotMatch(source, /候选人姓名|candidateName|candidate\.name/);
 });
 
-test("deletion queue path supports status and cursor without candidate joins", () => {
+test("deletion queue path sends every real status and rejects obsolete values", () => {
   requireFunction(buildDeletionRequestsPath, "buildDeletionRequestsPath");
+  for (const status of ["requested", "approved", "executing", "completed", "failed"]) {
+    assert.equal(buildDeletionRequestsPath(status), `/api/v1/deletion-requests?status=${status}&limit=50`);
+  }
   assert.equal(buildDeletionRequestsPath("failed", { cursor: "next-token", limit: 25 }), "/api/v1/deletion-requests?status=failed&cursor=next-token&limit=25");
   assert.equal(buildDeletionRequestsPath("", {}), "/api/v1/deletion-requests?limit=50");
+  assert.equal(buildDeletionRequestsPath("queued"), "/api/v1/deletion-requests?limit=50");
+  assert.equal(buildDeletionRequestsPath("processing"), "/api/v1/deletion-requests?limit=50");
+});
+
+test("new governance surfaces keep body, queue, detail, counts and actions at 16px without 390px overflow", () => {
+  const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  for (const selector of [
+    "candidate-governance", "candidate-governance h3", "candidate-governance dl div",
+    "governance-dialog", "governance-dialog header p", "governance-dialog-body small",
+    "governance-impact > small", "deletion-queue", "deletion-queue \\.status-muted",
+    "deletion-queue \\.governance-empty span", "deletion-request-list small",
+    "deletion-impact-grid", "deletion-request-drawer", "deletion-request-drawer header p",
+    "deletion-approval-dialog",
+  ]) {
+    assert.match(styles, new RegExp(`\\.${selector}\\s*\\{[^}]*font-size:\\s*16px`), selector);
+  }
+  for (const selector of [
+    "candidate-governance \\.button", "governance-dialog \\.button",
+    "governance-dialog-body textarea", "deletion-queue-toolbar select",
+    "deletion-request-list > button", "deletion-request-drawer \\.button",
+    "deletion-approval-dialog \\.button",
+  ]) {
+    assert.match(styles, new RegExp(`\\.${selector}\\s*\\{[^}]*font-size:\\s*16px\\s*!important`), selector);
+  }
+  assert.match(styles, /@media \(max-width: 600px\)[\s\S]*?\.deletion-queue \{ margin: 10px 8px; \}/);
+  assert.match(styles, /\.deletion-request-list > button \{[^}]*min-width: 0;/);
+  assert.match(styles, /\.deletion-request-drawer \.settings-drawer-body dl div \{ grid-template-columns: 1fr;/);
 });
 
 test("deletion request normalization keeps only the safe detail projection", () => {

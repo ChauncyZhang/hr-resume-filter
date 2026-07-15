@@ -19,7 +19,13 @@ const ERROR_MESSAGES = {
   validation_failed: "设置内容无效，请检查后重试。",
   service_unavailable: "服务暂时不可用，请稍后重试。",
   stale_manifest: "删除影响已变化，已加载最新影响，请重新确认。",
+  self_approval_forbidden: "不能批准自己提交的删除请求，请由其他系统管理员审批。",
+  active_application_exists: "候选人仍有进行中的职位申请，请先结束相关申请后再审批。",
+  legal_hold_active: "候选人处于法律保留状态，请由招聘管理员确认并解除后再审批。",
+  invalid_deletion_state_transition: "该删除请求状态已变化，已无法批准；请刷新请求后核对最新状态。",
 };
+
+const DELETION_STATUSES = new Set(["requested", "approved", "executing", "completed", "failed"]);
 
 const PREVIEW_FAILURE_CODES = new Set([
   "retention_confirmation_required",
@@ -91,7 +97,7 @@ export function buildAuditLogsPath(filters = {}, { cursor = "", limit = 50 } = {
 
 export function buildDeletionRequestsPath(status = "", { cursor = "", limit = 50 } = {}) {
   const params = new URLSearchParams();
-  if (safeString(status)) params.set("status", status);
+  if (DELETION_STATUSES.has(status)) params.set("status", status);
   if (safeString(cursor)) params.set("cursor", cursor);
   params.set("limit", String(Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : 50));
   return `/api/v1/deletion-requests?${params}`;

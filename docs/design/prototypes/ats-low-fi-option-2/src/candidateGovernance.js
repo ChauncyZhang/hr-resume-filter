@@ -6,7 +6,8 @@ const COUNT_FIELDS = [
   ["feedback_records", "feedbackRecords"], ["talent_memberships", "talentMemberships"],
   ["resume_objects", "resumeObjects"], ["temporary_exports", "temporaryExports"],
 ];
-const OPEN_DELETION_STATUSES = new Set(["requested", "approved", "queued", "processing", "failed"]);
+const DELETION_STATUSES = new Set(["requested", "approved", "executing", "completed", "failed"]);
+const OPEN_DELETION_STATUSES = new Set(["requested", "approved", "executing"]);
 const ERROR_MESSAGES = {
   authentication_required: "登录状态已失效，请重新登录。",
   csrf_validation_failed: "当前会话已失效，请刷新后重试。",
@@ -29,6 +30,7 @@ function defaultKey() {
 }
 function safeString(value) { return typeof value === "string" ? value : ""; }
 function nullableString(value) { return typeof value === "string" ? value : null; }
+function deletionStatus(value, fallback = null) { return DELETION_STATUSES.has(value) ? value : fallback; }
 function positiveVersion(value) { return Number.isInteger(value) && value >= 1 ? value : null; }
 function safeCount(value) { return Number.isSafeInteger(value) && value >= 0 ? value : 0; }
 function isAbort(error) { return error?.name === "AbortError"; }
@@ -38,7 +40,7 @@ function usableKey(value) { const key = safeString(value); return key && key.len
 
 export function normalizeGovernanceStatus(value) {
   return {
-    deletionStatus: nullableString(value?.deletion_status),
+    deletionStatus: deletionStatus(value?.deletion_status),
     deletionRequestId: nullableString(value?.deletion_request_id),
     legalHoldActive: value?.legal_hold_active === true,
     legalHoldReason: nullableString(value?.legal_hold_reason),
@@ -56,7 +58,7 @@ export function normalizeDeletionRequest(value) {
   for (const [serverName, clientName] of COUNT_FIELDS) counts[clientName] = safeCount(impact?.counts?.[serverName]);
   return {
     id,
-    status: safeString(value?.status),
+    status: deletionStatus(value?.status, ""),
     version,
     reasonCode: safeString(value?.reason_code),
     requestedAt: safeString(value?.requested_at),

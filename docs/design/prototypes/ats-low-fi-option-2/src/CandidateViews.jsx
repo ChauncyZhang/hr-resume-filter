@@ -249,6 +249,9 @@ function ResumePreview({ candidate, preview, loading, error, onClose, onRetry, o
 const governanceCountLabels = [
   ["contacts", "联系方式"], ["resumes", "简历记录"], ["applications", "职位申请"], ["screeningRecords", "筛选记录"], ["interviews", "面试"], ["feedbackRecords", "反馈记录"], ["talentMemberships", "人才库关系"], ["resumeObjects", "简历文件"], ["temporaryExports", "临时导出"],
 ];
+const governanceDeletionStatusLabels = {
+  requested: "待审批", approved: "已批准", executing: "执行中", completed: "已完成", failed: "失败",
+};
 
 function GovernanceDialog({ mode, status, busy, reason, onReasonChange, onClose, onConfirm }) {
   const dialogRef = useRef(null);
@@ -298,7 +301,7 @@ function CandidateGovernance({ candidate, role, onNotify }) {
   const legalHoldId = status?.legalHoldId;
   const legalHoldVersion = status?.legalHoldVersion;
   const releaseDisabled = !legalHoldId || !legalHoldVersion;
-  const duplicateOpen = ["requested", "approved", "queued", "processing", "failed"].includes(status?.deletionStatus);
+  const duplicateOpen = ["requested", "approved", "executing"].includes(status?.deletionStatus);
   async function commit() {
     const completed = dialog === "delete" ? await controller.requestDeletion() : dialog === "place" ? await controller.placeLegalHold(reason) : await controller.releaseLegalHold(reason);
     if (completed) { onNotify(dialog === "delete" ? "删除请求已提交审批" : dialog === "place" ? "法律保留已生效" : "法律保留已解除"); setDialog(""); setReason(""); }
@@ -306,7 +309,7 @@ function CandidateGovernance({ candidate, role, onNotify }) {
   return <section className="candidate-governance" aria-live="polite"><h3>数据治理</h3>
     {loadStatus === "loading" && <div className="governance-compact-state" role="status"><LoaderCircle className="spin" size={17} />正在读取治理状态…</div>}
     {loadStatus === "error" && <div className="governance-compact-state error" role="alert"><span>{error}</span><button type="button" onClick={() => controller.refresh()}>重试</button></div>}
-    {status && <><dl><div><dt>删除状态</dt><dd>{status.deletionStatus || "无删除请求"}</dd></div><div><dt>法律保留</dt><dd>{status.legalHoldActive ? "已生效" : "未设置"}</dd></div>{status.legalHoldReason && <div><dt>保留原因</dt><dd>{status.legalHoldReason}</dd></div>}</dl>
+    {status && <><dl><div><dt>删除状态</dt><dd>{status.deletionStatus ? governanceDeletionStatusLabels[status.deletionStatus] : "无删除请求"}</dd></div><div><dt>法律保留</dt><dd>{status.legalHoldActive ? "已生效" : "未设置"}</dd></div>{status.legalHoldReason && <div><dt>保留原因</dt><dd>{status.legalHoldReason}</dd></div>}</dl>
       {deletionRequest && <details className="governance-impact"><summary>查看删除影响（9 类）</summary><div>{governanceCountLabels.map(([key, label]) => <span key={key}>{label}<strong>{deletionRequest.impact.counts[key]}</strong></span>)}</div><small>备份窗口至 {new Date(deletionRequest.impact.backupWindowEndsAt).toLocaleString("zh-CN", { hour12: false })}</small></details>}
       {error && loadStatus !== "error" && <p className="governance-inline-error" role="alert">{error}</p>}{message && <p className="governance-inline-message" role="status">{message}</p>}
       <div className="governance-actions">{canRequest && <button className="button danger full" type="button" disabled={duplicateOpen || Boolean(mutation)} onClick={() => setDialog("delete")}>{duplicateOpen ? "已有删除请求" : "请求删除"}</button>}{canHold && !status.legalHoldActive && <button className="button secondary full" type="button" disabled={Boolean(mutation)} onClick={() => { setReason(""); setDialog("place"); }}>设置法律保留</button>}{canHold && status.legalHoldActive && <button className="button secondary full" type="button" disabled={releaseDisabled || Boolean(mutation)} title={releaseDisabled ? "缺少法律保留 ID 或版本，请刷新" : undefined} onClick={() => { setReason(""); setDialog("release"); }}>解除法律保留</button>}</div>
