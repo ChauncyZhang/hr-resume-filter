@@ -26,7 +26,7 @@ from server.app.recruiting.models import (
     Resume,
 )
 from server.app.recruiting.service import IdempotencyConflict, RecruitingService
-from server.app.reports.models import ExportRecord
+from server.app.reports.models import ExportCandidateMembership, ExportRecord
 from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.app.talent.models import TalentPoolMembership
 
@@ -448,6 +448,12 @@ def build_private_manifest(
                 select(ExportRecord.id, ExportRecord.object_key).where(
                     ExportRecord.organization_id == organization_id,
                     ExportRecord.object_key.is_not(None),
+                    ExportRecord.id.in_(
+                        select(ExportCandidateMembership.export_id).where(
+                            ExportCandidateMembership.organization_id == organization_id,
+                            ExportCandidateMembership.candidate_id == candidate_id,
+                        )
+                    ),
                 )
             )
         ),

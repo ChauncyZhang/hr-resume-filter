@@ -15,6 +15,38 @@ depends_on = None
 
 def upgrade() -> None:
     op.add_column(
+        "report_exports",
+        sa.Column("generation_token", postgresql.UUID(as_uuid=True), nullable=True),
+    )
+    op.create_table(
+        "report_export_candidates",
+        sa.Column("organization_id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("export_id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("candidate_id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.ForeignKeyConstraint(
+            ["organization_id", "export_id"],
+            ["report_exports.organization_id", "report_exports.id"],
+            name="fk_report_export_candidates_export",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["organization_id", "candidate_id"],
+            ["candidates.organization_id", "candidates.id"],
+            name="fk_report_export_candidates_candidate",
+        ),
+    )
+    op.create_index(
+        "ix_report_export_candidates_candidate",
+        "report_export_candidates",
+        ["organization_id", "candidate_id"],
+    )
+    op.add_column(
         "candidates",
         sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
     )
@@ -39,6 +71,10 @@ def upgrade() -> None:
         sa.Column("policy_version", sa.Integer(), nullable=False),
         sa.Column("candidate_version", sa.Integer(), nullable=False),
         sa.Column("recovery_generation", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("database_redaction_checksum", sa.String(64), nullable=True),
+        sa.Column("ledger_completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("ledger_object_key", sa.String(512), nullable=True),
+        sa.Column("ledger_sha256", sa.String(64), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()),
         sa.UniqueConstraint("organization_id", "id", name="uq_deletion_requests_tenant_id"),
@@ -91,6 +127,18 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "recovery_generation >= 0",
             name="ck_deletion_requests_recovery_generation",
+        ),
+        sa.CheckConstraint(
+            "database_redaction_checksum IS NULL OR database_redaction_checksum ~ '^[0-9a-f]{64}$'",
+            name="ck_deletion_requests_redaction_checksum",
+        ),
+        sa.CheckConstraint(
+            "ledger_sha256 IS NULL OR ledger_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_deletion_requests_ledger_sha256",
+        ),
+        sa.CheckConstraint(
+            "status <> 'completed' OR (database_redaction_checksum IS NOT NULL AND ledger_completed_at IS NOT NULL AND ledger_object_key IS NOT NULL AND ledger_sha256 IS NOT NULL)",
+            name="ck_deletion_requests_completed_receipt",
         ),
     )
     op.create_index(
@@ -976,7 +1024,9 @@ def downgrade() -> None:
               deletion_artifacts,
               deletion_recovery_runs,
               deletion_requests,
-              legal_holds
+              legal_holds,
+              report_export_candidates,
+              report_exports
             IN ACCESS EXCLUSIVE MODE
             """
         )
@@ -1136,3 +1186,5 @@ def downgrade() -> None:
     op.drop_table("deletion_artifacts")
     op.drop_table("deletion_requests")
     op.drop_column("candidates", "deleted_at")
+    op.drop_table("report_export_candidates")
+    op.drop_column("report_exports", "generation_token")

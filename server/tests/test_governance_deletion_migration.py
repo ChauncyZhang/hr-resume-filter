@@ -153,8 +153,18 @@ def test_0017_upgrade_registers_additive_deletion_schema() -> None:
         "deletion_artifacts",
         "legal_holds",
         "deletion_recovery_runs",
+        "report_export_candidates",
     } <= set(inspector.get_table_names())
     assert "deleted_at" in {column["name"] for column in inspector.get_columns("candidates")}
+    assert "generation_token" in {
+        column["name"] for column in inspector.get_columns("report_exports")
+    }
+    assert {
+        "database_redaction_checksum",
+        "ledger_completed_at",
+        "ledger_object_key",
+        "ledger_sha256",
+    } <= {column["name"] for column in inspector.get_columns("deletion_requests")}
     assert {
         "uq_deletion_requests_open_candidate",
         "uq_legal_holds_active_candidate",
@@ -196,7 +206,15 @@ def test_0017_enforces_tenant_fks_partial_uniqueness_and_privileged_boundaries()
     with engine.begin() as connection:
         connection.execute(
             text(
-                "UPDATE deletion_requests SET status = 'completed', completed_at = now() WHERE id = :id"
+                """
+                UPDATE deletion_requests
+                SET status = 'completed', completed_at = now(),
+                    database_redaction_checksum = repeat('b', 64),
+                    ledger_completed_at = now(),
+                    ledger_object_key = 'deletions/test.json',
+                    ledger_sha256 = repeat('c', 64)
+                WHERE id = :id
+                """
             ),
             {"id": first_request},
         )
@@ -559,11 +577,15 @@ def test_0017_empty_downgrade_removes_additive_schema() -> None:
             "deletion_artifacts",
             "legal_holds",
             "deletion_recovery_runs",
+            "report_export_candidates",
         }
         & set(inspector.get_table_names())
     )
     assert "deleted_at" not in {
         column["name"] for column in inspector.get_columns("candidates")
+    }
+    assert "generation_token" not in {
+        column["name"] for column in inspector.get_columns("report_exports")
     }
     with engine.connect() as connection:
         assert connection.scalar(

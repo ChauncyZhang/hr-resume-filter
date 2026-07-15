@@ -48,8 +48,40 @@ restoring the single ordinary executor membership, so the governance login canno
 
 The API container receives none of the governance database, object-deletion, ledger, or signing
 settings. The general worker continues to use `DATABASE_URL` for normal queue work and receives a
-separate `GOVERNANCE_DATABASE_URL` for the later deletion handler. Task B2B1 does not register or
-run that handler.
+separate `GOVERNANCE_DATABASE_URL` only for the registered
+`governance.delete_candidate` handler.
+
+## Governance deletion execution
+
+The deletion job payload is exactly `organization_id`, `deletion_request_id`, and
+`request_version`. Execution locks Candidate before DeletionRequest, revalidates the approved
+version, legal hold, active applications, candidate version, and private manifest, then commits
+`executing`, exact object checkpoints, and the started audit before any object call.
+
+The same Candidate lock is followed by ordered ScreeningItem locks. A matching parse, score, or
+LLM job with a live queue lease makes deletion retry before execution side effects; matching
+queued jobs are cancelled, while running jobs (including expired leases) are never cancelled.
+This pairs with the screening-side active-deletion guard: queue claim may happen first, but no
+provider or scoring work can begin after deletion reaches approved or executing. The common lock
+order is Candidate, ScreeningItem, then queue job.
+
+New report exports persist exact candidate membership. Export preparation and finalization are
+short transactions around an out-of-transaction MinIO write; a generation token prevents a late
+writer from reviving a failed export. Deletion cancels only matching queued exports and retries
+while a matching export or queue job is running. Exports created before revision 0017 have no
+membership rows and are never guessed to belong to a candidate.
+
+Resume and matching export objects are deleted outside database transactions. Each successful or
+failed attempt is checkpointed in its own transaction; missing objects count as deleted. Database
+redaction starts only after every checkpoint is deleted. The redaction checksum, tombstone time,
+manifest hash, and exact checkpoint keys form stable ledger input across retries.
+
+The worker writes the canonical signed ledger last, reads it back through independent signature
+verification, and accepts an existing object only when it matches exactly. Only then does one
+short Candidate-before-Request transaction persist the ledger receipt, mark the request completed,
+and append the completed audit. Completed re-entry verifies the ledger without mutating the
+request or `recovery_generation`. A dead-letter callback matches only the exact tenant, request,
+version, and executing state; it does not acquire a Candidate lock while the queue row is locked.
 
 ## Compose
 

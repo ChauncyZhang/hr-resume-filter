@@ -1,5 +1,6 @@
 import hashlib
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import and_, select
@@ -12,7 +13,12 @@ from server.app.recruiting.models import Application, ApplicationStageEvent, Can
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.interviews.models import Interview, InterviewFeedback, InterviewParticipant
 from server.app.reports.csv_export import render_application_csv
-from server.app.reports.models import ExportDownloadTicket, ExportRecord
+from server.app.governance.deletion_models import DeletionRequest
+from server.app.reports.models import (
+    ExportCandidateMembership,
+    ExportDownloadTicket,
+    ExportRecord,
+)
 from server.app.reports.storage import MAX_EXPORT_BYTES
 
 
@@ -23,6 +29,15 @@ MAX_EXPORT_ROWS = 100_000
 
 class ExportLimitExceeded(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class PreparedExport:
+    export_id: uuid.UUID
+    generation_token: uuid.UUID
+    object_key: str
+    content: bytes
+    row_count: int
 
 
 def _aware(value: datetime) -> datetime:
@@ -253,6 +268,50 @@ def create_export_record(db, principal: Principal, job_ids: list[uuid.UUID], fro
     )
     db.add_all([background, export])
     db.flush()
+    candidate_ids = list(
+        db.scalars(
+            select(Application.candidate_id)
+            .join(
+                Candidate,
+                and_(
+                    Candidate.organization_id == Application.organization_id,
+                    Candidate.id == Application.candidate_id,
+                ),
+            )
+            .where(
+                Application.organization_id == principal.organization_id,
+                Application.job_id.in_(job_ids),
+                Candidate.deleted_at.is_(None),
+                *_date_scope(Application.created_at, from_, to),
+            )
+            .distinct()
+            .order_by(Application.candidate_id)
+        )
+    ) if job_ids else []
+    for candidate_id in candidate_ids:
+        candidate = db.scalar(
+            select(Candidate)
+            .where(
+                Candidate.organization_id == principal.organization_id,
+                Candidate.id == candidate_id,
+            )
+            .with_for_update()
+        )
+        blocked = db.scalar(
+            select(DeletionRequest.id).where(
+                DeletionRequest.organization_id == principal.organization_id,
+                DeletionRequest.candidate_id == candidate_id,
+                DeletionRequest.status.in_(("approved", "executing", "completed")),
+            )
+        )
+        if candidate is not None and candidate.deleted_at is None and blocked is None:
+            db.add(
+                ExportCandidateMembership(
+                    organization_id=principal.organization_id,
+                    export_id=export.id,
+                    candidate_id=candidate_id,
+                )
+            )
     db.add(
         AuditLog(
             organization_id=principal.organization_id,
@@ -279,9 +338,13 @@ def _principal_for_export(db, export: ExportRecord) -> Principal | None:
     )
 
 
-def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
+def prepare_export(db, export_id: uuid.UUID) -> PreparedExport | None:
     export = db.scalar(select(ExportRecord).where(ExportRecord.id == export_id).with_for_update())
     if export is None:
+        raise LookupError("export unavailable")
+    if export.status == "succeeded":
+        return None
+    if export.status == "failed":
         raise LookupError("export unavailable")
     principal = _principal_for_export(db, export)
     requested_job_ids = [uuid.UUID(item) for item in export.filters.get("job_ids", [])]
@@ -291,6 +354,32 @@ def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
     allowed = set(requested_job_ids) & set(currently_authorized)
     from_ = datetime.fromisoformat(export.filters["from"]) if export.filters.get("from") else None
     to = datetime.fromisoformat(export.filters["to"]) if export.filters.get("to") else None
+    candidate_ids = list(
+        db.scalars(
+            select(ExportCandidateMembership.candidate_id).where(
+                ExportCandidateMembership.organization_id == export.organization_id,
+                ExportCandidateMembership.export_id == export.id,
+            )
+        )
+    )
+    for candidate_id in sorted(candidate_ids, key=str):
+        candidate = db.scalar(
+            select(Candidate)
+            .where(
+                Candidate.organization_id == export.organization_id,
+                Candidate.id == candidate_id,
+            )
+            .with_for_update()
+        )
+        blocked = db.scalar(
+            select(DeletionRequest.id).where(
+                DeletionRequest.organization_id == export.organization_id,
+                DeletionRequest.candidate_id == candidate_id,
+                DeletionRequest.status.in_(("approved", "executing", "completed")),
+            )
+        )
+        if candidate is None or candidate.deleted_at is not None or blocked is not None:
+            raise PermissionError("export subject unavailable")
     rows = db.execute(
         select(Application, Candidate)
         .join(
@@ -301,6 +390,8 @@ def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
         .where(
             Application.organization_id == export.organization_id,
             Application.job_id.in_(allowed),
+            Application.candidate_id.in_(candidate_ids),
+            Candidate.deleted_at.is_(None),
             AUTHORIZATION.job_predicate(principal, RecruitingAction.READ, Job),
             *_date_scope(Application.created_at, from_, to),
         )
@@ -326,13 +417,54 @@ def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
     if len(content) > MAX_EXPORT_BYTES:
         raise ExportLimitExceeded("export byte limit exceeded")
     object_key = f"exports/{export.organization_id}/{export.id}.csv"
-    storage.write(object_key, content, "text/csv; charset=utf-8")
     export.object_key = object_key
-    export.row_count = len(rows)
+    export.generation_token = export.generation_token or uuid.uuid4()
+    export.status = "running"
+    export.updated_at = datetime.now(timezone.utc)
+    db.flush()
+    return PreparedExport(
+        export_id=export.id,
+        generation_token=export.generation_token,
+        object_key=object_key,
+        content=content,
+        row_count=len(rows),
+    )
+
+
+def finalize_export(db, prepared: PreparedExport) -> bool:
+    export = db.scalar(
+        select(ExportRecord)
+        .where(ExportRecord.id == prepared.export_id)
+        .with_for_update()
+    )
+    if (
+        export is None
+        or export.status != "running"
+        or export.generation_token != prepared.generation_token
+        or export.object_key != prepared.object_key
+    ):
+        return False
+    export.row_count = prepared.row_count
     export.status = "succeeded"
     export.completed_at = datetime.now(timezone.utc)
     export.updated_at = export.completed_at
     db.flush()
+    return True
+
+
+def generate_export(db, export_id: uuid.UUID, storage) -> ExportRecord:
+    prepared = prepare_export(db, export_id)
+    if prepared is None:
+        export = db.get(ExportRecord, export_id)
+        if export is None:
+            raise LookupError("export unavailable")
+        return export
+    storage.write(prepared.object_key, prepared.content, "text/csv; charset=utf-8")
+    if not finalize_export(db, prepared):
+        raise LookupError("export unavailable")
+    export = db.get(ExportRecord, export_id)
+    if export is None:
+        raise LookupError("export unavailable")
     return export
 
 

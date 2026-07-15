@@ -1,21 +1,31 @@
 import os
 import subprocess
 import threading
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from server.app.core.settings import Settings
-from server.app.governance.deletion_models import DeletionRequest, LegalHold
+from server.app.governance.deletion_models import DeletionArtifact, DeletionRequest, LegalHold
+from server.app.governance.deletion_service import build_private_manifest, canonical_manifest_hash
 from server.app.identity.bootstrap import bootstrap_system_admin
-from server.app.identity.models import Organization, User, UserRole
+from server.app.identity.models import AuditLog, Job, Organization, User, UserRole
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.queue.models import BackgroundJob
-from server.app.recruiting.models import Candidate
+from server.app.queue.repository import QueueRepository
+from server.app.queue.service import RetryableJobError
+from server.app.recruiting.models import (
+    Candidate,
+    FileObject,
+    JobJdVersion,
+    ScreeningRuleVersion,
+)
+from server.app.screening.models import ScreeningItem, ScreeningRun
 
 
 pytestmark = pytest.mark.skipif(
@@ -157,6 +167,200 @@ def test_two_request_creators_serialize_to_one_open_request(postgres_app) -> Non
     assert next(response for response in responses if response.status_code == 409).json()["code"] == "deletion_request_open"
     with Session(engine) as db:
         assert db.scalar(select(func.count()).select_from(DeletionRequest)) == 1
+
+
+def test_two_deletion_workers_materialize_started_state_once(postgres_app) -> None:
+    from server.app.governance.worker import DeletionJobHandler
+
+    app, engine, candidate_id = postgres_app
+    with TestClient(app) as client:
+        requested = create_request(
+            client,
+            login(client, "recruiter@deletion-pg.test"),
+            candidate_id,
+            "worker-request",
+        )
+        request_id = UUID(requested.json()["data"]["id"])
+        approved = client.post(
+            f"/api/v1/deletion-requests/{request_id}/transitions",
+            json={"target_status": "approved"},
+            headers={
+                **login(client, "system@deletion-pg.test"),
+                "If-Match": '"1"',
+                "Idempotency-Key": "worker-approve",
+            },
+        )
+    assert approved.status_code == 200
+    with Session(engine) as db:
+        organization_id = db.scalar(select(Organization.id))
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    outcomes = []
+
+    def claim() -> None:
+        handler = DeletionJobHandler(
+            sessions,
+            None,
+            None,
+            None,
+            resume_bucket="resumes",
+            export_bucket="resumes",
+        )
+        outcomes.append(
+            handler._claim(
+                organization_id,
+                request_id,
+                2,
+                "two-worker-claim",
+            )
+        )
+
+    run_concurrently(claim, claim)
+
+    with Session(engine) as db:
+        request = db.get(DeletionRequest, request_id)
+        assert outcomes == [False, False]
+        assert request.status == "executing"
+        assert db.scalar(
+            select(func.count())
+            .select_from(AuditLog)
+            .where(AuditLog.event_type == "governance.deletion_started")
+        ) == 1
+
+
+def test_atomic_screening_claim_precedes_and_blocks_deletion_claim(postgres_app) -> None:
+    from server.app.governance.worker import DeletionJobHandler
+
+    app, engine, candidate_id = postgres_app
+    with TestClient(app) as client:
+        requested = create_request(
+            client,
+            login(client, "recruiter@deletion-pg.test"),
+            candidate_id,
+            "screening-barrier-request",
+        )
+        request_id = UUID(requested.json()["data"]["id"])
+        approved = client.post(
+            f"/api/v1/deletion-requests/{request_id}/transitions",
+            json={"target_status": "approved"},
+            headers={
+                **login(client, "system@deletion-pg.test"),
+                "If-Match": '"1"',
+                "Idempotency-Key": "screening-barrier-approve",
+            },
+        )
+    assert approved.status_code == 200
+
+    with Session(engine) as db:
+        candidate = db.get(Candidate, candidate_id)
+        request = db.get(DeletionRequest, request_id)
+        recruiting_job = Job(
+            organization_id=candidate.organization_id,
+            title="Claimed screening",
+            owner_id=candidate.owner_id,
+            status="closed",
+        )
+        db.add(recruiting_job)
+        db.flush()
+        jd = JobJdVersion(
+            organization_id=candidate.organization_id,
+            job_id=recruiting_job.id,
+            version_number=1,
+            content={"text": "Python"},
+            created_by=candidate.owner_id,
+        )
+        rule = ScreeningRuleVersion(
+            organization_id=candidate.organization_id,
+            job_id=recruiting_job.id,
+            version_number=1,
+            content={},
+            created_by=candidate.owner_id,
+        )
+        stored = FileObject(
+            organization_id=candidate.organization_id,
+            storage_key=f"clean/{candidate.organization_id}/{uuid4()}",
+            original_filename="claimed.txt",
+            mime_type="text/plain",
+            size_bytes=6,
+            sha256="1" * 64,
+            uploaded_by=candidate.owner_id,
+        )
+        db.add_all([jd, rule, stored])
+        db.flush()
+        run = ScreeningRun(
+            organization_id=candidate.organization_id,
+            job_id=recruiting_job.id,
+            jd_version_id=jd.id,
+            rule_version_id=rule.id,
+            source="upload",
+            status="rule_scoring",
+            total_count=1,
+            processed_count=0,
+            succeeded_count=0,
+            failed_count=0,
+            created_by=candidate.owner_id,
+        )
+        db.add(run)
+        db.flush()
+        item = ScreeningItem(
+            organization_id=candidate.organization_id,
+            run_id=run.id,
+            file_object_id=stored.id,
+            candidate_id=candidate.id,
+            status="parsed",
+            attempts=1,
+        )
+        db.add(item)
+        db.flush()
+        now = datetime.now(timezone.utc)
+        score_job = BackgroundJob(
+            organization_id=candidate.organization_id,
+            type="screening.score_item",
+            payload={
+                "organization_id": str(candidate.organization_id),
+                "screening_item_id": str(item.id),
+            },
+            status="queued",
+            priority=100,
+            attempts=0,
+            max_attempts=3,
+            run_after=now,
+            dedupe_key=f"score:{item.id}",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(score_job)
+        db.flush()
+        manifest, policy = build_private_manifest(db, candidate, now=request.requested_at)
+        request.impact_manifest = manifest
+        request.manifest_hash = canonical_manifest_hash(manifest)
+        request.policy_version = policy.version
+        organization_id = candidate.organization_id
+        score_job_id = score_job.id
+        db.commit()
+
+    with Session(engine) as db:
+        claimed = QueueRepository(db).claim(
+            organization_id, "score-worker", lease_seconds=60
+        )
+        assert claimed is not None and claimed.id == score_job_id
+        db.commit()
+
+    handler = DeletionJobHandler(
+        sessionmaker(engine, expire_on_commit=False),
+        None,
+        None,
+        None,
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+    with pytest.raises(RetryableJobError) as raised:
+        handler._claim(organization_id, request_id, 2, "screening-claimed-first")
+
+    assert raised.value.safe_code == "deletion_screening_inflight"
+    with Session(engine) as db:
+        assert db.get(DeletionRequest, request_id).status == "approved"
+        assert db.get(BackgroundJob, score_job_id).status == "running"
+        assert db.scalar(select(DeletionArtifact.id)) is None
 
 
 def test_same_key_different_candidates_never_replays_cross_candidate(postgres_app) -> None:

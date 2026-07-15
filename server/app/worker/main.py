@@ -10,12 +10,12 @@ from sqlalchemy.exc import DisconnectionError, OperationalError, StatementError,
 
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
-from server.app.core.settings import Settings
+from server.app.core.settings import GovernanceSettings, Settings
 from server.app.queue.payloads import IDENTIFIER_PATTERN, OpaqueIdField, PayloadSchema, TYPE_PATTERN, UnsafePayload
 from server.app.queue.service import PermanentJobError, RetryableJobError, normalize_safe_code
 from server.app.recruiting.storage import StorageReadFailed
 from server.app.reports.models import ExportRecord
-from server.app.reports.service import ExportLimitExceeded, generate_export
+from server.app.reports.service import ExportLimitExceeded, finalize_export, prepare_export
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,17 @@ class ReportExportJobHandler:
             )
             if export is None:
                 raise LookupError("export unavailable")
-            generate_export(database, export.id, self._storage)
+            prepared = prepare_export(database, export.id)
+        if prepared is None:
+            return
+        self._storage.write(
+            prepared.object_key,
+            prepared.content,
+            "text/csv; charset=utf-8",
+        )
+        with self._sessions.begin() as database:
+            if not finalize_export(database, prepared):
+                raise LookupError("export unavailable")
 
 def build_screening_handlers(settings,storage_client,bucket):
     from sqlalchemy import create_engine
@@ -89,11 +99,66 @@ def build_screening_handlers(settings,storage_client,bucket):
     return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"reports.export":report_export}
 
 
+def build_governance_handler(settings: Settings, governance: GovernanceSettings):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from server.app.core.storage import create_storage_client
+    from server.app.governance.storage import DeleteOnlyObjectAdapter, SignedLedgerAdapter
+    from server.app.governance.worker import DeletionJobHandler
+
+    delete_client = create_storage_client(
+        governance.storage_endpoint,
+        governance.delete_access_key,
+        governance.delete_secret_key.get_secret_value(),
+        secure=governance.storage_secure,
+        connect_timeout_seconds=settings.object_storage_connect_timeout_seconds,
+        read_timeout_seconds=settings.object_storage_read_timeout_seconds,
+        total_timeout_seconds=settings.object_storage_total_timeout_seconds,
+    )
+    ledger_client = create_storage_client(
+        governance.storage_endpoint,
+        governance.ledger_access_key,
+        governance.ledger_secret_key.get_secret_value(),
+        secure=governance.storage_secure,
+        connect_timeout_seconds=settings.object_storage_connect_timeout_seconds,
+        read_timeout_seconds=settings.object_storage_read_timeout_seconds,
+        total_timeout_seconds=settings.object_storage_total_timeout_seconds,
+    )
+    sessions = sessionmaker(
+        create_engine(_sync_database_url(settings.database_url), pool_pre_ping=True),
+        expire_on_commit=False,
+    )
+    governance_engine = create_engine(
+        _sync_database_url(governance.database_url.get_secret_value()),
+        pool_pre_ping=True,
+    )
+    ledger = SignedLedgerAdapter(
+        ledger_client,
+        governance.ledger_bucket,
+        governance.ledger_prefix,
+        governance.signing_key.get_secret_value().encode("utf-8"),
+    )
+    return DeletionJobHandler(
+        sessions,
+        governance_engine,
+        DeleteOnlyObjectAdapter(delete_client),
+        ledger,
+        resume_bucket=governance.resume_bucket,
+        export_bucket=governance.export_bucket,
+    )
+
+
 def build_terminal_callbacks():
+    from server.app.governance.terminal import governance_terminal_callbacks
     from server.app.reports.terminal import report_terminal_callbacks
     from server.app.screening.terminal import screening_terminal_callbacks
 
-    return {**screening_terminal_callbacks(), **report_terminal_callbacks()}
+    return {
+        **screening_terminal_callbacks(),
+        **report_terminal_callbacks(),
+        **governance_terminal_callbacks(),
+    }
 
 
 class Worker:
@@ -225,8 +290,9 @@ async def _run() -> None:
     from server.app.core.storage import ObjectStorageProbe, create_storage_client
     from server.app.db.session import DatabaseProbe, create_engine
     from server.app.queue.runtime import DatabaseQueueGateway
-    settings = Settings.from_environment(); gateway = DatabaseQueueGateway(settings.database_url,terminal_callbacks=build_terminal_callbacks()); storage_client=create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds)
+    settings = Settings.from_environment(); governance = GovernanceSettings.from_environment(settings); gateway = DatabaseQueueGateway(settings.database_url,terminal_callbacks=build_terminal_callbacks()); storage_client=create_storage_client(settings.object_storage_endpoint, settings.object_storage_access_key, settings.object_storage_secret_key, secure=settings.object_storage_secure, connect_timeout_seconds=settings.object_storage_connect_timeout_seconds, read_timeout_seconds=settings.object_storage_read_timeout_seconds, total_timeout_seconds=settings.object_storage_total_timeout_seconds)
     handlers=build_screening_handlers(settings,storage_client,settings.object_storage_bucket)
+    handlers["governance.delete_candidate"] = build_governance_handler(settings, governance)
     worker = Worker(DatabaseProbe(create_engine(settings.database_url)), ObjectStorageProbe(storage_client, settings.object_storage_bucket), interval_seconds=settings.worker_poll_interval_seconds, readiness_timeout_seconds=settings.readiness_timeout_seconds, worker_id=settings.worker_id, lease_seconds=settings.worker_lease_seconds, shutdown_timeout_seconds=settings.worker_shutdown_timeout_seconds, cancel_timeout_seconds=settings.worker_cancel_timeout_seconds, heartbeat_seconds=settings.worker_heartbeat_seconds, queue=gateway, handlers=handlers, outbox_handlers={})
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM): loop.add_signal_handler(event, worker.request_shutdown)

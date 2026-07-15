@@ -26,6 +26,7 @@ class ExportRecord(Base):
     status: Mapped[str] = mapped_column(String(20), default="queued")
     filters: Mapped[dict] = mapped_column(JSON_DOCUMENT, default=dict)
     object_key: Mapped[str | None] = mapped_column(String(512))
+    generation_token: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     row_count: Mapped[int] = mapped_column(Integer, default=0)
     safe_error_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -48,6 +49,27 @@ class ExportRecord(Base):
             ["background_jobs.organization_id", "background_jobs.id"],
         ),
         Index("ix_report_exports_requester_created", "organization_id", "requested_by", "created_at"),
+    )
+
+
+class ExportCandidateMembership(Base):
+    __tablename__ = "report_export_candidates"
+
+    organization_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    export_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    candidate_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "export_id"],
+            ["report_exports.organization_id", "report_exports.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "candidate_id"],
+            ["candidates.organization_id", "candidates.id"],
+        ),
+        Index("ix_report_export_candidates_candidate", "organization_id", "candidate_id"),
     )
 
 

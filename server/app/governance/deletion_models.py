@@ -98,6 +98,10 @@ class DeletionRequest(Base):
     policy_version: Mapped[int] = mapped_column(Integer, nullable=False)
     candidate_version: Mapped[int] = mapped_column(Integer, nullable=False)
     recovery_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    database_redaction_checksum: Mapped[str | None] = mapped_column(String(64))
+    ledger_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    ledger_object_key: Mapped[str | None] = mapped_column(String(512))
+    ledger_sha256: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
