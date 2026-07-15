@@ -96,7 +96,7 @@ exit 93
 
 
 def _run_production_preflight(
-    tmp_path: Path, remote_runbook: Path
+    tmp_path: Path, remote_runbook: Path, *, curl_exit_code: int = 0
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     docker_shim = tmp_path / "docker"
     docker_shim.write_text(
@@ -112,6 +112,10 @@ fi
     curl_shim.write_text(
         """#!/bin/sh
 printf '%s\n' "$*" >> "$NETWORK_CALL_LOG"
+if [ "$CURL_EXIT_CODE" -ne 0 ]; then
+    printf '%s\n' 'curl: simulated HTTP 404' >&2
+    exit "$CURL_EXIT_CODE"
+fi
 case "$*" in
     *raw.githubusercontent.com*) cat "$REMOTE_RUNBOOK_SOURCE" ;;
 esac
@@ -124,6 +128,7 @@ esac
     environment.update(
         {
             "COMPOSE_ENV_FILE": "deploy/.env.example",
+            "CURL_EXIT_CODE": str(curl_exit_code),
             "NETWORK_CALL_LOG": _shell_path(network_call_log),
             "OBSERVABILITY_PREFLIGHT_MODE": "production",
             "REMOTE_RUNBOOK_SOURCE": _shell_path(remote_runbook),
@@ -169,16 +174,50 @@ def test_production_preflight_checks_canonical_blob_raw_and_remote_anchors(
     )
 
 
-def test_production_preflight_rejects_remote_runbook_missing_local_alert_anchors(
+def test_production_preflight_rejects_remote_runbook_with_only_matching_headings(
     tmp_path: Path,
 ) -> None:
     remote_runbook = tmp_path / "remote-runbook.md"
-    remote_runbook.write_text("# published runbook is incomplete\n", encoding="utf-8")
+    headings_only = "\n".join(
+        line
+        for line in RUNBOOK.read_text(encoding="utf-8").splitlines()
+        if line.startswith("#")
+    )
+    remote_runbook.write_text(f"{headings_only}\n", encoding="utf-8")
 
     result, _ = _run_production_preflight(tmp_path, remote_runbook)
 
     assert result.returncode != 0
-    assert "anchor" in result.stderr.lower()
+    assert "content" in result.stderr.lower()
+
+
+def test_production_preflight_rejects_stale_remote_runbook_body(
+    tmp_path: Path,
+) -> None:
+    remote_runbook = tmp_path / "remote-runbook.md"
+    stale = RUNBOOK.read_text(encoding="utf-8").replace(
+        "The first-release SLIs", "The stale-release SLIs", 1
+    )
+    remote_runbook.write_text(stale, encoding="utf-8")
+
+    result, _ = _run_production_preflight(tmp_path, remote_runbook)
+
+    assert result.returncode != 0
+    assert "content" in result.stderr.lower()
+
+
+def test_production_preflight_fails_closed_when_canonical_runbook_is_404(
+    tmp_path: Path,
+) -> None:
+    remote_runbook = tmp_path / "remote-runbook.md"
+    remote_runbook.write_text(RUNBOOK.read_text(encoding="utf-8"), encoding="utf-8")
+
+    result, _ = _run_production_preflight(
+        tmp_path, remote_runbook, curl_exit_code=22
+    )
+
+    assert result.returncode == 22
+    assert "404" in result.stderr
 
 
 def test_runbook_requires_main_publication_before_production_alert_deploy() -> None:
@@ -187,3 +226,5 @@ def test_runbook_requires_main_publication_before_production_alert_deploy() -> N
     assert "OBSERVABILITY_PREFLIGHT_MODE=production" in runbook
     assert "published to `main`" in runbook
     assert "before deploying alert rules" in runbook
+    assert "full published runbook content" in runbook
+    assert "CRLF/LF" in runbook

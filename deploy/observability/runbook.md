@@ -42,9 +42,12 @@ OBSERVABILITY_PREFLIGHT_MODE=production \
 ```
 
 Production mode fails unless the canonical GitHub blob URL and raw runbook URL
-both resolve successfully and every local alert anchor is present in the
-published runbook. Do not deploy alert rules from an unpublished branch: a
-local anchor test cannot prove that an operator-facing URL is online.
+both resolve successfully and every local alert anchor is present.
+The full published runbook content
+must also match the local runbook. Comparison normalizes only CRLF/LF line
+endings; any heading or body difference still fails. Do not deploy
+alert rules from an unpublished branch: a local anchor test cannot prove that
+an operator-facing URL is online or current.
 
 After it passes, start the fixed three-file model. The one-shot
 `observability-role-provision` service idempotently creates the two logins and

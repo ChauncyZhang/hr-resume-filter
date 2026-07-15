@@ -39,8 +39,22 @@ case "$preflight_mode" in
             printf '%s\n' 'observability preflight: curl is required in production mode' >&2
             exit 1
         }
+        command -v cmp >/dev/null 2>&1 || {
+            printf '%s\n' 'observability preflight: cmp is required in production mode' >&2
+            exit 1
+        }
+        remote_runbook=
+        local_runbook_normalized=
+        remote_runbook_normalized=
+        cleanup_runbook_files() {
+            [ -z "$remote_runbook" ] || rm -f "$remote_runbook"
+            [ -z "$local_runbook_normalized" ] || rm -f "$local_runbook_normalized"
+            [ -z "$remote_runbook_normalized" ] || rm -f "$remote_runbook_normalized"
+        }
+        trap cleanup_runbook_files EXIT HUP INT TERM
         remote_runbook=$(mktemp)
-        trap 'rm -f "$remote_runbook"' EXIT HUP INT TERM
+        local_runbook_normalized=$(mktemp)
+        remote_runbook_normalized=$(mktemp)
         curl --fail --location --silent --show-error \
             --output /dev/null "$canonical_runbook_url"
         curl --fail --location --silent --show-error \
@@ -69,7 +83,14 @@ case "$preflight_mode" in
                 exit 1
             fi
         done
-        rm -f "$remote_runbook"
+        sed 's/\r$//' "$local_runbook" > "$local_runbook_normalized"
+        sed 's/\r$//' "$remote_runbook" > "$remote_runbook_normalized"
+        if ! cmp -s "$local_runbook_normalized" "$remote_runbook_normalized"; then
+            printf '%s\n' \
+                'observability preflight: published runbook content differs from local runbook' >&2
+            exit 1
+        fi
+        cleanup_runbook_files
         trap - EXIT HUP INT TERM
         ;;
     *)

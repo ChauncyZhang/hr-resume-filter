@@ -2,10 +2,11 @@
 
 ## Status
 
-The Phase 6B final-review follow-up is implemented on top of `586639f` within
-the Phase 6B write set. The two Important findings and one Minor finding have
-automated regression coverage. No B2B1 WIP, governance/migration file, shared
-Dockerfile/README/settings file, or user-protected file was modified or staged.
+The Phase 6B final-review follow-ups are implemented through `97b7874` within
+the Phase 6B write set. The remaining Important content-equivalence finding now
+has automated regression coverage. No Phase 6C file, B2B1 WIP,
+governance/migration file, shared Dockerfile/README/settings file, or
+user-protected file was modified or staged.
 
 The code is ready to commit, but production alert deployment is intentionally
 release-gated: the canonical GitHub blob and raw runbook URLs currently return
@@ -71,7 +72,9 @@ The ordinary preflight remains offline for development/static CI. With
 2. requires `curl` and verifies both the canonical GitHub blob URL and raw URL;
 3. requires every alert URL to use the canonical base;
 4. checks every alert fragment against both local and published runbook
-   headings.
+   headings; and
+5. normalizes only CRLF/LF line endings and uses `cmp -s` to require the full
+   published body to equal the current local runbook.
 
 Tests use a local curl shim, so offline CI never depends on external network.
 They prove production mode checks both URLs, accepts aligned remote content,
@@ -79,6 +82,19 @@ and rejects a published runbook missing a local alert anchor. The runbook makes
 publication to `main` a required predecessor of production alert deployment;
 the current real 404 is recorded as that expected release-order block, not as
 evidence of online availability.
+
+### 4. Full published-content equivalence
+
+The production gate no longer treats matching headings as sufficient. It uses
+three `mktemp` files for the downloaded raw runbook and the local/remote
+line-ending-normalized copies, installs cleanup traps before allocation, and
+removes every temporary file on success, HTTP failure, content mismatch, or
+signal. It never prints either runbook body.
+
+Regression tests prove that identical complete content passes, while a remote
+file containing every matching heading but no body and a remote file with one
+stale body sentence both fail. A simulated HTTP 404 remains fail-closed, and
+the development-mode curl shim proves offline preflight makes no network call.
 
 ## TDD evidence
 
@@ -98,7 +114,9 @@ GREEN after the scoped fixes:
 - node-exporter static boundary and Docker Desktop VM runtime subset:
   `2 passed`;
 - preflight offline/production simulation and release-order documentation:
-  `4 passed`;
+  `6 passed` for the final content-equivalence focused suite;
+- final preflight plus static topology rerun: `11 passed, 1 deselected`; the
+  node runtime gate was intentionally excluded per the final-review request;
 - ordinary installed preflight: success;
 - real production-mode preflight before publication: expected fail-closed,
   curl exit 22 / HTTP 404 for both canonical URLs.
@@ -119,8 +137,8 @@ GREEN after the scoped fixes:
 
 ## Commit
 
-Base commit: `586639f fix(observability): close Phase6B review findings`.
+Base commit: `97b7874 fix(observability): close final review gaps`.
 Intended follow-up subject:
-`fix(observability): close final review gaps`.
+`fix(observability): verify published runbook content`.
 The immutable follow-up hash is reported in the final handoff because a commit
 cannot contain its own hash.
