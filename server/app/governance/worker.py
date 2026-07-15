@@ -24,7 +24,8 @@ from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.recruiting.models import Application, Candidate
 from server.app.recruiting.service import RecruitingService
 from server.app.reports.models import ExportCandidateMembership, ExportRecord
-from server.app.screening.models import ScreeningItem
+from server.app.screening.models import ScreeningItem, ScreeningRun
+from server.app.screening.progress import aggregate_run
 
 
 DELETE_CANDIDATE_PAYLOAD = PayloadSchema(
@@ -208,6 +209,18 @@ class DeletionJobHandler:
         if not items:
             return
         items_by_id = {str(item.id): item for item in items}
+        runs = list(
+            db.scalars(
+                select(ScreeningRun)
+                .where(
+                    ScreeningRun.organization_id == organization_id,
+                    ScreeningRun.id.in_({item.run_id for item in items}),
+                )
+                .order_by(ScreeningRun.id)
+                .with_for_update()
+            )
+        )
+        runs_by_id = {run.id: run for run in runs}
         jobs = list(
             db.scalars(
                 select(BackgroundJob)
@@ -254,9 +267,34 @@ class DeletionJobHandler:
             ):
                 raise RetryableJobError("deletion_screening_inflight")
         queue = QueueRepository(db)
+        affected_run_ids = set()
         for job in jobs:
             if job.status == "queued":
-                queue.cancel(organization_id, job.id)
+                if not queue.cancel(organization_id, job.id):
+                    continue
+                item = items_by_id.get(str(job.payload.get("screening_item_id")))
+                if item is None:
+                    continue
+                affected_run_ids.add(item.run_id)
+                if job.type in {"screening.parse_item", "screening.score_item"}:
+                    if item.status not in {"scored", "failed", "cancelled"}:
+                        item.status = "cancelled"
+                        item.safe_error_code = "candidate_unavailable"
+                        item.finished_at = item.finished_at or now
+                elif (
+                    job.type == "screening.llm_score_item"
+                    and item.status == "scored"
+                    and item.llm_status == "queued"
+                ):
+                    item.llm_status = "skipped"
+                    item.llm_safe_error_code = "candidate_unavailable"
+                    item.llm_finished_at = item.llm_finished_at or now
+                    item.finished_at = item.finished_at or now
+        db.flush()
+        for run_id in sorted(affected_run_ids):
+            run = runs_by_id.get(run_id)
+            if run is not None:
+                aggregate_run(db, run)
 
     def _settle_exports(self, organization_id, request_id) -> None:
         with self._sessions.begin() as db:

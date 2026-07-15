@@ -8,7 +8,7 @@ B2B2 implements the governed candidate-deletion worker from strict queue dispatc
 
 - The handler accepts only the exact tenant, deletion-request, and request-version payload shape.
 - Candidate and deletion request are locked in Candidate-to-DeletionRequest order. Version, state, legal hold, active applications, and the private manifest are revalidated before execution starts or resumes.
-- Candidate-associated ScreeningItems are then locked in stable order. Live parse, score, or LLM queue leases force a retry before execution side effects; matching queued jobs are cancelled and running jobs are never cancelled. Expired leases do not create a permanent block. The companion screening guard uses the same Candidate-to-ScreeningItem order and rejects new provider/scoring work after approval or execution begins.
+- Candidate-associated ScreeningItems and their runs are then locked in stable order. Live parse, score, or LLM queue leases force a retry before execution side effects; matching queued jobs are cancelled and running jobs are never cancelled. In the cancellation transaction, queued parse/score items become terminal `cancelled`, queued LLM work becomes `skipped`, safe terminal fields are recorded without overwriting succeeded LLM state, and each affected run is aggregated once. Expired leases do not create a permanent block. The companion screening guard uses the same Candidate-to-ScreeningItem order and rejects new provider/scoring work after approval or execution begins.
 - Approval transitions to `executing`, exact artifacts are materialized, and the started audit is committed in one short transaction.
 - Report exports persist exact candidate membership. Pre-0017 exports have no inferred membership. Matching queued jobs are cancelled; running or leased jobs force a safe retry before any object deletion.
 - Report generation uses prepare, object write, and token-checked finalize phases so a cancelled or stale writer cannot publish a late export.
@@ -36,6 +36,7 @@ Migration `0017_governance_deletion` adds exact report-export membership and rep
 - Fresh real MinIO B2B1 role/race gate: `2 passed in 1.77s`.
 - Fresh real MinIO B2B2 deletion ordering, ledger fail/retry, read-back verification, and tamper rejection, plus ledger race: `3 passed in 7.96s`.
 - Committed-version rerun on a new isolated MinIO instance: `1 passed in 6.48s`; the instance and network were removed after the gate.
+- B2B2 Important review fix, including parse/score/LLM cancellation, mixed candidates, run aggregation, live-lease preservation, and idempotent re-entry: `21 passed, 1 skipped in 42.25s`.
 
 The broad backend split was intentionally not used as completion evidence: an older long-running container was stopped because it occupied the shared PostgreSQL instance. Per task direction, completion is based on the focused unit, real PostgreSQL, and real MinIO gates above.
 

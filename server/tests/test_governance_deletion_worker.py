@@ -293,7 +293,7 @@ def _screening_job_for_candidate(
         request.impact_manifest = manifest
         request.manifest_hash = canonical_manifest_hash(manifest)
         request.policy_version = policy.version
-        return item.id, queued.id
+        return item.id, queued.id, run.id
 
 
 @pytest.mark.parametrize(
@@ -310,7 +310,7 @@ def test_claim_waits_for_active_screening_lease_before_side_effects(
 
     app = make_app(tmp_path)
     organization_id, candidate_id, request_id = _approved_request(app)
-    _item_id, queue_job_id = _screening_job_for_candidate(
+    _item_id, queue_job_id, _run_id = _screening_job_for_candidate(
         app,
         organization_id,
         candidate_id,
@@ -339,28 +339,28 @@ def test_claim_waits_for_active_screening_lease_before_side_effects(
 
 
 @pytest.mark.parametrize(
-    "job_type",
+    ("job_type", "item_status", "llm_status", "expected_status", "expected_llm"),
     [
-        "screening.parse_item",
-        "screening.score_item",
-        "screening.llm_score_item",
+        ("screening.parse_item", "queued", "not_requested", "cancelled", "not_requested"),
+        ("screening.score_item", "parsed", "not_requested", "cancelled", "not_requested"),
+        ("screening.llm_score_item", "scored", "queued", "scored", "skipped"),
     ],
 )
-def test_claim_cancels_queued_screening_work_before_executing(
-    tmp_path, job_type
+def test_claim_cancels_queued_screening_work_and_aggregates_run_idempotently(
+    tmp_path, job_type, item_status, llm_status, expected_status, expected_llm
 ) -> None:
     from server.app.governance.worker import DeletionJobHandler
 
     app = make_app(tmp_path)
     organization_id, candidate_id, request_id = _approved_request(app)
-    _item_id, queue_job_id = _screening_job_for_candidate(
+    item_id, queue_job_id, run_id = _screening_job_for_candidate(
         app,
         organization_id,
         candidate_id,
         request_id,
         job_type=job_type,
-        item_status="scored" if job_type == "screening.llm_score_item" else "queued",
-        llm_status="queued" if job_type == "screening.llm_score_item" else "not_requested",
+        item_status=item_status,
+        llm_status=llm_status,
         queue_status="queued",
     )
     handler = DeletionJobHandler(
@@ -377,6 +377,209 @@ def test_claim_cancels_queued_screening_work_before_executing(
     with app.state.identity_store.sync_session() as db:
         assert db.get(DeletionRequest, request_id).status == "executing"
         assert db.get(BackgroundJob, queue_job_id).status == "cancelled"
+        item = db.get(ScreeningItem, item_id)
+        run = db.get(ScreeningRun, run_id)
+        assert item.status == expected_status
+        assert item.llm_status == expected_llm
+        assert item.finished_at is not None
+        if job_type == "screening.llm_score_item":
+            assert item.safe_error_code is None
+            assert item.llm_safe_error_code == "candidate_unavailable"
+            assert item.llm_finished_at is not None
+            assert (run.processed_count, run.succeeded_count, run.failed_count) == (1, 1, 0)
+            assert run.status == "completed"
+        else:
+            assert item.safe_error_code == "candidate_unavailable"
+            assert item.llm_safe_error_code is None
+            assert (run.processed_count, run.succeeded_count, run.failed_count) == (1, 0, 1)
+            assert run.status == "failed"
+        first_state = (
+            item.status,
+            item.safe_error_code,
+            item.finished_at,
+            item.llm_status,
+            item.llm_safe_error_code,
+            item.llm_finished_at,
+            run.processed_count,
+            run.succeeded_count,
+            run.failed_count,
+            run.status,
+            run.version,
+            run.finished_at,
+        )
+
+    assert handler._claim(organization_id, request_id, 2, "screening-cancel-reentry") is False
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, item_id)
+        run = db.get(ScreeningRun, run_id)
+        assert (
+            item.status,
+            item.safe_error_code,
+            item.finished_at,
+            item.llm_status,
+            item.llm_safe_error_code,
+            item.llm_finished_at,
+            run.processed_count,
+            run.succeeded_count,
+            run.failed_count,
+            run.status,
+            run.version,
+            run.finished_at,
+        ) == first_state
+
+
+def test_claim_aggregates_mixed_items_without_overwriting_llm_success(tmp_path) -> None:
+    from server.app.governance.deletion_service import (
+        build_private_manifest,
+        canonical_manifest_hash,
+    )
+    from server.app.governance.worker import DeletionJobHandler
+
+    app = make_app(tmp_path)
+    organization_id, candidate_id, request_id = _approved_request(app)
+    cancelled_item_id, parse_job_id, run_id = _screening_job_for_candidate(
+        app,
+        organization_id,
+        candidate_id,
+        request_id,
+        job_type="screening.parse_item",
+        item_status="queued",
+        queue_status="queued",
+    )
+    now = datetime.now(timezone.utc)
+    with app.state.identity_store.sync_session.begin() as db:
+        candidate = db.get(Candidate, candidate_id)
+        request = db.get(DeletionRequest, request_id)
+        run = db.get(ScreeningRun, run_id)
+        run.total_count = 3
+        resumes = list(
+            db.scalars(
+                select(Resume)
+                .where(Resume.candidate_id == candidate_id)
+                .order_by(Resume.version_number)
+            )
+        )
+        succeeded_item = ScreeningItem(
+            organization_id=organization_id,
+            run_id=run_id,
+            file_object_id=resumes[1].file_object_id,
+            candidate_id=candidate_id,
+            resume_id=resumes[1].id,
+            status="scored",
+            attempts=1,
+            llm_status="succeeded",
+            llm_finished_at=now,
+            finished_at=now,
+        )
+        db.add(succeeded_item)
+        db.flush()
+        stale_llm_job = BackgroundJob(
+            organization_id=organization_id,
+            type="screening.llm_score_item",
+            payload={
+                "organization_id": str(organization_id),
+                "screening_item_id": str(succeeded_item.id),
+            },
+            status="queued",
+            priority=0,
+            attempts=0,
+            max_attempts=3,
+            run_after=now,
+            dedupe_key=f"stale-llm:{succeeded_item.id}",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(stale_llm_job)
+        db.flush()
+        other_candidate = Candidate(
+            organization_id=organization_id,
+            display_name="Unrelated candidate",
+            owner_id=candidate.owner_id,
+        )
+        other_file = FileObject(
+            organization_id=organization_id,
+            storage_key=f"clean/{organization_id}/{uuid4()}",
+            original_filename="unrelated.pdf",
+            mime_type="application/pdf",
+            size_bytes=10,
+            sha256="f" * 64,
+            uploaded_by=candidate.owner_id,
+        )
+        db.add_all([other_candidate, other_file])
+        db.flush()
+        other_item = ScreeningItem(
+            organization_id=organization_id,
+            run_id=run_id,
+            file_object_id=other_file.id,
+            candidate_id=other_candidate.id,
+            status="queued",
+            attempts=0,
+        )
+        db.add(other_item)
+        db.flush()
+        other_job = BackgroundJob(
+            organization_id=organization_id,
+            type="screening.parse_item",
+            payload={
+                "organization_id": str(organization_id),
+                "screening_item_id": str(other_item.id),
+            },
+            status="queued",
+            priority=0,
+            attempts=0,
+            max_attempts=3,
+            run_after=now,
+            dedupe_key=f"unrelated-parse:{other_item.id}",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(other_job)
+        db.flush()
+        manifest, policy = build_private_manifest(db, candidate, now=request.requested_at)
+        request.impact_manifest = manifest
+        request.manifest_hash = canonical_manifest_hash(manifest)
+        request.policy_version = policy.version
+        succeeded_item_id = succeeded_item.id
+        stale_llm_job_id = stale_llm_job.id
+        other_item_id = other_item.id
+        other_job_id = other_job.id
+    with app.state.identity_store.sync_session() as db:
+        succeeded_finished_at = db.get(
+            ScreeningItem, succeeded_item_id
+        ).llm_finished_at
+
+    handler = DeletionJobHandler(
+        sessions=app.state.identity_store.sync_session,
+        governance_engine=FakeGovernanceEngine(),
+        object_deleter=RecordingDeleter([]),
+        ledger=RecordingLedger([]),
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+
+    assert handler._claim(organization_id, request_id, 2, "screening-mixed") is False
+
+    with app.state.identity_store.sync_session() as db:
+        cancelled = db.get(ScreeningItem, cancelled_item_id)
+        succeeded = db.get(ScreeningItem, succeeded_item_id)
+        other = db.get(ScreeningItem, other_item_id)
+        run = db.get(ScreeningRun, run_id)
+        assert db.get(BackgroundJob, parse_job_id).status == "cancelled"
+        assert db.get(BackgroundJob, stale_llm_job_id).status == "cancelled"
+        assert (cancelled.status, cancelled.safe_error_code) == (
+            "cancelled",
+            "candidate_unavailable",
+        )
+        assert succeeded.status == "scored"
+        assert succeeded.llm_status == "succeeded"
+        assert succeeded.llm_safe_error_code is None
+        assert succeeded.llm_finished_at == succeeded_finished_at
+        assert db.get(BackgroundJob, other_job_id).status == "queued"
+        assert other.status == "queued"
+        assert other.finished_at is None
+        assert (run.processed_count, run.succeeded_count, run.failed_count) == (2, 1, 1)
+        assert run.status == "rule_scoring"
 
 
 def test_expired_screening_lease_does_not_permanently_block_or_get_cancelled(
@@ -386,7 +589,7 @@ def test_expired_screening_lease_does_not_permanently_block_or_get_cancelled(
 
     app = make_app(tmp_path)
     organization_id, candidate_id, request_id = _approved_request(app)
-    _item_id, queue_job_id = _screening_job_for_candidate(
+    _item_id, queue_job_id, _run_id = _screening_job_for_candidate(
         app,
         organization_id,
         candidate_id,
