@@ -103,9 +103,12 @@ endpoint identifiers, run IDs, and local evidence paths.
   cross-process/cross-host conditional creation; exactly one publisher may win
   a run ID and a loser must not overwrite payload, manifest, or COMPLETE.
   `s3-atomic-publisher.py` exits 75 for an existing lease/complete group, 74 for
-  a provider failure, and 78 for rejected input. Its messages are deliberately
-  generic; investigate through aggregate provider metrics without copying
-  object names, local filenames, client stderr, or config contents into logs.
+  a provider failure before the COMPLETE commit phase, 76 when commit status is
+  unknown, and 78 for rejected input. Exit 76 covers any ambiguous COMPLETE PUT
+  and every COMPLETE stat/get or local receipt failure after that PUT. Its
+  messages are deliberately generic; investigate through aggregate provider
+  metrics without copying object names, local filenames, client stderr, or
+  config contents into logs.
 - `BACKUP_DESTINATION_CLIENT`: signed `catalog`, verified
   `fetch-complete-group`, and complete-group `delete-complete-group` only.
 - Reference validation is bundled and pinned. The coordinator executes the
@@ -150,12 +153,26 @@ The disposable MinIO race is local evidence only and is not off-host evidence.
    marker, hash, inventory, and `pg_restore --list` validation. Record only the
    non-PII evidence location and result.
 
-If publication exits 74 after acquiring the lease, COMPLETE remains absent and
-the partial group is invisible to catalog consumers. Do not delete the lease or
-retry the same run ID. Stop the scheduler, preserve the partial group for
-forensics, correct the provider condition, and create a newly validated restore
-point with a new run ID. Exit 75 is a duplicate/conflict signal and must never
-be worked around with list-then-write or manual overwrite.
+No publisher exit code by itself proves whether the remote COMPLETE object is
+present. On exit 76, or when an exit 75/74 leaves remote state in doubt, stop the
+scheduler and preserve the lease and group. Do not republish, delete the lease,
+overwrite objects, or allocate a replacement run ID. Reconcile the same run ID
+with a new, known-absent local receipt path:
+
+```text
+s3-atomic-publisher.py reconcile-complete-group \
+  --lease-config-file FILE --destination URI --run-id ID \
+  --receipt RECONCILED_RECEIPT
+```
+
+Reconciliation is read-only against the provider: it uses stat/get to download
+the permanent lease and exact group into a private directory, validates the
+manifest, hashes, sizes, run binding, and COMPLETE, then creates the local
+receipt with no-replace semantics. A valid receipt proves that the original run
+committed. If reconciliation exits 76, status remains unknown: preserve all
+remote state and escalate to provider-backed investigation; do not bypass the
+lease with a new run ID. Exit 75 must never be worked around with
+list-then-write or manual overwrite.
 
 Schedule ledger archive followed by paired backup at least every 12 hours. A
 systemd timer should use `OnCalendar=*-*-* 00,12:00:00`,

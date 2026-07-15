@@ -96,15 +96,19 @@ recovery procedure.
 
 Publisher exit 75 is a duplicate/lease conflict; alert if it occurs for a newly
 allocated scheduler run ID. Exit 74 means provider upload or verification
-failed; page when it prevents a valid point from completing within 18 hours.
+failed before the COMPLETE commit phase. Exit 76 means commit status is unknown,
+including an ambiguous COMPLETE PUT or any later COMPLETE stat/get or receipt
+failure; page immediately and run the backup recovery runbook's read-only
+reconciliation for the same run ID. No exit code alone proves COMPLETE absent.
 Exit 78 is an input/security-contract rejection and blocks rollout. Keep alert
 labels aggregate—never attach destination objects, source filenames, config
 contents, credentials, or raw `mc` stderr.
 
 Publisher rollback is operationally reversible: stop new backup launches and
 restore the refusing rclone publication configuration while preserving all
-remote leases and incomplete groups. Never delete a lease to force retry. After
-root cause and provider policy are reviewed, resume with a fresh run ID and one
+remote leases and groups. Never delete a lease to force retry. Resolve every
+commit-unknown run through read-only reconciliation before choosing any later
+run ID. After status, root cause, and provider policy are reviewed, run one
 canary before restoring the 12-hour schedule.
 
 Evidence is aggregate and non-PII: versions/digests, timestamps, sizes, hashes,

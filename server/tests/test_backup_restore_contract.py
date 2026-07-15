@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -96,6 +97,16 @@ def _publisher_args(config: Path, source: Path, receipt: Path, run_id: str) -> l
         "--destination", "minio://backup/vault/ux09",
         "--run-id", run_id,
         "--source", str(source),
+        "--receipt", str(receipt),
+    ]
+
+
+def _reconcile_args(config: Path, receipt: Path, run_id: str) -> list[str]:
+    return [
+        "reconcile-complete-group",
+        "--lease-config-file", str(config),
+        "--destination", "minio://backup/vault/ux09",
+        "--run-id", run_id,
         "--receipt", str(receipt),
     ]
 
@@ -575,6 +586,215 @@ def test_s3_publisher_rejects_unprotected_or_aliased_config(
 
     assert publisher.main(_publisher_args(config, source, tmp_path / "receipt.json", run_id)) == publisher.EXIT_SAFETY
     assert not calls
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd/openat race contract")
+def test_s3_publisher_snapshots_member_before_in_place_source_mutation(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    assert hasattr(publisher, "_copy_source_member"), "source members must be copied through pinned dir_fd"
+    run_id = "business-run-inplace01"
+    original_payload = b"before-in-place-mutation"
+    source = _write_publisher_source(tmp_path, run_id, original_payload)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+    original_copy = publisher._copy_source_member
+    mutated = False
+
+    def copy_then_mutate(source_fd: int, name: str, destination: Path):
+        nonlocal mutated
+        result = original_copy(source_fd, name, destination)
+        if name == "database.dump":
+            (source / name).write_bytes(b"after-in-place-mutation")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(publisher, "_copy_source_member", copy_then_mutate)
+    assert publisher.main(_publisher_args(config, source, tmp_path / "receipt.json", run_id)) == 0
+    assert mutated
+    remote = next(value for key, value in store.objects.items() if key.endswith("/database.dump"))
+    assert remote == original_payload
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd/openat race contract")
+def test_s3_publisher_pins_source_directory_before_path_replacement(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    assert hasattr(publisher, "_open_source_directory"), "source directory must have a pinned descriptor"
+    run_id = "business-run-dirreplace1"
+    original_payload = b"pinned-directory-payload"
+    source = _write_publisher_source(tmp_path / "original", run_id, original_payload)
+    attacker = _write_publisher_source(tmp_path / "attacker", run_id, b"replacement-directory-payload")
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+    original_open = publisher._open_source_directory
+    detached = source.with_name("detached-source")
+    replaced = False
+
+    def open_then_replace(path: Path) -> int:
+        nonlocal replaced
+        descriptor = original_open(path)
+        source.rename(detached)
+        shutil.copytree(attacker, source)
+        replaced = True
+        return descriptor
+
+    monkeypatch.setattr(publisher, "_open_source_directory", open_then_replace)
+    assert publisher.main(_publisher_args(config, source, tmp_path / "receipt.json", run_id)) == 0
+    assert replaced
+    remote = next(value for key, value in store.objects.items() if key.endswith("/database.dump"))
+    assert remote == original_payload
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd/openat race contract")
+def test_s3_publisher_pins_each_ancestor_before_symlink_swap(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-ancestor01"
+    tree = tmp_path / "tree"
+    ancestor = tree / "ancestor"
+    source = _write_publisher_source(ancestor, run_id, b"pinned-ancestor-payload")
+    attacker_parent = tmp_path / "attacker-parent"
+    _write_publisher_source(attacker_parent, run_id, b"symlink-target-payload")
+    detached = tree / "detached-ancestor"
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+    original_os_open = publisher.os.open
+    swapped = False
+
+    def open_and_swap(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        descriptor = original_os_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "ancestor" and dir_fd is not None and not swapped:
+            ancestor.rename(detached)
+            ancestor.symlink_to(attacker_parent, target_is_directory=True)
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(publisher.os, "open", open_and_swap)
+    assert publisher.main(_publisher_args(config, source, tmp_path / "receipt.json", run_id)) == 0
+    assert swapped, "the ancestor path was not opened component-by-component"
+    remote = next(value for key, value in store.objects.items() if key.endswith("/database.dump"))
+    assert remote == b"pinned-ancestor-payload"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd/openat race contract")
+def test_s3_publisher_receipt_target_creation_after_parent_open_is_commit_unknown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    publisher = _load_publisher()
+    assert hasattr(publisher, "_open_receipt_parent"), "receipt parent must have a pinned descriptor"
+    run_id = "business-run-receiptrace1"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    receipt_dir = tmp_path / "receipts"
+    receipt_dir.mkdir()
+    receipt = receipt_dir / "receipt.json"
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+    original_open = publisher._open_receipt_parent
+
+    def open_then_create(path: Path) -> int:
+        descriptor = original_open(path)
+        attacker = os.open(receipt.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=descriptor)
+        os.write(attacker, b"attacker-owned")
+        os.close(attacker)
+        return descriptor
+
+    monkeypatch.setattr(publisher, "_open_receipt_parent", open_then_create)
+    assert publisher.main(_publisher_args(config, source, receipt, run_id)) == publisher.EXIT_COMMIT_UNKNOWN
+    assert receipt.read_bytes() == b"attacker-owned"
+    assert any(key.endswith("/COMPLETE") for key in store.objects)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd/openat race contract")
+def test_s3_publisher_receipt_parent_replacement_writes_only_to_pinned_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    publisher = _load_publisher()
+    assert hasattr(publisher, "_open_receipt_parent"), "receipt parent must have a pinned descriptor"
+    run_id = "business-run-parentrace1"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    receipt_dir = tmp_path / "receipts"
+    receipt_dir.mkdir()
+    detached = tmp_path / "detached-receipts"
+    receipt = receipt_dir / "receipt.json"
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+    original_open = publisher._open_receipt_parent
+    replaced = False
+
+    def open_then_replace(path: Path) -> int:
+        nonlocal replaced
+        descriptor = original_open(path)
+        receipt_dir.rename(detached)
+        receipt_dir.mkdir()
+        replaced = True
+        return descriptor
+
+    monkeypatch.setattr(publisher, "_open_receipt_parent", open_then_replace)
+    assert publisher.main(_publisher_args(config, source, receipt, run_id)) == 0
+    assert replaced
+    assert (detached / receipt.name).is_file()
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize("failure", ["complete-put", "complete-stat", "complete-get", "receipt"])
+def test_s3_publisher_failures_at_or_after_complete_are_commit_unknown(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-unknown01"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    receipt = tmp_path / "receipt.json"
+    if failure == "receipt":
+        receipt.write_bytes(b"preexisting")
+    store = _FakeConditionalStore(publisher)
+
+    def fail_after_complete(command, *, stdin=None, capture_stdout=False):
+        args = tuple(command)
+        operation = next(item for item in ("pipe", "put", "stat", "get") if item in args)
+        target = args[-2] if operation == "get" else args[-1]
+        if failure == "complete-put" and operation == "put" and target.endswith("/COMPLETE"):
+            store(command, stdin=stdin, capture_stdout=capture_stdout)
+            raise publisher.ProviderFailure()
+        complete_exists = any(key.endswith("/COMPLETE") for key in store.objects)
+        if complete_exists and failure == f"complete-{operation}" and target.endswith("/COMPLETE"):
+            raise publisher.ProviderFailure()
+        return store(command, stdin=stdin, capture_stdout=capture_stdout)
+
+    monkeypatch.setattr(publisher, "_execute_mc", fail_after_complete)
+    assert publisher.main(_publisher_args(config, source, receipt, run_id)) == publisher.EXIT_COMMIT_UNKNOWN
+    assert any(key.endswith("/COMPLETE") for key in store.objects)
+
+
+def test_s3_publisher_read_only_reconciliation_recovers_bound_receipt(tmp_path: Path, monkeypatch) -> None:
+    publisher = _load_publisher()
+    run_id = "business-run-reconcile1"
+    source = _write_publisher_source(tmp_path, run_id)
+    config = tmp_path / "config.json"
+    _write_test_mc_config(config)
+    initial_receipt = tmp_path / "initial-receipt.json"
+    store = _FakeConditionalStore(publisher)
+    monkeypatch.setattr(publisher, "_execute_mc", store)
+    assert publisher.main(_publisher_args(config, source, initial_receipt, run_id)) == 0
+    initial_receipt.unlink()
+    store.commands.clear()
+
+    reconciled = tmp_path / "reconciled-receipt.json"
+    assert publisher.main(_reconcile_args(config, reconciled, run_id)) == 0
+    complete_hash = hashlib.sha256((source / "manifest.json").read_bytes()).hexdigest()
+    _load_backupctl().validate_publish_receipt(reconciled, run_id, complete_hash)
+    assert store.commands
+    assert not any("pipe" in command or "put" in command for command in store.commands)
 
 
 @pytest.mark.parametrize(
@@ -1316,7 +1536,10 @@ def test_s3_publisher_real_disposable_minio_two_process_race(tmp_path: Path) -> 
     config.chmod(0o600)
 
     def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        result = subprocess.run(["docker", *args], cwd=ROOT, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            ["docker", *args], cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", check=False,
+        )
         if check and result.returncode != 0:
             pytest.fail("disposable MinIO Docker operation failed without exposing provider output")
         return result
@@ -1387,6 +1610,9 @@ def test_s3_publisher_real_disposable_minio_two_process_race(tmp_path: Path) -> 
         assert sorted(result.returncode for result in results) == [0, 75], (
             f"unexpected publisher exit codes; remote_object_count={diagnostic_count}"
         )
+        winner_index = next(index for index, result in enumerate(results) if result.returncode == 0)
+        winner_label = ("one", "two")[winner_index]
+        winner_source = (source_one, source_two)[winner_index]
         assert all(result.stdout == "" for result in results)
         assert all("vault" not in result.stderr and "source-" not in result.stderr for result in results)
 
@@ -1417,6 +1643,45 @@ def test_s3_publisher_real_disposable_minio_two_process_race(tmp_path: Path) -> 
             for label in ("one", "two")
         ]
         assert sorted(receipt_checks) == [0, 1]
+
+        winner_receipt = tmp_path / "winner-receipt.json"
+        docker("cp", f"{runner}:/tmp/receipt-{winner_label}.json", str(winner_receipt))
+        receipt_value = json.loads(winner_receipt.read_text(encoding="ascii"))
+        assert set(receipt_value) == {
+            "schema_version", "status", "backup_run_id", "complete_sha256", "lease_id_hash",
+        }
+        assert receipt_value["schema_version"] == 1
+        assert receipt_value["status"] == "committed"
+        complete_hash = hashlib.sha256((winner_source / "manifest.json").read_bytes()).hexdigest()
+        _load_backupctl().validate_publish_receipt(winner_receipt, run_id, complete_hash)
+
+        remote_lease = f"backup/vault/{lease_keys[0]}"
+        docker("exec", runner, "mc", "-C", "/tmp", "--quiet", "get", remote_lease, "/tmp/permanent-lease")
+        downloaded_lease = tmp_path / "permanent-lease"
+        docker("cp", f"{runner}:/tmp/permanent-lease", str(downloaded_lease))
+        lease_value = downloaded_lease.read_bytes()
+        assert len(lease_value) == 32
+        assert hashlib.sha256(lease_value).hexdigest() == receipt_value["lease_id_hash"]
+
+        reconciled_result = docker(
+            "exec", runner, "python3", "/opt/ux09-backup/s3-atomic-publisher.py",
+            "reconcile-complete-group", "--lease-config-file", "/tmp/config.json",
+            "--destination", "minio://backup/vault/ux09", "--run-id", run_id,
+            "--receipt", "/tmp/reconciled-receipt.json", check=False,
+        )
+        assert reconciled_result.returncode == 0
+        assert reconciled_result.stdout == ""
+        reconciled_receipt = tmp_path / "reconciled-receipt.json"
+        docker("cp", f"{runner}:/tmp/reconciled-receipt.json", str(reconciled_receipt))
+        assert json.loads(reconciled_receipt.read_text(encoding="ascii")) == receipt_value
+        _load_backupctl().validate_publish_receipt(reconciled_receipt, run_id, complete_hash)
+        post_reconcile_listing = docker(
+            "exec", runner, "mc", "-C", "/tmp", "--json", "ls", "--recursive", "backup/vault"
+        )
+        post_reconcile_entries = [
+            json.loads(line) for line in post_reconcile_listing.stdout.splitlines() if line.strip()
+        ]
+        assert {entry["key"] for entry in post_reconcile_entries} == keys
     finally:
         docker("rm", "-f", runner, server, check=False)
         docker("network", "rm", network, check=False)

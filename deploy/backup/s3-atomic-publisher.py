@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from contextlib import ExitStack
 import hashlib
 import io
 import json
@@ -23,6 +22,7 @@ from urllib.parse import unquote, urlparse
 EXIT_USAGE = 64
 EXIT_PROVIDER_FAILURE = 74
 EXIT_CONFLICT = 75
+EXIT_COMMIT_UNKNOWN = 76
 EXIT_SAFETY = 78
 EXIT_INTERNAL = 70
 MC_BIN = "/usr/local/bin/mc"
@@ -61,6 +61,10 @@ class LeaseConflict(RuntimeError):
 
 
 class ObjectMissing(RuntimeError):
+    pass
+
+
+class CommitUnknown(RuntimeError):
     pass
 
 
@@ -123,6 +127,90 @@ def _copy_open_file(source: BinaryIO, destination: Path) -> None:
             os.close(descriptor)
 
 
+def _open_directory_without_symlinks(path: Path) -> int:
+    if os.name == "nt":
+        if _is_reparse(path) or path.resolve(strict=False) != Path(os.path.abspath(path)):
+            raise SafetyError("unsafe directory")
+        try:
+            return os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        except OSError as error:
+            raise SafetyError("unsafe directory") from error
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise SafetyError("unsafe directory")
+        return descriptor
+    except OSError as error:
+        os.close(descriptor)
+        raise SafetyError("unsafe directory") from error
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_source_directory(path: Path) -> int:
+    return _open_directory_without_symlinks(path)
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def _copy_descriptor_to_snapshot(source_descriptor: int, destination: Path) -> tuple[int, str]:
+    destination_descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            _write_all(destination_descriptor, chunk)
+        os.fsync(destination_descriptor)
+    finally:
+        os.close(destination_descriptor)
+    return size, digest.hexdigest()
+
+
+def _copy_source_member(source_fd: int, name: str, destination: Path) -> tuple[int, str]:
+    if name not in BUSINESS_MEMBERS | LEDGER_MEMBERS or "/" in name or "\\" in name:
+        raise SafetyError("unsafe source member")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=source_fd)
+    except OSError as error:
+        raise SafetyError("unsafe source member") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise SafetyError("unsafe source member")
+        result = _copy_descriptor_to_snapshot(descriptor, destination)
+        after = os.fstat(descriptor)
+        if (
+            (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            raise SafetyError("source member changed during snapshot")
+        return result
+    finally:
+        os.close(descriptor)
+
+
 def _sha256_file(path: Path) -> bytes:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -131,7 +219,7 @@ def _sha256_file(path: Path) -> bytes:
     return digest.digest()
 
 
-def _validate_open_file_binding(handle: BinaryIO, evidence: object, hash_field: str = "sha256") -> None:
+def _validate_file_binding(evidence: object, size: int, digest: str, hash_field: str = "sha256") -> None:
     if not isinstance(evidence, Mapping):
         raise SafetyError("missing payload evidence")
     expected_hash = evidence.get(hash_field)
@@ -144,13 +232,7 @@ def _validate_open_file_binding(handle: BinaryIO, evidence: object, hash_field: 
         or expected_size < 0
     ):
         raise SafetyError("invalid payload evidence")
-    digest = hashlib.sha256()
-    size = 0
-    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-        digest.update(chunk)
-        size += len(chunk)
-    handle.seek(0)
-    if size != expected_size or digest.hexdigest() != expected_hash:
+    if size != expected_size or digest != expected_hash:
         raise SafetyError("payload does not match manifest")
 
 
@@ -201,61 +283,84 @@ def _validate_config(config: Path, alias: str, destination: Path) -> None:
         _copy_open_file(io.BytesIO(payload), destination)
 
 
-def _snapshot_source(source: Path, run_id: str, destination: Path) -> tuple[list[str], str]:
+def _validate_snapshot(
+    destination: Path,
+    run_id: str,
+    names: frozenset[str],
+    metadata: Mapping[str, tuple[int, str]],
+) -> tuple[list[str], str]:
+    if names not in {BUSINESS_MEMBERS, LEDGER_MEMBERS}:
+        raise SafetyError("unexpected source members")
+    manifest_name = "manifest.json" if names == BUSINESS_MEMBERS else "ledger-manifest.json"
+    manifest_payload = (destination / manifest_name).read_bytes()
+    try:
+        manifest = json.loads(manifest_payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SafetyError("invalid manifest") from error
+    run_field = "backup_run_id" if names == BUSINESS_MEMBERS else "archive_run_id"
+    if not isinstance(manifest, Mapping) or manifest.get(run_field) != run_id:
+        raise SafetyError("manifest run binding is invalid")
+    if names == BUSINESS_MEMBERS:
+        _validate_file_binding(manifest.get("database"), *metadata["database.dump"])
+        business = manifest.get("business_snapshot")
+        _validate_file_binding(business, *metadata["business.snapshot"])
+        if not isinstance(business, Mapping):
+            raise SafetyError("missing payload evidence")
+        inventory_size, inventory_hash = metadata["inventory.jsonl"]
+        _validate_file_binding(
+            {"sha256": business.get("inventory_sha256"), "size_bytes": inventory_size},
+            inventory_size,
+            inventory_hash,
+        )
+    else:
+        _validate_file_binding(
+            {"sha256": manifest.get("archive_sha256"), "size_bytes": manifest.get("size_bytes")},
+            *metadata["ledger.archive"],
+        )
+    complete = (destination / "COMPLETE").read_bytes()
+    expected = hashlib.sha256(manifest_payload).hexdigest()
+    try:
+        marker = complete.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise SafetyError("invalid COMPLETE") from error
+    if marker != expected + "\n" or not SHA256_RE.fullmatch(expected):
+        raise SafetyError("invalid COMPLETE")
+    return sorted(names - {"COMPLETE"}), expected
+
+
+def _snapshot_source_windows(source: Path, run_id: str, destination: Path) -> tuple[list[str], str]:
     if _is_reparse(source):
         raise SafetyError("unsafe source")
     try:
-        metadata = source.lstat()
+        names = frozenset(entry.name for entry in os.scandir(source))
     except OSError as error:
-        raise SafetyError("missing source") from error
-    if not stat.S_ISDIR(metadata.st_mode):
-        raise SafetyError("unsafe source")
-    names = frozenset(entry.name for entry in os.scandir(source))
+        raise SafetyError("unsafe source") from error
     if names not in {BUSINESS_MEMBERS, LEDGER_MEMBERS}:
         raise SafetyError("unexpected source members")
-    handles: dict[str, BinaryIO] = {}
-    with ExitStack() as stack:
-        for name in sorted(names):
-            handles[name] = stack.enter_context(_open_verified_regular(source / name, protected=False))
-        manifest_name = "manifest.json" if names == BUSINESS_MEMBERS else "ledger-manifest.json"
-        manifest_payload = handles[manifest_name].read()
-        handles[manifest_name].seek(0)
-        try:
-            manifest = json.loads(manifest_payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise SafetyError("invalid manifest") from error
-        run_field = "backup_run_id" if names == BUSINESS_MEMBERS else "archive_run_id"
-        if not isinstance(manifest, Mapping) or manifest.get(run_field) != run_id:
-            raise SafetyError("manifest run binding is invalid")
-        if names == BUSINESS_MEMBERS:
-            _validate_open_file_binding(handles["database.dump"], manifest.get("database"))
-            business = manifest.get("business_snapshot")
-            _validate_open_file_binding(handles["business.snapshot"], business)
-            if not isinstance(business, Mapping):
-                raise SafetyError("missing payload evidence")
-            inventory_evidence = {
-                "sha256": business.get("inventory_sha256"),
-                "size_bytes": sum(len(line) for line in handles["inventory.jsonl"]),
-            }
-            handles["inventory.jsonl"].seek(0)
-            _validate_open_file_binding(handles["inventory.jsonl"], inventory_evidence)
-        else:
-            _validate_open_file_binding(
-                handles["ledger.archive"],
-                {"sha256": manifest.get("archive_sha256"), "size_bytes": manifest.get("size_bytes")},
-            )
-        complete = handles["COMPLETE"].read()
-        handles["COMPLETE"].seek(0)
-        expected = hashlib.sha256(manifest_payload).hexdigest()
-        try:
-            marker = complete.decode("ascii")
-        except UnicodeDecodeError as error:
-            raise SafetyError("invalid COMPLETE") from error
-        if marker != expected + "\n" or not SHA256_RE.fullmatch(expected):
-            raise SafetyError("invalid COMPLETE")
-        for name, handle in handles.items():
-            _copy_open_file(handle, destination / name)
-    return sorted(names - {"COMPLETE"}), expected
+    metadata: dict[str, tuple[int, str]] = {}
+    for name in sorted(names):
+        with _open_verified_regular(source / name, protected=False) as handle:
+            destination_path = destination / name
+            _copy_open_file(handle, destination_path)
+        metadata[name] = (destination_path.stat().st_size, hashlib.sha256(destination_path.read_bytes()).hexdigest())
+    return _validate_snapshot(destination, run_id, names, metadata)
+
+
+def _snapshot_source(source: Path, run_id: str, destination: Path) -> tuple[list[str], str]:
+    if os.name == "nt":
+        return _snapshot_source_windows(source, run_id, destination)
+    source_fd = _open_source_directory(source)
+    try:
+        names = frozenset(os.listdir(source_fd))
+        if names not in {BUSINESS_MEMBERS, LEDGER_MEMBERS}:
+            raise SafetyError("unexpected source members")
+        metadata = {
+            name: _copy_source_member(source_fd, name, destination / name)
+            for name in sorted(names)
+        }
+    finally:
+        os.close(source_fd)
+    return _validate_snapshot(destination, run_id, names, metadata)
 
 
 def _safe_environment(home: Path) -> dict[str, str]:
@@ -349,32 +454,67 @@ def _verify_remote(config_dir: Path, target: str, local: Path, verification: Pat
         raise ProviderFailure()
 
 
+def _download_remote(config_dir: Path, target: str, destination: Path) -> None:
+    raw = _execute_mc(_mc_command(config_dir, "stat", "--no-list", target), capture_stdout=True)
+    try:
+        stat_value = json.loads(raw.splitlines()[-1])
+        remote_size = int(stat_value["size"])
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ProviderFailure() from error
+    _execute_mc(_mc_command(config_dir, "get", target, str(destination)))
+    if not destination.is_file() or destination.stat().st_size != remote_size:
+        raise ProviderFailure()
+
+
+def _open_receipt_parent(path: Path) -> int:
+    return _open_directory_without_symlinks(path)
+
+
 def _write_receipt(path: Path, value: Mapping[str, object]) -> None:
-    if path.exists() or _is_reparse(path) or _is_reparse(path.parent) or not path.parent.is_dir():
+    if path.name in {"", ".", ".."} or path.parent == path:
         raise SafetyError("unsafe receipt")
     payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".publisher-receipt-", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as output:
-            descriptor = -1
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        if path.exists() or _is_reparse(path):
-            raise SafetyError("unsafe receipt")
-        os.replace(temporary, path)
-    finally:
-        if descriptor >= 0:
+    if os.name == "nt":
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
+        except OSError as error:
+            raise SafetyError("unsafe receipt") from error
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
             os.close(descriptor)
-        temporary.unlink(missing_ok=True)
+        return
+    parent_fd = _open_receipt_parent(path.parent)
+    try:
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            raise SafetyError("unsafe receipt") from error
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _parse_args(argv: Sequence[str]) -> dict[str, str]:
-    if not argv or argv[0] != "publish-complete-group" or len(argv) != 11:
+    if not argv or argv[0] not in {"publish-complete-group", "reconcile-complete-group"}:
         raise SafetyError("invalid command")
-    expected = {"--lease-config-file", "--destination", "--run-id", "--source", "--receipt"}
+    operation = argv[0]
+    expected = {"--lease-config-file", "--destination", "--run-id", "--receipt"}
+    if operation == "publish-complete-group":
+        expected.add("--source")
+    if len(argv) != 1 + len(expected) * 2:
+        raise SafetyError("invalid command")
     result: dict[str, str] = {}
     index = 1
     while index < len(argv):
@@ -388,6 +528,7 @@ def _parse_args(argv: Sequence[str]) -> dict[str, str]:
         index += 2
     if set(result) != expected:
         raise SafetyError("invalid command")
+    result["operation"] = operation
     return result
 
 
@@ -426,24 +567,77 @@ def _publish(arguments: Mapping[str, str]) -> None:
             _execute_mc(_mc_command(config_dir, "put", "--checksum", "SHA256", str(local), target))
             _verify_remote(config_dir, target, local, verification_dir / name)
         complete = source_dir / "COMPLETE"
-        _execute_mc(_mc_command(config_dir, "put", "--checksum", "SHA256", str(complete), complete_target))
-        _verify_remote(config_dir, complete_target, complete, verification_dir / "COMPLETE")
-        _write_receipt(receipt, {
-            "schema_version": 1,
-            "status": "committed",
-            "backup_run_id": run_id,
-            "complete_sha256": complete_hash,
-            "lease_id_hash": hashlib.sha256(lease_value).hexdigest(),
-        })
+        try:
+            _execute_mc(_mc_command(config_dir, "put", "--checksum", "SHA256", str(complete), complete_target))
+            _verify_remote(config_dir, complete_target, complete, verification_dir / "COMPLETE")
+            _write_receipt(receipt, {
+                "schema_version": 1,
+                "status": "committed",
+                "backup_run_id": run_id,
+                "complete_sha256": complete_hash,
+                "lease_id_hash": hashlib.sha256(lease_value).hexdigest(),
+            })
+        except Exception as error:
+            raise CommitUnknown() from error
+
+
+def _reconcile(arguments: Mapping[str, str]) -> None:
+    run_id = _validate_run_id(arguments["--run-id"])
+    alias, group_root, lease_root = _parse_destination(arguments["--destination"])
+    config = Path(arguments["--lease-config-file"])
+    receipt = Path(arguments["--receipt"])
+    with tempfile.TemporaryDirectory(prefix="ux09-reconcile-") as private_name:
+        private = Path(private_name)
+        os.chmod(private, 0o700)
+        config_dir = private / "mc"
+        remote_dir = private / "remote"
+        config_dir.mkdir(mode=0o700)
+        remote_dir.mkdir(mode=0o700)
+        _validate_config(config, alias, config_dir / "config.json")
+        try:
+            lease = remote_dir / "lease"
+            _download_remote(config_dir, f"{lease_root}/{run_id}", lease)
+            business_manifest = f"{group_root}/{run_id}/manifest.json"
+            ledger_manifest = f"{group_root}/{run_id}/ledger-manifest.json"
+            business_exists = _object_exists(config_dir, business_manifest)
+            ledger_exists = _object_exists(config_dir, ledger_manifest)
+            if business_exists == ledger_exists:
+                raise ProviderFailure()
+            names = BUSINESS_MEMBERS if business_exists else LEDGER_MEMBERS
+            metadata: dict[str, tuple[int, str]] = {}
+            for name in sorted(names):
+                local = remote_dir / name
+                _download_remote(config_dir, f"{group_root}/{run_id}/{name}", local)
+                metadata[name] = (local.stat().st_size, _sha256_file(local).hex())
+            _, complete_hash = _validate_snapshot(remote_dir, run_id, names, metadata)
+            lease_value = lease.read_bytes()
+            if len(lease_value) != 32:
+                raise ProviderFailure()
+            _write_receipt(receipt, {
+                "schema_version": 1,
+                "status": "committed",
+                "backup_run_id": run_id,
+                "complete_sha256": complete_hash,
+                "lease_id_hash": hashlib.sha256(lease_value).hexdigest(),
+            })
+        except Exception as error:
+            raise CommitUnknown() from error
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        _publish(_parse_args(list(sys.argv[1:] if argv is None else argv)))
+        arguments = _parse_args(list(sys.argv[1:] if argv is None else argv))
+        if arguments["operation"] == "publish-complete-group":
+            _publish(arguments)
+        else:
+            _reconcile(arguments)
         return 0
     except LeaseConflict:
         print("publisher conflict", file=sys.stderr)
         return EXIT_CONFLICT
+    except CommitUnknown:
+        print("publisher commit status unknown; use read-only reconciliation", file=sys.stderr)
+        return EXIT_COMMIT_UNKNOWN
     except SafetyError:
         print("publisher rejected unsafe input", file=sys.stderr)
         return EXIT_SAFETY
