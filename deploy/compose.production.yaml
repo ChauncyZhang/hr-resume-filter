@@ -9,7 +9,7 @@ services:
         app_protocol: https
     environment:
       NGINX_ENVSUBST_FILTER: "^SERVER_NAME"
-      SERVER_NAME: "${SERVER_NAME:-_}"
+      SERVER_NAME: "${SERVER_NAME:?Set SERVER_NAME to the production hostname}"
     volumes: !override
       - type: bind
         source: ./nginx/production.conf.template
@@ -36,3 +36,11 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+
+  api:
+    environment:
+      APP_ENVIRONMENT: production
+
+  worker:
+    environment:
+      APP_ENVIRONMENT: production

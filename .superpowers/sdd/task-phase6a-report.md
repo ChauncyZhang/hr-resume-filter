@@ -94,3 +94,102 @@ validation and contain no certificate, key, password, or secret material.
   release that supports this merge tag.
 - HSTS includes subdomains. The production server name and certificate scope
   must be reviewed before first exposure because clients cache this policy.
+
+## Independent review remediation
+
+The Phase 6A review findings were addressed without modifying the base Compose
+or any backend, Worker, Dockerfile, README, migration, MinIO, frontend, or
+user-owned file.
+
+- The production overlay now forces `APP_ENVIRONMENT=production` for both API
+  and Worker, and the fully merged model test asserts both effective values.
+- `SERVER_NAME` is now required during Compose interpolation instead of falling
+  back to a wildcard/default name.
+- `deploy/production-preflight.sh` parses `docker compose version --short`,
+  rejects versions below 2.24.4 before any config call, and always validates the
+  hard-coded base-plus-production-overlay model. Its test records the actual
+  config invocation and proves both files are present, so there is no base-only
+  fallback.
+- Each merged-model run supplies a unique synthetic governance sentinel across
+  every governance-related deployment input and proves that no API environment
+  value or URL contains it.
+- A temporary running Nginx container now receives real HTTPS requests for both
+  `/metrics` and `/metrics/child`; both must return 404.
+- The Nginx syntax and runtime tests read the proxy image from the fully merged
+  Compose model rather than hard-coding an image version in test code.
+
+### Review-fix TDD evidence
+
+The expanded focused suite was run before production changes and reported five
+failures: API remained in development, `SERVER_NAME` was optional, and the
+preflight did not exist. The existing runtime metrics behavior and merged-image
+syntax gate passed under the stronger tests.
+
+After the minimal implementation, the first GREEN run reported `7 passed, 2
+failed`; both failures identified a Git awk portability error caused by using
+the built-in name `index` as a function parameter. Renaming that local variable
+closed the Linux-shell portability defect.
+
+Final focused run:
+
+```text
+python -m pytest server/tests/test_production_topology.py -q
+9 passed in 8.58s
+```
+
+### Review-fix verification
+
+Fake Compose version gates:
+
+```text
+python -m pytest server/tests/test_production_topology.py::test_preflight_rejects_compose_older_than_minimum_before_config server/tests/test_production_topology.py::test_preflight_accepts_minimum_version_and_validates_merged_model -q
+2 passed in 1.70s
+```
+
+The 2.24.3 fake exits before config; the 2.24.4 fake invokes real Compose and
+the test verifies that both `deploy/compose.yaml` and
+`deploy/compose.production.yaml` were passed.
+
+Installed Compose gate:
+
+```text
+python -m pytest server/tests/test_production_topology.py::test_preflight_accepts_installed_compose_and_validates_merged_model -q
+1 passed in 1.63s
+```
+
+Merged-image disposable-certificate syntax gate:
+
+```text
+python -m pytest server/tests/test_production_topology.py::test_rendered_production_nginx_passes_nginx_t_with_disposable_certificate -q
+1 passed in 2.17s
+```
+
+Additional commands all exited zero:
+
+```powershell
+& 'C:\Program Files\Git\bin\bash.exe' -n deploy/production-preflight.sh
+
+$env:HTTPS_BIND_ADDRESS='127.0.0.1'
+$env:HTTPS_PORT='443'
+$env:SERVER_NAME='recruiting.example.test'
+$env:TLS_CERTIFICATE_PATH=(Resolve-Path 'deploy/nginx/production.conf.template').Path
+$env:TLS_PRIVATE_KEY_PATH=(Resolve-Path 'deploy/nginx/snippets/security-headers.conf').Path
+docker compose --env-file deploy/.env.example -f deploy/compose.yaml -f deploy/compose.production.yaml config --quiet
+```
+
+The final pre-commit focused rerun reported `9 passed in 6.47s`. After staging
+only the four review-fix files, the following owned-scope whitespace gate also
+exited zero:
+
+```text
+git diff --cached --check -- deploy/compose.production.yaml deploy/production-preflight.sh server/tests/test_production_topology.py .superpowers/sdd/task-phase6a-report.md
+```
+
+### Remaining review-fix risks
+
+- The preflight validates configuration and minimum Compose capability; it does
+  not pull images, start services, validate production certificate trust, or
+  perform a live deployment smoke test.
+- The real-request Nginx test uses an ephemeral local port and disposable
+  self-signed certificate. External firewall, DNS, load-balancer, CA renewal,
+  and production host routing remain deployment-environment responsibilities.
