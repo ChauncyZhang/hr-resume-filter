@@ -44,3 +44,16 @@
 - `test_screening_actions_postgres.py`: 3 skipped because `POSTGRES_SMOKE_URL` is not configured.
 - The lock-order unit gate compiles the emitted statements with the PostgreSQL dialect and verifies `Candidate FOR UPDATE -> active deletion lookup -> ScreeningItem FOR UPDATE`.
 - Live PostgreSQL lock waiting remains unexecuted; no configured disposable PostgreSQL fixture was available.
+
+## Parse finalize review follow-up
+
+- A parse that committed `parsing` now treats a finalize-time tombstone or active deletion as a successful terminal discard. The short finalize transaction locks `Candidate -> ScreeningItem -> ScreeningRun`, sets the item to `cancelled` with `candidate_unavailable`, aggregates run progress, and commits without creating a candidate, resume, application, or parsed-text row.
+- A repeated callback observes the terminal `cancelled` item under the same candidate-first barrier and returns without changing timestamps, run version, or counts.
+- Single-item cancellation settles the run as `failed` with counts `(processed=1, succeeded=0, failed=1)`; a run containing one successful item and one cancelled parse settles as `partial` with `(2, 1, 1)`.
+- The test parser activates the deletion barrier from a separate database session only after observing committed `parsing`, verifying that scanning/parsing remains outside the claim and finalize transactions.
+
+### Parse finalize verification
+
+- RED: the three new finalize-barrier cases failed with `PermanentJobError("screening_item_missing")` from the old finalize path.
+- GREEN: `test_candidate_tombstone_visibility.py -k parse_finalize_barrier`: 3 passed.
+- Focused regression: `test_candidate_tombstone_visibility.py test_screening_pipeline.py`: 30 passed.

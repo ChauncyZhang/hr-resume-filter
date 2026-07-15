@@ -14,10 +14,10 @@ from server.app.llm.models import LlmInvocation, LlmScreeningEvaluation
 from server.app.llm.security import ApiKeyCipher
 from server.app.queue.service import PermanentJobError
 from server.app.recruiting import service as recruiting_service
-from server.app.recruiting.models import Application, Candidate, Resume
+from server.app.recruiting.models import Application, Candidate, FileObject, Resume
 from server.app.screening.llm_pipeline import LlmScreeningPipeline
 from server.app.screening import actions as screening_actions
-from server.app.screening.models import ScreeningItem, ScreeningResult
+from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.tests.test_interview_api import create_interview, make_app, seed_application
 from server.tests.test_llm_pipeline import Gateway, prepared
 from server.tests.test_recruiting_api import login, seed_user
@@ -49,6 +49,15 @@ def _active_deletion(db, candidate, status="approved"):
     db.add(request)
     db.flush()
     return request
+
+
+class FinalizeBarrierParser:
+    def __init__(self, callback):
+        self.callback = callback
+
+    async def parse(self, *_args, **_kwargs):
+        self.callback()
+        return SimpleNamespace(text="private parsed resume", parser_version="test-v1", quality="good")
 
 
 def test_tombstone_is_non_enumerable_from_candidate_resume_and_download_routes(tmp_path):
@@ -309,6 +318,84 @@ def test_active_deletion_blocks_parse_and_score_without_state_changes(tmp_path):
         stored = db.get(ScreeningItem, uuid.UUID(item["id"]))
         assert stored.status == "parsed"
         assert db.scalar(select(func.count(ScreeningResult.id))) == 0
+
+
+@pytest.mark.parametrize("barrier", ["tombstone", "approved_deletion"])
+def test_parse_finalize_barrier_cancels_and_aggregates_without_pii(tmp_path, barrier):
+    app, pipeline, _storage, _scanner, parse_job, run_data, item_data = seeded_pipeline(tmp_path)
+    item_id = uuid.UUID(item_data["id"])
+    candidate_id = uuid.uuid5(item_id, "candidate")
+    with app.state.identity_store.sync_session() as db:
+        run = db.get(ScreeningRun, uuid.UUID(run_data["id"]))
+        db.add(Candidate(id=candidate_id, organization_id=run.organization_id, display_name="Existing", owner_id=run.created_by))
+        db.commit()
+
+    def activate_barrier():
+        with app.state.identity_store.sync_session() as db:
+            item = db.get(ScreeningItem, item_id)
+            assert item.status == "parsing"
+            candidate = db.get(Candidate, candidate_id)
+            if barrier == "tombstone":
+                candidate.deleted_at = datetime.now(timezone.utc)
+            else:
+                _active_deletion(db, candidate)
+            db.commit()
+
+    pipeline.parser = FinalizeBarrierParser(activate_barrier)
+    asyncio.run(pipeline.parse_item(parse_job))
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, item_id)
+        run = db.get(ScreeningRun, uuid.UUID(run_data["id"]))
+        first_terminal = (item.finished_at, run.version)
+        assert item.status == "cancelled"
+        assert item.safe_error_code == "candidate_unavailable"
+        assert item.finished_at is not None
+        assert item.candidate_id is None and item.resume_id is None and item.application_id is None
+        assert run.status == "failed"
+        assert (run.processed_count, run.succeeded_count, run.failed_count) == (1, 0, 1)
+        assert run.finished_at is not None
+        assert db.scalar(select(func.count(Resume.id)).where(Resume.candidate_id == candidate_id)) == 0
+        assert db.scalar(select(func.count(Application.id)).where(Application.candidate_id == candidate_id)) == 0
+
+    asyncio.run(pipeline.parse_item(parse_job))
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, item_id)
+        run = db.get(ScreeningRun, uuid.UUID(run_data["id"]))
+        assert (item.finished_at, run.version) == first_terminal
+        assert (run.processed_count, run.succeeded_count, run.failed_count) == (1, 0, 1)
+
+
+def test_parse_finalize_barrier_makes_mixed_run_partial(tmp_path):
+    app, pipeline, _storage, _scanner, parse_job, run_data, item_data = seeded_pipeline(tmp_path)
+    item_id = uuid.UUID(item_data["id"])
+    candidate_id = uuid.uuid5(item_id, "candidate")
+    with app.state.identity_store.sync_session() as db:
+        run = db.get(ScreeningRun, uuid.UUID(run_data["id"]))
+        db.add(Candidate(id=candidate_id, organization_id=run.organization_id, display_name="Existing", owner_id=run.created_by))
+        completed_file = FileObject(organization_id=run.organization_id, storage_key=f"clean/{run.organization_id}/{uuid.uuid4()}", original_filename="completed.txt", mime_type="text/plain", size_bytes=6, sha256="2" * 64, uploaded_by=run.created_by, storage_state="clean", detected_type="txt", scan_status="clean")
+        db.add(completed_file)
+        db.flush()
+        db.add(ScreeningItem(organization_id=run.organization_id, run_id=run.id, file_object_id=completed_file.id, status="scored", attempts=1, llm_status="skipped", finished_at=datetime.now(timezone.utc)))
+        run.total_count = 2
+        db.commit()
+
+    def tombstone_during_parse():
+        with app.state.identity_store.sync_session() as db:
+            assert db.get(ScreeningItem, item_id).status == "parsing"
+            db.get(Candidate, candidate_id).deleted_at = datetime.now(timezone.utc)
+            db.commit()
+
+    pipeline.parser = FinalizeBarrierParser(tombstone_during_parse)
+    asyncio.run(pipeline.parse_item(parse_job))
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, item_id)
+        run = db.get(ScreeningRun, uuid.UUID(run_data["id"]))
+        assert item.status == "cancelled"
+        assert run.status == "partial"
+        assert (run.processed_count, run.succeeded_count, run.failed_count) == (2, 1, 1)
+        assert run.finished_at is not None
 
 
 def test_active_deletion_blocks_llm_provider_and_post_provider_results(tmp_path):
