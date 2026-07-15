@@ -36,7 +36,10 @@ unchanged and unstaged.
   fragments are validated before safe resolved joins. Credentials and signing
   material are distinct no-follow, single-inode protected files copied to
   process-private 0600 paths and absent from argv values, logs, manifests, and
-  evidence.
+  evidence. Child environments are strict allowlists rather than inherited
+  process environments. Staging roots reject symlinks, Windows junctions, and
+  reparse points; business bucket traversal/URI values are rejected before any
+  client call.
 - COMPLETE-last publication now requires an external conditional-create/lease
   publisher and a run/hash-bound receipt. The rclone adapter refuses publishing
   with safety code 78. The local concurrency reference proves one winner cannot
@@ -51,12 +54,19 @@ unchanged and unstaged.
   restore/delete ledger data. Restore verifies ledger schema, active key
   version/history, HMAC, COMPLETE, archive hash, freshness, run binding, and a
   signed run/generation-bound restore proof; client exit zero is insufficient.
+  Backup pairing now uses the same strict archive-group validator through a
+  dedicated `LEDGER_MANIFEST_VERIFY_KEY_FILE` and
+  `LEDGER_PAIRING_GROUP_PATH`; bare/forged manifests or missing archive payloads
+  cannot produce a paired manifest or COMPLETE.
 - Restore and drill reject production projects/volumes and require
   `DISPOSABLE_RECOVERY_CONFIRMED=1`. Restore start atomically clears stale open
   state and binds closed evidence to the current run/generation. MinIO tar
   members are fully allowlisted before safe extraction. Traffic-open is not an
   available state transition in this foundation, even if JSON claims B2B3
   success.
+- Drill has a fixed `preflight-drill` entry that validates a strict image
+  repository/tag plus exact lowercase sha256 digest, disposable isolation, the
+  verified catalog, retention policy, and invalid latest state before Compose.
 - The operational contract schedules backup every 12 hours, budgets a 24-hour
   RPO and 4-hour RTO, and excludes object keys, candidate/request IDs,
   filenames, PII, content, credentials, and secrets from public evidence.
@@ -72,13 +82,22 @@ TOCTOU, strict reference counts, immutable Compose image, and malicious tar
 members. All non-platform-specific cases are GREEN. Generated-artifact checks
 explicitly reject `deploy/backup/__pycache__`, `.pyc`, and `.pyo` files.
 
+This review round added the remaining malicious reproductions first. The RED
+run was `20 failed, 68 passed, 2 skipped`; after core GREEN, copyable drill
+preflight/Compose/runbook assertions were separately observed RED before their
+implementation. The Windows junction reproduction created a real junction and
+passed after the root-boundary fix; no Windows capability was fabricated.
+
 Fresh pre-commit evidence:
 
-- Focused contract suite: `68 passed, 2 skipped` (Windows symlink capability
-  skips; traversal, hardlink, permissions, absolute paths, and tar attacks ran).
+- Focused contract suite: `88 passed, 2 skipped` (two optional Windows symlink
+  creation cases skipped; the non-privileged Windows junction/reparse test ran
+  and passed, as did traversal, hardlink, absolute-path, bucket, env, and tar attacks).
 - POSIX `sh -n` for all backup scripts: success.
 - Isolated `docker compose ... config --quiet`: success; no traffic service or
   production volume is present.
+- Fixed drill preflight: valid immutable image/catalog passed with traffic
+  closed; malformed/invalid latest catalog failed closed as expected.
 - Drill Compose requires `${BACKUP_IMAGE:?}@${BACKUP_IMAGE_DIGEST:?}` and has no
   mutable backup-tool tag or local build fallback.
 - Python syntax, runtime secret scan, PII/secret-value scan, and generated

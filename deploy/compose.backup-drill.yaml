@@ -49,6 +49,10 @@ services:
       COMPOSE_PROJECT_NAME: ${BACKUP_DRILL_PROJECT:-ux09-backup-drill-local}
       DISPOSABLE_RECOVERY_CONFIRMED: ${DISPOSABLE_RECOVERY_CONFIRMED:-0}
       RECOVERY_VOLUME_NAMES: ${BACKUP_DRILL_PROJECT:-ux09-backup-drill-local}-postgres-data,${BACKUP_DRILL_PROJECT:-ux09-backup-drill-local}-minio-data
+      BACKUP_IMAGE: ${BACKUP_IMAGE:?Set BACKUP_IMAGE to the backup repository}
+      BACKUP_IMAGE_DIGEST: ${BACKUP_IMAGE_DIGEST:?Set BACKUP_IMAGE_DIGEST to sha256 digest}
+      BACKUP_CATALOG_FILE: /work/verified-backup-catalog.json
+      BACKUP_WINDOW_DAYS: ${BACKUP_WINDOW_DAYS:-}
       PGPASSFILE: /run/secrets/recovery_pgpass
       BUSINESS_RESTORE_CONFIG_FILE: /run/secrets/business_restore_config
       BACKUP_RESTORE_CONFIG_FILE: /run/secrets/backup_restore_config

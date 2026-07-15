@@ -17,7 +17,9 @@ storage capacity, clock synchronization, Docker/Compose versions, immutable
 image digests, secret-file ownership, remote TLS, PostgreSQL/MinIO reachability,
 and independent ledger/business destinations. Run the existing production
 preflight unchanged, then run backup destination, manifest schema, and
-disposable drill Compose checks from the backup-recovery runbook.
+the fixed `preflight-drill` plus disposable drill Compose checks from the
+backup-recovery runbook. Preflight must reject an invalid latest restore point,
+an unverified catalog, or any image not resolved as `image@sha256`.
 
 Reliability objectives are a 24-hour RPO and 4-hour RTO. Schedule paired backup
 every 12 hours to preserve RPO margin. Launch is blocked until the newest two
@@ -73,6 +75,11 @@ verification history for all retained archives, marks exactly one version
 active, verifies old and new signatures, then retires the old signing key.
 Replacing one unversioned key is prohibited. Never record key material in the
 history contract, manifests, logs, reports, or commits.
+
+Paired backup uses a distinct read-only `LEDGER_MANIFEST_VERIFY_KEY_FILE` and a
+fetched immutable `LEDGER_PAIRING_GROUP_PATH`. Rotation is incomplete until the
+pairing verifier proves the manifest HMAC/key version, COMPLETE, archive hash
+and size, archive run ID, and cutoff freshness with both retained and new keys.
 
 ## Monitoring, alerting, and evidence
 

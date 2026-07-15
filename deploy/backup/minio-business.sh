@@ -21,6 +21,8 @@ while [ "$#" -gt 0 ]; do
 done
 : "${config_file:?CONFIG_FILE is required}"
 : "${MINIO_ALIAS:?MINIO_ALIAS must name the preconfigured least-privilege alias}"
+python3 /opt/ux09-backup/backupctl.py validate-minio-alias "$MINIO_ALIAS"
+python3 /opt/ux09-backup/backupctl.py validate-buckets "${buckets:?business buckets are required}"
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 mkdir -m 700 "$temporary/config" "$temporary/objects"

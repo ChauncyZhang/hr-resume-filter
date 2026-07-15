@@ -24,7 +24,10 @@ open transition.
   immutable tag and digest. Build and record the resulting local image digest.
 - `backup.sh` creates one PostgreSQL custom-format dump and one business MinIO
   snapshot under the same `backup_run_id`. The live governance ledger bucket is
-  rejected from the business bucket list.
+  rejected from the business bucket list. Before pairing, it requires a fetched
+  complete ledger group and validates schema, active signing-key version/HMAC,
+  COMPLETE, archive hash/size/run ID, and cutoff freshness with a dedicated
+  verification key.
 - `ledger-archive.sh` uses separate source, append, restore, lifecycle, and
   signing-key-history contracts. The business read/append/prune identities must
   have no ledger restore or delete grants.
@@ -38,6 +41,15 @@ open transition.
   0600 or stricter. The coordinator opens with no-follow semantics, checks the
   opened inode, and gives child processes private 0600 copies. Never pass
   secret values in argv, shell tracing, logs, manifests, reports, or tickets.
+- Child processes receive a new strict environment containing only PATH,
+  minimal locale/temp/home values, explicitly approved non-sensitive runtime
+  values, and process-private secret paths. `PGPASSWORD`, `AWS_*`,
+  `RCLONE_CONFIG_PASS`, and password/secret/token/key/credential variables are
+  never inherited.
+- Every configured staging root must equal its resolved path and cannot be a
+  symlink, Windows junction, or other reparse point. Every business bucket is
+  validated with the pinned bucket regex before any client call; empty items,
+  traversal, separators, and URI-shaped values fail closed.
 
 Production backups must use a destination URI whose host differs from the
 application host and whose path is outside PostgreSQL and MinIO data volumes.
@@ -55,8 +67,9 @@ fail closed. The application host is not an acceptable off-host destination.
    restore, ledger source read, ledger archive append, and ledger restore.
    Revoke retired identities after rotation and after temporary restores.
 3. Create protected files for `PGPASSFILE`, each `*_CONFIG_FILE`, and signing
-   keys. Restrict ownership to the backup runtime. Do not place them in this
-   repository or in Compose environment values.
+   keys, including the dedicated `LEDGER_MANIFEST_VERIFY_KEY_FILE`. Restrict
+   ownership to the backup runtime. Do not place them in this repository or in
+   Compose environment values.
 4. Build the toolchain:
 
    ```sh
@@ -107,12 +120,15 @@ least-privilege policies, TLS, and lifecycle behavior.
    archive cutoff, entry count, archive hash, lifecycle policy version, and its
    active signing-key version. The independent key history retains all versions
    and has exactly one active version; replacing one unversioned key is forbidden.
+   Fetch the immutable complete archive group with a read-only identity and set
+   `LEDGER_PAIRING_GROUP_PATH` to that group. A bare manifest is never accepted.
 2. Export a retention-policy snapshot from
    `retention_policies.backup_window_days` with its policy version. Supply that
    exact value as `BACKUP_WINDOW_DAYS`; no default is permitted.
 3. Set a non-PII `BACKUP_RUN_ID`, UTC cutoff, pinned image digest, business
    buckets excluding the live ledger, protected secret-file paths, off-host
-   destination, application hostname, and client executable paths.
+   destination, application hostname, client executable paths,
+   `LEDGER_PAIRING_GROUP_PATH`, and `LEDGER_MANIFEST_VERIFY_KEY_FILE`.
 4. Run `deploy/backup/backup.sh`. It must finish `pg_restore --list`, dump and
    snapshot hashes, complete object inventory, and the pinned reference proof
    before atomically writing local manifest/COMPLETE and invoking the external
@@ -152,15 +168,39 @@ content, credentials, or PII.
 
 ## Isolated restore and recovery drill
 
-Use a unique project and new volumes:
+Use a unique project and new volumes. Replace the syntactically valid example
+image/digest with the reviewed immutable artifact, and point the catalog at a
+freshly generated, signature-verified catalog. These variables, preflight,
+Compose config, and drill commands are one copyable sequence:
 
 ```sh
 export BACKUP_DRILL_PROJECT=ux09-backup-drill-$(date -u +%Y%m%d%H%M%S)
 export COMPOSE_PROJECT_NAME=$BACKUP_DRILL_PROJECT
 export DISPOSABLE_RECOVERY_CONFIRMED=1
+export RECOVERY_VOLUME_NAMES=$BACKUP_DRILL_PROJECT-postgres-data,$BACKUP_DRILL_PROJECT-minio-data
+export BACKUP_IMAGE=registry.example.test/ux09-backup:phase6c-foundation
+export BACKUP_IMAGE_DIGEST=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+export BACKUP_CATALOG_FILE="$PWD/verified-backup-catalog.json"
+export BACKUP_WINDOW_DAYS=30
+
+python3 deploy/backup/backupctl.py preflight-drill
 docker compose -f deploy/compose.backup-drill.yaml config --quiet
 docker compose -f deploy/compose.backup-drill.yaml up -d postgres minio backup-tool
+docker compose -f deploy/compose.backup-drill.yaml cp \
+  "$BACKUP_CATALOG_FILE" backup-tool:/work/verified-backup-catalog.json
+docker compose -f deploy/compose.backup-drill.yaml exec \
+  -e B2B3_CLI_COMMAND=/released/b2b3-cli \
+  -e B2B3_WORKER_COMMAND=/released/b2b3-worker \
+  backup-tool /opt/ux09-backup/drill.sh
 ```
+
+`preflight-drill` strictly validates the image repository/tag and exact
+`sha256:` plus 64-lowercase-hex digest, verifies disposable project/volume
+isolation, and reuses complete-group retention checks. An invalid latest point,
+policy mismatch, malformed catalog, fewer than two valid points, mutable image
+reference, or malformed digest fails before Compose/drill execution. The final
+drill command still exits fail closed in this foundation because real B2B3 is
+not implemented; it cannot open traffic.
 
 The drill sequence is strict:
 

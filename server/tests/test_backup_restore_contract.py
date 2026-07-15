@@ -401,16 +401,49 @@ def test_secret_snapshot_uses_private_regular_copies_and_closes_tocotu(tmp_path:
     assert not private_root.exists()
 
 
-def test_child_environment_exposes_only_private_secret_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_child_environment_is_strict_allowlist_and_fake_child_sees_only_private_secret_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     backupctl = _load_backupctl()
-    monkeypatch.setenv("BUSINESS_SOURCE_CONFIG_FILE", "/original/source-secret")
-    monkeypatch.setenv("BACKUP_MANIFEST_SIGNING_KEY_FILE", "/original/signing-secret")
-    monkeypatch.setenv("SAFE_NON_SECRET_SETTING", "retained")
-    environment = backupctl._sanitized_child_environment(PGPASSFILE="/private/secret-0")
-    assert "BUSINESS_SOURCE_CONFIG_FILE" not in environment
-    assert "BACKUP_MANIFEST_SIGNING_KEY_FILE" not in environment
+    malicious = {
+        "PGPASSWORD": "pg-password-value",
+        "AWS_ACCESS_KEY_ID": "aws-access-value",
+        "AWS_SECRET_ACCESS_KEY": "aws-secret-value",
+        "AWS_SESSION_TOKEN": "aws-token-value",
+        "RCLONE_CONFIG_PASS": "rclone-password-value",
+        "DATABASE_PASSWORD": "database-password-value",
+        "API_TOKEN": "api-token-value",
+        "SIGNING_KEY": "signing-key-value",
+        "CREDENTIAL_BLOB": "credential-value",
+        "UNRELATED_INHERITED_VALUE": "must-not-pass",
+    }
+    for name, value in malicious.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    environment = backupctl._sanitized_child_environment(
+        runtime_values={"MINIO_ALIAS": "business-source"},
+        private_secret_paths={"PGPASSFILE": "/private/secret-0"},
+    )
+    assert not set(malicious).intersection(environment)
     assert environment["PGPASSFILE"] == "/private/secret-0"
-    assert environment["SAFE_NON_SECRET_SETTING"] == "retained"
+    assert environment["MINIO_ALIAS"] == "business-source"
+    assert environment["LANG"] == "C.UTF-8"
+    child = subprocess.run(
+        [sys.executable, "-c", "import json,os; print(json.dumps(dict(os.environ), sort_keys=True))"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=environment,
+    )
+    observed = json.loads(child.stdout)
+    assert not set(malicious).intersection(observed)
+    assert observed["PGPASSFILE"] == "/private/secret-0"
+    assert observed["MINIO_ALIAS"] == "business-source"
+    assert not any(value in child.stdout for value in malicious.values())
+    with pytest.raises(ValueError, match="non-sensitive"):
+        backupctl._sanitized_child_environment(runtime_values={"API_TOKEN": "must-not-pass"})
+    with pytest.raises(ValueError, match="alias"):
+        backupctl.validate_minio_alias("https://user:secret@example.test")
 
 
 def test_prune_deletes_complete_expired_groups_and_preserves_newest_two() -> None:
@@ -540,6 +573,50 @@ def test_ledger_consumer_validates_schema_signature_complete_hash_freshness_and_
         backupctl.validate_ledger_archive_group(group, key, history, minimum_cutoff_utc="2026-07-15T00:00:00Z")
 
 
+def test_backup_pairing_accepts_only_strictly_verified_ledger_group(tmp_path: Path) -> None:
+    backupctl = _load_backupctl()
+    history = {
+        "schema_version": 1,
+        "active_key_version": "ledger-v2",
+        "versions": [{"version": "ledger-v1", "status": "retired"}, {"version": "ledger-v2", "status": "active"}],
+    }
+    group, key, manifest = _write_signed_ledger_group(tmp_path / "valid", backupctl)
+    evidence = backupctl.validate_ledger_pairing(
+        group,
+        key,
+        history,
+        business_run_id="business-run-safe1",
+        business_cutoff_utc="2026-07-15T00:00:00Z",
+    )
+    assert evidence["archive_run_id"] == manifest["archive_run_id"]
+    assert evidence["cutoff_utc"] == manifest["cutoff_utc"]
+    assert evidence["manifest_sha256"] == hashlib.sha256((group / "ledger-manifest.json").read_bytes()).hexdigest()
+
+    bare = tmp_path / "bare" / "ledger-run-bare1"
+    bare.mkdir(parents=True)
+    (bare / "ledger-manifest.json").write_bytes(backupctl._canonical_json(manifest))
+    with pytest.raises((OSError, ValueError), match="ledger|archive|signature|COMPLETE|manifest"):
+        backupctl.validate_ledger_pairing(
+            bare, key, history, business_run_id="business-run-safe1", business_cutoff_utc="2026-07-15T00:00:00Z"
+        )
+
+    group, key, _ = _write_signed_ledger_group(tmp_path / "missing-archive", backupctl)
+    (group / "ledger.snapshot").unlink()
+    with pytest.raises((OSError, ValueError), match="archive|size|hash"):
+        backupctl.validate_ledger_pairing(
+            group, key, history, business_run_id="business-run-safe1", business_cutoff_utc="2026-07-15T00:00:00Z"
+        )
+
+
+def test_backup_command_requires_dedicated_ledger_verify_key_and_verified_group() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    backup = source.split("def command_backup", 1)[1].split("def command_prune", 1)[0]
+    assert "LEDGER_MANIFEST_VERIFY_KEY_FILE" in backup
+    assert "LEDGER_PAIRING_GROUP_PATH" in backup
+    assert "validate_ledger_pairing" in backup
+    assert "_load_json(ledger_manifest_path)" not in backup
+
+
 def test_ledger_restore_proof_is_signed_and_bound_to_run_and_generation(tmp_path: Path) -> None:
     backupctl = _load_backupctl()
     group, key, manifest = _write_signed_ledger_group(tmp_path, backupctl)
@@ -663,6 +740,63 @@ def test_joined_path_rejects_existing_symlink_escape(tmp_path: Path) -> None:
         pytest.skip("symlink creation is unavailable")
     with pytest.raises(ValueError, match="escape|symlink|path"):
         backupctl.safe_run_path(tmp_path, "symlink-safe1")
+
+
+def test_safe_run_path_rejects_root_symlink_on_posix(tmp_path: Path) -> None:
+    if os.name == "nt":
+        return
+    backupctl = _load_backupctl()
+    target = tmp_path / "target"
+    target.mkdir()
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError, match="root|symlink|reparse|junction"):
+        backupctl.safe_run_path(root_link, "child-safe1")
+
+
+def test_safe_run_path_rejects_windows_root_junction_without_symlink_privilege(tmp_path: Path) -> None:
+    if os.name != "nt":
+        return
+    backupctl = _load_backupctl()
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    junction = tmp_path / "junction-root"
+    created = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert created.returncode == 0, created.stderr or created.stdout
+    try:
+        with pytest.raises(ValueError, match="root|symlink|reparse|junction"):
+            backupctl.safe_run_path(junction, "child-safe1")
+    finally:
+        os.rmdir(junction)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", "resumes,", "resumes,,exports", "../ledger", "resumes/escape", "resumes\\escape", "s3://bucket"],
+)
+def test_business_bucket_validation_rejects_empty_traversal_separator_and_uri(raw: str) -> None:
+    backupctl = _load_backupctl()
+    with pytest.raises(ValueError, match="bucket"):
+        backupctl.validate_business_buckets(raw)
+    assert backupctl.validate_business_buckets("resumes,report-exports") == ["resumes", "report-exports"]
+
+
+def test_business_buckets_are_validated_before_every_client_call() -> None:
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    for command_name, next_name in (
+        ("command_backup", "command_prune"),
+        ("command_restore", "command_ledger_archive"),
+        ("command_ledger_archive", "command_drill"),
+    ):
+        section = source.split(f"def {command_name}", 1)[1].split(f"def {next_name}", 1)[0]
+        assert section.index("validate_business_buckets") < section.index("_client("), command_name
+    minio = (BACKUP_DIR / "minio-business.sh").read_text(encoding="utf-8")
+    assert minio.index("validate-buckets") < minio.index("mc --config-dir")
 
 
 def test_reference_proof_requires_pinned_schema_fingerprints_and_exact_counts() -> None:
@@ -879,10 +1013,58 @@ def test_drill_compose_is_isolated_disposable_and_has_no_traffic_service() -> No
     assert "ux09_postgres-data" not in rendered
     assert "ux09_minio-data" not in rendered
     assert model["services"]["backup-tool"]["image"].endswith("@sha256:" + "a" * 64)
+    tool_environment = model["services"]["backup-tool"]["environment"]
+    assert tool_environment["BACKUP_IMAGE"] == "registry.example.test/ux09-backup"
+    assert tool_environment["BACKUP_IMAGE_DIGEST"] == "sha256:" + "a" * 64
+    assert tool_environment["BACKUP_CATALOG_FILE"] == "/work/verified-backup-catalog.json"
     raw_compose = DRILL_COMPOSE.read_text(encoding="utf-8")
     assert "ux09-backup:phase6c-foundation" not in raw_compose
     assert "${BACKUP_IMAGE:?" in raw_compose
     assert "${BACKUP_IMAGE_DIGEST:?" in raw_compose
+
+
+@pytest.mark.parametrize(
+    ("image", "digest"),
+    [
+        ("https://registry.example.test/ux09-backup", "sha256:" + "a" * 64),
+        ("Registry.example.test/ux09-backup", "sha256:" + "a" * 64),
+        ("registry.example.test/ux09-backup@sha256:" + "a" * 64, "sha256:" + "a" * 64),
+        ("registry.example.test/ux09 backup", "sha256:" + "a" * 64),
+        ("registry.example.test/ux09-backup", "a" * 64),
+        ("registry.example.test/ux09-backup", "sha256:" + "A" * 64),
+        ("registry.example.test/ux09-backup", "sha256:short"),
+    ],
+)
+def test_drill_preflight_rejects_mutable_or_malformed_image_reference(image: str, digest: str) -> None:
+    backupctl = _load_backupctl()
+    with pytest.raises(ValueError, match="image|digest"):
+        backupctl.validate_backup_image_reference(image, digest)
+    assert backupctl.validate_backup_image_reference(
+        "registry.example.test/ux09-backup:phase6c-foundation", "sha256:" + "a" * 64
+    ).endswith("@sha256:" + "a" * 64)
+
+
+def test_drill_preflight_fails_closed_on_invalid_latest_and_is_fixed_entry() -> None:
+    backupctl = _load_backupctl()
+    catalog = [
+        _catalog_entry("business-run-old11", "2026-07-14T00:00:00Z", complete_order=1),
+        _catalog_entry("business-run-latest1", "2026-07-15T00:00:00Z", complete_order=2, valid=False),
+    ]
+    with pytest.raises(ValueError, match="latest|valid"):
+        backupctl.validate_drill_preflight(
+            project="ux09-backup-drill-safe123",
+            volumes=["ux09-backup-drill-safe123-postgres-data", "ux09-backup-drill-safe123-minio-data"],
+            confirmed="1",
+            image="registry.example.test/ux09-backup",
+            digest="sha256:" + "a" * 64,
+            catalog=catalog,
+            retention_days=30,
+            now=datetime(2026, 7, 15, 1, tzinfo=timezone.utc),
+        )
+    source = BACKUPCTL.read_text(encoding="utf-8")
+    drill_script = (BACKUP_DIR / "drill.sh").read_text(encoding="utf-8")
+    assert '"preflight-drill"' in source
+    assert "preflight-drill" in drill_script
 
 
 def _tar_with_member(path: Path, member: tarfile.TarInfo, payload: bytes = b"") -> None:
@@ -950,7 +1132,14 @@ def test_runbooks_and_report_state_foundation_limits_and_real_b2b3_dependency() 
         "credential",
         "signing-key",
         "Phase 6C foundation",
+        "preflight-drill",
+        "BACKUP_IMAGE_DIGEST=sha256:",
+        "LEDGER_MANIFEST_VERIFY_KEY_FILE",
+        "LEDGER_PAIRING_GROUP_PATH",
+        "invalid latest",
     ):
         assert required.lower() in combined.lower()
+    assert "docker compose -f deploy/compose.backup-drill.yaml config --quiet" in combined
+    assert "/opt/ux09-backup/drill.sh" in combined
     assert "not production ready" in FOUNDATION_REPORT.read_text(encoding="utf-8").lower()
     assert "complete real restore drill" in FOUNDATION_REPORT.read_text(encoding="utf-8").lower()
