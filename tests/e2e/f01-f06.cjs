@@ -93,7 +93,7 @@ async function flow01(page, state, viewportName) {
   await page.getByRole("button", { name: /编辑职位/ }).click();
   await page.getByLabel("工作地点").fill("北京、上海或远程");
   const updateResponsePromise = page.waitForResponse((response) => response.request().method() === "PUT" && /\/job-definitions\/[^/]+$/.test(new URL(response.url()).pathname));
-  await page.getByRole("button", { name: "保存并发布", exact: true }).click();
+  await page.getByRole("button", { name: "保存修改", exact: true }).click();
   const updateResponse = await updateResponsePromise;
   if (updateResponse.status() !== 200) throw blocker(`F-01 immediate edit returned HTTP ${updateResponse.status()}; create/publish succeeded but edit persistence cannot be accepted.`);
   await page.reload({ waitUntil: "domcontentloaded" });

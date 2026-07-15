@@ -22,6 +22,7 @@ test("final runner exposes all six named real-UI flows in both required viewport
   assert.match(source, /getByRole|getByLabel/);
   assert.match(source, /getByRole\(\"heading\",\s*\{\s*name:\s*\"工作台\",\s*exact:\s*true\s*\}\)/);
   assert.match(source, /waitForResponse[\s\S]*job-definitions/);
+  assert.match(source, /getByRole\("button",\s*\{\s*name:\s*"保存修改",\s*exact:\s*true\s*\}\)/);
   assert.match(source, /nonRetryableFailures/);
   assert.match(source, /launchPersistentContext[\s\S]*E2E_BROWSER_PROFILE/);
   const flow05Source = source.slice(source.indexOf("async function flow05"), source.indexOf("async function flow06"));
