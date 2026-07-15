@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from server.app.core.settings import Settings
@@ -26,6 +26,7 @@ from server.app.recruiting.models import (
     ScreeningRuleVersion,
 )
 from server.app.screening.models import ScreeningItem, ScreeningRun
+from server.app.reports.models import ExportCandidateMembership, ExportRecord
 
 
 pytestmark = pytest.mark.skipif(
@@ -361,6 +362,177 @@ def test_atomic_screening_claim_precedes_and_blocks_deletion_claim(postgres_app)
         assert db.get(DeletionRequest, request_id).status == "approved"
         assert db.get(BackgroundJob, score_job_id).status == "running"
         assert db.scalar(select(DeletionArtifact.id)) is None
+
+
+def test_export_prepare_and_deletion_settle_share_candidate_first_lock_order(
+    postgres_app,
+) -> None:
+    from server.app.governance.worker import DeletionJobHandler
+    from server.app.worker.main import ReportExportJobHandler
+
+    app, engine, candidate_id = postgres_app
+    now = datetime.now(timezone.utc)
+    with Session(engine) as db:
+        candidate = db.get(Candidate, candidate_id)
+        requester = db.scalar(
+            select(User).where(User.email == "recruiter@deletion-pg.test")
+        )
+        export_id = uuid4()
+        export_job = BackgroundJob(
+            organization_id=candidate.organization_id,
+            type="reports.export",
+            payload={
+                "organization_id": str(candidate.organization_id),
+                "export_id": str(export_id),
+            },
+            status="queued",
+            priority=0,
+            attempts=0,
+            max_attempts=3,
+            run_after=now,
+            dedupe_key=f"pg-export-race:{export_id}",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(export_job)
+        db.flush()
+        db.add(
+            ExportRecord(
+                id=export_id,
+                organization_id=candidate.organization_id,
+                requested_by=requester.id,
+                background_job_id=export_job.id,
+                filters={"job_ids": [], "from": None, "to": None},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.flush()
+        db.add(
+            ExportCandidateMembership(
+                organization_id=candidate.organization_id,
+                export_id=export_id,
+                candidate_id=candidate.id,
+            )
+        )
+        organization_id = candidate.organization_id
+        export_job_id = export_job.id
+        db.commit()
+
+    with TestClient(app) as client:
+        requested = create_request(
+            client,
+            login(client, "recruiter@deletion-pg.test"),
+            candidate_id,
+            "export-race-request",
+        )
+        request_id = UUID(requested.json()["data"]["id"])
+        approved = client.post(
+            f"/api/v1/deletion-requests/{request_id}/transitions",
+            json={"target_status": "approved"},
+            headers={
+                **login(client, "system@deletion-pg.test"),
+                "If-Match": '"1"',
+                "Idempotency-Key": "export-race-approve",
+            },
+        )
+    assert approved.status_code == 200
+
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    deletion = DeletionJobHandler(
+        sessions,
+        None,
+        None,
+        None,
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+    assert deletion._claim(organization_id, request_id, 2, "export-race") is False
+
+    class RecordingStorage:
+        def __init__(self):
+            self.writes = []
+
+        def write(self, object_key, content, content_type):
+            self.writes.append((object_key, content, content_type))
+
+    storage = RecordingStorage()
+    report = ReportExportJobHandler(sessions, storage)
+    deletion_candidate_locked = threading.Event()
+    prepare_candidate_started = threading.Event()
+    outcomes = []
+    errors = []
+
+    def candidate_lock_statement(statement: str) -> bool:
+        normalized = " ".join(statement.lower().split())
+        return " from candidates " in f" {normalized} " and "for update" in normalized
+
+    def before_cursor_execute(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ):
+        if (
+            threading.current_thread().name == "prepare-export"
+            and candidate_lock_statement(statement)
+        ):
+            prepare_candidate_started.set()
+
+    def after_cursor_execute(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ):
+        if (
+            threading.current_thread().name == "settle-deletion"
+            and candidate_lock_statement(statement)
+        ):
+            deletion_candidate_locked.set()
+            if not prepare_candidate_started.wait(timeout=BARRIER_TIMEOUT_SECONDS):
+                raise AssertionError("export prepare did not reach the candidate lock")
+
+    def settle_deletion():
+        try:
+            deletion._settle_exports(organization_id, request_id)
+            outcomes.append("deletion_settled")
+        except BaseException as error:
+            errors.append(error)
+
+    def prepare_report():
+        try:
+            report._generate(organization_id, export_id)
+            outcomes.append("export_prepared")
+        except (LookupError, PermissionError):
+            outcomes.append("export_safely_rejected")
+        except BaseException as error:
+            errors.append(error)
+
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    event.listen(engine, "after_cursor_execute", after_cursor_execute)
+    try:
+        deletion_thread = threading.Thread(
+            target=settle_deletion, name="settle-deletion", daemon=True
+        )
+        prepare_thread = threading.Thread(
+            target=prepare_report, name="prepare-export", daemon=True
+        )
+        deletion_thread.start()
+        assert deletion_candidate_locked.wait(timeout=BARRIER_TIMEOUT_SECONDS)
+        prepare_thread.start()
+        deletion_thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        prepare_thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
+        assert not deletion_thread.is_alive()
+        assert not prepare_thread.is_alive()
+    finally:
+        event.remove(engine, "before_cursor_execute", before_cursor_execute)
+        event.remove(engine, "after_cursor_execute", after_cursor_execute)
+
+    assert errors == []
+    assert sorted(outcomes) == ["deletion_settled", "export_safely_rejected"]
+    assert storage.writes == []
+    with Session(engine) as db:
+        export = db.get(ExportRecord, export_id)
+        assert export.status == "failed"
+        assert export.safe_error_code == "deletion_in_progress"
+        assert export.generation_token is None
+        assert export.object_key is None
+        assert db.get(BackgroundJob, export_job_id).status == "cancelled"
 
 
 def test_same_key_different_candidates_never_replays_cross_candidate(postgres_app) -> None:

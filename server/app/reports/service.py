@@ -339,13 +339,96 @@ def _principal_for_export(db, export: ExportRecord) -> Principal | None:
 
 
 def prepare_export(db, export_id: uuid.UUID) -> PreparedExport | None:
-    export = db.scalar(select(ExportRecord).where(ExportRecord.id == export_id).with_for_update())
+    export_snapshot = db.execute(
+        select(
+            ExportRecord.organization_id,
+            ExportRecord.status,
+            ExportRecord.generation_token,
+        ).where(ExportRecord.id == export_id)
+    ).one_or_none()
+    if export_snapshot is None:
+        raise LookupError("export unavailable")
+    organization_id, snapshot_status, snapshot_generation = export_snapshot
+    candidate_ids = tuple(
+        sorted(
+            db.scalars(
+                select(ExportCandidateMembership.candidate_id).where(
+                    ExportCandidateMembership.organization_id == organization_id,
+                    ExportCandidateMembership.export_id == export_id,
+                )
+            )
+        )
+    )
+    candidates = (
+        list(
+            db.scalars(
+                select(Candidate)
+                .where(
+                    Candidate.organization_id == organization_id,
+                    Candidate.id.in_(candidate_ids),
+                )
+                .order_by(Candidate.id)
+                .with_for_update()
+            )
+        )
+        if candidate_ids
+        else []
+    )
+    if tuple(candidate.id for candidate in candidates) != candidate_ids:
+        raise PermissionError("export subject unavailable")
+    blocked = (
+        db.scalar(
+            select(DeletionRequest.id)
+            .where(
+                DeletionRequest.organization_id == organization_id,
+                DeletionRequest.candidate_id.in_(candidate_ids),
+                DeletionRequest.status.in_(("approved", "executing", "completed")),
+            )
+            .limit(1)
+        )
+        if candidate_ids
+        else None
+    )
+    if (
+        any(candidate.deleted_at is not None for candidate in candidates)
+        or blocked is not None
+    ):
+        raise PermissionError("export subject unavailable")
+
+    export = db.scalar(
+        select(ExportRecord)
+        .where(
+            ExportRecord.organization_id == organization_id,
+            ExportRecord.id == export_id,
+        )
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
     if export is None:
+        raise LookupError("export unavailable")
+    locked_candidate_ids = tuple(
+        sorted(
+            db.scalars(
+                select(ExportCandidateMembership.candidate_id)
+                .where(
+                    ExportCandidateMembership.organization_id == organization_id,
+                    ExportCandidateMembership.export_id == export_id,
+                )
+                .with_for_update()
+            )
+        )
+    )
+    if (
+        export.status != snapshot_status
+        or export.generation_token != snapshot_generation
+        or locked_candidate_ids != candidate_ids
+    ):
         raise LookupError("export unavailable")
     if export.status == "succeeded":
         return None
     if export.status == "failed":
         raise LookupError("export unavailable")
+
     principal = _principal_for_export(db, export)
     requested_job_ids = [uuid.UUID(item) for item in export.filters.get("job_ids", [])]
     if principal is None:
@@ -354,32 +437,6 @@ def prepare_export(db, export_id: uuid.UUID) -> PreparedExport | None:
     allowed = set(requested_job_ids) & set(currently_authorized)
     from_ = datetime.fromisoformat(export.filters["from"]) if export.filters.get("from") else None
     to = datetime.fromisoformat(export.filters["to"]) if export.filters.get("to") else None
-    candidate_ids = list(
-        db.scalars(
-            select(ExportCandidateMembership.candidate_id).where(
-                ExportCandidateMembership.organization_id == export.organization_id,
-                ExportCandidateMembership.export_id == export.id,
-            )
-        )
-    )
-    for candidate_id in sorted(candidate_ids, key=str):
-        candidate = db.scalar(
-            select(Candidate)
-            .where(
-                Candidate.organization_id == export.organization_id,
-                Candidate.id == candidate_id,
-            )
-            .with_for_update()
-        )
-        blocked = db.scalar(
-            select(DeletionRequest.id).where(
-                DeletionRequest.organization_id == export.organization_id,
-                DeletionRequest.candidate_id == candidate_id,
-                DeletionRequest.status.in_(("approved", "executing", "completed")),
-            )
-        )
-        if candidate is None or candidate.deleted_at is not None or blocked is not None:
-            raise PermissionError("export subject unavailable")
     rows = db.execute(
         select(Application, Candidate)
         .join(

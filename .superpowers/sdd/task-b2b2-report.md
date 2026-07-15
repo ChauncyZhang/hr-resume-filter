@@ -37,6 +37,10 @@ Migration `0017_governance_deletion` adds exact report-export membership and rep
 - Fresh real MinIO B2B2 deletion ordering, ledger fail/retry, read-back verification, and tamper rejection, plus ledger race: `3 passed in 7.96s`.
 - Committed-version rerun on a new isolated MinIO instance: `1 passed in 6.48s`; the instance and network were removed after the gate.
 - B2B2 Important review fix, including parse/score/LLM cancellation, mixed candidates, run aggregation, live-lease preservation, and idempotent re-entry: `21 passed, 1 skipped in 42.25s`.
+- Final Minor lock-order gate: report prepare now takes an unlocked exact membership snapshot, locks every Candidate in UUID order, checks active deletion, then locks ExportRecord and revalidates status, generation, and locked membership. The deterministic PostgreSQL two-session prepare-vs-settle test first reproduced `DeadlockDetected` on the old Export-to-Candidate order and passes on the Candidate-first order: `1 passed in 8.85s`; deletion safely cancelled the export and no storage write occurred.
+- Final Minor checkpoint fault gate crashes after a strongly consistent fake deletes the first object but before the artifact checkpoint commit. Restart observes not-found, checkpoints it as deleted, completes remaining objects before redaction, and writes the ledger last: `1 passed in 4.05s`. A fresh isolated real MinIO delete-twice/not-found and cross-policy gate also passed: `1 passed in 2.89s`.
+- Automatic PII log gate injects filename, object key, candidate text, secret, payload, and a sensitive exception into worker/terminal paths. Captured records contain only safe identifiers and safe codes; terminal audit metadata normalizes the unsafe code: `1 passed in 4.34s`.
+- Final reports/governance focused split after the Minor fixes: `32 passed, 1 skipped in 31.16s`.
 
 The broad backend split was intentionally not used as completion evidence: an older long-running container was stopped because it occupied the shared PostgreSQL instance. Per task direction, completion is based on the focused unit, real PostgreSQL, and real MinIO gates above.
 

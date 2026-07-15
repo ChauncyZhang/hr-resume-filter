@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import os
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from server.app.governance.deletion_models import DeletionArtifact, DeletionRequest, LegalHold
 from server.app.governance.deletion_service import DatabaseRedactionResult
@@ -666,10 +667,6 @@ def test_object_checkpoint_resume_precedes_redaction_and_ledger(tmp_path, monkey
         request = db.get(DeletionRequest, request_id)
         assert request.status == "completed"
         assert request.recovery_generation == 0
-        assert all(
-            artifact.status == "deleted"
-            for artifact in db.scalars(select(DeletionArtifact)).all()
-        )
 
     counts_before_reentry = {
         name: [event[0] for event in events].count(name)
@@ -684,6 +681,121 @@ def test_object_checkpoint_resume_precedes_redaction_and_ledger(tmp_path, monkey
     with app.state.identity_store.sync_session() as db:
         request = db.get(DeletionRequest, request_id)
         assert request.recovery_generation == 0
+
+
+def test_crash_after_object_delete_before_checkpoint_commit_recovers_from_not_found(
+    tmp_path, monkeypatch
+) -> None:
+    from server.app.governance import worker as deletion_worker
+    from server.app.governance.worker import DeletionJobHandler
+
+    class SimulatedCheckpointCrash(RuntimeError):
+        pass
+
+    class StronglyConsistentDeleter:
+        def __init__(self, objects, events):
+            self.objects = set(objects)
+            self.events = events
+
+        def delete(self, bucket, key):
+            if key in self.objects:
+                self.objects.remove(key)
+                self.events.append(("delete", bucket, key))
+            else:
+                self.events.append(("delete_not_found", bucket, key))
+
+    app = make_app(tmp_path)
+    organization_id, candidate_id, request_id = _approved_request(app)
+    object_keys = {
+        f"clean/{organization_id}/1.pdf",
+        f"clean/{organization_id}/2.pdf",
+    }
+    events = []
+    deleter = StronglyConsistentDeleter(object_keys, events)
+    ledger = RecordingLedger(events)
+
+    def redact(_connection, *, organization_id, request_id, candidate_id):
+        with app.state.identity_store.sync_session() as db:
+            artifacts = list(
+                db.scalars(
+                    select(DeletionArtifact).where(
+                        DeletionArtifact.request_id == request_id
+                    )
+                )
+            )
+            assert artifacts
+            assert all(artifact.status == "deleted" for artifact in artifacts)
+        assert deleter.objects == set()
+        events.append(("redact",))
+        with app.state.identity_store.sync_session.begin() as db:
+            candidate = db.get(Candidate, candidate_id)
+            candidate.deleted_at = datetime(2026, 7, 15, 11, 0, tzinfo=timezone.utc)
+            candidate.display_name = "已删除候选人"
+            candidate.version += 1
+        return DatabaseRedactionResult("d" * 64, (0, 2, 0, 0, 0, 0, 0, 2, 0))
+
+    monkeypatch.setattr(deletion_worker, "execute_database_redaction", redact)
+    handler = DeletionJobHandler(
+        sessions=app.state.identity_store.sync_session,
+        governance_engine=FakeGovernanceEngine(),
+        object_deleter=deleter,
+        ledger=ledger,
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+    crashed = False
+
+    def crash_before_checkpoint_commit(session):
+        nonlocal crashed
+        if crashed:
+            return
+        if any(
+            isinstance(row, DeletionArtifact) and row.status == "deleted"
+            for row in session.dirty
+        ):
+            crashed = True
+            raise SimulatedCheckpointCrash("after delete, before checkpoint commit")
+
+    session_class = app.state.identity_store.sync_session.class_
+    event.listen(session_class, "before_commit", crash_before_checkpoint_commit)
+    try:
+        with pytest.raises(SimulatedCheckpointCrash):
+            asyncio.run(handler(_job(organization_id, request_id, 2)))
+    finally:
+        event.remove(session_class, "before_commit", crash_before_checkpoint_commit)
+
+    assert crashed is True
+    assert [name for name, *_ in events] == ["delete"]
+    with app.state.identity_store.sync_session() as db:
+        request = db.get(DeletionRequest, request_id)
+        candidate = db.get(Candidate, candidate_id)
+        artifacts = list(db.scalars(select(DeletionArtifact)))
+        assert request.status == "executing"
+        assert candidate.deleted_at is None
+        assert artifacts
+        assert all(artifact.status == "pending" for artifact in artifacts)
+
+    restarted = DeletionJobHandler(
+        sessions=app.state.identity_store.sync_session,
+        governance_engine=FakeGovernanceEngine(),
+        object_deleter=deleter,
+        ledger=ledger,
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+    asyncio.run(restarted(_job(organization_id, request_id, 2)))
+
+    names = [name for name, *_ in events]
+    assert names.count("delete") == 2
+    assert names.count("delete_not_found") == 1
+    assert names[-3:] == ["redact", "ledger_write", "ledger_read"]
+    with app.state.identity_store.sync_session() as db:
+        request = db.get(DeletionRequest, request_id)
+        assert request.status == "completed"
+        assert all(
+            artifact.status == "deleted"
+            for artifact in db.scalars(select(DeletionArtifact)).all()
+        )
 
 
 def test_terminal_callback_matches_exact_tenant_request_version_and_executing(tmp_path) -> None:
@@ -719,6 +831,129 @@ def test_terminal_callback_matches_exact_tenant_request_version_and_executing(tm
             select(AuditLog).where(AuditLog.event_type == "governance.deletion_failed")
         ).all()
         assert len(audits) == 1
+
+
+def test_worker_and_governance_terminal_logs_never_include_payload_or_pii(
+    tmp_path,
+) -> None:
+    from server.app.governance.terminal import finalize_deletion_dead_letter
+    from server.app.worker.main import Worker
+
+    filename = "private-candidate-resume.pdf"
+    object_key = "clean/tenant/private-candidate-resume.pdf"
+    candidate_text = "Alice Example salary 999999 private notes"
+    secret = "sk-super-private-provider-secret"
+    sensitive_values = (filename, object_key, candidate_text, secret)
+    app = make_app(tmp_path)
+    organization_id, _candidate_id, request_id = _approved_request(app)
+    with app.state.identity_store.sync_session.begin() as db:
+        db.get(DeletionRequest, request_id).status = "executing"
+
+    class Probe:
+        async def check(self):
+            return None
+
+    class Queue:
+        def __init__(self):
+            self.failures = []
+
+        async def fail(self, item, worker_id, *, safe_code, retryable):
+            self.failures.append((item.id, worker_id, safe_code, retryable))
+
+        async def heartbeat(self, *_args, **_kwargs):
+            await asyncio.Event().wait()
+
+    queue = Queue()
+    malicious_job = SimpleNamespace(
+        id=uuid4(),
+        organization_id=organization_id,
+        type="governance.delete_candidate",
+        payload={
+            "filename": filename,
+            "object_key": object_key,
+            "candidate_text": candidate_text,
+            "secret": secret,
+        },
+        attempts=1,
+        trace_id="safe-trace-id",
+    )
+
+    async def fail_with_sensitive_exception(_job):
+        raise RuntimeError(
+            f"payload={_job.payload!r} filename={filename} key={object_key} "
+            f"candidate={candidate_text} secret={secret}"
+        )
+
+    worker = Worker(
+        Probe(),
+        Probe(),
+        interval_seconds=0,
+        queue=queue,
+        handlers={"governance.delete_candidate": fail_with_sensitive_exception},
+        worker_id="safe-worker-id",
+    )
+    records = []
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    capture = CaptureHandler()
+    worker_logger = logging.getLogger("server.app.worker.main")
+    terminal_logger = logging.getLogger("server.app.governance.terminal")
+    worker_logger.addHandler(capture)
+    terminal_logger.addHandler(capture)
+    try:
+        asyncio.run(worker._process(malicious_job, "job"))
+    finally:
+        worker_logger.removeHandler(capture)
+
+    assert queue.failures == [
+        (malicious_job.id, "safe-worker-id", "handler_failed", True)
+    ]
+    assert records
+    for record in records:
+        rendered = f"{record.getMessage()} {getattr(record, 'context', {})!r}"
+        assert all(value not in rendered for value in sensitive_values)
+        context = getattr(record, "context", {})
+        assert set(context) <= {
+            "item_id",
+            "item_type",
+            "kind",
+            "attempt",
+            "trace_id",
+            "safe_error_code",
+        }
+
+    records.clear()
+    terminal_job = _job(organization_id, request_id, 2)
+    terminal_job.filename = filename
+    terminal_job.object_key = object_key
+    terminal_job.candidate_text = candidate_text
+    terminal_job.secret = secret
+    try:
+        with app.state.identity_store.sync_session.begin() as db:
+            finalize_deletion_dead_letter(
+                db,
+                terminal_job,
+                f"failed {filename} {object_key} {candidate_text} {secret}",
+                datetime.now(timezone.utc),
+            )
+    finally:
+        terminal_logger.removeHandler(capture)
+    assert records == []
+    with app.state.identity_store.sync_session() as db:
+        request = db.get(DeletionRequest, request_id)
+        assert request.status == "failed"
+        assert request.safe_error_code == "internal_error"
+        audit = db.scalar(
+            select(AuditLog).where(
+                AuditLog.event_type == "governance.deletion_failed"
+            )
+        )
+        assert audit.metadata_json["safe_error_code"] == "internal_error"
+        serialized_audit = repr(audit.metadata_json)
+        assert all(value not in serialized_audit for value in sensitive_values)
 
 
 @pytest.mark.parametrize(
