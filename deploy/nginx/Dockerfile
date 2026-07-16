@@ -4,6 +4,7 @@ WORKDIR /opt/ux09-frontend
 COPY package.json package-lock.json ./
 RUN npm ci --fund=false --audit=false
 COPY index.html vite.config.js vite.config.mjs ./
+COPY public ./public
 COPY src ./src
 RUN npm run build
 

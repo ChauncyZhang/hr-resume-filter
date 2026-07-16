@@ -30,7 +30,7 @@ from server.app.recruiting.http import content_disposition
 from server.app.recruiting.storage import MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, StorageObjectTooLarge, StorageReadFailed
 from server.app.recruiting.schemas import (
     ApplicationCollection, ApplicationResource, CandidateCollection, CandidateResource,
-    FunnelResource, JobCollection, JobDefinitionCommand, JobDefinitionResource, JobResource, NoteCollection, NoteResource,
+    FunnelResource, JobCollection, JobDefinitionCommand, JobDefinitionResource, JobOwnerOptionCollection, JobResource, NoteCollection, NoteResource,
     PreviewResource, ResumeCollection, TicketResource, TimelineCollection,
     VersionCollection, VersionResource, WorkbenchResource, Problem,
 )
@@ -371,6 +371,15 @@ def _eligible_recruiter(db, organization_id: UUID, user_id: UUID) -> bool:
     )))
 
 
+def _eligible_hiring_manager(db, organization_id: UUID, user_id: UUID | None) -> bool:
+    return user_id is None or bool(db.scalar(select(exists().where(
+        User.organization_id == organization_id,
+        User.id == user_id,
+        User.status == UserStatus.ACTIVE,
+        exists().where(UserRole.user_id == User.id, UserRole.role == "hiring_manager"),
+    ))))
+
+
 def _department_is_valid(db, organization_id: UUID, department_id: UUID | None) -> bool:
     return department_id is None or db.scalar(
         select(
@@ -410,6 +419,8 @@ def create_job_definition(payload: JobDefinitionCommand, request: Request, idemp
             return problem(
                 request, 422, "department_invalid", "The department is invalid."
             )
+        if not _eligible_hiring_manager(db, principal.organization_id, command["hiring_owner_id"]):
+            return problem(request, 422, "hiring_owner_invalid", "The hiring owner is invalid.")
         try:
             status, body = persisted_idempotent(
                 db,
@@ -460,6 +471,8 @@ def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request:
     with request.app.state.identity_store.sync_session() as db:
         if _load_job(db, principal, job_id, RecruitingAction.MANAGE_JOB) is None:
             return _denied(request)
+        if not _eligible_hiring_manager(db, principal.organization_id, command["hiring_owner_id"]):
+            return problem(request, 422, "hiring_owner_invalid", "The hiring owner is invalid.")
         try:
             status, body = persisted_idempotent(
                 db,
@@ -572,6 +585,25 @@ def get_workbench(request: Request, response: Response):
                 "tasks": tasks,
                 "interviews": {"available": False, "upcoming": [], "pending_feedback": []},
             },
+        }
+
+
+@router.get("/job-owner-options", response_model=JobOwnerOptionCollection)
+def list_job_owner_options(request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    if not AUTH.role_allows(principal, RecruitingAction.MANAGE_JOB):
+        return _denied(request)
+    with request.app.state.identity_store.sync_session() as db:
+        rows = db.execute(select(User.id, User.display_name).where(
+            User.organization_id == principal.organization_id,
+            User.status == UserStatus.ACTIVE,
+            exists().where(UserRole.user_id == User.id, UserRole.role == "hiring_manager"),
+        ).order_by(User.display_name.asc(), User.id.asc())).all()
+        return {
+            "data": [{"id": str(user_id), "name": display_name} for user_id, display_name in rows],
+            "meta": {"count": len(rows)},
         }
 
 

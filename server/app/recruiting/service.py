@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import delete, func, select, text, update
 
 from server.app.governance.retention import (
     lock_candidate_retention_facts,
@@ -264,6 +264,8 @@ def create_job_definition_record(db, organization_id, actor_user_id, command, *,
         jd,
         rules,
     ])
+    if command["hiring_owner_id"] is not None:
+        db.add(JobCollaborator(organization_id=organization_id, job_id=job.id, user_id=command["hiring_owner_id"], access_role="job_manager"))
     db.flush()
     safe_metadata = {"job_id": str(job.id), "jd_version_number": 1, "rule_version_number": 1, "status": job.status}
     db.add(AuditLog(organization_id=organization_id, actor_user_id=actor_user_id, event_type="job.definition_created", outcome="success", trace_id=trace_id, metadata_json=safe_metadata))
@@ -272,7 +274,7 @@ def create_job_definition_record(db, organization_id, actor_user_id, command, *,
 
 
 def replace_job_definition_record(db, organization_id, job_id, actor_user_id, command, *, expected_version, trace_id):
-    from server.app.identity.models import AuditLog, Job
+    from server.app.identity.models import AuditLog, Job, JobCollaborator
     from server.app.recruiting.models import JobJdVersion, ScreeningRuleVersion
 
     jd_content,rule_content=_job_definition_contents(command)
@@ -284,6 +286,13 @@ def replace_job_definition_record(db, organization_id, job_id, actor_user_id, co
     source_status = job.status
     for key in ("title", "department_id", "headcount", "priority", "hiring_owner_id"):
         setattr(job, key, command[key])
+    db.execute(delete(JobCollaborator).where(
+        JobCollaborator.organization_id == organization_id,
+        JobCollaborator.job_id == job_id,
+        JobCollaborator.access_role == "job_manager",
+    ))
+    if command["hiring_owner_id"] is not None:
+        db.add(JobCollaborator(organization_id=organization_id, job_id=job_id, user_id=command["hiring_owner_id"], access_role="job_manager"))
     if command["publish"]:
         job.status = "open"
     job.version += 1

@@ -68,6 +68,15 @@ class JobMeta(ApiModel):
     status_counts: dict[str, int]
 
 
+class JobOwnerOptionMeta(ApiModel):
+    count: int
+
+
+class JobOwnerOptionCollection(ApiModel):
+    data: list[OwnerFacetOut]
+    meta: JobOwnerOptionMeta
+
+
 RuleItem = Annotated[str, Field(min_length=1, max_length=MAX_RULE_TERM_CHARS)]
 
 

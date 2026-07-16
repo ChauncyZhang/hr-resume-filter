@@ -107,26 +107,26 @@ async function assertNavLabels(nav, expected) {
   assert.deepEqual(await nav.getByRole("button", { includeHidden: true }).allTextContents(), expected);
 }
 
-test("390px keeps the permitted navigation and primary action reachable", { timeout: 60_000 }, async () => {
+test("390px keeps the navigation drawer and primary action reachable", { timeout: 60_000 }, async () => {
   const viewport = { width: 390, height: 844 };
   const { context, page } = await openAuthenticatedPage(viewport, ["recruiting_admin"]);
   try {
     const sidebar = page.locator(".sidebar");
     const nav = page.locator("#primary-navigation");
     const menu = page.locator(".mobile-menu");
-    assert.deepEqual(await computed(sidebar), { display: "flex", visibility: "visible", position: "static", overflowX: "visible" });
-    assert.equal((await computed(nav)).overflowX, "auto");
-    assert.equal((await computed(menu)).display, "none");
+    assert.deepEqual(await computed(sidebar), { display: "flex", visibility: "hidden", position: "fixed", overflowX: "visible" });
+    assert.notEqual((await computed(menu)).display, "none");
     await assertNavLabels(nav, recruitingNav);
-    assert.equal(await nav.getByRole("button", { name: labels.workbench, exact: true }).getAttribute("aria-current"), "page");
+    assert.equal(await nav.getByRole("button", { name: labels.workbench, exact: true, includeHidden: true }).getAttribute("aria-current"), "page");
 
+    await menu.click();
+    await page.waitForFunction(() => document.activeElement?.textContent?.trim() === "工作台");
     for (const name of recruitingNav) {
       await assertInsideViewport(nav.getByRole("button", { name, exact: true }), viewport, `390px ${name}`);
     }
     await assertInsideViewport(page.getByRole("button", { name: labels.importResume, exact: true }), viewport, "390px import resume");
-    await page.evaluate(() => document.activeElement?.blur());
-    await page.keyboard.press("Tab");
-    assert.equal(await page.evaluate(() => document.activeElement?.textContent?.trim()), labels.workbench);
+    await page.keyboard.press("Escape");
+    await sidebar.waitFor({ state: "hidden" });
     await assertNoBodyOverflow(page, "390px");
   } finally {
     await context.close();
@@ -222,9 +222,32 @@ test("1280px keeps the desktop sidebar visible and filters navigation by role", 
     const workspaceBox = await workspace.boundingBox();
     assert.ok(sidebarBox && workspaceBox);
     assert.equal(sidebarBox.x, 0);
-    assert.equal(sidebarBox.width, 178);
-    assert.equal(workspaceBox.x, 178);
+    assert.equal(sidebarBox.width, 72);
+    assert.equal(workspaceBox.x, 72);
     await assertNoBodyOverflow(page, "1280px");
+  } finally {
+    await context.close();
+  }
+});
+
+test("1440px uses the full desktop sidebar", { timeout: 60_000 }, async () => {
+  const viewport = { width: 1440, height: 900 };
+  const { context, page } = await openAuthenticatedPage(viewport, ["recruiting_admin"]);
+  try {
+    const sidebarBox = await page.locator(".sidebar").boundingBox();
+    const workspaceBox = await page.locator(".workspace").boundingBox();
+    assert.ok(sidebarBox && workspaceBox);
+    assert.equal(sidebarBox.width, 224);
+    assert.equal(workspaceBox.x, 224);
+    const brand = page.locator(".brand");
+    await assertInsideViewport(brand, viewport, "1440px brand");
+    const brandBounds = await brand.evaluate((element) => {
+      const container = element.getBoundingClientRect();
+      const text = element.querySelector("span").getBoundingClientRect();
+      return { containerRight: container.right, textRight: text.right };
+    });
+    assert.ok(brandBounds.textRight <= brandBounds.containerRight, `brand text exceeds sidebar: ${JSON.stringify(brandBounds)}`);
+    await assertNoBodyOverflow(page, "1440px");
   } finally {
     await context.close();
   }

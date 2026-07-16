@@ -42,3 +42,17 @@ test("audit toolbar remains full-width and step labels stay contained on mobile"
   assert.match(styles, /@media \(max-width: 600px\) \{[\s\S]*?\.wizard-steps strong\s*\{[^}]*min-width:\s*0[^}]*text-align:\s*center/);
   assert.match(styles, /@media \(max-width: 600px\) \{[\s\S]*?\.wizard-steps i\s*\{[^}]*right:\s*calc\(-50% \+ 17px\)/);
 });
+
+test("UX10 shell follows the 1440, 1280, 768, and 390 layout contract", () => {
+  assert.match(declarationsFor(".sidebar"), /width:\s*224px/);
+  assert.match(declarationsFor(".workspace"), /calc\(100% - 224px\)/);
+  assert.match(declarationsFor(".workspace"), /margin-left:\s*224px/);
+  assert.match(declarationsFor(".topbar"), /height:\s*56px/);
+  assert.match(declarationsFor(".topbar"), /padding:\s*0 24px/);
+  assert.match(declarationsFor(".page-body"), /padding:\s*24px/);
+  assert.match(styles, /@media \(min-width: 841px\) and \(max-width: 1439px\) \{[\s\S]*?\.sidebar\s*\{[^}]*width:\s*72px/);
+  assert.match(styles, /@media \(min-width: 841px\) and \(max-width: 1439px\) \{[\s\S]*?\.workspace\s*\{[^}]*calc\(100% - 72px\)[^}]*margin-left:\s*72px/);
+  assert.match(styles, /@media \(max-width: 840px\) \{[\s\S]*?\.topbar\s*\{[^}]*height:\s*52px[^}]*padding:\s*0 14px/);
+  assert.match(styles, /@media \(max-width: 840px\) \{[\s\S]*?\.page-body\s*\{[^}]*padding:\s*14px/);
+  assert.match(declarationsFor(".brand"), /overflow:\s*hidden/);
+});

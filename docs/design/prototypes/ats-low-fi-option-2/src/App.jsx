@@ -462,7 +462,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   }, [activeNav, jobMode, candidateMode, interviewMode, talentMode, Boolean(screeningTask)]);
 
   useEffect(() => {
-    const media = window.matchMedia("(min-width: 601px) and (max-width: 900px)");
+    const media = window.matchMedia("(max-width: 840px)");
     const syncDrawerViewport = () => {
       setDrawerViewport(media.matches);
       if (!media.matches) setMenuOpen(false);

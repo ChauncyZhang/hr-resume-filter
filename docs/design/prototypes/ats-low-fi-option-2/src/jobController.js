@@ -240,6 +240,11 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     return normalizeFacets(await client.listDepartments({ signal }));
   }
 
+  async function listHiringManagers({ signal } = {}) {
+    const result = await client.request("/api/v1/job-owner-options", requestOptions(signal));
+    return normalizeFacets(result?.data).filter((item) => safeUuid(item.id));
+  }
+
   async function listJobs(filters = {}, { signal } = {}) {
     const params = new URLSearchParams();
     const query = safeString(filters.q).trim();
@@ -327,7 +332,7 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     return normalizeJob(result?.data);
   }
 
-  return { listDepartments, listJobs, loadDefinition, saveDefinition, refreshEditBaseline, transition, mergeDefinition };
+  return { listDepartments, listHiringManagers, listJobs, loadDefinition, saveDefinition, refreshEditBaseline, transition, mergeDefinition };
 }
 
 export const jobController = createJobController();

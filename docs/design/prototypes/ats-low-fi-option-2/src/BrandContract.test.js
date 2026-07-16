@@ -5,12 +5,13 @@ import { readFile } from "node:fs/promises";
 const root = new URL("../", import.meta.url);
 
 test("the product shell uses the BeyondCandidate identity instead of a prototype label", async () => {
-  const [index, app, login, invite, icon] = await Promise.all([
+  const [index, app, login, invite, icon, dockerfile] = await Promise.all([
     readFile(new URL("index.html", root), "utf8"),
     readFile(new URL("src/App.jsx", root), "utf8"),
     readFile(new URL("src/LoginView.jsx", root), "utf8"),
     readFile(new URL("src/InviteAcceptView.jsx", root), "utf8"),
     readFile(new URL("public/favicon.svg", root), "utf8"),
+    readFile(new URL("../../../../../deploy/nginx/Dockerfile", import.meta.url), "utf8"),
   ]);
 
   for (const source of [index, app, login, invite]) {
@@ -19,4 +20,5 @@ test("the product shell uses the BeyondCandidate identity instead of a prototype
   }
   assert.match(index, /favicon\.svg/);
   assert.match(icon, /aria-label="BeyondCandidate"/);
+  assert.match(dockerfile, /COPY public \.\/public/);
 });

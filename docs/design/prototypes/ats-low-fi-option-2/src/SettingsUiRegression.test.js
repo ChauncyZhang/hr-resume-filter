@@ -138,6 +138,7 @@ test("audit controls align at desktop width and stack without overflow on narrow
   for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
     const { context, page } = await openAuthenticatedPage(viewport);
     try {
+      if (viewport.width <= 840) await page.getByRole("button", { name: "打开主导航", exact: true }).click();
       await page.getByRole("button", { name: "设置", exact: true }).click();
       await page.getByRole("button", { name: "审计与数据治理", exact: true }).click();
       const toolbar = page.locator(".audit-toolbar.governance-filters");

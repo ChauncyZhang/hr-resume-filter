@@ -1140,6 +1140,87 @@ def test_create_job_definition_atomically_creates_typed_versions(tmp_path, publi
         assert db.query(Job).count() == db.query(JobJdVersion).count() == db.query(ScreeningRuleVersion).count() == 1
 
 
+def test_job_owner_options_and_definition_writes_enforce_active_tenant_hiring_managers(tmp_path) -> None:
+    app = make_app(tmp_path)
+    admin_id = seed_user(app, "recruiting_admin", "admin@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin = db.get(User, admin_id)
+
+        def add_user(email, display_name, *, organization=None, status=UserStatus.ACTIVE, roles=("hiring_manager",)):
+            user = User(
+                organization=organization or admin.organization,
+                email=email,
+                normalized_email=email,
+                display_name=display_name,
+                password_hash=PasswordService().hash("correct horse"),
+                status=status,
+            )
+            user.roles.extend(UserRole(role=role) for role in roles)
+            db.add(user)
+            db.flush()
+            return user.id
+
+        eligible_id = add_user("eligible@example.test", "可选负责人")
+        replacement_id = add_user("replacement@example.test", "第二负责人")
+        disabled_id = add_user("disabled@example.test", "停用负责人", status=UserStatus.DISABLED)
+        wrong_role_id = add_user("recruiter@example.test", "招聘专员", roles=("recruiter",))
+        other_organization = Organization(slug="other", name="Other", status="active")
+        db.add(other_organization)
+        db.flush()
+        cross_tenant_id = add_user("other@example.test", "其他组织负责人", organization=other_organization)
+        db.commit()
+
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        options = client.get("/api/v1/job-owner-options", headers=headers)
+        assert options.status_code == 200
+        assert options.json() == {
+            "data": [
+                {"id": str(eligible_id), "name": "可选负责人"},
+                {"id": str(replacement_id), "name": "第二负责人"},
+            ],
+            "meta": {"count": 2},
+        }
+
+        invalid_ids = {
+            "disabled": disabled_id,
+            "wrong-role": wrong_role_id,
+            "cross-tenant": cross_tenant_id,
+        }
+        for key, invalid_id in invalid_ids.items():
+            rejected = client.post(
+                "/api/v1/job-definitions",
+                json=job_definition_payload(hiring_owner_id=str(invalid_id)),
+                headers={**headers, "Idempotency-Key": f"invalid-owner-{key}"},
+            )
+            assert rejected.status_code == 422
+            assert rejected.json()["code"] == "hiring_owner_invalid"
+
+        created = client.post(
+            "/api/v1/job-definitions",
+            json=job_definition_payload(hiring_owner_id=str(eligible_id)),
+            headers={**headers, "Idempotency-Key": "valid-owner"},
+        )
+        assert created.status_code == 201
+        job_id = UUID(created.json()["data"]["job"]["id"])
+
+        replaced = client.put(
+            f"/api/v1/job-definitions/{job_id}",
+            json=job_definition_payload(hiring_owner_id=str(replacement_id)),
+            headers={**headers, "Idempotency-Key": "replace-owner", "If-Match": '"1"'},
+        )
+        assert replaced.status_code == 200
+
+    with app.state.identity_store.sync_session() as db:
+        managers = db.scalars(select(JobCollaborator).where(
+            JobCollaborator.job_id == job_id,
+            JobCollaborator.access_role == "job_manager",
+        )).all()
+        assert [(item.organization_id, item.user_id) for item in managers] == [
+            (db.get(User, replacement_id).organization_id, replacement_id),
+        ]
+
+
 def test_get_job_definition_returns_latest_versions_and_legacy_nulls(tmp_path) -> None:
     app = make_app(tmp_path)
     admin_id = seed_user(app, "recruiting_admin", "admin@example.test")

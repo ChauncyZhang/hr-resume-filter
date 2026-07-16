@@ -98,6 +98,23 @@ test("job form departments come from the organization directory instead of job f
   assert.equal(calls[0].signal, signal);
 });
 
+test("job form owners come from the dedicated hiring-manager directory", async () => {
+  const { client, calls } = queuedClient([{
+    data: [
+      { id: HIRING_OWNER_ID, name: "招聘经理" },
+      { id: "invalid", name: "无效用户" },
+    ],
+    meta: { count: 1 },
+  }]);
+  const signal = new AbortController().signal;
+  const controller = createJobController({ client });
+
+  const owners = await controller.listHiringManagers({ signal });
+
+  assert.deepEqual(calls, [{ path: "/api/v1/job-owner-options", options: { signal } }]);
+  assert.deepEqual(owners, [{ id: HIRING_OWNER_ID, name: "招聘经理" }]);
+});
+
 test("job form actions execute the correct publish payload for create and every editable status", async () => {
   const cases = [
     { job: null, expected: { secondary: { label: "保存草稿", publish: false }, primary: { label: "发布职位", publish: true } } },
