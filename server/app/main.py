@@ -145,6 +145,13 @@ def create_app(
         feishu_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
     app.state.feishu_secret_cipher = FeishuSecretCipher(feishu_key.encode())
     app.state.feishu_provider = HttpFeishuProvider()
+    from server.app.integrations.feishu.availability import FeishuAwareAvailabilityProvider
+    from server.app.interviews.availability import INTERNAL_AVAILABILITY_PROVIDER
+    app.state.interview_availability_provider = FeishuAwareAvailabilityProvider(
+        INTERNAL_AVAILABILITY_PROVIDER,
+        app.state.feishu_provider,
+        app.state.feishu_secret_cipher,
+    )
     app.include_router(identity_router)
     app.include_router(identity_admin_router)
     app.include_router(recruiting_router)
