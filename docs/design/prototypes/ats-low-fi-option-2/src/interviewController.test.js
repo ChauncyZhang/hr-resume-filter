@@ -218,6 +218,21 @@ test("checks conflicts, transitions, downloads calendar, and lists my tasks", as
   ]);
 });
 
+test("loads an interview-scoped resume for preview and original download", async () => {
+  const preview = { blob: new Blob(["preview"], { type: "application/pdf" }), filename: "候选人.pdf" };
+  const original = { blob: new Blob(["download"], { type: "application/pdf" }), filename: "候选人.pdf" };
+  const { client, calls } = queuedClient([preview, original]);
+  const controller = createInterviewController({ client });
+  const signal = new AbortController().signal;
+
+  assert.equal(await controller.getResumeFile(INTERVIEW_ID, { signal }), preview);
+  assert.equal(await controller.downloadResumeFile(INTERVIEW_ID, { signal }), original);
+  assert.deepEqual(calls, [
+    { kind: "download", path: `/api/v1/interviews/${INTERVIEW_ID}/resume-file`, options: { signal } },
+    { kind: "download", path: `/api/v1/interviews/${INTERVIEW_ID}/resume-file?download=true`, options: { signal } },
+  ]);
+});
+
 test("lists authorized participant options for the selected application", async () => {
   const { client, calls } = queuedClient([{ data: [
     { id: USER_ID, display_name: "张小北", roles: ["interviewer"] },

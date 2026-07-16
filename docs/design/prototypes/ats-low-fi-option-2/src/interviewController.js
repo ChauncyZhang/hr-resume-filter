@@ -425,6 +425,16 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
     return client.download(`/api/v1/interviews/${id}/calendar-file`, signalOption(signal));
   }
 
+  async function getResumeFile(interviewId, { signal } = {}) {
+    const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
+    return client.download(`/api/v1/interviews/${id}/resume-file`, signalOption(signal));
+  }
+
+  async function downloadResumeFile(interviewId, { signal } = {}) {
+    const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
+    return client.download(`/api/v1/interviews/${id}/resume-file?download=true`, signalOption(signal));
+  }
+
   async function getMyFeedback(interviewId, { signal } = {}) {
     const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
     const response = await client.request(`/api/v1/interviews/${id}/my-feedback`, signalOption(signal));
@@ -491,7 +501,7 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
     return normalizeMaterials(response?.data);
   }
 
-  return { list, listRange, availability, get, save, checkConflicts, transition, downloadCalendar, getMyFeedback, saveMyFeedback, submitMyFeedback, amendFeedback, listMyTasks, listParticipantOptions, listFeedbacks, getMaterials };
+  return { list, listRange, availability, get, save, checkConflicts, transition, downloadCalendar, getResumeFile, downloadResumeFile, getMyFeedback, saveMyFeedback, submitMyFeedback, amendFeedback, listMyTasks, listParticipantOptions, listFeedbacks, getMaterials };
 }
 
 export const interviewController = createInterviewController();

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from tempfile import SpooledTemporaryFile
 from uuid import UUID
 
 import pytest
@@ -58,6 +59,7 @@ def test_interview_openapi_registers_the_phase_4_contract(tmp_path) -> None:
         "/api/v1/interviews/{interview_id}/calendar-file": {"get"},
         "/api/v1/interviews/{interview_id}/feedbacks": {"get"},
         "/api/v1/interviews/{interview_id}/materials": {"get"},
+        "/api/v1/interviews/{interview_id}/resume-file": {"get"},
         "/api/v1/interviews/{interview_id}/my-feedback": {"get", "put"},
         "/api/v1/interviews/{interview_id}/my-feedback/submit": {"post"},
         "/api/v1/interview-feedback/{feedback_id}/amendments": {"post"},
@@ -164,6 +166,20 @@ def test_interview_availability_strips_provider_event_details(tmp_path) -> None:
         "starts_at": "2026-07-20T08:00:00+00:00",
         "ends_at": "2026-07-20T09:00:00+00:00",
     }]
+
+class InterviewResumeStorage:
+    def __init__(self, content: bytes = b"%PDF interview resume") -> None:
+        self.content = content
+        self.opened = []
+        self.last_spool = None
+
+    def open_download(self, storage_key: str, max_bytes: int):
+        self.opened.append((storage_key, max_bytes))
+        spool = SpooledTemporaryFile(max_size=1024, mode="w+b")
+        spool.write(self.content)
+        spool.seek(0)
+        self.last_spool = spool
+        return spool
 
 
 def test_interview_participant_options_return_only_active_tenant_users_with_eligible_roles(tmp_path) -> None:
@@ -672,6 +688,71 @@ def test_interview_materials_enforce_job_or_active_assignment_scope(tmp_path) ->
         cancelled = client.get(path, headers=login(client, "assigned@example.test"))
         assert cancelled.status_code == 404
         assert cancelled.json()["code"] == "resource_not_found"
+
+
+def test_interview_resume_file_allows_scoped_hr_and_active_assigned_interviewer(tmp_path) -> None:
+    app = make_app(tmp_path)
+    storage = InterviewResumeStorage()
+    app.state.resume_storage = storage
+    seed = seed_interview_materials(app)
+    path = f"/api/v1/interviews/{seed['interview_id']}/resume-file"
+
+    with TestClient(app) as client:
+        interviewer = client.get(path, headers=login(client, "assigned@example.test"))
+        hr_download = client.get(
+            f"{path}?download=true",
+            headers=login(client, "interview-admin@example.test"),
+        )
+        outsider = client.get(path, headers=login(client, "unassigned@example.test"))
+
+    assert interviewer.status_code == 200
+    assert interviewer.content == b"%PDF interview resume"
+    assert interviewer.headers["content-type"] == "application/pdf"
+    assert interviewer.headers["Content-Disposition"].startswith("inline;")
+    assert interviewer.headers["Cache-Control"] == "no-store"
+    assert interviewer.headers["X-Content-Type-Options"] == "nosniff"
+    assert hr_download.status_code == 200
+    assert hr_download.headers["Content-Disposition"].startswith("attachment;")
+    assert outsider.status_code == 404
+    assert outsider.json()["code"] == "resource_not_found"
+    assert storage.opened == [
+        ("interviews/resume.pdf", 10 * 1024 * 1024),
+        ("interviews/resume.pdf", 10 * 1024 * 1024),
+    ]
+    assert storage.last_spool.closed
+
+    with app.state.identity_store.sync_session() as database:
+        audits = database.scalars(
+            select(AuditLog)
+            .where(AuditLog.event_type == "interview.resume_file_accessed")
+            .order_by(AuditLog.created_at)
+        ).all()
+        assert [audit.metadata_json["disposition"] for audit in audits] == ["inline", "attachment"]
+        assert all(audit.metadata_json["interview_id"] == str(seed["interview_id"]) for audit in audits)
+
+
+def test_interview_resume_file_revokes_cancelled_assignment(tmp_path) -> None:
+    app = make_app(tmp_path)
+    app.state.resume_storage = InterviewResumeStorage()
+    seed = seed_interview_materials(app)
+    with app.state.identity_store.sync_session() as database:
+        participant = database.scalar(
+            select(InterviewParticipant).where(
+                InterviewParticipant.interview_id == seed["interview_id"],
+                InterviewParticipant.user_id == seed["interviewer_id"],
+            )
+        )
+        participant.task_status = "cancelled"
+        database.commit()
+
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/interviews/{seed['interview_id']}/resume-file",
+            headers=login(client, "assigned@example.test"),
+        )
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "resource_not_found"
 
 
 def test_interview_materials_reject_oversized_resume_preview_without_audit(tmp_path) -> None:

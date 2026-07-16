@@ -6,7 +6,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Header, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import and_, delete, exists, func, or_, select, text
 
 from server.app.governance.retention import recalculate_candidate_retention
@@ -36,8 +36,14 @@ from server.app.interviews.schemas import (
     ScheduleInput,
 )
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
-from server.app.recruiting.models import Application, Candidate, JobJdVersion, Resume
-from server.app.recruiting.storage import MAX_PREVIEW_BYTES
+from server.app.recruiting.http import content_disposition
+from server.app.recruiting.models import Application, Candidate, FileObject, JobJdVersion, Resume
+from server.app.recruiting.storage import (
+    MAX_DOWNLOAD_BYTES,
+    MAX_PREVIEW_BYTES,
+    StorageObjectTooLarge,
+    StorageReadFailed,
+)
 from server.app.recruiting.service import (
     CandidateUnavailable,
     IdempotencyConflict,
@@ -1419,6 +1425,93 @@ def get_interview_materials(interview_id: UUID, request: Request):
         response = JSONResponse(body)
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+@router.get(
+    "/interviews/{interview_id}/resume-file",
+    responses={200: {"content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
+)
+def get_interview_resume_file(interview_id: UUID, request: Request, download: bool = Query(False)):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    with request.app.state.identity_store.sync_session() as db:
+        context = _load_interview_material_context(db, principal, interview_id)
+        if context is None:
+            return _denied(request)
+        interview, application, _ = context
+        row = db.execute(
+            select(Resume, FileObject)
+            .join(
+                FileObject,
+                and_(
+                    FileObject.organization_id == Resume.organization_id,
+                    FileObject.id == Resume.file_object_id,
+                ),
+            )
+            .where(
+                Resume.organization_id == principal.organization_id,
+                Resume.id == application.resume_id,
+                Resume.candidate_id == application.candidate_id,
+                FileObject.storage_state == "clean",
+                FileObject.scan_status == "clean",
+            )
+        ).one_or_none()
+        if row is None:
+            return _denied(request)
+        resume, file_object = row
+        spool = None
+        try:
+            spool = request.app.state.resume_storage.open_download(
+                file_object.storage_key,
+                MAX_DOWNLOAD_BYTES,
+            )
+            disposition = content_disposition(file_object.original_filename)
+        except (StorageReadFailed, StorageObjectTooLarge, ValueError):
+            if spool is not None:
+                spool.close()
+            db.rollback()
+            return problem(request, 503, "attachment_unavailable", "The attachment is temporarily unavailable.")
+
+        disposition_kind = "attachment" if download else "inline"
+        if not download:
+            disposition = disposition.replace("attachment;", "inline;", 1)
+        db.add(
+            AuditLog(
+                organization_id=principal.organization_id,
+                actor_user_id=principal.user_id,
+                event_type="interview.resume_file_accessed",
+                outcome="success",
+                trace_id=request.state.trace_id,
+                metadata_json={
+                    "interview_id": str(interview.id),
+                    "resume_id": str(resume.id),
+                    "disposition": disposition_kind,
+                },
+            )
+        )
+        try:
+            db.commit()
+        except Exception:
+            spool.close()
+            raise
+
+        def stream_spool():
+            try:
+                while chunk := spool.read(64 * 1024):
+                    yield chunk
+            finally:
+                spool.close()
+
+        return StreamingResponse(
+            stream_spool(),
+            media_type=file_object.mime_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": disposition,
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
 
 @router.get("/interviews/{interview_id}/feedbacks", response_model=DataCollection)
