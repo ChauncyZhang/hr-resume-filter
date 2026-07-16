@@ -36,6 +36,7 @@ test("parses every required application route from the URL", () => {
     ["/settings/templates/rejection-reasons", { kind: "settings", nav: "设置", section: "流程与评价模板", tab: "淘汰原因" }],
     ["/settings/templates/interview-scorecards", { kind: "settings", nav: "设置", section: "流程与评价模板", tab: "面试评价模板" }],
     ["/settings/ai", { kind: "settings", nav: "设置", section: "AI 设置" }],
+    ["/settings/feishu", { kind: "settings", nav: "设置", section: "飞书集成" }],
     ["/settings/governance", { kind: "settings", nav: "设置", section: "审计与数据治理" }],
   ];
 
@@ -63,6 +64,7 @@ test("candidate list URL keeps only meaningful key filters", () => {
 test("candidate detail tab and settings return target are encoded in URLs", () => {
   assert.equal(candidateDetailPath({ id: UUID_A }, "面试与反馈"), `/candidates/${UUID_A}?tab=interviews`);
   assert.equal(settingsPath("组织与权限", "部门", "/jobs/new"), "/settings/organization/departments?return=%2Fjobs%2Fnew");
+  assert.equal(settingsPath("飞书集成"), "/settings/feishu");
   assert.equal(parseAppRoute(new URL("/settings/organization/departments?return=%2Fjobs%2Fnew", "https://ats.example.test")).returnTo, "/jobs/new");
 });
 

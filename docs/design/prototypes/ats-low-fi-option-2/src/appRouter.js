@@ -21,6 +21,7 @@ const settingsRoutes = Object.freeze({
     面试评价模板: "/settings/templates/interview-scorecards",
   }),
   "AI 设置": "/settings/ai",
+  "飞书集成": "/settings/feishu",
   "审计与数据治理": "/settings/governance",
 });
 
@@ -89,6 +90,7 @@ export function parseAppRoute(location) {
     ["/settings/templates/rejection-reasons", "流程与评价模板", "淘汰原因"],
     ["/settings/templates/interview-scorecards", "流程与评价模板", "面试评价模板"],
     ["/settings/ai", "AI 设置"],
+    ["/settings/feishu", "飞书集成"],
     ["/settings/governance", "审计与数据治理"],
   ];
   const setting = settings.find(([path]) => path === pathname);
