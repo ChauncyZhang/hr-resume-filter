@@ -174,6 +174,13 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     async changePassword(body) {
       return request("/api/v1/me/password", { method: "POST", body });
     },
+    async getFeishuConfig() { const response = await request("/api/v1/settings/integrations/feishu"); return response?.data ?? null; },
+    async saveFeishuConfig(body) { const response = await request("/api/v1/settings/integrations/feishu", { method: "PUT", body }); return response?.data ?? null; },
+    async testFeishuConnection() { const response = await request("/api/v1/settings/integrations/feishu/test", { method: "POST" }); return response?.data ?? null; },
+    async authorizeFeishuLogin(organizationSlug) { const response = await request("/api/v1/auth/feishu/authorize", { method: "POST", body: { organization_slug: organizationSlug } }); return response?.data ?? null; },
+    async authorizeFeishuBinding() { const response = await request("/api/v1/me/integrations/feishu/authorize", { method: "POST" }); return response?.data ?? null; },
+    async getFeishuBinding() { const response = await request("/api/v1/me/integrations/feishu"); return response?.data ?? null; },
+    async unbindFeishu() { return request("/api/v1/me/integrations/feishu", { method: "DELETE" }); },
     clearCsrf() {
       csrfToken = null;
     },

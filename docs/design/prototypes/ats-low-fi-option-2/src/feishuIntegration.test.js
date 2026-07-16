@@ -1,0 +1,69 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+import { createApiClient } from "./apiClient.js";
+import { normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
+
+function response(body, status = 200, headers = {}) {
+  return new Response(body == null ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
+}
+
+test("Feishu API methods follow the organization login and binding contracts", async () => {
+  const calls = [];
+  const client = createApiClient({ fetchImpl: async (path, options) => {
+    calls.push([path, options]);
+    if (path.endsWith("/authorize")) return response({ data: { authorization_url: "https://accounts.feishu.cn/auth", state: "opaque" } });
+    if (options.method === "DELETE") return response(null, 204);
+    return response({ data: { configured: false, enabled: false, bound: false } });
+  } });
+
+  await client.getFeishuConfig();
+  await client.saveFeishuConfig({ app_id: "cli", enabled: false });
+  await client.testFeishuConnection();
+  await client.authorizeFeishuLogin("acme");
+  await client.authorizeFeishuBinding();
+  await client.getFeishuBinding();
+  await client.unbindFeishu();
+
+  assert.deepEqual(calls.map(([path, options]) => [path, options.method]), [
+    ["/api/v1/settings/integrations/feishu", "GET"],
+    ["/api/v1/settings/integrations/feishu", "PUT"],
+    ["/api/v1/settings/integrations/feishu/test", "POST"],
+    ["/api/v1/auth/feishu/authorize", "POST"],
+    ["/api/v1/me/integrations/feishu/authorize", "POST"],
+    ["/api/v1/me/integrations/feishu", "GET"],
+    ["/api/v1/me/integrations/feishu", "DELETE"],
+  ]);
+});
+
+test("Feishu projections keep only safe configuration and binding fields", () => {
+  const config = normalizeFeishuConfig({
+    configured: true, app_id: "cli", redirect_uri: "https://example.test/callback", calendar_id: "primary", enabled: true,
+    app_secret_configured: true, verification_token_configured: true, encrypt_key_configured: true, version: 2,
+    app_secret: "must-not-survive", verification_token: "must-not-survive", encrypt_key: "must-not-survive",
+  });
+  assert.equal(config.appSecretConfigured, true);
+  assert.equal(JSON.stringify(config).includes("must-not-survive"), false);
+  assert.deepEqual(normalizeFeishuBinding({ bound: true, union_id: "on_1", open_id: "ou_1", access_token: "no" }), { bound: true, unionId: "on_1", openId: "ou_1" });
+});
+
+test("Feishu authorization navigates only to an HTTPS Feishu URL", async () => {
+  const destinations = [];
+  await startFeishuAuthorization(async () => ({ authorization_url: "https://accounts.feishu.cn/open-apis/authen/v1/authorize" }), (url) => destinations.push(url));
+  assert.deepEqual(destinations, ["https://accounts.feishu.cn/open-apis/authen/v1/authorize"]);
+  await assert.rejects(() => startFeishuAuthorization(async () => ({ authorization_url: "javascript:alert(1)" }), () => {}));
+});
+
+test("Login Settings and Profile expose only the requested Feishu entry points", async () => {
+  const [login, settings, profile, interviews] = await Promise.all([
+    readFile(new URL("./LoginView.jsx", import.meta.url), "utf8"),
+    readFile(new URL("./SettingsViews.jsx", import.meta.url), "utf8"),
+    readFile(new URL("./ProfileSettings.jsx", import.meta.url), "utf8"),
+    readFile(new URL("./InterviewViews.jsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(login, /飞书登录/);
+  assert.match(settings, /飞书集成/);
+  assert.match(profile, /飞书账号/);
+  assert.doesNotMatch(interviews, /Feishu|飞书/);
+});

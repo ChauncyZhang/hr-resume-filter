@@ -128,6 +128,26 @@ class IdentityService:
             db.commit()
             return session_token, csrf
 
+    def issue_session(self, user_id, *, trace_id: str, network: str | None, event: str):
+        now = self.clock.current_time()
+        with self.store.sync_session() as db:
+            user = db.scalar(select(User).where(User.id == user_id).with_for_update(of=User))
+            if user is None or user.status != UserStatus.ACTIVE:
+                raise AuthenticationFailed
+            session_token, csrf = self.tokens.new_token(), self.tokens.new_token()
+            db.add(UserSession(
+                organization_id=user.organization_id,
+                user_id=user.id,
+                token_hash=hash_token(session_token),
+                csrf_token_hash=hash_token(csrf),
+                idle_expires_at=now + timedelta(minutes=30),
+                absolute_expires_at=now + timedelta(hours=12),
+                authorization_version=user.authorization_version,
+            ))
+            self._audit(db, event, "success", organization_id=user.organization_id, user_id=user.id, trace_id=trace_id, network=network)
+            db.commit()
+            return session_token, csrf
+
     @staticmethod
     def _aware(value: datetime) -> datetime:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)

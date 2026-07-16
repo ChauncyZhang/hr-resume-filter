@@ -39,6 +39,7 @@ class Settings(BaseModel):
     contact_encryption_key: SecretStr = SecretStr("change-me")
     contact_lookup_secret: SecretStr = SecretStr("change-me")
     llm_config_encryption_key: SecretStr = SecretStr("change-me")
+    feishu_config_encryption_key: SecretStr = SecretStr("change-me")
     llm_provider_allowlist: dict[str, dict[str, object]] = Field(default_factory=dict)
     default_organization_slug: str | None = Field(default=None, min_length=1, max_length=100)
     default_organization_name: str | None = Field(default=None, min_length=1, max_length=200)
@@ -111,6 +112,7 @@ class Settings(BaseModel):
             self.contact_encryption_key.get_secret_value().strip().lower(),
             self.contact_lookup_secret.get_secret_value().strip().lower(),
             self.llm_config_encryption_key.get_secret_value().strip().lower(),
+            self.feishu_config_encryption_key.get_secret_value().strip().lower(),
         )
         database_url = urlsplit(self.database_url)
         if not database_url.scheme or not database_url.hostname:
@@ -126,7 +128,7 @@ class Settings(BaseModel):
             raise ValueError("production credentials must not use placeholders")
         if not all(credentials):
             raise ValueError("production credentials are required")
-        contact_values = [self.contact_encryption_key.get_secret_value(), self.contact_lookup_secret.get_secret_value(), self.llm_config_encryption_key.get_secret_value()]
+        contact_values = [self.contact_encryption_key.get_secret_value(), self.contact_lookup_secret.get_secret_value(), self.llm_config_encryption_key.get_secret_value(), self.feishu_config_encryption_key.get_secret_value()]
         if any(re.fullmatch(r"[A-Za-z0-9_-]{43}=", value) is None for value in contact_values):
             raise ValueError("encryption keys must use padded base64url")
         try:
@@ -158,6 +160,7 @@ class Settings(BaseModel):
             "CONTACT_ENCRYPTION_KEY": "contact_encryption_key",
             "CONTACT_LOOKUP_SECRET": "contact_lookup_secret",
             "LLM_CONFIG_ENCRYPTION_KEY": "llm_config_encryption_key",
+            "FEISHU_CONFIG_ENCRYPTION_KEY": "feishu_config_encryption_key",
             "DEFAULT_ORGANIZATION_SLUG": "default_organization_slug",
             "DEFAULT_ORGANIZATION_NAME": "default_organization_name",
             "OBJECT_STORAGE_SECURE": "object_storage_secure",

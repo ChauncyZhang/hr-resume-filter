@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AlertTriangle, Bot, CheckCircle2, ChevronDown, Copy, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
+import { AlertTriangle, Bot, CalendarDays, CheckCircle2, ChevronDown, Copy, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
 import { canEditAiSettings, canEditOrganizationSettings, canEditRetentionSettings, canViewAuditSettings, canViewDeletionApprovalQueue, canViewRetentionSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
 import { createLlmSettingsController, getTestDisabledReason, releaseLlmSettingsSubscription } from "./llmSettings.js";
 import { createGovernanceSettingsController, releaseGovernanceSettingsSubscription } from "./governanceSettings.js";
 import { getInviteRoleOptions, organizationSettingsController } from "./organizationSettings.js";
+import { FeishuIntegrationSettings } from "./FeishuIntegrationSettings.jsx";
 
 const settingsSections = [
   ["组织与权限", Users],
   ["流程与评价模板", SlidersHorizontal],
   ["AI 设置", Bot],
+  ["飞书集成", CalendarDays],
   ["审计与数据治理", FileClock],
 ];
 const settingsDefaultTabs = { "组织与权限": "成员", "流程与评价模板": "招聘流程" };
@@ -304,7 +306,7 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify, section
   const allowedSettingsSections = getAllowedSettingsSections(currentRole);
   const visibleSettingsSections = settingsSections.filter(([label]) => allowedSettingsSections.includes(label));
   const activeSection = allowedSettingsSections.includes(section) ? section : allowedSettingsSections[0];
-  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} activeTab={organizationTab} onTabChange={(tab) => onRouteChange("组织与权限", tab)} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} activeTab={templateTab} onTabChange={(tab) => onRouteChange("流程与评价模板", tab)} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} onDirtyChange={setAiDirty} /> : activeSection === "审计与数据治理" ? <AuditSettings key={currentRole} role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
+  const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} activeTab={organizationTab} onTabChange={(tab) => onRouteChange("组织与权限", tab)} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} activeTab={templateTab} onTabChange={(tab) => onRouteChange("流程与评价模板", tab)} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} onDirtyChange={setAiDirty} /> : activeSection === "飞书集成" ? <FeishuIntegrationSettings onNotify={onNotify} /> : activeSection === "审计与数据治理" ? <AuditSettings key={currentRole} role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
   function openSection(nextSection) {
     if (activeSection === "AI 设置" && aiDirty && nextSection !== activeSection) {
       setPendingSection(nextSection);

@@ -136,3 +136,18 @@ DEFAULT_PAYLOAD_POLICIES.register_job(
         }
     ),
 )
+for _feishu_topic in (
+    "feishu.calendar.create",
+    "feishu.calendar.update",
+    "feishu.calendar.cancel",
+):
+    DEFAULT_PAYLOAD_POLICIES.register_topic(
+        _feishu_topic,
+        PayloadSchema(
+            {
+                "organization_id": OpaqueIdField(),
+                "interview_id": OpaqueIdField(),
+                "sync_id": OpaqueIdField(),
+            }
+        ),
+    )

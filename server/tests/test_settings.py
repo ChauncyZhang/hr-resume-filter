@@ -16,6 +16,7 @@ def production_settings(**overrides: object) -> Settings:
         "contact_encryption_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
         "contact_lookup_secret": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
         "llm_config_encryption_key": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8=",
+        "feishu_config_encryption_key": "YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn8=",
         "cors_origins": ["https://hr.example.com"],
     }
     values.update(overrides)
@@ -137,7 +138,7 @@ def test_production_accepts_explicit_origins_and_non_placeholder_secrets() -> No
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("contact_encryption_key", "change-me"), ("contact_lookup_secret", "placeholder"), ("llm_config_encryption_key", "change-me")],
+    [("contact_encryption_key", "change-me"), ("contact_lookup_secret", "placeholder"), ("llm_config_encryption_key", "change-me"), ("feishu_config_encryption_key", "change-me")],
 )
 def test_production_rejects_placeholder_contact_secrets(field: str, value: str) -> None:
     with pytest.raises(ValidationError):
@@ -147,6 +148,7 @@ def test_production_rejects_placeholder_contact_secrets(field: str, value: str) 
 def test_production_accepts_deployment_supplied_contact_secrets() -> None:
     settings = production_settings()
     assert isinstance(settings.contact_encryption_key, SecretStr)
+    assert isinstance(settings.feishu_config_encryption_key, SecretStr)
     assert "AAECAw" not in repr(settings)
 
 

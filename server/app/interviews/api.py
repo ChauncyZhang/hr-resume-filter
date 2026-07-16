@@ -14,6 +14,7 @@ from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
+from server.app.integrations.feishu.sync import schedule_interview_sync
 from server.app.interviews.domain import CalendarContact, build_calendar_invitation
 from server.app.interviews.availability import INTERNAL_AVAILABILITY_PROVIDER, privacy_safe_availability
 from server.app.llm.redaction import redact_screening_text
@@ -876,6 +877,7 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                 recalculate_candidate_retention(
                     db, principal.organization_id, candidate_id
                 )
+                schedule_interview_sync(db, interview, "create")
                 return 201, {"data": _interview_data(db, interview)}
 
             status_code, body = persisted_idempotent(
@@ -1071,6 +1073,7 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             recalculate_candidate_retention(
                 db, principal.organization_id, candidate_id
             )
+            schedule_interview_sync(db, interview, "update")
             body = {"data": _interview_data(db, interview)}
             db.commit()
             response = JSONResponse(body)
@@ -1242,6 +1245,8 @@ def transition_interview(
                 recalculate_candidate_retention(
                     db, principal.organization_id, candidate_id
                 )
+                if target == "cancelled":
+                    schedule_interview_sync(db, locked, "cancel")
                 return 200, {"data": _interview_data(db, locked)}
 
             status_code, body = persisted_idempotent(

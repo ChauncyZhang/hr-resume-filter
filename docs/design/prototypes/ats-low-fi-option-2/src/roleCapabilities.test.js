@@ -30,7 +30,7 @@ test("系统管理员只能进入设置且没有招聘操作", () => {
     assert.equal(canPerformAction("系统管理员", action), false);
   }
   assert.equal(canAccessNav("系统管理员", "工作台"), false);
-  assert.deepEqual(getAllowedSettingsSections("系统管理员"), ["组织与权限", "AI 设置", "审计与数据治理"]);
+  assert.deepEqual(getAllowedSettingsSections("系统管理员"), ["组织与权限", "AI 设置", "飞书集成", "审计与数据治理"]);
   assert.equal(canEditOrganizationSettings("系统管理员"), true);
   assert.equal(canEditAuditSettings("系统管理员"), true);
 });
@@ -47,7 +47,7 @@ test("招聘管理员拥有完整招聘导航和设置能力", () => {
   assert.equal(getDefaultNavItem("招聘管理员"), "工作台");
   assert.equal(getSettingsAccess("招聘管理员"), "完整");
   assert.equal(canPerformAction("招聘管理员", "导入简历"), true);
-  assert.deepEqual(getAllowedSettingsSections("招聘管理员"), ["组织与权限", "流程与评价模板", "AI 设置", "审计与数据治理"]);
+  assert.deepEqual(getAllowedSettingsSections("招聘管理员"), ["组织与权限", "流程与评价模板", "AI 设置", "飞书集成", "审计与数据治理"]);
   assert.equal(canEditOrganizationSettings("招聘管理员"), true);
   assert.equal(canEditAuditSettings("招聘管理员"), false);
 });

@@ -84,6 +84,7 @@ try {
     # ContactCipher currently consumes this value as raw bytes in development.
     $env:CONTACT_LOOKUP_SECRET = [Guid]::NewGuid().ToString("N")
     $env:LLM_CONFIG_ENCRYPTION_KEY = New-Base64UrlKey
+    $env:FEISHU_CONFIG_ENCRYPTION_KEY = New-Base64UrlKey
     $env:LLM_PROVIDER_ALLOWLIST_JSON = "{}"
     $env:CORS_ORIGINS = "[`"http://localhost:$WebPort`"]"
     $env:VITE_API_PROXY_TARGET = "http://localhost:$ApiPort"

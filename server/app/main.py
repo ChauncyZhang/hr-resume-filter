@@ -46,7 +46,7 @@ def _is_governance_path(path: str) -> bool:
 
 
 def _requires_no_store(path: str) -> bool:
-    return _is_governance_path(path) or path == "/api/v1/settings" or path.startswith(
+    return _is_governance_path(path) or path.startswith("/api/v1/auth/feishu") or path == "/api/v1/settings" or path.startswith(
         "/api/v1/settings/"
     )
 
@@ -138,6 +138,13 @@ def create_app(
     app.state.llm_key_cipher=ApiKeyCipher(llm_key.encode())
     app.state.llm_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
     app.state.llm_gateway=OpenAiCompatibleGateway(app.state.llm_allowlist)
+    from server.app.integrations.feishu.provider import HttpFeishuProvider
+    from server.app.integrations.feishu.service import FeishuSecretCipher
+    feishu_key = settings.feishu_config_encryption_key.get_secret_value()
+    if feishu_key == "change-me":
+        feishu_key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    app.state.feishu_secret_cipher = FeishuSecretCipher(feishu_key.encode())
+    app.state.feishu_provider = HttpFeishuProvider()
     app.include_router(identity_router)
     app.include_router(identity_admin_router)
     app.include_router(recruiting_router)
@@ -150,6 +157,8 @@ def create_app(
     app.include_router(talent_router)
     app.include_router(reports_router)
     app.include_router(governance_router)
+    from server.app.integrations.feishu.api import router as feishu_router
+    app.include_router(feishu_router)
 
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):
@@ -175,15 +184,17 @@ def create_app(
         if request.url.path.startswith("/api/v1") and request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             service: IdentityService = request.app.state.identity_service
             network = request.headers.get("x-real-ip") or (request.client.host if request.client else None)
-            if not allowed_origin(request):
+            provider_authenticated = request.url.path == "/api/v1/integrations/feishu/events"
+            if not provider_authenticated and not allowed_origin(request):
                 event = "authentication.logout" if request.url.path == "/api/v1/auth/logout" else "csrf.denied"
                 audited = service.audit_denial(event, token=session_token(request), trace_id=trace_id, network=network)
                 if not audited:
                     logger.info("anonymous_csrf_denied", extra={"context": {"trace_id": trace_id}})
                 response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
-            if response is None and request.url.path not in {
+            if response is None and not provider_authenticated and request.url.path not in {
                 "/api/v1/auth/login",
                 "/api/v1/auth/invitations/accept",
+                "/api/v1/auth/feishu/authorize",
             }:
                 token = session_token(request)
                 csrf = request.headers.get("x-csrf-token")

@@ -1,7 +1,7 @@
 const RECRUITING_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "人才库", "报表", "设置"];
 const INTERVIEWER_NAV_ITEMS = ["工作台", "面试"];
 const HIRING_MANAGER_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "报表"];
-const ALL_SETTINGS_SECTIONS = ["组织与权限", "流程与评价模板", "AI 设置", "审计与数据治理"];
+const ALL_SETTINGS_SECTIONS = ["组织与权限", "流程与评价模板", "AI 设置", "飞书集成", "审计与数据治理"];
 const GOVERNANCE_VIEW_ROLES = new Set(["系统管理员", "system_admin", "招聘管理员", "recruiting_admin", "HR 招聘专员", "HR"]);
 const GOVERNANCE_EDIT_ROLES = new Set(["系统管理员", "system_admin"]);
 const CANDIDATE_GOVERNANCE_READ_ROLES = new Set(["招聘管理员", "recruiting_admin", "HR 招聘专员", "recruiter", "HR", "用人经理", "hiring_manager"]);
@@ -85,7 +85,7 @@ export function canEditAiSettings(role) {
 }
 
 export function getAllowedSettingsSections(role) {
-  if (role === "系统管理员") return ["组织与权限", "AI 设置", "审计与数据治理"];
+  if (role === "系统管理员") return ["组织与权限", "AI 设置", "飞书集成", "审计与数据治理"];
   if (["招聘管理员", "HR 招聘专员", "HR"].includes(role)) return [...ALL_SETTINGS_SECTIONS];
   return [];
 }
