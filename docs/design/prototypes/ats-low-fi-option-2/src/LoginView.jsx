@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Building2, LoaderCircle, LockKeyhole, LogIn, LogOut, Mail, MessageCircle, ShieldX } from "lucide-react";
 import { apiClient } from "./apiClient.js";
 import { getSessionMessage } from "./session.js";
-import { startFeishuAuthorization } from "./feishuIntegration.js";
+import { getFeishuLoginErrorMessage, startFeishuAuthorization } from "./feishuIntegration.js";
 
 export function SessionLoadingView() {
   return (
@@ -36,6 +36,7 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
   const [form, setForm] = useState({ organization_slug: "", email: initialEmail, password: "" });
   const [authContextStatus, setAuthContextStatus] = useState("loading");
   const [feishuStatus, setFeishuStatus] = useState("idle");
+  const [feishuError, setFeishuError] = useState("");
   const message = getSessionMessage(error);
 
   useEffect(() => {
@@ -72,9 +73,9 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
 
   async function loginWithFeishu() {
     if (!form.organization_slug || feishuStatus === "loading") return;
-    setFeishuStatus("loading");
+    setFeishuError(""); setFeishuStatus("loading");
     try { await startFeishuAuthorization(() => client.authorizeFeishuLogin(form.organization_slug)); }
-    catch { setFeishuStatus("error"); }
+    catch (error) { setFeishuError(getFeishuLoginErrorMessage(error)); setFeishuStatus("error"); }
   }
 
   return (
@@ -146,7 +147,7 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
             {submitting ? "正在登录…" : "登录"}
           </button>
           <button className="button secondary login-submit" type="button" disabled={submitting || feishuStatus === "loading" || authContextStatus === "loading" || !form.organization_slug} onClick={loginWithFeishu}><MessageCircle size={17} aria-hidden="true" />{feishuStatus === "loading" ? "正在跳转…" : "飞书登录"}</button>
-          {feishuStatus === "error" && <div className="login-message" role="alert">当前组织未启用飞书登录或服务暂时不可用。</div>}
+          {feishuStatus === "error" && <div className="login-message" role="alert">{feishuError}</div>}
         </form>
       </section>
       <p className="login-footnote">账号权限由组织管理员统一配置</p>

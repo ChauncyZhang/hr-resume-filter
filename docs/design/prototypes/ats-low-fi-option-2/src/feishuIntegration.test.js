@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createApiClient } from "./apiClient.js";
-import { normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
+import { getFeishuLoginErrorMessage, normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
 
 function response(body, status = 200, headers = {}) {
   return new Response(body == null ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
@@ -53,6 +53,14 @@ test("Feishu authorization navigates only to an HTTPS Feishu URL", async () => {
   await startFeishuAuthorization(async () => ({ authorization_url: "https://accounts.feishu.cn/open-apis/authen/v1/authorize" }), (url) => destinations.push(url));
   assert.deepEqual(destinations, ["https://accounts.feishu.cn/open-apis/authen/v1/authorize"]);
   await assert.rejects(() => startFeishuAuthorization(async () => ({ authorization_url: "javascript:alert(1)" }), () => {}));
+});
+
+test("Feishu login errors explain when an administrator must enable the integration", () => {
+  assert.equal(
+    getFeishuLoginErrorMessage({ code: "feishu_disabled" }),
+    "当前组织尚未启用飞书登录，请联系管理员前往“设置 → 飞书集成”完成配置并启用。",
+  );
+  assert.equal(getFeishuLoginErrorMessage({ code: "service_unavailable" }), "飞书登录服务暂时不可用，请稍后重试。");
 });
 
 test("Login Settings and Profile expose only the requested Feishu entry points", async () => {

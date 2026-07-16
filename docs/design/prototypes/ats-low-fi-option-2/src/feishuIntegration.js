@@ -24,6 +24,13 @@ export function normalizeFeishuBinding(value = {}) {
   return { bound: true, unionId: safeString(value.union_id), openId: safeString(value.open_id) };
 }
 
+export function getFeishuLoginErrorMessage(error) {
+  if (error?.code === "feishu_disabled") {
+    return "当前组织尚未启用飞书登录，请联系管理员前往“设置 → 飞书集成”完成配置并启用。";
+  }
+  return "飞书登录服务暂时不可用，请稍后重试。";
+}
+
 export async function startFeishuAuthorization(authorize, navigate = (url) => window.location.assign(url)) {
   const result = await authorize();
   const authorizationUrl = new URL(result?.authorization_url || "");
