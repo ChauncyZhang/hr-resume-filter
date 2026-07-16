@@ -102,6 +102,18 @@ test("final runner separates display-only identity hints and stale sessions", ()
   assert.doesNotMatch(source, /page\.context\(\)\.newPage\(\)/);
 });
 
+test("final runner proves dedicated deployments do not ask users for an organization slug", () => {
+  const runner = fs.readFileSync(runnerPath, "utf8");
+  const powershell = fs.readFileSync(powershellPath, "utf8");
+
+  assert.match(runner, /\/api\/v1\/auth\/config/);
+  assert.match(runner, /default_organization[\s\S]*final-e2e/);
+  assert.match(runner, /postDataJSON\(\)[\s\S]*organization_slug/);
+  assert.doesNotMatch(runner, /getByLabel\("组织标识"\)/);
+  assert.match(powershell, /DEFAULT_ORGANIZATION_SLUG\s*=\s*"final-e2e"/);
+  assert.match(powershell, /DEFAULT_ORGANIZATION_NAME/);
+});
+
 test("final runner waits for feedback hydration and isolates later account state", () => {
   const source = fs.readFileSync(runnerPath, "utf8");
   const flow03Source = source.slice(source.indexOf("async function flow03"), source.indexOf("async function advanceScheduleCollaboration"));

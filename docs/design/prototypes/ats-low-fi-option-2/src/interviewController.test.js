@@ -81,6 +81,8 @@ test("lists interviews from the server envelope and maps display fields", async 
     duration: 60,
     method: "视频面试",
     timezone: "Asia/Shanghai",
+    startsAt: "2026-07-15T02:00:00Z",
+    endsAt: "2026-07-15T03:00:00Z",
     interviewerIds: [USER_ID],
     interviewers: ["张小北"],
     participants: [{ id: USER_ID, name: "张小北", role: "interviewer", requiredFeedback: true }],

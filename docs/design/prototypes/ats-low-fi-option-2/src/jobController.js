@@ -236,6 +236,10 @@ function definitionCommand(values, job, publish) {
 }
 
 export function createJobController({ client = apiClient, idempotencyKey = () => globalThis.crypto.randomUUID() } = {}) {
+  async function listDepartments({ signal } = {}) {
+    return normalizeFacets(await client.listDepartments({ signal }));
+  }
+
   async function listJobs(filters = {}, { signal } = {}) {
     const params = new URLSearchParams();
     const query = safeString(filters.q).trim();
@@ -323,7 +327,7 @@ export function createJobController({ client = apiClient, idempotencyKey = () =>
     return normalizeJob(result?.data);
   }
 
-  return { listJobs, loadDefinition, saveDefinition, refreshEditBaseline, transition, mergeDefinition };
+  return { listDepartments, listJobs, loadDefinition, saveDefinition, refreshEditBaseline, transition, mergeDefinition };
 }
 
 export const jobController = createJobController();

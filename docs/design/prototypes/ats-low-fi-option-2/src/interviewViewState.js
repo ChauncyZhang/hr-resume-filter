@@ -30,3 +30,47 @@ export function isInWorkweek(date, columns) {
 export function isMyInterview(record, userId) {
   return Boolean(userId && Array.isArray(record?.interviewerIds) && record.interviewerIds.includes(userId));
 }
+
+function interviewHasStarted(record, now = new Date()) {
+  const startsAt = new Date(record?.startsAt || "").getTime();
+  const reference = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  return Number.isFinite(startsAt) && Number.isFinite(reference) && startsAt <= reference;
+}
+
+export function canSubmitInterviewFeedback(record, now = new Date()) {
+  if (record?.feedbackStatus === "待反馈") return true;
+  return ["待确认", "已安排", "已确认"].includes(record?.status) && interviewHasStarted(record, now);
+}
+
+export function getInterviewPrimaryAction(record, { canSchedule = true, userId = "", now = new Date() } = {}) {
+  if (!record) return null;
+  const assigned = isMyInterview(record, userId);
+  if (assigned && record.feedbackStatus === "已提交") return { kind: "feedback", label: "查看评价" };
+  if (assigned && canSubmitInterviewFeedback(record, now)) return { kind: "feedback", label: "填写评价" };
+  if (canSchedule && ["待确认", "已安排"].includes(record.status)) return { kind: "confirm", label: "确认面试" };
+  if (canSchedule && record.status === "已确认") return { kind: "complete", label: "完成面试" };
+  if (assigned && ["待确认", "已安排", "已确认"].includes(record.status)) return { kind: "feedback", label: "查看材料" };
+  return null;
+}
+
+function scheduleCandidateKey(candidate) {
+  return candidate?.applicationId || candidate?.candidateId || candidate?.id || "";
+}
+
+export function mergeScheduleCandidateOptions(candidates, pinnedCandidate) {
+  const pinnedKey = scheduleCandidateKey(pinnedCandidate);
+  if (!pinnedKey) return candidates;
+  return [pinnedCandidate, ...candidates.filter((candidate) => scheduleCandidateKey(candidate) !== pinnedKey)];
+}
+
+export function resolveScheduleCandidateId(record, requestedCandidateId, fallbackCandidate) {
+  return record?.candidateId || requestedCandidateId || fallbackCandidate?.candidateId || fallbackCandidate?.id || "";
+}
+
+export function shouldHydrateScheduleCandidate(currentCandidateId, requestedCandidateId) {
+  return !currentCandidateId || currentCandidateId === requestedCandidateId;
+}
+
+export function isScheduleCandidateEligible(candidate) {
+  return ["新简历", "待复核", "待沟通", "待安排", "面试中"].includes(candidate?.stage);
+}

@@ -5,6 +5,7 @@ import vm from "node:vm";
 
 const source = readFileSync(new URL("./InterviewViews.jsx", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+const stylesSource = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
 const helpersSource = source.match(/\/\* feedback-draft-helpers:start \*\/([\s\S]*?)\/\* feedback-draft-helpers:end \*\//)?.[1];
 assert.ok(helpersSource, "InterviewViews.jsx must expose the feedback draft helper block");
 const {
@@ -88,6 +89,13 @@ test("feedback version conflicts explain that the local draft was preserved", ()
   assert.equal(getFeedbackSubmitError({ code: "service_unavailable" }), "网络请求失败，表单和本机草稿均已保留。请重试提交。");
 });
 
+test("invalid feedback state transitions explain when submission becomes available", () => {
+  assert.equal(
+    getFeedbackSubmitError({ code: "invalid_state_transition" }),
+    "当前面试状态暂不允许提交反馈。面试开始后或进入待反馈状态即可提交，本机草稿已保留。",
+  );
+});
+
 test("feedback submit retry distinguishes ambiguous transport failures", () => {
   assert.equal(isAmbiguousFeedbackSubmitError({ status: 0, kind: "unavailable" }), true);
   assert.equal(isAmbiguousFeedbackSubmitError({ status: 503 }), true);
@@ -98,4 +106,25 @@ test("schedule workspace loads pending applications from the server without fixt
   assert.match(appSource, /candidateController\.listCandidates\(\{ stage: "待安排", limit: 100, cursor: cursor \|\| undefined \}/);
   assert.match(appSource, /selectSchedulableCandidates\(interviewCandidateRecords\)/);
   assert.doesNotMatch(appSource, /if \(!selectedCandidateWithInterviews\) return candidateRecords/);
+});
+
+test("the interview table treats calendar export as a secondary utility instead of the next task", () => {
+  assert.match(source, />待办</);
+  assert.match(source, /className="interview-calendar-action"/);
+  assert.match(source, />添加到日历</);
+  assert.match(source, /getInterviewPrimaryAction/);
+  assert.doesNotMatch(source, /interview-row-actions[^\n]*onDownload/);
+  assert.match(stylesSource, /\.interview-calendar-action\s*\{[^}]*background:\s*transparent[^}]*text-decoration:\s*underline/s);
+  assert.match(stylesSource, /\.interview-primary-action\s*\{[^}]*font-weight:\s*600/s);
+});
+
+test("assigned participants can edit future interview drafts while submission stays gated", () => {
+  assert.match(source, /const canSubmitFeedback = canSubmitInterviewFeedback\(record, submitEligibilityTime\)/);
+  assert.match(source, /setSubmitEligibilityTime\(new Date\(\)\)/);
+  assert.match(source, /window\.setTimeout\(refreshEligibility, delay\)/);
+  assert.match(source, /const \[editing, setEditing\] = useState\(ownsFeedback\)/);
+  assert.match(source, /disabled=\{submitting \|\| loading \|\| !ownsFeedback \|\| !canSubmitFeedback\}/);
+  assert.match(source, /canSubmitFeedback \? "提交反馈" : "面试开始后可提交"/);
+  assert.match(source, /className="feedback-submit-gate"[^>]*role="status"/);
+  assert.doesNotMatch(source, /textarea disabled=\{[^}]*!canSubmitFeedback/);
 });

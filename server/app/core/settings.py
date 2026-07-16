@@ -5,7 +5,7 @@ import re
 from typing import Literal
 from urllib.parse import unquote, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 
 PLACEHOLDERS = {
@@ -19,6 +19,7 @@ PLACEHOLDERS = {
 }
 PLACEHOLDER_FRAGMENTS = PLACEHOLDERS - {""}
 PLACEHOLDER_PREFIXES = ("change-me", "changeme", "placeholder", "replace-me")
+ORGANIZATION_SLUG_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$")
 
 
 def is_example_placeholder(value: str) -> bool:
@@ -39,6 +40,8 @@ class Settings(BaseModel):
     contact_lookup_secret: SecretStr = SecretStr("change-me")
     llm_config_encryption_key: SecretStr = SecretStr("change-me")
     llm_provider_allowlist: dict[str, dict[str, object]] = Field(default_factory=dict)
+    default_organization_slug: str | None = Field(default=None, min_length=1, max_length=100)
+    default_organization_name: str | None = Field(default=None, min_length=1, max_length=200)
     object_storage_secure: bool = False
     object_storage_connect_timeout_seconds: float = Field(default=1, gt=0)
     object_storage_read_timeout_seconds: float = Field(default=3, gt=0)
@@ -64,6 +67,27 @@ class Settings(BaseModel):
     clamav_connect_timeout_seconds: float = Field(default=2, gt=0, le=30)
     clamav_read_timeout_seconds: float = Field(default=10, gt=0, le=60)
     clamav_total_timeout_seconds: float = Field(default=15, gt=0, le=120)
+
+    @field_validator("default_organization_slug", "default_organization_name", mode="before")
+    @classmethod
+    def normalize_optional_organization_identity(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized or None
+        return value
+
+    @field_validator("default_organization_slug")
+    @classmethod
+    def validate_default_organization_slug(cls, value: str | None) -> str | None:
+        if value is not None and ORGANIZATION_SLUG_PATTERN.fullmatch(value) is None:
+            raise ValueError("default organization slug must use lowercase letters, digits, and hyphens")
+        return value
+
+    @model_validator(mode="after")
+    def validate_default_organization_identity(self) -> "Settings":
+        if (self.default_organization_slug is None) != (self.default_organization_name is None):
+            raise ValueError("default organization slug and name must be configured together")
+        return self
 
     @model_validator(mode="after")
     def validate_worker_timing(self) -> "Settings":
@@ -134,6 +158,8 @@ class Settings(BaseModel):
             "CONTACT_ENCRYPTION_KEY": "contact_encryption_key",
             "CONTACT_LOOKUP_SECRET": "contact_lookup_secret",
             "LLM_CONFIG_ENCRYPTION_KEY": "llm_config_encryption_key",
+            "DEFAULT_ORGANIZATION_SLUG": "default_organization_slug",
+            "DEFAULT_ORGANIZATION_NAME": "default_organization_name",
             "OBJECT_STORAGE_SECURE": "object_storage_secure",
             "OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS": "object_storage_connect_timeout_seconds",
             "OBJECT_STORAGE_READ_TIMEOUT_SECONDS": "object_storage_read_timeout_seconds",

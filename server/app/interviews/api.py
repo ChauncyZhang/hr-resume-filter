@@ -40,6 +40,7 @@ from server.app.recruiting.service import (
     CandidateUnavailable,
     IdempotencyConflict,
     InvalidStateTransition,
+    RecruitingService,
     ResourceVersionConflict,
     persisted_idempotent,
     lock_active_candidate,
@@ -54,6 +55,7 @@ ETAG = re.compile(r'^"(0|[1-9][0-9]*)"$')
 REQUIRED_RATINGS = {"professional_ability", "problem_solving", "communication", "role_fit"}
 INTERVIEW_ACCESS_ROLES = frozenset({"recruiting_admin", "recruiter", "hiring_manager", "interviewer"})
 INTERVIEW_PARTICIPANT_ROLES = ("recruiting_admin", "recruiter", "hiring_manager", "interviewer")
+INTERVIEW_SCHEDULABLE_STAGES = frozenset({"new", "review", "contact", "interview_pending", "interviewing"})
 
 
 class ScheduleConflict(Exception):
@@ -61,6 +63,26 @@ class ScheduleConflict(Exception):
         self.kind = kind
         self.interview_ids = interview_ids
         super().__init__(kind)
+
+
+def _advance_application_to_interviewing(db, application, *, principal, trace_id):
+    if application.stage not in INTERVIEW_SCHEDULABLE_STAGES:
+        raise InvalidStateTransition
+    target_index = RecruitingService.APPLICATION_PATH.index("interviewing")
+    while application.stage != "interviewing":
+        source_index = RecruitingService.APPLICATION_PATH.index(application.stage)
+        if source_index >= target_index:
+            raise InvalidStateTransition
+        application = transition_application_record(
+            db,
+            principal.organization_id,
+            application.id,
+            RecruitingService.APPLICATION_PATH[source_index + 1],
+            expected_version=application.version,
+            actor_user_id=principal.user_id,
+            trace_id=trace_id,
+        )
+    return application
 
 
 def _principal(request: Request) -> Principal | JSONResponse:
@@ -746,18 +768,12 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                         for item in payload.participants
                     ]
                 )
-                if locked_application.stage == "interview_pending":
-                    transition_application_record(
-                        db,
-                        principal.organization_id,
-                        locked_application.id,
-                        "interviewing",
-                        expected_version=locked_application.version,
-                        actor_user_id=principal.user_id,
-                        trace_id=request.state.trace_id,
-                    )
-                elif locked_application.stage != "interviewing":
-                    raise ValueError("application stage is not schedulable")
+                locked_application = _advance_application_to_interviewing(
+                    db,
+                    locked_application,
+                    principal=principal,
+                    trace_id=request.state.trace_id,
+                )
                 db.add(
                     InterviewEvent(
                         organization_id=principal.organization_id,
@@ -1398,15 +1414,31 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
         interview = _load_interview(db, principal, interview_id)
         if interview is None:
             return _denied(request)
+        application_id = interview.application_id
         try:
-            _lock_application_candidate_retention(db, principal.organization_id, interview.application_id)
+            _lock_application_candidate_retention(db, principal.organization_id, application_id)
         except CandidateUnavailable:
             db.rollback()
             return _denied(request)
-        participant = _assigned_participant(db, principal, interview_id, for_update=True)
-        if interview is None or participant is None:
+        locked_interview = db.scalar(
+            select(Interview)
+            .where(
+                Interview.organization_id == principal.organization_id,
+                Interview.id == interview_id,
+            )
+            .with_for_update()
+        )
+        if locked_interview is None or locked_interview.application_id != application_id:
             return _denied(request)
-        if interview.status != "pending_feedback":
+        participant = _assigned_participant(db, principal, interview_id, for_update=True)
+        if participant is None:
+            return _denied(request)
+        now = datetime.now(timezone.utc)
+        can_open_feedback = (
+            locked_interview.status in {"scheduled", "rescheduled", "confirmed"}
+            and _aware(locked_interview.starts_at) <= now
+        )
+        if locked_interview.status != "pending_feedback" and not can_open_feedback:
             return problem(request, 409, "invalid_state_transition", "Feedback is not open for this interview.")
         feedback = db.scalar(
             select(InterviewFeedback)
@@ -1420,6 +1452,30 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
         if feedback is None:
             if expected != 0:
                 return problem(request, 409, "resource_version_conflict", "The feedback draft changed. Refresh and retry.")
+            if can_open_feedback:
+                source_status = locked_interview.status
+                locked_interview.status = "pending_feedback"
+                locked_interview.version += 1
+                locked_interview.updated_at = now
+                db.add(
+                    InterviewEvent(
+                        organization_id=principal.organization_id,
+                        interview_id=interview_id,
+                        actor_user_id=principal.user_id,
+                        event_type="interview.feedback_opened",
+                        payload={"source_status": source_status},
+                    )
+                )
+                db.add(
+                    AuditLog(
+                        organization_id=principal.organization_id,
+                        actor_user_id=principal.user_id,
+                        event_type="interview.feedback_opened",
+                        outcome="success",
+                        trace_id=request.state.trace_id,
+                        metadata_json={"interview_id": str(interview_id)},
+                    )
+                )
             feedback = InterviewFeedback(
                 organization_id=principal.organization_id,
                 interview_id=interview_id,
@@ -1430,6 +1486,8 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
             )
             db.add(feedback)
         else:
+            if locked_interview.status != "pending_feedback":
+                return problem(request, 409, "invalid_state_transition", "Feedback is not open for this interview.")
             if feedback.status != "draft":
                 return problem(request, 409, "feedback_already_submitted", "Submitted feedback cannot be overwritten.")
             if feedback.version != expected:

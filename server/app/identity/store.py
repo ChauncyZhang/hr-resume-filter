@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
-from server.app.identity.models import AuditLog, Base, UserSession
+from server.app.identity.models import AuditLog, Base, PasswordInvitation, UserSession
 
 
 def _enable_sqlite_foreign_keys(dbapi_connection, _) -> None:
@@ -13,6 +13,7 @@ def _enable_sqlite_foreign_keys(dbapi_connection, _) -> None:
 class IdentityStore:
     SessionModel = UserSession
     AuditModel = AuditLog
+    PasswordInvitationModel = PasswordInvitation
 
     def __init__(self, database_url: str) -> None:
         sync_url = database_url.replace("postgresql+asyncpg", "postgresql+psycopg").replace("sqlite+aiosqlite", "sqlite")

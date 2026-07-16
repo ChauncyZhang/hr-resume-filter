@@ -47,15 +47,21 @@ async function responseData(response) {
 }
 
 async function login(page, email = process.env.E2E_ADMIN_EMAIL, password = process.env.E2E_ADMIN_PASSWORD) {
+  const authConfigResponsePromise = page.waitForResponse((response) => response.request().method() === "GET" && responsePath(response).endsWith("/api/v1/auth/config"));
   await page.goto(process.env.E2E_WEB_URL, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "登录工作台", exact: true }).waitFor({ timeout: 30_000 });
-  await page.getByLabel("组织标识").fill("final-e2e");
+  const authConfigResponse = await authConfigResponsePromise;
+  assert.equal(authConfigResponse.status(), 200, `auth config returned HTTP ${authConfigResponse.status()}`);
+  const authConfig = await responseData(authConfigResponse);
+  assert.equal(authConfig?.default_organization?.slug, "final-e2e");
+  assert.equal(await page.locator('input[name="organization_slug"]').count(), 0, "dedicated deployment exposed the organization slug field");
   await page.getByLabel("工作邮箱").fill(email);
   await page.getByLabel("密码").fill(password);
   const loginResponsePromise = page.waitForResponse((response) => response.request().method() === "POST" && responsePath(response).endsWith("/api/v1/auth/login"));
   await page.getByRole("button", { name: "登录", exact: true }).click();
   const loginResponse = await loginResponsePromise;
   assert.equal(loginResponse.status(), 200, `login returned HTTP ${loginResponse.status()}`);
+  assert.equal(loginResponse.request().postDataJSON()?.organization_slug, "final-e2e");
   await page.getByRole("heading", { name: "工作台", exact: true }).waitFor({ timeout: 30_000 });
 }
 

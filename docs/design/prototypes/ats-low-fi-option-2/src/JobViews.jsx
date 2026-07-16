@@ -37,6 +37,18 @@ export const initialPositionRecords = [
   { id: "JOB-OPS-005", name: "招聘运营专员", department: "人力资源部", location: "北京", owner: "王敏", status: "已暂停", priority: "低", headcount: 1, candidates: 15, review: 2, interview: 0, decision: 0, updated: "07-09 14:10", jd: "负责招聘渠道运营、数据分析和候选人体验提升。", mustHave: ["招聘运营", "数据分析"], niceToHave: ["ATS 使用经验", "雇主品牌"], process: "职能岗位标准流程" },
 ];
 
+const processTemplates = {
+  "标准社招流程": ["新简历", "待复核", "待沟通", "面试", "待决策", "录用"],
+  "技术岗位流程": ["新简历", "待复核", "技术一面", "技术二面", "待决策", "录用"],
+  "精简流程": ["新简历", "面试", "待决策", "录用"],
+};
+
+function formProcessTemplate(value) {
+  if (Object.hasOwn(processTemplates, value)) return value;
+  if (value === "技术岗位标准流程") return "技术岗位流程";
+  return "标准社招流程";
+}
+
 const JOB_STATUSES = ["全部", "招聘中", "草稿", "已暂停", "已关闭", "已归档"];
 const CANDIDATE_STAGES = ["全部阶段", "新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已淘汰"];
 const DEFAULT_CANDIDATE_FILTERS = Object.freeze({ q: "", stage: "全部阶段" });
@@ -125,7 +137,7 @@ function JobDialog({ onClose, onDiscard, onSave, saving }) {
   return <div className="job-confirm-backdrop" role="presentation" onMouseDown={onClose}><section className="job-confirm" role="dialog" aria-modal="true" aria-label="保存未完成的职位" onMouseDown={(event) => event.stopPropagation()}><header><CircleAlert size={21} /><h3>职位尚未保存</h3></header><p>你填写的内容还没有保存。可以先保存为草稿，或者放弃本次修改。</p><footer><button className="button secondary" type="button" onClick={onClose} disabled={saving}>继续编辑</button><button className="button danger-text" type="button" onClick={onDiscard} disabled={saving}>放弃修改</button><button className="button primary" type="button" onClick={onSave} disabled={saving}>保存草稿</button></footer></section></div>;
 }
 
-function JobForm({ initialJob, departments, owners, onBack, onSubmit, onRetryConflictRefresh }) {
+function JobForm({ initialJob, departments, owners, onBack, onSubmit, onRetryConflictRefresh, onManageDepartments }) {
   const actions = getJobFormActions(initialJob);
   const [values, setValues] = useState({
     name: initialJob?.name || "",
@@ -137,7 +149,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit, onRetryCon
     jd: initialJob?.jd || "",
     mustHave: initialJob?.mustHave?.join("、") || "",
     niceToHave: initialJob?.niceToHave?.join("、") || "",
-    process: initialJob?.process || "",
+    process: formProcessTemplate(initialJob?.process),
     llmEnabled: initialJob?.llmEnabled === true,
   });
   const [errors, setErrors] = useState({});
@@ -208,7 +220,7 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit, onRetryCon
           <div className="job-form-sections">
             <section className="form-section"><header><span>1</span><div><h3>基本信息</h3><p>设置职位归属、招聘目标和负责人。</p></div></header><div className="job-fields two-columns">
               <label>职位名称<input value={values.name} onChange={(event) => change("name", event.target.value)} placeholder="例如：平台工程师" />{errors.name && <small className="field-error">{errors.name}</small>}</label>
-              <label>所属部门<select value={values.departmentId} onChange={(event) => change("departmentId", event.target.value)}><option value="">未分配部门</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+              <div className="job-department-field"><span className="field-label-row"><label htmlFor="job-department">所属部门</label><button aria-label="管理部门" type="button" onClick={onManageDepartments}>管理部门</button></span><select id="job-department" aria-label="所属部门" value={values.departmentId} onChange={(event) => change("departmentId", event.target.value)}><option value="">未分配部门</option>{departments.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
               <label>工作地点<input value={values.location} onChange={(event) => change("location", event.target.value)} placeholder="例如：上海或远程" /></label>
               <label>招聘人数<input type="number" min="1" max="99" value={values.headcount} onChange={(event) => change("headcount", Number(event.target.value))} /></label>
               <label>负责人<select value={values.ownerId} onChange={(event) => change("ownerId", event.target.value)}><option value="">未分配负责人</option>{owners.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
@@ -219,9 +231,10 @@ function JobForm({ initialJob, departments, owners, onBack, onSubmit, onRetryCon
               <label>必须条件<textarea rows="3" value={values.mustHave} onChange={(event) => change("mustHave", event.target.value)} placeholder="用顿号分隔" /></label>
               <label>加分项<textarea rows="3" value={values.niceToHave} onChange={(event) => change("niceToHave", event.target.value)} placeholder="用顿号分隔" /></label>
             </div></section>
-            <section className="form-section"><header><span>3</span><div><h3>招聘流程与 AI</h3><p>记录服务端流程模板，并确认是否允许模型辅助评估。</p></div></header><div className="job-fields">
-              <label>流程模板<input value={values.process} onChange={(event) => change("process", event.target.value)} placeholder="例如：技术岗位标准流程" />{errors.process && <small className="field-error">{errors.process}</small>}</label>
-              <label className="toggle-row"><span><Bot size={18} /><span><strong>启用 LLM 简历评估</strong><small>使用组织已配置的模型服务。</small></span></span><input aria-label="启用 LLM 简历评估" type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
+            <section className="form-section recruitment-config"><header><span>3</span><div><h3>招聘配置</h3><p>选择招聘流程，并配置规则评分后的 AI 辅助评估。</p></div></header><div className="job-fields">
+              <label>流程模板<select aria-label="流程模板" value={values.process} onChange={(event) => change("process", event.target.value)}>{Object.keys(processTemplates).map((template) => <option key={template} value={template}>{template}</option>)}</select>{errors.process && <small className="field-error">{errors.process}</small>}</label>
+              <div className="process-summary"><strong>阶段摘要</strong><span>{processTemplates[values.process].join(" → ")}</span></div>
+              <label className="toggle-row ai-evaluation-row"><span><Bot size={18} /><span><strong>AI 简历评估</strong><small>规则评分后补充匹配分、结论和理由。</small></span></span><input aria-label="AI 简历评估" type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
             </div></section>
           </div>
           <aside className="form-summary"><h3>发布检查</h3><div className="completion-ring"><strong>{completion}/5</strong><span>关键项已完成</span></div>{[["职位名称", values.name], ["所属部门", values.departmentId], ["公开 JD", values.jd], ["筛选条件", values.mustHave], ["招聘流程", values.process]].map(([label, value]) => <div className={value ? "check-row done" : "check-row"} key={label}>{value ? <Check size={15} /> : <Clock3 size={15} />}<span>{label}</span></div>)}</aside>
@@ -279,12 +292,14 @@ function JobDetail({ state, lifecycleState, refreshState, onBack, onEdit, onImpo
   );
 }
 
-export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate }) {
+export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate, onManageDepartments }) {
   const [detailState, setDetailState] = useState({ status: "idle", job: null, candidates: null });
   const [lifecycleState, setLifecycleState] = useState({ status: "idle", error: "", conflict: false });
   const [refreshState, setRefreshState] = useState({ error: "", retrying: false, kind: "updated" });
+  const [formDepartments, setFormDepartments] = useState([]);
   const detailRequestRef = useRef(null);
   const candidateRequestRef = useRef(null);
+  const departmentRequestRef = useRef(null);
   const skipNextDetailLoadRef = useRef(false);
   const detailSequenceRef = useRef(0);
   const candidateSequenceRef = useRef(0);
@@ -324,9 +339,27 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     void loadDetail(selectedJob);
   }, [loadDetail, mode, selectedJob?.id]);
 
+  useEffect(() => {
+    if (mode !== "form") return undefined;
+    departmentRequestRef.current?.abort();
+    const controller = new AbortController();
+    departmentRequestRef.current = controller;
+    setFormDepartments(listState.departments);
+    if (typeof jobController.listDepartments !== "function") return () => controller.abort();
+    void jobController.listDepartments({ signal: controller.signal }).then((departments) => {
+      if (departmentRequestRef.current === controller) setFormDepartments(departments);
+    }).catch((error) => {
+      if (error?.name !== "AbortError" && departmentRequestRef.current === controller) setFormDepartments(listState.departments);
+    }).finally(() => {
+      if (departmentRequestRef.current === controller) departmentRequestRef.current = null;
+    });
+    return () => controller.abort();
+  }, [jobController, mode]);
+
   useEffect(() => () => {
     detailRequestRef.current?.abort();
     candidateRequestRef.current?.abort();
+    departmentRequestRef.current?.abort();
   }, []);
 
   const loadCandidates = useCallback(async (filters, { append = false, cursor = null } = {}) => {
@@ -428,7 +461,7 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     }));
   }
 
-  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={listState.departments} owners={listState.owners} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} />;
+  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={formDepartments} owners={listState.owners} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} onManageDepartments={onManageDepartments} />;
   if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} refreshState={refreshState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onRetryRefresh={retryMutationRefresh} onLoadCandidates={loadCandidates} onTransition={transition} />;
   return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
 }

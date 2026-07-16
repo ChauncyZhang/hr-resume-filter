@@ -92,6 +92,49 @@ def get_me(client, *, fetch_site="same-origin", origin=None):
     return client.get("/api/v1/me", headers=headers)
 
 
+def test_public_auth_config_preserves_multi_tenant_login_when_default_is_unset(
+    identity_app,
+) -> None:
+    _, client, _ = identity_app
+
+    response = client.get("/api/v1/auth/config")
+
+    assert response.status_code == 200
+    assert response.json() == {"data": {"default_organization": None}}
+    assert "X-Trace-ID" in response.headers
+
+
+def test_public_auth_config_exposes_only_configured_default_organization(
+    tmp_path,
+) -> None:
+    settings = Settings(
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'configured-identity.db'}",
+        cors_origins=["https://hr.example.test"],
+        default_organization_slug="acme",
+        default_organization_name="Acme Recruiting",
+        object_storage_secret_key="must-not-leak",
+    )
+    app = create_app(
+        settings=settings,
+        database_probe=Probe(),
+        storage_probe=Probe(),
+    )
+
+    response = TestClient(app).get("/api/v1/auth/config")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "data": {
+            "default_organization": {
+                "slug": "acme",
+                "name": "Acme Recruiting",
+            }
+        }
+    }
+    assert "must-not-leak" not in response.text
+
+
 def test_passwords_use_argon2id_and_verify() -> None:
     service = PasswordService()
     encoded = service.hash("correct horse")

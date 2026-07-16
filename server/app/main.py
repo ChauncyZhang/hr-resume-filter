@@ -22,6 +22,7 @@ from server.app.observability.http_metrics import (
     route_template,
 )
 from server.app.identity.api import allowed_origin, problem, router as identity_router, session_token
+from server.app.identity.admin_api import router as identity_admin_router
 from server.app.identity.service import Clock, IdentityService, TokenSource
 from server.app.identity.store import IdentityStore
 from server.app.recruiting.api import router as recruiting_router
@@ -42,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 def _is_governance_path(path: str) -> bool:
     return path == "/api/v1/audit-logs" or path.startswith("/api/v1/audit-logs/") or path == "/api/v1/settings/retention-policy" or path.startswith("/api/v1/settings/retention-policy/")
+
+
+def _requires_no_store(path: str) -> bool:
+    return _is_governance_path(path) or path == "/api/v1/settings" or path.startswith(
+        "/api/v1/settings/"
+    )
 
 
 def _new_trace_id() -> str:
@@ -132,6 +139,7 @@ def create_app(
     app.state.llm_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
     app.state.llm_gateway=OpenAiCompatibleGateway(app.state.llm_allowlist)
     app.include_router(identity_router)
+    app.include_router(identity_admin_router)
     app.include_router(recruiting_router)
     from server.app.screening.api import router as screening_router
     app.include_router(screening_router)
@@ -146,7 +154,7 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_problem(request: Request, _: RequestValidationError):
         response = problem(request, 422, "validation_failed", "The request is invalid.")
-        if _is_governance_path(request.url.path):
+        if _requires_no_store(request.url.path):
             response.headers["Cache-Control"] = "no-store"
         return response
     app.add_middleware(
@@ -173,7 +181,10 @@ def create_app(
                 if not audited:
                     logger.info("anonymous_csrf_denied", extra={"context": {"trace_id": trace_id}})
                 response = problem(request, 403, "csrf_validation_failed", "Request origin or CSRF token is invalid.")
-            if response is None and request.url.path != "/api/v1/auth/login":
+            if response is None and request.url.path not in {
+                "/api/v1/auth/login",
+                "/api/v1/auth/invitations/accept",
+            }:
                 token = session_token(request)
                 csrf = request.headers.get("x-csrf-token")
                 if not token or not csrf or not service.validate_csrf(token, csrf, trace_id=trace_id, network=network):
@@ -212,7 +223,7 @@ def create_app(
             status_code=response.status_code,
             duration_seconds=perf_counter() - started,
         )
-        if _is_governance_path(request.url.path):
+        if _requires_no_store(request.url.path):
             response.headers["Cache-Control"] = "no-store"
         response.headers["X-Trace-ID"] = trace_id
         logger.info(

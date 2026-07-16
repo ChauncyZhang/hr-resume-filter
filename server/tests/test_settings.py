@@ -22,6 +22,38 @@ def production_settings(**overrides: object) -> Settings:
     return Settings(**values)
 
 
+def test_default_organization_identity_loads_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("DEFAULT_ORGANIZATION_SLUG", "acme")
+    monkeypatch.setenv("DEFAULT_ORGANIZATION_NAME", "Acme Recruiting")
+
+    settings = Settings.from_environment()
+
+    assert settings.default_organization_slug == "acme"
+    assert settings.default_organization_name == "Acme Recruiting"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"default_organization_slug": "acme"},
+        {"default_organization_name": "Acme Recruiting"},
+        {
+            "default_organization_slug": "Acme",
+            "default_organization_name": "Acme Recruiting",
+        },
+        {
+            "default_organization_slug": "acme",
+            "default_organization_name": "   ",
+        },
+    ],
+)
+def test_default_organization_identity_rejects_partial_or_invalid_config(
+    overrides: dict[str, str],
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**overrides)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

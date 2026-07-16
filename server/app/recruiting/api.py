@@ -371,6 +371,17 @@ def _eligible_recruiter(db, organization_id: UUID, user_id: UUID) -> bool:
     )))
 
 
+def _department_is_valid(db, organization_id: UUID, department_id: UUID | None) -> bool:
+    return department_id is None or db.scalar(
+        select(
+            exists().where(
+                Department.organization_id == organization_id,
+                Department.id == department_id,
+            )
+        )
+    )
+
+
 def _application_data(item: Application) -> dict[str, Any]:
     return {"id": str(item.id), "candidate_id": str(item.candidate_id), "job_id": str(item.job_id), "resume_id": str(item.resume_id), "owner_id": str(item.owner_id), "stage": item.stage, "source": item.source, "source_application_id": str(item.source_application_id) if item.source_application_id else None, "human_conclusion": item.human_conclusion, "version": item.version, "updated_at": item.updated_at.isoformat()}
 
@@ -393,6 +404,12 @@ def create_job_definition(payload: JobDefinitionCommand, request: Request, idemp
         return _denied(request)
     command = payload.model_dump()
     with request.app.state.identity_store.sync_session() as db:
+        if not _department_is_valid(
+            db, principal.organization_id, command["department_id"]
+        ):
+            return problem(
+                request, 422, "department_invalid", "The department is invalid."
+            )
         try:
             status, body = persisted_idempotent(
                 db,
@@ -695,6 +712,12 @@ def create_job(payload: JobCreate, request: Request):
     if isinstance(principal, JSONResponse): return principal
     if not AUTH.role_allows(principal, RecruitingAction.MANAGE_JOB): return _denied(request)
     with request.app.state.identity_store.sync_session() as db:
+        if not _department_is_valid(
+            db, principal.organization_id, payload.department_id
+        ):
+            return problem(
+                request, 422, "department_invalid", "The department is invalid."
+            )
         job = Job(organization_id=principal.organization_id, owner_id=principal.user_id, **payload.model_dump())
         db.add(job); db.flush()
         db.add(JobCollaborator(organization_id=principal.organization_id, job_id=job.id, user_id=principal.user_id, access_role="job_owner"))

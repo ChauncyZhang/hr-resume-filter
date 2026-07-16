@@ -79,6 +79,23 @@ function queuedClient(responses) {
 test("exports the job controller factory and default controller", () => {
   assert.equal(typeof createJobController, "function");
   assert.equal(typeof jobController.listJobs, "function");
+  assert.equal(typeof jobController.listDepartments, "function");
+});
+
+test("job form departments come from the organization directory instead of job facets", async () => {
+  const calls = [];
+  const signal = new AbortController().signal;
+  const controller = createJobController({ client: {
+    async listDepartments(options) {
+      calls.push(options);
+      return [
+        { id: DEPARTMENT_ID, name: "技术部", job_count: 0 },
+      ];
+    },
+  } });
+
+  assert.deepEqual(await controller.listDepartments({ signal }), [{ id: DEPARTMENT_ID, name: "技术部" }]);
+  assert.equal(calls[0].signal, signal);
 });
 
 test("job form actions execute the correct publish payload for create and every editable status", async () => {

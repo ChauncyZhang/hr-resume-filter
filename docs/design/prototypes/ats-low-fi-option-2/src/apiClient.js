@@ -139,12 +139,40 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
       const response = await request("/api/v1/auth/login", { method: "POST", body: credentials });
       return response?.data ?? null;
     },
+    async getAuthContext() {
+      const response = await request("/api/v1/auth/config");
+      const organization = response?.data?.default_organization;
+      return organization ? { organization_slug: organization.slug, organization_name: organization.name } : null;
+    },
     async getMe() {
       const response = await request("/api/v1/me");
       return response?.data ?? null;
     },
     async logout() {
       return request("/api/v1/auth/logout", { method: "POST" });
+    },
+    async listDepartments({ signal } = {}) {
+      const response = await request("/api/v1/settings/departments", signal ? { signal } : {});
+      return Array.isArray(response?.data) ? response.data : [];
+    },
+    async createDepartment(body) {
+      const response = await request("/api/v1/settings/departments", { method: "POST", body });
+      return response?.data ?? null;
+    },
+    async listUsers() {
+      const response = await request("/api/v1/settings/users");
+      return Array.isArray(response?.data) ? response.data : [];
+    },
+    async inviteUser(body, { idempotencyKey } = {}) {
+      const response = await request("/api/v1/settings/users", { method: "POST", body, idempotencyKey });
+      return response?.data ?? null;
+    },
+    async acceptInvitation(body) {
+      const response = await request("/api/v1/auth/invitations/accept", { method: "POST", body });
+      return response?.data ?? null;
+    },
+    async changePassword(body) {
+      return request("/api/v1/me/password", { method: "POST", body });
     },
     clearCsrf() {
       csrfToken = null;

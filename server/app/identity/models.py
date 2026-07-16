@@ -20,6 +20,7 @@ class Base(DeclarativeBase):
 class UserStatus(str, enum.Enum):
     ACTIVE = "active"
     DISABLED = "disabled"
+    INVITED = "invited"
 
 
 class Timestamped:
@@ -102,6 +103,29 @@ class UserSession(Timestamped, Base):
     authorization_version: Mapped[int] = mapped_column(Integer)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revocation_reason: Mapped[str | None] = mapped_column(String(64))
+    user: Mapped[User] = relationship()
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "user_id"],
+            ["users.organization_id", "users.id"],
+            ondelete="CASCADE",
+        ),
+    )
+
+
+class PasswordInvitation(Base):
+    __tablename__ = "password_invitations"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
     user: Mapped[User] = relationship()
     __table_args__ = (
         ForeignKeyConstraint(

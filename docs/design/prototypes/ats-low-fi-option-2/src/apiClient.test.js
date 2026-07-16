@@ -9,6 +9,19 @@ function jsonResponse(body, { status = 200, headers = {} } = {}) {
   });
 }
 
+test("登录上下文只读取公开的部署组织信息", async () => {
+  const calls = [];
+  const client = createApiClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return jsonResponse({ data: { default_organization: { slug: "acme", name: "Acme" } } });
+  } });
+
+  assert.deepEqual(await client.getAuthContext(), { organization_slug: "acme", organization_name: "Acme" });
+  assert.equal(calls[0].url, "/api/v1/auth/config");
+  assert.equal(calls[0].options.method, "GET");
+  assert.equal(calls[0].options.headers.get("X-CSRF-Token"), null);
+});
+
 test("API 请求携带会话凭据，并仅在登录后为写请求附加内存 CSRF", async () => {
   const calls = [];
   const responses = [
@@ -288,4 +301,39 @@ test("unauthorized unregister only clears the handler it registered", async () =
   unregisterSecond();
   await assert.rejects(client.request("/api/v1/jobs"), ApiError);
   assert.equal(secondNotifications, 1);
+});
+
+test("organization and account methods follow the fixed API contract", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ data: [{ id: "dep-1", name: "技术部" }] }),
+    jsonResponse({ data: { id: "dep-2", name: "产品部" } }),
+    jsonResponse({ data: [{ id: "user-1", display_name: "林岚" }] }),
+    jsonResponse({ data: { user: { id: "user-2" }, invitation: { token: "once" } } }),
+    jsonResponse({ data: { email: "lin@example.test" } }),
+    new Response(null, { status: 204 }),
+  ];
+  const client = createApiClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  } });
+
+  assert.deepEqual(await client.listDepartments(), [{ id: "dep-1", name: "技术部" }]);
+  assert.deepEqual(await client.createDepartment({ name: "产品部", parent_id: null }), { id: "dep-2", name: "产品部" });
+  assert.deepEqual(await client.listUsers(), [{ id: "user-1", display_name: "林岚" }]);
+  assert.deepEqual(await client.inviteUser({ display_name: "周宁", email: "zhou@example.test", department_id: "dep-1", role: "recruiter" }, { idempotencyKey: "invite-key" }), { user: { id: "user-2" }, invitation: { token: "once" } });
+  assert.deepEqual(await client.acceptInvitation({ token: "once", password: "a-secure-password" }), { email: "lin@example.test" });
+  assert.equal(await client.changePassword({ current_password: "old-password", new_password: "new-secure-password" }), null);
+
+  assert.deepEqual(calls.map(({ url, options }) => [url, options.method]), [
+    ["/api/v1/settings/departments", "GET"],
+    ["/api/v1/settings/departments", "POST"],
+    ["/api/v1/settings/users", "GET"],
+    ["/api/v1/settings/users", "POST"],
+    ["/api/v1/auth/invitations/accept", "POST"],
+    ["/api/v1/me/password", "POST"],
+  ]);
+  assert.equal(calls[3].options.headers.get("Idempotency-Key"), "invite-key");
+  assert.deepEqual(JSON.parse(calls[4].options.body), { token: "once", password: "a-secure-password" });
+  assert.deepEqual(JSON.parse(calls[5].options.body), { current_password: "old-password", new_password: "new-secure-password" });
 });

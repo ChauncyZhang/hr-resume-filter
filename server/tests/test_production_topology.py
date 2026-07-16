@@ -228,6 +228,31 @@ def test_merged_production_topology_has_one_https_host_entry(tmp_path: Path) -> 
     assert port["protocol"] == "tcp"
 
 
+def test_default_organization_identity_is_wired_only_to_api(tmp_path: Path) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+    environment = _compose_environment(
+        cert_path, key_path, server_name="recruiting.example.test"
+    )
+    environment.update(
+        {
+            "DEFAULT_ORGANIZATION_SLUG": "acme",
+            "DEFAULT_ORGANIZATION_NAME": "Acme Recruiting",
+        }
+    )
+
+    result = _run_compose_config(environment)
+
+    assert result.returncode == 0, result.stderr
+    model = json.loads(result.stdout)
+    assert model["services"]["api"]["environment"]["DEFAULT_ORGANIZATION_SLUG"] == "acme"
+    assert model["services"]["api"]["environment"]["DEFAULT_ORGANIZATION_NAME"] == "Acme Recruiting"
+    assert "DEFAULT_ORGANIZATION_SLUG" not in model["services"]["worker"]["environment"]
+    assert "DEFAULT_ORGANIZATION_NAME" not in model["services"]["worker"]["environment"]
+
+
 def test_production_services_use_immutable_release_images_without_builds(
     tmp_path: Path,
 ) -> None:

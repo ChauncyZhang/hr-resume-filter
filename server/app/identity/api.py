@@ -2,7 +2,15 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-from server.app.identity.service import AuthenticationFailed, CsrfFailed, IdentityService, InvalidSession
+from server.app.identity.service import (
+    AuthenticationFailed,
+    CsrfFailed,
+    CurrentPasswordInvalid,
+    IdentityService,
+    InvalidSession,
+    InvitationInvalidOrExpired,
+    PasswordUnchanged,
+)
 
 
 PRODUCTION_COOKIE_NAME = "__Host-hr_session"
@@ -21,6 +29,16 @@ class LoginRequest(BaseModel):
         if value.count("@") != 1 or not all(value.split("@")):
             raise ValueError("invalid email address")
         return value
+
+
+class InvitationAcceptRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=512)
+    password: str = Field(min_length=12, max_length=128)
+
+
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=12, max_length=128)
 
 
 def problem(request: Request, status: int, code: str, detail: str) -> JSONResponse:
@@ -43,6 +61,18 @@ def session_token(request: Request) -> str | None:
     return request.cookies.get(cookie_name(request))
 
 
+@router.get("/auth/config")
+def auth_config(request: Request):
+    settings = request.app.state.settings
+    default_organization = None
+    if settings.default_organization_slug is not None:
+        default_organization = {
+            "slug": settings.default_organization_slug,
+            "name": settings.default_organization_name,
+        }
+    return {"data": {"default_organization": default_organization}}
+
+
 @router.post("/auth/login")
 def login(payload: LoginRequest, request: Request):
     if not allowed_origin(request):
@@ -56,6 +86,29 @@ def login(payload: LoginRequest, request: Request):
     response.set_cookie(cookie_name(request), session_token, httponly=True, secure=request.app.state.settings.environment == "production", samesite="lax", path="/")
     response.headers["X-CSRF-Token"] = csrf
     return response
+
+
+@router.post("/auth/invitations/accept")
+def accept_invitation(payload: InvitationAcceptRequest, request: Request):
+    if not allowed_origin(request):
+        return problem(
+            request,
+            403,
+            "csrf_validation_failed",
+            "Request origin or CSRF token is invalid.",
+        )
+    try:
+        email = request.app.state.identity_service.accept_password_invitation(
+            payload.token, payload.password, trace_id=request.state.trace_id
+        )
+    except InvitationInvalidOrExpired:
+        return problem(
+            request,
+            422,
+            "invitation_invalid_or_expired",
+            "The invitation is invalid or expired.",
+        )
+    return {"data": {"email": email}}
 
 
 @router.get("/me")
@@ -92,3 +145,40 @@ def logout(request: Request):
     response = Response(status_code=204)
     response.delete_cookie(cookie_name(request), path="/", secure=request.app.state.settings.environment == "production", httponly=True, samesite="lax")
     return response
+
+
+@router.post("/me/password", status_code=204)
+def change_password(payload: PasswordChangeRequest, request: Request):
+    token = session_token(request)
+    if not token:
+        return problem(
+            request, 401, "authentication_required", "Authentication is required."
+        )
+    try:
+        request.app.state.identity_service.change_password(
+            token,
+            payload.current_password,
+            payload.new_password,
+            trace_id=request.state.trace_id,
+            network=request.headers.get("x-real-ip")
+            or (request.client.host if request.client else None),
+        )
+    except InvalidSession:
+        return problem(
+            request, 401, "authentication_required", "Authentication is required."
+        )
+    except CurrentPasswordInvalid:
+        return problem(
+            request,
+            422,
+            "current_password_invalid",
+            "The current password is invalid.",
+        )
+    except PasswordUnchanged:
+        return problem(
+            request,
+            422,
+            "password_unchanged",
+            "The new password must be different.",
+        )
+    return Response(status_code=204)

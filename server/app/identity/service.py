@@ -4,10 +4,18 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
-from server.app.identity.models import AuditLog, Organization, User, UserSession, UserStatus
+from server.app.identity.models import (
+    AuditLog,
+    Department,
+    Organization,
+    PasswordInvitation,
+    User,
+    UserSession,
+    UserStatus,
+)
 from server.app.identity.security import PasswordService, hash_token, tokens_match
 from server.app.identity.store import IdentityStore
 
@@ -31,6 +39,18 @@ class InvalidSession(Exception):
 
 
 class CsrfFailed(Exception):
+    pass
+
+
+class InvitationInvalidOrExpired(Exception):
+    pass
+
+
+class CurrentPasswordInvalid(Exception):
+    pass
+
+
+class PasswordUnchanged(Exception):
     pass
 
 
@@ -164,16 +184,122 @@ class IdentityService:
             record.csrf_token_hash = hash_token(csrf)
             record.idle_expires_at = min(now + timedelta(minutes=30), self._aware(record.absolute_expires_at))
             user = record.user
+            department = (
+                db.scalar(
+                    select(Department).where(
+                        Department.organization_id == user.organization_id,
+                        Department.id == user.department_id,
+                    )
+                )
+                if user.department_id is not None
+                else None
+            )
             data = {
                 "id": str(user.id),
                 "email": user.email,
                 "display_name": user.display_name,
                 "organization": {"id": str(user.organization.id), "slug": user.organization.slug, "name": user.organization.name},
+                "department": (
+                    {"id": str(department.id), "name": department.name}
+                    if department is not None
+                    else None
+                ),
                 "roles": sorted(role.role for role in user.roles),
                 "permissions": self.permission_summary(role.role for role in user.roles),
             }
             db.commit()
             return data, csrf
+
+    def accept_password_invitation(
+        self, token: str, password: str, *, trace_id: str
+    ) -> str:
+        now = self.clock.current_time()
+        with self.store.sync_session() as db:
+            invitation = db.scalar(
+                select(PasswordInvitation)
+                .options(selectinload(PasswordInvitation.user))
+                .where(PasswordInvitation.token_hash == hash_token(token))
+                .with_for_update(of=PasswordInvitation)
+            )
+            if (
+                invitation is None
+                or invitation.used_at is not None
+                or self._aware(invitation.expires_at) <= now
+                or invitation.user.status != UserStatus.INVITED
+            ):
+                raise InvitationInvalidOrExpired
+            invitation.user.password_hash = self.passwords.hash(password)
+            invitation.user.status = UserStatus.ACTIVE
+            invitation.used_at = now
+            db.add(
+                AuditLog(
+                    organization_id=invitation.organization_id,
+                    actor_user_id=invitation.user_id,
+                    category="system",
+                    event_type="identity.password_invitation_accepted",
+                    outcome="success",
+                    resource_type="user",
+                    resource_id=invitation.user_id,
+                    trace_id=trace_id,
+                    metadata_json={},
+                )
+            )
+            email = invitation.user.email
+            db.commit()
+            return email
+
+    def change_password(
+        self,
+        token: str,
+        current_password: str,
+        new_password: str,
+        *,
+        trace_id: str,
+        network: str | None,
+    ) -> None:
+        now = self.clock.current_time()
+        with self.store.sync_session() as db:
+            current_session = self._resolve_session(
+                db, token, trace_id=trace_id, network=network
+            )
+            user = db.scalar(
+                select(User)
+                .where(
+                    User.organization_id == current_session.organization_id,
+                    User.id == current_session.user_id,
+                )
+                .with_for_update(of=User)
+            )
+            if user is None or not self.passwords.verify(
+                user.password_hash, current_password
+            ):
+                raise CurrentPasswordInvalid
+            if self.passwords.verify(user.password_hash, new_password):
+                raise PasswordUnchanged
+
+            user.password_hash = self.passwords.hash(new_password)
+            user.authorization_version += 1
+            current_session.authorization_version = user.authorization_version
+            db.execute(
+                update(UserSession)
+                .where(
+                    UserSession.organization_id == user.organization_id,
+                    UserSession.user_id == user.id,
+                    UserSession.id != current_session.id,
+                    UserSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=now, revocation_reason="password_changed")
+            )
+            self._audit(
+                db,
+                "authentication.password_changed",
+                "success",
+                organization_id=user.organization_id,
+                user_id=user.id,
+                trace_id=trace_id,
+                network=network,
+            )
+            db.commit()
 
     def principal(self, token: str):
         from server.app.identity.policy import Principal

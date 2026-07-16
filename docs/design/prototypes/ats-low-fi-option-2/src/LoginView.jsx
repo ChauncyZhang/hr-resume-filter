@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Building2, LoaderCircle, LockKeyhole, LogIn, LogOut, Mail, ShieldX } from "lucide-react";
+import { apiClient } from "./apiClient.js";
 import { getSessionMessage } from "./session.js";
 
 export function SessionLoadingView() {
@@ -30,9 +31,29 @@ export function AccessDeniedView({ displayName, error, loggingOut, onLogout }) {
   );
 }
 
-export function LoginView({ error, submitting, onLogin }) {
-  const [form, setForm] = useState({ organization_slug: "", email: "", password: "" });
+export function LoginView({ error, submitting, onLogin, initialEmail = "", loadAuthContext = apiClient.getAuthContext }) {
+  const [form, setForm] = useState({ organization_slug: "", email: initialEmail, password: "" });
+  const [authContextStatus, setAuthContextStatus] = useState("loading");
   const message = getSessionMessage(error);
+
+  useEffect(() => {
+    if (initialEmail) setForm((current) => ({ ...current, email: initialEmail }));
+  }, [initialEmail]);
+
+  useEffect(() => {
+    let active = true;
+    void loadAuthContext()
+      .then((context) => {
+        if (!active) return;
+        const organizationSlug = typeof context?.organization_slug === "string" ? context.organization_slug.trim() : "";
+        if (organizationSlug) setForm((current) => ({ ...current, organization_slug: organizationSlug }));
+        setAuthContextStatus(organizationSlug ? "configured" : "manual");
+      })
+      .catch(() => {
+        if (active) setAuthContextStatus("manual");
+      });
+    return () => { active = false; };
+  }, [loadAuthContext]);
 
   function update(field, value) {
     setForm((current) => ({ ...current, [field]: value }));
@@ -51,16 +72,16 @@ export function LoginView({ error, submitting, onLogin }) {
     <main className="login-page">
       <section className="login-card" aria-labelledby="login-title">
         <header className="login-heading">
-          <div className="login-mark" aria-hidden="true">招</div>
+          <div className="login-mark" aria-hidden="true"><img src="/favicon.svg" alt="" /></div>
           <div>
-            <p>招聘协同平台</p>
+            <p>BeyondCandidate · 候选人全流程招聘平台</p>
             <h1 id="login-title">登录工作台</h1>
           </div>
         </header>
-        <p className="login-intro">使用所属组织与工作账号继续。</p>
+        <p className="login-intro">使用工作账号继续。</p>
 
         <form className="login-form" onSubmit={submit} aria-busy={submitting}>
-          <label>
+          {authContextStatus === "manual" && <label>
             <span>组织标识</span>
             <div className="login-input">
               <Building2 size={17} aria-hidden="true" />
@@ -74,7 +95,7 @@ export function LoginView({ error, submitting, onLogin }) {
                 disabled={submitting}
               />
             </div>
-          </label>
+          </label>}
           <label>
             <span>工作邮箱</span>
             <div className="login-input">
@@ -109,9 +130,9 @@ export function LoginView({ error, submitting, onLogin }) {
           </label>
 
           <div className="login-message" role={message ? "alert" : "status"} aria-live="polite">
-            {message}
+            {message || (authContextStatus === "loading" ? "正在读取部署配置…" : "")}
           </div>
-          <button className="button primary login-submit" type="submit" disabled={submitting}>
+          <button className="button primary login-submit" type="submit" disabled={submitting || authContextStatus === "loading"}>
             {submitting ? <LoaderCircle className="spin" size={17} aria-hidden="true" /> : <LogIn size={17} aria-hidden="true" />}
             {submitting ? "正在登录…" : "登录"}
           </button>

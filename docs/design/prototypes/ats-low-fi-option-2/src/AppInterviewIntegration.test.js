@@ -25,6 +25,11 @@ test("candidate detail scheduling preserves a server-backed candidate id", () =>
 
 test("schedule form hydrates an asynchronously loaded candidate without replacing a user selection", () => {
   assert.match(interviewSource, /const loadedCandidate = candidates\.find/);
-  assert.match(interviewSource, /current\.candidateId \? current/);
+  assert.match(interviewSource, /shouldHydrateScheduleCandidate\(current\.candidateId, candidateId\)/);
   assert.match(interviewSource, /position: current\.position \|\| loadedCandidate\.position/);
+});
+
+test("schedule and feedback back links describe the actual origin", () => {
+  assert.match(interviewSource, /backLabel/);
+  assert.match(interviewSource, /\{backLabel\}/);
 });

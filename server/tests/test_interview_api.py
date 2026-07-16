@@ -644,6 +644,27 @@ def test_create_interview_is_idempotent_checks_conflicts_and_scopes_interviewer_
         assert database.scalar(select(InterviewParticipant).where(InterviewParticipant.interview_id == interview_id)) is not None
 
 
+def test_create_interview_advances_an_earlier_application_stage_atomically(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    with app.state.identity_store.sync_session() as database:
+        application = database.get(Application, seed["application_id"])
+        application.stage = "new"
+        database.commit()
+
+    with TestClient(app) as client:
+        created, _ = create_interview(client, seed, key="create-from-new-application")
+
+    assert created.status_code == 201
+    with app.state.identity_store.sync_session() as database:
+        application = database.get(Application, seed["application_id"])
+        assert application.stage == "interviewing"
+        assert application.version == 5
+        assert database.scalar(
+            select(Interview).where(Interview.application_id == seed["application_id"])
+        ) is not None
+
+
 def test_revoked_recruiting_role_removes_historical_assignment_access(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
@@ -1168,6 +1189,96 @@ def test_feedback_is_private_idempotent_and_advances_only_after_all_required_sub
         assert stored_interview.status == "feedback_completed"
         assert len(feedbacks) == 2
         assert all(item.status == "submitted" for item in feedbacks)
+
+
+def test_assigned_participant_can_open_feedback_after_a_scheduled_interview_starts(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    manager_id = seed_user(app, "hiring_manager", "feedback-manager@example.test")
+    start = datetime.now(timezone.utc) - timedelta(minutes=30)
+    payload = interview_payload(seed, starts_at=start)
+    payload["participants"] = [
+        {
+            "user_id": str(manager_id),
+            "role": "interviewer",
+            "required_feedback": True,
+        }
+    ]
+    with TestClient(app) as client:
+        created, _ = create_interview(
+            client,
+            seed,
+            key="started-interview-create",
+            payload=payload,
+        )
+        interview_id = created.json()["data"]["id"]
+        participant_headers = login(client, "feedback-manager@example.test")
+        saved = client.put(
+            f"/api/v1/interviews/{interview_id}/my-feedback",
+            json=feedback_payload(),
+            headers={**participant_headers, "If-Match": '"0"'},
+        )
+        submitted = client.post(
+            f"/api/v1/interviews/{interview_id}/my-feedback/submit",
+            headers={**participant_headers, "Idempotency-Key": "started-feedback-submit"},
+        )
+
+    assert saved.status_code == 200
+    assert submitted.status_code == 200
+    with app.state.identity_store.sync_session() as database:
+        interview = database.get(Interview, UUID(interview_id))
+        application = database.get(Application, seed["application_id"])
+        assert interview.status == "feedback_completed"
+        assert application.stage == "decision"
+        assert database.scalar(
+            select(InterviewEvent).where(
+                InterviewEvent.interview_id == UUID(interview_id),
+                InterviewEvent.event_type == "interview.feedback_opened",
+            )
+        ) is not None
+        assert database.scalar(
+            select(AuditLog).where(
+                AuditLog.actor_user_id == manager_id,
+                AuditLog.event_type == "interview.feedback_opened",
+            )
+        ) is not None
+
+
+def test_assigned_participant_cannot_open_feedback_before_the_interview_starts(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    manager_id = seed_user(app, "hiring_manager", "future-feedback-manager@example.test")
+    start = datetime.now(timezone.utc) + timedelta(hours=2)
+    payload = interview_payload(seed, starts_at=start)
+    payload["participants"] = [
+        {
+            "user_id": str(manager_id),
+            "role": "interviewer",
+            "required_feedback": True,
+        }
+    ]
+    with TestClient(app) as client:
+        created, _ = create_interview(
+            client,
+            seed,
+            key="upcoming-interview-create",
+            payload=payload,
+        )
+        interview_id = created.json()["data"]["id"]
+        participant_headers = login(client, "future-feedback-manager@example.test")
+        saved = client.put(
+            f"/api/v1/interviews/{interview_id}/my-feedback",
+            json=feedback_payload(),
+            headers={**participant_headers, "If-Match": '"0"'},
+        )
+
+    assert saved.status_code == 409
+    assert saved.json()["code"] == "invalid_state_transition"
+    with app.state.identity_store.sync_session() as database:
+        assert database.get(Interview, UUID(interview_id)).status == "scheduled"
+        assert database.scalar(
+            select(InterviewFeedback).where(InterviewFeedback.interview_id == UUID(interview_id))
+        ) is None
 
 
 def test_submitted_feedback_amendment_requires_its_author_reason_and_version(tmp_path) -> None:

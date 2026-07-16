@@ -128,6 +128,8 @@ export function normalizeInterview(value) {
     duration: durationMinutes(value?.starts_at, value?.ends_at),
     method: API_TO_UI_METHOD[value?.method] || "面试",
     timezone,
+    startsAt: safeString(value?.starts_at),
+    endsAt: safeString(value?.ends_at),
     interviewerIds: participants.map((item) => item.id),
     interviewers: participants.map((item) => item.name),
     participants,

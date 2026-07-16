@@ -71,6 +71,8 @@ try {
 
     $env:E2E_API_PORT = [string]$ApiPort
     $env:E2E_APP_IMAGE = "$ProjectName-app"
+    $env:DEFAULT_ORGANIZATION_SLUG = "final-e2e"
+    $env:DEFAULT_ORGANIZATION_NAME = "Final E2E Recruiting"
     $env:E2E_ADMIN_EMAIL = "admin-$RunToken@example.test"
     $env:E2E_ADMIN_PASSWORD = "Admin-$([Guid]::NewGuid().ToString('N'))"
     $env:E2E_INTERVIEWER_EMAIL = "interviewer-$RunToken@example.test"
