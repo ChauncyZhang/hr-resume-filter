@@ -20,7 +20,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { buildWorkweekColumns, canSubmitInterviewFeedback, getInterviewPrimaryAction, isInWorkweek, isMyInterview, isScheduleCandidateEligible, resolveScheduleCandidateId, shouldHydrateScheduleCandidate } from "./interviewViewState.js";
+import { buildWorkweekColumns, getInterviewPrimaryAction, getLocalDateInputMin, isInterviewStartStrictlyFuture, isInWorkweek, isMyInterview, isScheduleCandidateEligible, resolveScheduleCandidateId, shouldHydrateScheduleCandidate } from "./interviewViewState.js";
 
 /* feedback-draft-helpers:start */
 export const INTERVIEW_FEEDBACK_DRAFT_PREFIX = "ats.interview-feedback-draft.v1:";
@@ -78,7 +78,7 @@ export function getFeedbackSubmitError(error) {
     return "服务端草稿已在其他页面或设备更新。本机内容已保留，请刷新后核对再提交。";
   }
   if (error?.code === "invalid_state_transition") {
-    return "当前面试状态暂不允许提交反馈。面试开始后或进入待反馈状态即可提交，本机草稿已保留。";
+    return "当前面试状态暂不允许提交反馈，本机草稿已保留。请刷新面试状态后重试。";
   }
   return "网络请求失败，表单和本机草稿均已保留。请重试提交。";
 }
@@ -104,6 +104,26 @@ export function getScheduleSavedMessage(record) {
   return record
     ? "面试改期已保存；新的邀请文件可下载；通知待发送"
     : "面试安排已保存；邀请文件可下载；通知待发送";
+}
+
+export function getScheduleSubmitError(error, fallback = "面试保存失败，表单内容已保留。请检查网络后重试。") {
+  if (error?.code === "interview_time_in_past") {
+    return "面试日期和开始时间必须晚于当前时刻，请重新选择。";
+  }
+  if (error?.code === "schedule_hard_conflict") {
+    return "该时段存在面试冲突，请调整后重试。";
+  }
+  return fallback;
+}
+
+export function showInterviewDatePicker(input) {
+  if (typeof input?.showPicker !== "function") return false;
+  try {
+    input.showPicker();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function copyInterviewText(text, clipboard) {
@@ -189,7 +209,7 @@ function InterviewList({ records, status: loadStatus, error, onRetry, nextCursor
         {filtered.map((record) => {
           const primaryAction = getInterviewPrimaryAction(record, { canSchedule, userId: interviewerId });
           return <div className="interview-table-row" key={record.id}>
-            <span className="interview-person"><span>{record.candidate.slice(-1)}</span><span><strong>{record.candidate}</strong><small>{record.role}</small></span></span>
+            <button className="interview-person" type="button" aria-label={`查看${record.candidate}的面试材料与评价`} onClick={() => onFeedback(record)}><span>{record.candidate.slice(-1)}</span><span><strong>{record.candidate}</strong><small>{record.role}</small></span></button>
             <span><strong>{record.position}</strong><small>{record.round}</small></span>
             <span><strong>{record.dateLabel} {record.time}</strong><small>{record.method} · {record.duration} 分钟</small><button className="interview-calendar-action" type="button" onClick={() => onDownload(record)}><CalendarPlus size={13} />添加到日历</button></span>
             <span><strong>{record.interviewers.join("、")}</strong><small>{record.location}</small></span>
@@ -245,15 +265,17 @@ function ScheduleInterview({ record, candidateId, candidates, participantOptions
     if (!form.position.trim()) next.position = "请确认应聘职位";
     if (!form.date) next.date = "请选择日期";
     if (!form.time) next.time = "请选择开始时间";
+    else if (form.date && !isInterviewStartStrictlyFuture(form.date, form.time)) next.time = "面试日期和开始时间必须晚于当前时刻";
     setErrors(next); if (Object.keys(next).length) return;
     setStep(2);
   }
 
   async function checkConflict() {
     const next = {};
+    if (!isInterviewStartStrictlyFuture(form.date, form.time)) next.time = "面试日期和开始时间必须晚于当前时刻";
     if (!form.interviewerIds.length) next.interviewers = "至少选择一位面试官";
     if (!form.location.trim()) next.location = form.method === "视频面试" ? "请填写会议链接" : "请填写地点或联系说明";
-    setErrors(next); if (Object.keys(next).length) return;
+    setErrors(next); if (Object.keys(next).length) { if (next.time) setStep(1); return; }
     setSubmitError("");
     try {
       const result = await onCheckConflicts(record, {
@@ -267,11 +289,17 @@ function ScheduleInterview({ record, candidateId, candidates, participantOptions
       setConflict(null);
       setStep(3);
     } catch (error) {
-      if (error?.name !== "AbortError") setSubmitError("冲突检查失败，当前安排仍保留。请检查网络后重试。");
+      if (error?.name !== "AbortError") setSubmitError(getScheduleSubmitError(error, "冲突检查失败，当前安排仍保留。请检查网络后重试。"));
     }
   }
 
   async function save() {
+    if (!isInterviewStartStrictlyFuture(form.date, form.time)) {
+      setErrors((current) => ({ ...current, time: "面试日期和开始时间必须晚于当前时刻" }));
+      setSubmitError("面试日期和开始时间必须晚于当前时刻，请重新选择。");
+      setStep(1);
+      return;
+    }
     setSubmitting(true); setSubmitError("");
     try {
       await onSave(record, {
@@ -282,7 +310,7 @@ function ScheduleInterview({ record, candidateId, candidates, participantOptions
       });
       onNotify(getScheduleSavedMessage(record));
     } catch (error) {
-      if (error?.name !== "AbortError") setSubmitError(error?.code === "schedule_hard_conflict" ? "该时段存在面试冲突，请调整后重试。" : "面试保存失败，表单内容已保留。请检查网络后重试。");
+      if (error?.name !== "AbortError") setSubmitError(getScheduleSubmitError(error));
     } finally {
       setSubmitting(false);
     }
@@ -299,7 +327,7 @@ function ScheduleInterview({ record, candidateId, candidates, participantOptions
 
   return <div className="interview-page schedule-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />{backLabel}</button><div className="schedule-heading"><div><h2>{record ? "改期面试" : "安排面试"}</h2><p>{candidate?.name || "选择候选人"} · {form.position}</p></div><div className="schedule-steps">{["基础安排", "面试协同", "确认邀请"].map((label, index) => <span key={label} className={step >= index + 1 ? "active" : ""}><i>{step > index + 1 ? <Check size={13} /> : index + 1}</i>{label}</span>)}</div></div>
     <div className="schedule-layout"><main className="schedule-main">
-      {step === 1 && <section className="schedule-section"><header><CalendarDays size={19} /><div><h3>基础安排</h3><p>确认候选人、面试轮次和时间。</p></div></header><div className="schedule-grid"><label>候选人<select value={form.candidateId} disabled={Boolean(record)} onChange={(event) => { const selected = candidates.find((item) => item.id === event.target.value || item.candidateId === event.target.value); setForm((current) => ({ ...current, candidateId: event.target.value, position: selected?.position || current.position })); }}><option value="">请选择候选人</option>{candidateOptions.map((item) => <option value={item.candidateId || item.id} key={item.applicationId || item.id}>{item.name} · {item.position}</option>)}</select>{errors.candidateId && <small className="field-error">{errors.candidateId}</small>}</label><label>应聘职位<input value={form.position} onChange={(event) => update("position", event.target.value)} />{errors.position && <small className="field-error">{errors.position}</small>}</label><label>面试轮次<select value={form.round} onChange={(event) => update("round", event.target.value)}><option>电话沟通</option><option>一面</option><option>二面</option><option>终面</option><option>技术面</option></select></label><label>面试方式<select value={form.method} onChange={(event) => update("method", event.target.value)}><option>视频面试</option><option>现场面试</option><option>电话面试</option></select></label><label>时区<select value={form.timezone} onChange={(event) => update("timezone", event.target.value)}><option value="Asia/Shanghai">北京时间 GMT+8</option><option value="Asia/Singapore">新加坡 GMT+8</option></select></label><label>日期<input type="date" value={form.date} onChange={(event) => update("date", event.target.value)} />{errors.date && <small className="field-error">{errors.date}</small>}</label><label>开始时间<div className="time-select-group"><select aria-label="开始时间（小时）" value={form.time.split(":")[0]} onChange={(event) => update("time", `${event.target.value}:${form.time.split(":")[1] || "00"}`)}>{interviewHours.map((hour) => <option value={hour} key={hour}>{hour} 时</option>)}</select><span>:</span><select aria-label="开始时间（分钟）" value={form.time.split(":")[1] || "00"} onChange={(event) => update("time", `${form.time.split(":")[0] || "09"}:${event.target.value}`)}>{interviewMinutes.map((minute) => <option value={minute} key={minute}>{minute} 分</option>)}</select></div>{errors.time && <small className="field-error">{errors.time}</small>}</label><label>时长<select value={form.duration} onChange={(event) => update("duration", event.target.value)}><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></label></div><footer><button className="button primary" type="button" onClick={validateStepOne}>下一步：面试协同<ChevronRight size={16} /></button></footer></section>}
+      {step === 1 && <section className="schedule-section"><header><CalendarDays size={19} /><div><h3>基础安排</h3><p>确认候选人、面试轮次和时间。</p></div></header><div className="schedule-grid"><label>候选人<select value={form.candidateId} disabled={Boolean(record)} onChange={(event) => { const selected = candidates.find((item) => item.id === event.target.value || item.candidateId === event.target.value); setForm((current) => ({ ...current, candidateId: event.target.value, position: selected?.position || current.position })); }}><option value="">请选择候选人</option>{candidateOptions.map((item) => <option value={item.candidateId || item.id} key={item.applicationId || item.id}>{item.name} · {item.position}</option>)}</select>{errors.candidateId && <small className="field-error">{errors.candidateId}</small>}</label><label>应聘职位<input value={form.position} onChange={(event) => update("position", event.target.value)} />{errors.position && <small className="field-error">{errors.position}</small>}</label><label>面试轮次<select value={form.round} onChange={(event) => update("round", event.target.value)}><option>电话沟通</option><option>一面</option><option>二面</option><option>终面</option><option>技术面</option></select></label><label>面试方式<select value={form.method} onChange={(event) => update("method", event.target.value)}><option>视频面试</option><option>现场面试</option><option>电话面试</option></select></label><label>时区<select value={form.timezone} onChange={(event) => update("timezone", event.target.value)}><option value="Asia/Shanghai">北京时间 GMT+8</option><option value="Asia/Singapore">新加坡 GMT+8</option></select></label><label className="schedule-date-field" onClick={(event) => showInterviewDatePicker(event.currentTarget.querySelector('input[type="date"]'))}>日期<input type="date" min={getLocalDateInputMin()} value={form.date} onChange={(event) => update("date", event.target.value)} />{errors.date && <small className="field-error">{errors.date}</small>}</label><label>开始时间<div className="time-select-group"><select aria-label="开始时间（小时）" value={form.time.split(":")[0]} onChange={(event) => update("time", `${event.target.value}:${form.time.split(":")[1] || "00"}`)}>{interviewHours.map((hour) => <option value={hour} key={hour}>{hour} 时</option>)}</select><span>:</span><select aria-label="开始时间（分钟）" value={form.time.split(":")[1] || "00"} onChange={(event) => update("time", `${form.time.split(":")[0] || "09"}:${event.target.value}`)}>{interviewMinutes.map((minute) => <option value={minute} key={minute}>{minute} 分</option>)}</select></div>{errors.time && <small className="field-error">{errors.time}</small>}</label><label>时长<select value={form.duration} onChange={(event) => update("duration", event.target.value)}><option value="30">30 分钟</option><option value="45">45 分钟</option><option value="60">60 分钟</option><option value="90">90 分钟</option></select></label></div><footer><button className="button primary" type="button" onClick={validateStepOne}>下一步：面试协同<ChevronRight size={16} /></button></footer></section>}
       {step === 2 && <section className="schedule-section"><header><Users size={19} /><div><h3>面试协同</h3><p>选择面试官，并检查系统内已知冲突。</p></div></header><div className="interviewer-picker"><strong>面试官</strong><div>{participantOptions.map((person) => <label key={person.id} className={form.interviewerIds.includes(person.id) ? "selected" : ""}><input type="checkbox" checked={form.interviewerIds.includes(person.id)} onChange={() => toggleInterviewer(person.id)} /><span><UserRound size={16} /></span><strong>{person.name}</strong><small>面试参与人</small></label>)}</div>{participantStatus === "loading" && <p><RefreshCw size={14} />正在加载可选面试官</p>}{participantStatus === "error" && <p className="field-error"><CircleAlert size={14} />面试官目录加载失败，请返回后重试</p>}{participantStatus === "ready" && participantOptions.length === 0 && <p className="field-error"><CircleAlert size={14} />暂无可用面试官身份</p>}{errors.interviewers && <p className="field-error"><CircleAlert size={14} />{errors.interviewers}</p>}</div><label className="schedule-full-field">{form.method === "视频面试" ? "会议链接" : form.method === "现场面试" ? "面试地点" : "联系说明"}<input value={form.location} onChange={(event) => update("location", event.target.value)} placeholder={form.method === "视频面试" ? "https://meeting.example.com/..." : "填写地点或联系说明"} />{errors.location && <small className="field-error">{errors.location}</small>}</label>{conflict && <div className={`schedule-conflict ${conflict.type}`}><AlertTriangle size={20} /><div><strong>{conflict.type === "hard" ? "发现时间冲突" : "安排过于紧凑"}</strong><p>{conflict.message}</p>{conflict.type === "soft" && <label><input type="checkbox" checked={overrideSoft} onChange={(event) => setOverrideSoft(event.target.checked)} />确认保留该时间并继续</label>}</div></div>}{submitError && <div className="feedback-submit-error" role="alert"><CircleAlert size={18} /><p>{submitError}</p></div>}<footer><button className="button secondary" type="button" onClick={() => setStep(1)}>上一步</button><button className="button primary" type="button" disabled={participantStatus !== "ready"} onClick={() => void checkConflict()}>{conflict?.type === "soft" && overrideSoft ? "确认覆盖并继续" : "检查时间并继续"}<ChevronRight size={16} /></button></footer></section>}
       {step === 3 && <section className="schedule-section"><header><Send size={19} /><div><h3>确认邀请</h3><p>保存后生成面试官待办、邀请文本和日历文件。</p></div></header><div className="schedule-summary"><div><span>候选人</span><strong>{candidate?.name || "未选择候选人"} · {form.position}</strong></div><div><span>时间</span><strong>{form.date} {form.time} · {form.duration} 分钟</strong></div><div><span>方式</span><strong>{form.method} · {form.timezone}</strong></div><div><span>面试官</span><strong>{selectedInterviewers.map((item) => item.name).join("、")}</strong></div><div><span>地点/链接</span><strong>{form.location}</strong></div></div><div className="invitation-preview"><section><header><strong>候选人邀请文本</strong><button type="button" onClick={() => void copyInvitation(form.candidateMessage, "候选人邀请文本")}><ClipboardCopy size={14} />复制</button></header><textarea rows="4" value={form.candidateMessage} onChange={(event) => update("candidateMessage", event.target.value)} /></section><section><header><strong>面试官任务文本</strong><button type="button" onClick={() => void copyInvitation(form.interviewerMessage, "面试官任务文本")}><ClipboardCopy size={14} />复制</button></header><textarea rows="4" value={form.interviewerMessage} onChange={(event) => update("interviewerMessage", event.target.value)} /></section></div><div className="calendar-output"><CalendarDays size={18} /><div><strong>日历文件将在保存后生成</strong><span>保存成功后可从面试列表下载最新 `.ics` 文件。</span></div></div>{submitError && <div className="feedback-submit-error" role="alert"><CircleAlert size={18} /><p>{submitError}</p></div>}<footer><button className="button secondary" type="button" disabled={submitting} onClick={() => setStep(2)}>上一步</button><button className="button primary" type="button" disabled={submitting} onClick={() => void save()}><CheckCircle2 size={16} />{submitting ? "正在保存" : "确认并保存"}</button></footer></section>}
     </main><aside className="schedule-aside"><section><h3>候选人摘要</h3><strong>{candidate?.name || "待选择"}</strong><p>{candidate?.role || "当前职称未填写"} · {candidate?.company || ""}</p><p>{candidate?.summary || "候选人详情以服务端档案为准。"}</p></section><section><h3>本次安排</h3><dl><div><dt>轮次</dt><dd>{form.round}</dd></div><div><dt>时间</dt><dd>{form.date} {form.time}</dd></div><div><dt>方式</dt><dd>{form.method}</dd></div><div><dt>面试官</dt><dd>{selectedInterviewers.map((item) => item.name).join("、") || "待选择"}</dd></div></dl></section></aside></div></div>;
@@ -323,8 +351,6 @@ function FeedbackMaterials({ record, materialsState, onRetry }) {
 function FeedbackForm({ record, onBack, backLabel, onSaved, onNotify, actorName = "张小北", userId, controller }) {
   const emptyForm = { ratings: { professional: "待评价", problem: "待评价", communication: "待评价", fit: "待评价" }, strengths: "", risks: "", conclusion: "", notes: "" };
   const ownsFeedback = record.interviewerIds.includes(userId) || record.interviewers.includes(actorName);
-  const [submitEligibilityTime, setSubmitEligibilityTime] = useState(() => new Date());
-  const canSubmitFeedback = canSubmitInterviewFeedback(record, submitEligibilityTime);
   const localDraft = useMemo(() => loadInterviewFeedbackDraft(userId, record), [record, userId]);
   const [existing, setExisting] = useState(null);
   const [summaryFeedbacks, setSummaryFeedbacks] = useState([]);
@@ -340,16 +366,6 @@ function FeedbackForm({ record, onBack, backLabel, onSaved, onNotify, actorName 
   const [form, setForm] = useState(() => localDraft || emptyForm);
   const [materialsState, setMaterialsState] = useState({ status: "loading", data: null });
   const [materialsReload, setMaterialsReload] = useState(0);
-
-  useEffect(() => {
-    if (canSubmitFeedback) return undefined;
-    const startsAt = new Date(record.startsAt || "").getTime();
-    if (!Number.isFinite(startsAt)) return undefined;
-    const delay = Math.min(Math.max(startsAt - Date.now() + 100, 100), 2_147_483_647);
-    const refreshEligibility = () => setSubmitEligibilityTime(new Date());
-    const timer = window.setTimeout(refreshEligibility, delay);
-    return () => window.clearTimeout(timer);
-  }, [canSubmitFeedback, record.startsAt, submitEligibilityTime]);
 
   useEffect(() => {
     const abortController = new AbortController();
@@ -463,7 +479,7 @@ function FeedbackForm({ record, onBack, backLabel, onSaved, onNotify, actorName 
   }
   return <div className="interview-page feedback-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />{backLabel}</button><header className="feedback-header"><div className="feedback-candidate"><span>{record.candidate.slice(-1)}</span><div><div><h2>{record.candidate}</h2><StatusTag status={draftState} /></div><p>{record.position} · {record.round} · {record.dateLabel} {record.time}</p></div></div><div className="feedback-header-actions"><span><CheckCircle2 size={14} />{loading ? "正在加载反馈" : draftState}</span>{existing && !editing && ownsFeedback && <button className="button secondary" type="button" onClick={() => setEditing(true)}>修改反馈</button>}</div></header>
     <div className="feedback-layout"><main className="feedback-main"><FeedbackMaterials record={record} materialsState={materialsState} onRetry={() => setMaterialsReload((value) => value + 1)} />
-      <section className="feedback-form-section"><header><h3>结构化评价</h3><p>仅当前面试官可编辑自己的草稿和反馈。</p></header>{dimensions.map(([key, label]) => <div className="rating-row" key={key}><strong>{label}<span>*</span></strong><div>{ratingOptions.slice(1).map((option) => <button type="button" disabled={!editing || submitting} className={form.ratings[key] === option ? "active" : ""} key={option} onClick={() => rate(key, option)}>{option}</button>)}</div>{errors[key] && <small className="field-error">{errors[key]}</small>}</div>)}<label>候选人优点 <span>*</span><textarea disabled={!editing || submitting} rows="4" value={form.strengths} onChange={(event) => update("strengths", event.target.value)} placeholder="记录与岗位相关的优势和证据" />{errors.strengths && <small className="field-error">{errors.strengths}</small>}</label><label>风险与待确认项 <span>*</span><textarea disabled={!editing || submitting} rows="4" value={form.risks} onChange={(event) => update("risks", event.target.value)} placeholder="记录风险、信息缺口或后续建议" />{errors.risks && <small className="field-error">{errors.risks}</small>}</label><div className="feedback-conclusion"><strong>面试结论 <span>*</span></strong><div>{["强烈推荐", "推荐", "保留", "不推荐"].map((option) => <button type="button" disabled={!editing || submitting} className={form.conclusion === option ? "active" : ""} key={option} onClick={() => update("conclusion", option)}>{option}</button>)}</div>{errors.conclusion && <small className="field-error">{errors.conclusion}</small>}</div><label>补充说明<textarea disabled={!editing || submitting} rows="3" value={form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="可选：给 HR 或下一轮面试官的建议" /></label>{existing && editing && <label className="edit-reason">修改原因 <span>*</span><input disabled={submitting} value={editReason} onChange={(event) => { setEditReason(event.target.value); setErrors((current) => ({ ...current, editReason: "" })); }} placeholder="说明为什么需要修改已提交反馈" />{errors.editReason && <small className="field-error">{errors.editReason}</small>}</label>}{submitError && <div className="feedback-submit-error" role="alert"><CircleAlert size={18} /><div><strong>反馈请求失败</strong><p>{submitError}</p></div><button type="button" disabled={submitting || loading} onClick={() => void submit()}><RefreshCw size={14} />重试提交</button></div>}{editing && <footer><span><Check size={14} />{draftState}</span>{!canSubmitFeedback && <span className="feedback-submit-gate" role="status"><Clock3 size={14} />面试开始后可提交</span>}<button className="button primary" type="button" disabled={submitting || loading || !ownsFeedback || !canSubmitFeedback} onClick={() => void submit()}><Send size={16} />{submitting ? "正在提交" : canSubmitFeedback ? "提交反馈" : "面试开始后可提交"}</button></footer>}</section></main><aside className="feedback-aside"><section><h3>面试信息</h3><dl><div><dt>方式</dt><dd>{record.method}</dd></div><div><dt>时长</dt><dd>{record.duration} 分钟</dd></div><div><dt>面试官</dt><dd>{record.interviewers.join("、")}</dd></div><div><dt>负责人</dt><dd>{record.owner}</dd></div></dl></section><section><h3>提交后</h3><p>HR 将汇总本轮反馈，并决定推进、追加面试、淘汰或加入人才库。</p></section>{!ownsFeedback && <section className="permission-note"><AlertTriangle size={17} /><div><strong>只读反馈</strong><p>你不是该面试的反馈参与人。</p></div></section>}</aside></div></div>;
+      <section className="feedback-form-section"><header><h3>结构化评价</h3><p>仅当前面试官可编辑自己的草稿和反馈。</p></header>{dimensions.map(([key, label]) => <div className="rating-row" key={key}><strong>{label}<span>*</span></strong><div>{ratingOptions.slice(1).map((option) => <button type="button" disabled={!editing || submitting} className={form.ratings[key] === option ? "active" : ""} key={option} onClick={() => rate(key, option)}>{option}</button>)}</div>{errors[key] && <small className="field-error">{errors[key]}</small>}</div>)}<label>候选人优点 <span>*</span><textarea disabled={!editing || submitting} rows="4" value={form.strengths} onChange={(event) => update("strengths", event.target.value)} placeholder="记录与岗位相关的优势和证据" />{errors.strengths && <small className="field-error">{errors.strengths}</small>}</label><label>风险与待确认项 <span>*</span><textarea disabled={!editing || submitting} rows="4" value={form.risks} onChange={(event) => update("risks", event.target.value)} placeholder="记录风险、信息缺口或后续建议" />{errors.risks && <small className="field-error">{errors.risks}</small>}</label><div className="feedback-conclusion"><strong>面试结论 <span>*</span></strong><div>{["强烈推荐", "推荐", "保留", "不推荐"].map((option) => <button type="button" disabled={!editing || submitting} className={form.conclusion === option ? "active" : ""} key={option} onClick={() => update("conclusion", option)}>{option}</button>)}</div>{errors.conclusion && <small className="field-error">{errors.conclusion}</small>}</div><label>补充说明<textarea disabled={!editing || submitting} rows="3" value={form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="可选：给 HR 或下一轮面试官的建议" /></label>{existing && editing && <label className="edit-reason">修改原因 <span>*</span><input disabled={submitting} value={editReason} onChange={(event) => { setEditReason(event.target.value); setErrors((current) => ({ ...current, editReason: "" })); }} placeholder="说明为什么需要修改已提交反馈" />{errors.editReason && <small className="field-error">{errors.editReason}</small>}</label>}{submitError && <div className="feedback-submit-error" role="alert"><CircleAlert size={18} /><div><strong>反馈请求失败</strong><p>{submitError}</p></div><button type="button" disabled={submitting || loading} onClick={() => void submit()}><RefreshCw size={14} />重试提交</button></div>}{editing && <footer><span><Check size={14} />{draftState}</span><button className="button primary" type="button" disabled={submitting || loading || !ownsFeedback} onClick={() => void submit()}><Send size={16} />{submitting ? "正在提交" : "提交反馈"}</button></footer>}</section></main><aside className="feedback-aside"><section><h3>面试信息</h3><dl><div><dt>方式</dt><dd>{record.method}</dd></div><div><dt>时长</dt><dd>{record.duration} 分钟</dd></div><div><dt>面试官</dt><dd>{record.interviewers.join("、")}</dd></div><div><dt>负责人</dt><dd>{record.owner}</dd></div></dl></section><section><h3>提交后</h3><p>HR 将汇总本轮反馈，并决定推进、追加面试、淘汰或加入人才库。</p></section>{!ownsFeedback && <section className="permission-note"><AlertTriangle size={17} /><div><strong>只读反馈</strong><p>你不是该面试的反馈参与人。</p></div></section>}</aside></div></div>;
 }
 
 export function InterviewsWorkspace({ mode, setMode, selectedInterviewId, setSelectedInterviewId, scheduleCandidateId, records, status, error, onRetry, nextCursor, loadingMore, onLoadMore, candidates, onNotify, onBack, backLabel = "返回面试列表", onOpenSubView, onRecordsChanged, canSchedule = true, actorName = "张小北", actorId, controller }) {

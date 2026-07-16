@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
@@ -721,6 +722,25 @@ def test_create_rejects_same_candidate_overlap_with_different_interviewer(tmp_pa
     assert response.json()["code"] == "schedule_hard_conflict"
 
 
+def test_create_interview_rejects_a_past_start_time(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    past_start = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/interviews",
+            json=interview_payload(seed, starts_at=past_start),
+            headers={
+                **login(client, "interview-admin@example.test"),
+                "Idempotency-Key": "past-interview-create",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "interview_time_in_past"
+
+
 def test_new_interview_conflicts_report_hard_candidate_overlap(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
@@ -902,6 +922,55 @@ def test_reschedule_rejects_same_candidate_overlap_with_different_interviewer(tm
 
     assert response.status_code == 409
     assert response.json()["code"] == "schedule_hard_conflict"
+
+
+def test_reschedule_rejects_a_past_start_time(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    past_start = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    with TestClient(app) as client:
+        created, admin_headers = create_interview(client, seed, key="past-reschedule-create")
+        response = client.patch(
+            f"/api/v1/interviews/{created.json()['data']['id']}",
+            json={
+                "starts_at": past_start.isoformat(),
+                "ends_at": (past_start + timedelta(minutes=45)).isoformat(),
+            },
+            headers={**admin_headers, "If-Match": '"1"'},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["code"] == "interview_time_in_past"
+
+
+def test_conflict_preflights_reject_a_past_start_time(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    past_start = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+    with TestClient(app) as client:
+        created, admin_headers = create_interview(client, seed, key="past-preflight-create")
+        schedule = {
+            "starts_at": past_start.isoformat(),
+            "ends_at": (past_start + timedelta(minutes=45)).isoformat(),
+            "participant_ids": [str(seed["interviewer_id"])],
+            "buffer_minutes": 15,
+        }
+        new_interview = client.post(
+            "/api/v1/interview-conflicts",
+            json={**schedule, "application_id": str(seed["application_id"])},
+            headers=admin_headers,
+        )
+        existing_interview = client.post(
+            f"/api/v1/interviews/{created.json()['data']['id']}/conflicts",
+            json=schedule,
+            headers=admin_headers,
+        )
+
+    for response in (new_interview, existing_interview):
+        assert response.status_code == 422
+        assert response.json()["code"] == "interview_time_in_past"
 
 
 def test_reschedule_preserves_history_and_transition_calendar_versions(tmp_path) -> None:
@@ -1191,11 +1260,14 @@ def test_feedback_is_private_idempotent_and_advances_only_after_all_required_sub
         assert all(item.status == "submitted" for item in feedbacks)
 
 
-def test_assigned_participant_can_open_feedback_after_a_scheduled_interview_starts(tmp_path) -> None:
+@pytest.mark.parametrize("interview_status", ["scheduled", "rescheduled", "confirmed"])
+def test_assigned_participant_can_save_and_submit_feedback_for_a_future_interview(
+    tmp_path, interview_status
+) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
     manager_id = seed_user(app, "hiring_manager", "feedback-manager@example.test")
-    start = datetime.now(timezone.utc) - timedelta(minutes=30)
+    start = datetime.now(timezone.utc) + timedelta(hours=2)
     payload = interview_payload(seed, starts_at=start)
     payload["participants"] = [
         {
@@ -1208,23 +1280,75 @@ def test_assigned_participant_can_open_feedback_after_a_scheduled_interview_star
         created, _ = create_interview(
             client,
             seed,
-            key="started-interview-create",
+            key=f"future-{interview_status}-interview-create",
             payload=payload,
         )
         interview_id = created.json()["data"]["id"]
+        admin_headers = login(client, "interview-admin@example.test")
+        if interview_status == "rescheduled":
+            changed_start = start + timedelta(hours=1)
+            rescheduled = client.patch(
+                f"/api/v1/interviews/{interview_id}",
+                json={
+                    "starts_at": changed_start.isoformat(),
+                    "ends_at": (changed_start + timedelta(minutes=45)).isoformat(),
+                },
+                headers={**admin_headers, "If-Match": '"1"'},
+            )
+            assert rescheduled.status_code == 200
+            assert rescheduled.json()["data"]["status"] == "rescheduled"
+        elif interview_status == "confirmed":
+            confirmed = client.post(
+                f"/api/v1/interviews/{interview_id}/transitions",
+                json={"target": "confirmed"},
+                headers={
+                    **admin_headers,
+                    "If-Match": '"1"',
+                    "Idempotency-Key": "future-feedback-confirm",
+                },
+            )
+            assert confirmed.status_code == 200
+            assert confirmed.json()["data"]["status"] == "confirmed"
         participant_headers = login(client, "feedback-manager@example.test")
-        saved = client.put(
+        created_feedback = client.put(
             f"/api/v1/interviews/{interview_id}/my-feedback",
             json=feedback_payload(),
             headers={**participant_headers, "If-Match": '"0"'},
         )
+        with app.state.identity_store.sync_session() as database:
+            assert database.get(Interview, UUID(interview_id)).status == interview_status
+        if interview_status == "scheduled":
+            admin_headers = login(client, "interview-admin@example.test")
+            changed_start = start + timedelta(hours=1)
+            rescheduled_after_draft = client.patch(
+                f"/api/v1/interviews/{interview_id}",
+                json={
+                    "starts_at": changed_start.isoformat(),
+                    "ends_at": (changed_start + timedelta(minutes=45)).isoformat(),
+                },
+                headers={**admin_headers, "If-Match": '"1"'},
+            )
+            assert rescheduled_after_draft.status_code == 200
+            assert rescheduled_after_draft.json()["data"]["status"] == "rescheduled"
+            participant_headers = login(client, "feedback-manager@example.test")
+        saved = client.put(
+            f"/api/v1/interviews/{interview_id}/my-feedback",
+            json=feedback_payload("strong_recommend"),
+            headers={**participant_headers, "If-Match": '"1"'},
+        )
         submitted = client.post(
             f"/api/v1/interviews/{interview_id}/my-feedback/submit",
-            headers={**participant_headers, "Idempotency-Key": "started-feedback-submit"},
+            headers={
+                **participant_headers,
+                "Idempotency-Key": f"future-{interview_status}-feedback-submit",
+            },
         )
 
+    assert created_feedback.status_code == 200
     assert saved.status_code == 200
+    assert saved.json()["data"]["version"] == 2
     assert submitted.status_code == 200
+    assert submitted.json()["data"]["status"] == "submitted"
     with app.state.identity_store.sync_session() as database:
         interview = database.get(Interview, UUID(interview_id))
         application = database.get(Application, seed["application_id"])
@@ -1242,43 +1366,6 @@ def test_assigned_participant_can_open_feedback_after_a_scheduled_interview_star
                 AuditLog.event_type == "interview.feedback_opened",
             )
         ) is not None
-
-
-def test_assigned_participant_cannot_open_feedback_before_the_interview_starts(tmp_path) -> None:
-    app = make_app(tmp_path)
-    seed = seed_application(app)
-    manager_id = seed_user(app, "hiring_manager", "future-feedback-manager@example.test")
-    start = datetime.now(timezone.utc) + timedelta(hours=2)
-    payload = interview_payload(seed, starts_at=start)
-    payload["participants"] = [
-        {
-            "user_id": str(manager_id),
-            "role": "interviewer",
-            "required_feedback": True,
-        }
-    ]
-    with TestClient(app) as client:
-        created, _ = create_interview(
-            client,
-            seed,
-            key="upcoming-interview-create",
-            payload=payload,
-        )
-        interview_id = created.json()["data"]["id"]
-        participant_headers = login(client, "future-feedback-manager@example.test")
-        saved = client.put(
-            f"/api/v1/interviews/{interview_id}/my-feedback",
-            json=feedback_payload(),
-            headers={**participant_headers, "If-Match": '"0"'},
-        )
-
-    assert saved.status_code == 409
-    assert saved.json()["code"] == "invalid_state_transition"
-    with app.state.identity_store.sync_session() as database:
-        assert database.get(Interview, UUID(interview_id)).status == "scheduled"
-        assert database.scalar(
-            select(InterviewFeedback).where(InterviewFeedback.interview_id == UUID(interview_id))
-        ) is None
 
 
 def test_submitted_feedback_amendment_requires_its_author_reason_and_version(tmp_path) -> None:

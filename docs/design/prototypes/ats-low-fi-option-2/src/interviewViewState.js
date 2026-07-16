@@ -5,6 +5,17 @@ function localDateKey(value) {
   return `${year}-${month}-${day}`;
 }
 
+export function getLocalDateInputMin(reference = new Date()) {
+  return localDateKey(reference);
+}
+
+export function isInterviewStartStrictlyFuture(date, time, now = new Date()) {
+  if (!date || !time) return false;
+  const startsAt = new Date(`${date}T${time}:00`).getTime();
+  const reference = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  return Number.isFinite(startsAt) && Number.isFinite(reference) && startsAt > reference;
+}
+
 export function buildWorkweekColumns(reference = new Date()) {
   const today = new Date(reference.getFullYear(), reference.getMonth(), reference.getDate());
   const monday = new Date(today);
@@ -31,15 +42,9 @@ export function isMyInterview(record, userId) {
   return Boolean(userId && Array.isArray(record?.interviewerIds) && record.interviewerIds.includes(userId));
 }
 
-function interviewHasStarted(record, now = new Date()) {
-  const startsAt = new Date(record?.startsAt || "").getTime();
-  const reference = now instanceof Date ? now.getTime() : new Date(now).getTime();
-  return Number.isFinite(startsAt) && Number.isFinite(reference) && startsAt <= reference;
-}
-
-export function canSubmitInterviewFeedback(record, now = new Date()) {
+export function canSubmitInterviewFeedback(record) {
   if (record?.feedbackStatus === "待反馈") return true;
-  return ["待确认", "已安排", "已确认"].includes(record?.status) && interviewHasStarted(record, now);
+  return ["待确认", "已安排", "已确认"].includes(record?.status);
 }
 
 export function getInterviewPrimaryAction(record, { canSchedule = true, userId = "", now = new Date() } = {}) {

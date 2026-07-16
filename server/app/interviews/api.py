@@ -65,6 +65,10 @@ class ScheduleConflict(Exception):
         super().__init__(kind)
 
 
+class InterviewTimeInPast(Exception):
+    pass
+
+
 def _advance_application_to_interviewing(db, application, *, principal, trace_id):
     if application.stage not in INTERVIEW_SCHEDULABLE_STAGES:
         raise InvalidStateTransition
@@ -116,6 +120,10 @@ def _expected_version(request: Request, value: str | None) -> int | JSONResponse
 
 def _aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _interview_time_in_past(value: datetime) -> bool:
+    return _aware(value).astimezone(timezone.utc) <= datetime.now(timezone.utc)
 
 
 def _has_assignment_access(principal: Principal) -> bool:
@@ -718,6 +726,8 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                     raise InvalidStateTransition
                 if not _lock_participants(db, principal.organization_id, participant_ids):
                     raise InvalidStateTransition
+                if _interview_time_in_past(payload.starts_at):
+                    raise InterviewTimeInPast
                 calendar_organizer, calendar_attendees = _calendar_contact_snapshot(
                     db,
                     principal.organization_id,
@@ -826,6 +836,9 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                 f"schedule_{error.kind}_conflict",
                 "One or more interviewers are unavailable.",
             )
+        except InterviewTimeInPast:
+            db.rollback()
+            return problem(request, 422, "interview_time_in_past", "The interview must start in the future.")
         except CandidateUnavailable:
             db.rollback()
             return _denied(request)
@@ -888,6 +901,8 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
         ends_at = payload.ends_at or _aware(interview.ends_at)
         if ends_at <= starts_at:
             return problem(request, 422, "validation_failed", "ends_at must be after starts_at.")
+        if _interview_time_in_past(starts_at):
+            return problem(request, 422, "interview_time_in_past", "The interview must start in the future.")
         final_method = changes.get("method", interview.method)
         final_location = changes.get("location", interview.location)
         final_meeting_url = changes.get("meeting_url", interview.meeting_url)
@@ -1011,6 +1026,8 @@ def check_new_interview_conflicts(payload: NewInterviewConflictInput, request: R
             return _denied(request)
         if not _validate_participants(db, principal.organization_id, payload.participant_ids):
             return _denied(request)
+        if _interview_time_in_past(payload.starts_at):
+            return problem(request, 422, "interview_time_in_past", "The interview must start in the future.")
         hard, soft = _schedule_conflicts(
             db,
             principal.organization_id,
@@ -1034,6 +1051,8 @@ def check_conflicts(interview_id: UUID, payload: ScheduleInput, request: Request
             return _denied(request)
         if not _validate_participants(db, principal.organization_id, payload.participant_ids):
             return _denied(request)
+        if _interview_time_in_past(payload.starts_at):
+            return problem(request, 422, "interview_time_in_past", "The interview must start in the future.")
         application = db.get(Application, interview.application_id)
         hard, soft = _schedule_conflicts(
             db,
@@ -1434,10 +1453,7 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
         if participant is None:
             return _denied(request)
         now = datetime.now(timezone.utc)
-        can_open_feedback = (
-            locked_interview.status in {"scheduled", "rescheduled", "confirmed"}
-            and _aware(locked_interview.starts_at) <= now
-        )
+        can_open_feedback = locked_interview.status in {"scheduled", "rescheduled", "confirmed"}
         if locked_interview.status != "pending_feedback" and not can_open_feedback:
             return problem(request, 409, "invalid_state_transition", "Feedback is not open for this interview.")
         feedback = db.scalar(
@@ -1454,9 +1470,6 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
                 return problem(request, 409, "resource_version_conflict", "The feedback draft changed. Refresh and retry.")
             if can_open_feedback:
                 source_status = locked_interview.status
-                locked_interview.status = "pending_feedback"
-                locked_interview.version += 1
-                locked_interview.updated_at = now
                 db.add(
                     InterviewEvent(
                         organization_id=principal.organization_id,
@@ -1486,7 +1499,7 @@ def put_my_feedback(interview_id: UUID, payload: FeedbackDraft, request: Request
             )
             db.add(feedback)
         else:
-            if locked_interview.status != "pending_feedback":
+            if locked_interview.status != "pending_feedback" and not can_open_feedback:
                 return problem(request, 409, "invalid_state_transition", "Feedback is not open for this interview.")
             if feedback.status != "draft":
                 return problem(request, 409, "feedback_already_submitted", "Submitted feedback cannot be overwritten.")
@@ -1534,7 +1547,8 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                 if (
                     locked_interview is None
                     or locked_interview.application_id != application_id
-                    or locked_interview.status != "pending_feedback"
+                    or locked_interview.status
+                    not in {"scheduled", "rescheduled", "confirmed", "pending_feedback"}
                 ):
                     raise InvalidStateTransition
                 locked_participant = _assigned_participant(

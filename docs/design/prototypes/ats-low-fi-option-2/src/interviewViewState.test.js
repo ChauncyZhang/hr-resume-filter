@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildWorkweekColumns, canSubmitInterviewFeedback, getInterviewPrimaryAction, isInWorkweek, isMyInterview, isScheduleCandidateEligible, mergeScheduleCandidateOptions, resolveScheduleCandidateId, shouldHydrateScheduleCandidate } from "./interviewViewState.js";
+import * as interviewViewState from "./interviewViewState.js";
+
+const { buildWorkweekColumns, canSubmitInterviewFeedback, getInterviewPrimaryAction, getLocalDateInputMin, isInterviewStartStrictlyFuture, isInWorkweek, isMyInterview, isScheduleCandidateEligible, mergeScheduleCandidateOptions, resolveScheduleCandidateId, shouldHydrateScheduleCandidate } = interviewViewState;
 
 test("workweek columns follow the current Monday through Friday across month boundaries", () => {
   const columns = buildWorkweekColumns(new Date("2026-08-01T09:00:00+08:00"));
@@ -48,8 +50,8 @@ test("only interview-ready applications can continue to scheduling", () => {
   assert.equal(isScheduleCandidateEligible({ stage: "待决策" }), false);
 });
 
-test("an assigned hiring manager gets a feedback task once the interview starts", () => {
-  const record = { interviewerIds: ["manager-1"], status: "已安排", feedbackStatus: "未开始", startsAt: "2026-07-16T02:00:00Z" };
+test("an assigned hiring manager can submit feedback for a future scheduled interview", () => {
+  const record = { interviewerIds: ["manager-1"], status: "已安排", feedbackStatus: "未开始", startsAt: "2026-07-16T04:00:00Z" };
 
   assert.deepEqual(
     getInterviewPrimaryAction(record, { canSchedule: false, userId: "manager-1", now: new Date("2026-07-16T03:00:00Z") }),
@@ -58,14 +60,29 @@ test("an assigned hiring manager gets a feedback task once the interview starts"
   assert.equal(canSubmitInterviewFeedback(record, new Date("2026-07-16T03:00:00Z")), true);
 });
 
-test("an upcoming assigned interview opens materials but cannot submit feedback yet", () => {
-  const record = { interviewerIds: ["manager-1"], status: "已安排", feedbackStatus: "未开始", startsAt: "2026-07-16T04:00:00Z" };
+test("an assigned hiring manager can submit feedback for a future confirmed interview", () => {
+  const record = { interviewerIds: ["manager-1"], status: "已确认", feedbackStatus: "未开始", startsAt: "2026-07-17T04:00:00Z" };
 
   assert.deepEqual(
     getInterviewPrimaryAction(record, { canSchedule: false, userId: "manager-1", now: new Date("2026-07-16T03:00:00Z") }),
-    { kind: "feedback", label: "查看材料" },
+    { kind: "feedback", label: "填写评价" },
   );
-  assert.equal(canSubmitInterviewFeedback(record, new Date("2026-07-16T03:00:00Z")), false);
+  assert.equal(canSubmitInterviewFeedback(record, new Date("2026-07-16T03:00:00Z")), true);
+});
+
+test("schedule dates use the browser-local current day as their minimum", () => {
+  assert.equal(typeof getLocalDateInputMin, "function");
+  assert.equal(getLocalDateInputMin(new Date(2026, 6, 16, 23, 59)), "2026-07-16");
+});
+
+test("schedule date and time must be strictly later than now", () => {
+  const now = new Date(2026, 6, 16, 10, 30, 0);
+
+  assert.equal(typeof isInterviewStartStrictlyFuture, "function");
+  assert.equal(isInterviewStartStrictlyFuture("2026-07-16", "10:45", now), true);
+  assert.equal(isInterviewStartStrictlyFuture("2026-07-16", "10:30", now), false);
+  assert.equal(isInterviewStartStrictlyFuture("2026-07-16", "10:15", now), false);
+  assert.equal(isInterviewStartStrictlyFuture("", "10:45", now), false);
 });
 
 test("recruiting management actions remain available to an unassigned administrator", () => {

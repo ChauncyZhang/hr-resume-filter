@@ -17,6 +17,9 @@ const {
   resolveInterviewFeedbackDraft,
   saveInterviewFeedbackDraft,
 } = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { clearInterviewFeedbackDraft, getFeedbackSubmitError, getInterviewFeedbackDraftKey, isAmbiguousFeedbackSubmitError, loadInterviewFeedbackDraft, resolveInterviewFeedbackDraft, saveInterviewFeedbackDraft }; })()`);
+const scheduleHelpersSource = source.match(/\/\* interview-schedule-helpers:start \*\/([\s\S]*?)\/\* interview-schedule-helpers:end \*\//)?.[1];
+assert.ok(scheduleHelpersSource, "InterviewViews.jsx must expose the schedule helper block");
+const scheduleHelpers = vm.runInNewContext(`(() => { ${scheduleHelpersSource.replaceAll("export ", "")} return { getScheduleSubmitError: typeof getScheduleSubmitError === "function" ? getScheduleSubmitError : undefined, showInterviewDatePicker: typeof showInterviewDatePicker === "function" ? showInterviewDatePicker : undefined }; })()`);
 
 function createStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -92,8 +95,25 @@ test("feedback version conflicts explain that the local draft was preserved", ()
 test("invalid feedback state transitions explain when submission becomes available", () => {
   assert.equal(
     getFeedbackSubmitError({ code: "invalid_state_transition" }),
-    "当前面试状态暂不允许提交反馈。面试开始后或进入待反馈状态即可提交，本机草稿已保留。",
+    "当前面试状态暂不允许提交反馈，本机草稿已保留。请刷新面试状态后重试。",
   );
+});
+
+test("a server rejection for a past interview time is explained in Chinese", () => {
+  assert.equal(typeof scheduleHelpers.getScheduleSubmitError, "function");
+  assert.equal(
+    scheduleHelpers.getScheduleSubmitError({ code: "interview_time_in_past" }),
+    "面试日期和开始时间必须晚于当前时刻，请重新选择。",
+  );
+});
+
+test("date picker enhancement calls showPicker and tolerates unsupported browsers", () => {
+  let called = 0;
+  assert.equal(typeof scheduleHelpers.showInterviewDatePicker, "function");
+  assert.equal(scheduleHelpers.showInterviewDatePicker({ showPicker() { called += 1; } }), true);
+  assert.equal(called, 1);
+  assert.equal(scheduleHelpers.showInterviewDatePicker({}), false);
+  assert.equal(scheduleHelpers.showInterviewDatePicker({ showPicker() { throw new Error("unsupported"); } }), false);
 });
 
 test("feedback submit retry distinguishes ambiguous transport failures", () => {
@@ -118,13 +138,24 @@ test("the interview table treats calendar export as a secondary utility instead 
   assert.match(stylesSource, /\.interview-primary-action\s*\{[^}]*font-weight:\s*600/s);
 });
 
-test("assigned participants can edit future interview drafts while submission stays gated", () => {
-  assert.match(source, /const canSubmitFeedback = canSubmitInterviewFeedback\(record, submitEligibilityTime\)/);
-  assert.match(source, /setSubmitEligibilityTime\(new Date\(\)\)/);
-  assert.match(source, /window\.setTimeout\(refreshEligibility, delay\)/);
+test("the candidate cell is an explicit keyboard-operable materials and feedback entry", () => {
+  assert.match(source, /<button className="interview-person" type="button" aria-label=\{`查看\$\{record\.candidate\}的面试材料与评价`\} onClick=\{\(\) => onFeedback\(record\)\}>/);
+  assert.match(stylesSource, /\.interview-person\s*\{[^}]*cursor:\s*pointer/s);
+  assert.match(stylesSource, /\.interview-person:focus-visible\s*\{/);
+  assert.match(source, /\(!\(mineOnly \|\| !canSchedule\) \|\| isMyInterview\(item, interviewerId\)\)/);
+});
+
+test("assigned participants can submit feedback before a scheduled or confirmed interview starts", () => {
   assert.match(source, /const \[editing, setEditing\] = useState\(ownsFeedback\)/);
-  assert.match(source, /disabled=\{submitting \|\| loading \|\| !ownsFeedback \|\| !canSubmitFeedback\}/);
-  assert.match(source, /canSubmitFeedback \? "提交反馈" : "面试开始后可提交"/);
-  assert.match(source, /className="feedback-submit-gate"[^>]*role="status"/);
-  assert.doesNotMatch(source, /textarea disabled=\{[^}]*!canSubmitFeedback/);
+  assert.match(source, /disabled=\{submitting \|\| loading \|\| !ownsFeedback\}/);
+  assert.doesNotMatch(source, /submitEligibilityTime|feedback-submit-gate|面试开始后可提交/);
+});
+
+test("the full date field opens the native picker and enforces a local-today minimum", () => {
+  assert.match(source, /<label className="schedule-date-field" onClick=\{\(event\) => showInterviewDatePicker\(event\.currentTarget\.querySelector\('input\[type="date"\]'\)\)\}>/);
+  assert.match(source, /<input type="date" min=\{getLocalDateInputMin\(\)\}/);
+});
+
+test("schedule validation rejects a date and time that is not strictly in the future", () => {
+  assert.match(source, /else if \(form\.date && !isInterviewStartStrictlyFuture\(form\.date, form\.time\)\) next\.time = "面试日期和开始时间必须晚于当前时刻"/);
 });
