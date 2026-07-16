@@ -125,7 +125,7 @@ test("new jobs default to the standard process and manage departments navigates 
     await page.goto(baseUrl);
     await page.getByRole("button", { name: "职位", exact: true }).click();
     await page.getByRole("button", { name: "新建职位", exact: true }).click();
-    assert.equal(await page.getByRole("heading", { name: "招聘配置", exact: true }).count(), 1);
+    await page.getByRole("heading", { name: "招聘配置", exact: true }).waitFor();
     const departmentSelect = page.getByLabel("所属部门", { exact: true });
     await departmentSelect.locator("option", { hasText: "技术部" }).waitFor({ state: "attached" });
     assert.deepEqual(await departmentSelect.locator("option").allTextContents(), ["未分配部门", "技术部"]);
@@ -134,8 +134,34 @@ test("new jobs default to the standard process and manage departments navigates 
     assert.equal(await process.inputValue(), "标准社招流程");
     assert.match(await page.getByText("阶段摘要", { exact: true }).locator("..").textContent(), /新简历.*待复核.*面试.*待决策/s);
     assert.match(await page.getByText("AI 简历评估", { exact: true }).locator("..").textContent(), /规则评分后补充匹配分、结论和理由/);
+    await page.getByLabel("职位名称", { exact: true }).fill("平台工程师");
     await page.getByRole("button", { name: /管理部门/ }).click();
     await page.getByRole("heading", { name: "组织与权限", exact: true }).waitFor();
+    assert.equal(new URL(page.url()).pathname, "/settings/organization/departments");
     assert.equal(await page.getByRole("tab", { name: "部门", exact: true }).getAttribute("aria-selected"), "true");
+    await page.getByRole("button", { name: "返回职位编辑", exact: true }).click();
+    await page.getByRole("heading", { name: "招聘配置", exact: true }).waitFor();
+    assert.equal(new URL(page.url()).pathname, "/jobs/new");
+    assert.equal(await page.getByLabel("职位名称", { exact: true }).inputValue(), "平台工程师");
+  } finally { await context.close(); }
+});
+
+test("candidate deep links restore tabs and URL filters while browser history follows shell navigation", { timeout: 60_000 }, async () => {
+  const { context, page } = await openPage();
+  try {
+    await page.goto(`${baseUrl}candidates/CAN-001?tab=timeline`);
+    await page.getByRole("heading", { name: "候选人详情", exact: true }).waitFor();
+    assert.equal(await page.getByRole("button", { name: "时间线", exact: true }).getAttribute("class"), "active");
+    await page.getByRole("button", { name: "返回候选人列表", exact: true }).click();
+    await page.getByRole("heading", { name: "候选人", exact: true, level: 1 }).waitFor();
+    assert.equal(new URL(page.url()).pathname, "/candidates");
+    await page.getByLabel("阶段筛选", { exact: true }).selectOption("待复核");
+    assert.equal(new URL(page.url()).searchParams.get("stage"), "待复核");
+    await page.getByRole("button", { name: "职位", exact: true }).click();
+    await page.getByRole("heading", { name: "职位", exact: true }).waitFor();
+    assert.equal(new URL(page.url()).pathname, "/jobs");
+    await page.goBack();
+    await page.getByRole("heading", { name: "候选人", exact: true, level: 1 }).waitFor();
+    assert.equal(new URL(page.url()).searchParams.get("stage"), "待复核");
   } finally { await context.close(); }
 });

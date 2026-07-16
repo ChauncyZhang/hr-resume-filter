@@ -185,7 +185,7 @@ test("workbench shell keeps real tasks accessible across loading and narrow layo
 
   assert.match(appSource, /className="page-body workbench-skeleton" role="status" aria-live="polite"/);
   assert.match(appSource, /aria-pressed=\{activeWorkbenchJob\.id === job\.id\}/);
-  assert.match(appSource, /setCandidatePreset\(\{ jobId: activeWorkbenchJob\.id, position: activeWorkbenchJob\.name, stage: name \}\)/);
+  assert.match(appSource, /navigate\(candidateListPath\(\{ jobId: activeWorkbenchJob\.id, stage: name \}\)\)/);
   assert.match(appSource, /candidateOrigin\?\.activeNav === "工作台" \? "返回工作台"/);
   assert.match(appSource, /role="alert"/);
   assert.doesNotMatch(appSource, /面试日历（未来 7 天）<\/h3><button/);

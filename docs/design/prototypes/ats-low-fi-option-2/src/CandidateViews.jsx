@@ -89,13 +89,13 @@ function StageTag({ stage }) {
   return <span className={`candidate-stage ${terminal ? "terminal" : ""}`}>{stage}</span>;
 }
 
-function CandidateList({ controller, onOpen, initialFilters }) {
-  const [query, setQuery] = useState("");
+function CandidateList({ controller, onOpen, filters = {}, onFiltersChange = () => {} }) {
+  const [query, setQuery] = useState(filters.q || "");
   const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [position, setPosition] = useState("全部职位");
-  const [stage, setStage] = useState(initialFilters?.stage || "全部阶段");
-  const [owner, setOwner] = useState("全部负责人");
-  const [minScore, setMinScore] = useState("不限分数");
+  const [position, setPosition] = useState(filters.jobId || "全部职位");
+  const [stage, setStage] = useState(filters.stage || "全部阶段");
+  const [owner, setOwner] = useState(filters.ownerId || "全部负责人");
+  const [minScore, setMinScore] = useState(filters.minScore || "不限分数");
   const [records, setRecords] = useState([]);
   const [ownerOptions, setOwnerOptions] = useState([]);
   const [jobs, setJobs] = useState([]);
@@ -124,14 +124,15 @@ function CandidateList({ controller, onOpen, initialFilters }) {
   }, [controller]);
 
   useEffect(() => {
-    setStage(initialFilters?.stage || "全部阶段");
-    if (jobsReady || (!initialFilters?.jobId && (!initialFilters?.position || initialFilters.position === "全部职位"))) {
-      setPosition(resolveCandidateJobPreset(jobs, initialFilters));
-    }
-  }, [initialFilters, jobs, jobsReady]);
+    setQuery(filters.q || "");
+    setStage(filters.stage || "全部阶段");
+    setOwner(filters.ownerId || "全部负责人");
+    setMinScore(filters.minScore || "不限分数");
+    if (jobsReady || !filters.jobId) setPosition(resolveCandidateJobPreset(jobs, filters));
+  }, [filters, jobs, jobsReady]);
 
-  const needsPositionPreset = Boolean(initialFilters?.jobId || (initialFilters?.position && initialFilters.position !== "全部职位"));
-  const presetJobId = jobsReady ? resolveCandidateJobPreset(jobs, initialFilters) : null;
+  const needsPositionPreset = Boolean(filters.jobId || (filters.position && filters.position !== "全部职位"));
+  const presetJobId = jobsReady ? resolveCandidateJobPreset(jobs, filters) : null;
   const presetRequestKey = needsPositionPreset ? `${jobsReady}:${presetJobId || ""}` : "";
 
   useEffect(() => {
@@ -193,12 +194,12 @@ function CandidateList({ controller, onOpen, initialFilters }) {
     <div className="candidate-page-heading"><div><h2>候选人</h2><p>跨职位搜索和查看候选人。</p></div><span>已加载 {records.length} 人</span></div>
     <section className="candidate-list-panel">
       <div className="candidate-filters">
-        <label className="candidate-search"><Search size={17} /><input aria-label="搜索候选人" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索姓名、当前职称、邮箱或手机号" /></label>
-        <label><select aria-label="职位筛选" value={position} onChange={(event) => setPosition(event.target.value)}><option>全部职位</option>{jobs.map((job) => <option key={job.id} value={job.id}>{job.title}</option>)}</select><ChevronDown size={14} /></label>
-        <label><select aria-label="阶段筛选" value={stage} onChange={(event) => setStage(event.target.value)}><option>全部阶段</option>{Object.keys(transitions).map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label>
-        <label><select aria-label="负责人筛选" value={owner} onChange={(event) => setOwner(event.target.value)}><option>全部负责人</option>{ownerOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label>
-        <label><select aria-label="分数筛选" value={minScore} onChange={(event) => setMinScore(event.target.value)}><option>不限分数</option><option value="80">80 分以上</option><option value="70">70 分以上</option></select><ChevronDown size={14} /></label>
-        <button className="button secondary compact" type="button" onClick={() => { setQuery(""); setPosition("全部职位"); setStage("全部阶段"); setOwner("全部负责人"); setMinScore("不限分数"); }}><X size={15} />清空</button>
+        <label className="candidate-search"><Search size={17} /><input aria-label="搜索候选人" value={query} onChange={(event) => { const q = event.target.value; setQuery(q); onFiltersChange({ ...filters, q }); }} placeholder="搜索姓名、当前职称、邮箱或手机号" /></label>
+        <label><select aria-label="职位筛选" value={position} onChange={(event) => { const jobId = event.target.value; setPosition(jobId); onFiltersChange({ ...filters, jobId }); }}><option>全部职位</option>{jobs.map((job) => <option key={job.id} value={job.id}>{job.title}</option>)}</select><ChevronDown size={14} /></label>
+        <label><select aria-label="阶段筛选" value={stage} onChange={(event) => { const value = event.target.value; setStage(value); onFiltersChange({ ...filters, stage: value }); }}><option>全部阶段</option>{Object.keys(transitions).map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label>
+        <label><select aria-label="负责人筛选" value={owner} onChange={(event) => { const ownerId = event.target.value; setOwner(ownerId); onFiltersChange({ ...filters, ownerId }); }}><option>全部负责人</option>{ownerOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label>
+        <label><select aria-label="分数筛选" value={minScore} onChange={(event) => { const value = event.target.value; setMinScore(value); onFiltersChange({ ...filters, minScore: value }); }}><option>不限分数</option><option value="80">80 分以上</option><option value="70">70 分以上</option></select><ChevronDown size={14} /></label>
+        <button className="button secondary compact" type="button" onClick={() => onFiltersChange({ q: "", jobId: "全部职位", stage: "全部阶段", ownerId: "全部负责人", minScore: "不限分数" })}><X size={15} />清空</button>
       </div>
       <div className="candidate-table">
         <div className="candidate-table-head"><span>候选人</span><span>当前申请</span><span>阶段</span><span>匹配分</span><span>来源</span><span>负责人</span><span>最近进展</span><span>下一步</span></div>
@@ -318,8 +319,8 @@ function CandidateGovernance({ candidate, role, onNotify }) {
   </section>;
 }
 
-function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotify, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, actorName, controller, onRefresh }) {
-  const [tab, setTab] = useState("档案与简历");
+function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotify, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, actorName, controller, onRefresh, activeTab = "档案与简历", onTabChange = () => {} }) {
+  const tab = candidateDetailTabs(candidate.serverBacked).includes(activeTab) ? activeTab : "档案与简历";
   const [transitionOpen, setTransitionOpen] = useState(false);
   const [note, setNote] = useState("");
   const [tagInput, setTagInput] = useState("");
@@ -425,7 +426,7 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
     <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />{backLabel || "返回候选人列表"}</button>
     <section className="candidate-detail-hero"><div className="candidate-profile"><span>{candidate.name.slice(-1)}</span><div><div><h2>{candidate.name}</h2><StageTag stage={candidate.stage} /></div><p>{profileLine}</p><div className="masked-contacts"><span><Phone size={13} />{candidate.phone}</span><span><Mail size={13} />{candidate.email}</span></div></div></div><div className="candidate-detail-actions">{!candidate.serverBacked && <button className="button secondary" type="button" onClick={() => onNotify("联系方式已复制，操作已记录") }><ClipboardCopy size={16} />复制联系信息</button>}<button className="button secondary" type="button" disabled={candidate.serverBacked && (!candidate.resume?.id || pendingAction === "download")} onClick={() => void downloadResume()}><Download size={16} />{pendingAction === "download" ? "下载中" : "下载简历"}</button>{canAddCandidateToTalentPool(candidate) && onAddToTalentPool && <button className="button secondary" type="button" onClick={() => onAddToTalentPool([candidate.id])}><BriefcaseBusiness size={16} />加入人才库</button>}{next && <button className="button primary" type="button" onClick={() => { setActionError(""); setConflict(false); setTransitionOpen(true); }}><UserRoundCheck size={16} />推进候选人</button>}</div></section>
     {actionError && !transitionOpen && <div className="candidate-action-error" role="alert"><CircleAlert size={16} /><span>{actionError}</span>{conflict && <button type="button" onClick={() => void onRefresh()}>刷新最新详情</button>}</div>}
-    <div className="candidate-detail-layout"><main className="candidate-detail-main"><section className="candidate-detail-panel"><div className="candidate-detail-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
+    <div className="candidate-detail-layout"><main className="candidate-detail-main"><section className="candidate-detail-panel"><div className="candidate-detail-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => onTabChange(item)}>{item}</button>)}</div>
       {tab === "档案与简历" && <div className="candidate-tab-content profile-tab"><section><h3>候选人摘要</h3><p>{candidate.summary}</p></section><section><h3>技能</h3><div className="candidate-skill-tags">{candidate.skills.length ? candidate.skills.map((item) => <span key={item}>{item}</span>) : <span>暂无结构化技能</span>}</div></section><div className="profile-facts"><div><BriefcaseBusiness size={18} /><span><strong>工作经验</strong><small>{candidate.experience}</small></span></div><div><GraduationCap size={18} /><span><strong>教育经历</strong><small>{candidate.education}</small></span></div><div className="resume-detail-row"><FileText size={18} /><span><strong>当前简历</strong><small>{candidate.serverBacked ? resumeDisplayName(candidate.resume) : `${candidate.name}_简历.pdf · 解析质量良好`}</small>{candidate.serverBacked && candidate.resume?.id && <span className="resume-inline-actions"><button type="button" onClick={() => void loadPreview()}><Eye size={14} />预览</button><button type="button" onClick={() => void downloadResume()}><Download size={14} />下载</button></span>}</span></div></div></div>}
       {tab === "职位申请" && <div className="candidate-tab-content"><div className="applications-table"><div><span>职位</span><span>状态</span><span>{candidate.serverBacked ? "最近更新" : "申请日期"}</span><span>来源</span></div>{candidate.applications.map((item) => <div key={`${item.position}-${item.created}`}><strong>{item.position}</strong><StageTag stage={item.state} /><span>{item.created}</span><span>{item.source}</span></div>)}</div></div>}
       {tab === "筛选证据" && <div className="candidate-tab-content evidence-grid"><section className="rule-evidence"><header><FileText size={18} /><div><h3>规则评分</h3><span>{candidate.serverBacked ? "本次筛选结果" : "岗位规则 v3 · 今天 10:30"}</span></div><strong>{candidate.ruleScore ?? "—"}</strong></header><p>命中：{candidate.matched}</p><p>缺失：{candidate.missing}</p><p>风险：{candidate.risk}</p></section><section className="llm-evidence"><header><Sparkles size={18} /><div><h3>LLM 辅助评分</h3><span>{candidate.serverBacked ? "本次筛选结果" : "OpenAI 兼容接口 · 今天 10:30"}</span></div><strong>{candidate.llmScore ?? "—"}</strong></header><p>{candidate.llmReason}</p><small>此内容为 AI 辅助建议，不替代人工结论。</small></section><section className="human-evidence"><header><UserRoundCheck size={18} /><div><h3>人工结论</h3><span>由招聘团队维护</span></div></header><div className="conclusion-options">{["建议推进", "需要补充", "暂不合适"].map((item) => <button type="button" disabled={pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} key={item} className={conclusion === item ? "active" : ""} onClick={() => setConclusion(item)}>{item}</button>)}</div><textarea rows="3" disabled={pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} value={conclusionReason} onChange={(event) => setConclusionReason(event.target.value)} placeholder="补充人工判断依据" /><button className="button primary" type="button" disabled={!conclusion || pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} onClick={() => void saveConclusion()}>{pendingAction === "conclusion" ? "保存中" : "保存人工结论"}</button></section></div>}
@@ -437,10 +438,10 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
   </div>;
 }
 
-export function CandidatesWorkspace({ mode, setMode, selectedCandidate, setSelectedCandidate, records, setRecords, onNotify, onBackDetail, detailBackLabel, onOpenCandidate, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, initialFilters, actorName = "张小北", currentRole, controller, detailState, onRetryDetail }) {
+export function CandidatesWorkspace({ mode, setMode, selectedCandidate, setSelectedCandidate, records, setRecords, onNotify, onBackDetail, detailBackLabel, onOpenCandidate, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, filters, onFiltersChange, detailTab, onDetailTabChange, actorName = "张小北", currentRole, controller, detailState, onRetryDetail }) {
   function updateCandidate(updated) { if (!updated.serverBacked) setRecords((current) => current.map((item) => item.id === updated.id ? updated : item)); setSelectedCandidate(updated); }
   if (mode === "detail" && detailState?.status === "loading") return <div className="candidate-page"><button className="back-link" type="button" onClick={onBackDetail}><ArrowLeft size={17} />{detailBackLabel}</button><div className="candidate-detail-state" role="status"><LoaderCircle className="spin" size={28} /><strong>正在加载候选人详情</strong><span>将从服务端读取候选人、申请、简历和时间线。</span></div></div>;
   if (mode === "detail" && detailState?.status === "error") return <div className="candidate-page"><button className="back-link" type="button" onClick={onBackDetail}><ArrowLeft size={17} />{detailBackLabel}</button><div className="candidate-detail-state error" role="alert"><CircleAlert size={28} /><strong>候选人详情加载失败</strong><span>{detailState.error}</span><button className="button primary" type="button" onClick={onRetryDetail}><RotateCcw size={16} />重试加载</button></div></div>;
-  if (mode === "detail" && selectedCandidate) return <CandidateDetail candidate={selectedCandidate} role={currentRole} onBack={onBackDetail || (() => { setSelectedCandidate(null); setMode("list"); })} backLabel={detailBackLabel} onUpdate={updateCandidate} onNotify={onNotify} onScheduleInterview={onScheduleInterview} onOpenInterviewFeedback={onOpenInterviewFeedback} onAddToTalentPool={onAddToTalentPool} actorName={actorName} controller={controller} onRefresh={onRetryDetail} />;
-  return <CandidateList controller={controller} onOpen={onOpenCandidate} initialFilters={initialFilters} />;
+  if (mode === "detail" && selectedCandidate) return <CandidateDetail candidate={selectedCandidate} role={currentRole} onBack={onBackDetail || (() => { setSelectedCandidate(null); setMode("list"); })} backLabel={detailBackLabel} onUpdate={updateCandidate} onNotify={onNotify} onScheduleInterview={onScheduleInterview} onOpenInterviewFeedback={onOpenInterviewFeedback} onAddToTalentPool={onAddToTalentPool} actorName={actorName} controller={controller} onRefresh={onRetryDetail} activeTab={detailTab} onTabChange={onDetailTabChange} />;
+  return <CandidateList controller={controller} onOpen={onOpenCandidate} filters={filters} onFiltersChange={onFiltersChange} />;
 }

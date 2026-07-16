@@ -1,5 +1,6 @@
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { createServer } from "vite";
@@ -106,6 +107,20 @@ async function assertNavLabels(nav, expected) {
   assert.equal(await nav.getAttribute("aria-label"), "主导航");
   assert.deepEqual(await nav.getByRole("button", { includeHidden: true }).allTextContents(), expected);
 }
+
+test("application shell uses BrowserRouter and URL-derived route state", async () => {
+  const [mainSource, appSource] = await Promise.all([
+    readFile(new URL("./main.jsx", import.meta.url), "utf8"),
+    readFile(new URL("./App.jsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(mainSource, /BrowserRouter/);
+  assert.match(appSource, /useLocation/);
+  assert.match(appSource, /useNavigate/);
+  assert.match(appSource, /parseAppRoute\(location\)/);
+  assert.match(appSource, /clearJobCreateDraft/);
+  assert.match(appSource, /interviewController\.get\(route\.id/);
+  assert.doesNotMatch(appSource, /createAppHistory/);
+});
 
 test("390px keeps the navigation drawer and primary action reachable", { timeout: 60_000 }, async () => {
   const viewport = { width: 390, height: 844 };

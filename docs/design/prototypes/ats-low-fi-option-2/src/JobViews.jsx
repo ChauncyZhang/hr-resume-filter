@@ -137,23 +137,23 @@ function JobDialog({ onClose, onDiscard, onSave, saving }) {
   return <div className="job-confirm-backdrop" role="presentation" onMouseDown={onClose}><section className="job-confirm" role="dialog" aria-modal="true" aria-label="保存未完成的职位" onMouseDown={(event) => event.stopPropagation()}><header><CircleAlert size={21} /><h3>职位尚未保存</h3></header><p>你填写的内容还没有保存。可以先保存为草稿，或者放弃本次修改。</p><footer><button className="button secondary" type="button" onClick={onClose} disabled={saving}>继续编辑</button><button className="button danger-text" type="button" onClick={onDiscard} disabled={saving}>放弃修改</button><button className="button primary" type="button" onClick={onSave} disabled={saving}>保存草稿</button></footer></section></div>;
 }
 
-function JobForm({ initialJob, departments, owners, ownersStatus, onBack, onSubmit, onRetryConflictRefresh, onManageDepartments, onRetryOwners }) {
+function JobForm({ initialJob, initialDraft, departments, owners, ownersStatus, onBack, onDiscard, onSubmit, onRetryConflictRefresh, onManageDepartments, onDraftChange, onDraftClear = () => {}, onRetryOwners }) {
   const actions = getJobFormActions(initialJob);
   const [values, setValues] = useState({
-    name: initialJob?.name || "",
-    departmentId: initialJob?.departmentId || "",
-    location: initialJob?.location || "",
-    headcount: initialJob?.headcount || 1,
-    ownerId: initialJob?.hiringOwnerId || initialJob?.ownerId || "",
-    priority: initialJob?.priority || "中",
-    jd: initialJob?.jd || "",
-    mustHave: initialJob?.mustHave?.join("、") || "",
-    niceToHave: initialJob?.niceToHave?.join("、") || "",
-    process: formProcessTemplate(initialJob?.process),
-    llmEnabled: initialJob?.llmEnabled === true,
+    name: initialJob?.name || initialDraft?.name || "",
+    departmentId: initialJob?.departmentId || initialDraft?.departmentId || "",
+    location: initialJob?.location || initialDraft?.location || "",
+    headcount: initialJob?.headcount || initialDraft?.headcount || 1,
+    ownerId: initialJob?.hiringOwnerId || initialJob?.ownerId || initialDraft?.ownerId || "",
+    priority: initialJob?.priority || initialDraft?.priority || "中",
+    jd: initialJob?.jd || initialDraft?.jd || "",
+    mustHave: initialJob?.mustHave?.join("、") || initialDraft?.mustHave || "",
+    niceToHave: initialJob?.niceToHave?.join("、") || initialDraft?.niceToHave || "",
+    process: initialJob ? formProcessTemplate(initialJob.process) : formProcessTemplate(initialDraft?.process),
+    llmEnabled: initialJob ? initialJob.llmEnabled === true : initialDraft?.llmEnabled === true,
   });
   const [errors, setErrors] = useState({});
-  const [dirty, setDirty] = useState(false);
+  const [dirty, setDirty] = useState(Boolean(!initialJob && initialDraft));
   const [saving, setSaving] = useState(false);
   const [submitError, setSubmitError] = useState("");
   const [conflictRefreshFailed, setConflictRefreshFailed] = useState(false);
@@ -165,7 +165,11 @@ function JobForm({ initialJob, departments, owners, ownersStatus, onBack, onSubm
   }, [submitError]);
 
   function change(field, value) {
-    setValues((current) => ({ ...current, [field]: value }));
+    setValues((current) => {
+      const next = { ...current, [field]: value };
+      if (!initialJob && onDraftChange) onDraftChange(next);
+      return next;
+    });
     setDirty(true);
     if (!conflictRefreshFailed) setSubmitError("");
     setErrors((current) => ({ ...current, [field]: "" }));
@@ -190,6 +194,7 @@ function JobForm({ initialJob, departments, owners, ownersStatus, onBack, onSubm
       }
       setConflictRefreshFailed(false);
       setDirty(false);
+      if (!initialJob && onDraftClear) onDraftClear();
     } catch (error) {
       setSubmitError("职位保存失败，请检查网络后重试。当前表单内容已保留。");
     } finally {
@@ -240,7 +245,7 @@ function JobForm({ initialJob, departments, owners, ownersStatus, onBack, onSubm
           <aside className="form-summary"><h3>发布检查</h3><div className="completion-ring"><strong>{completion}/5</strong><span>关键项已完成</span></div>{[["职位名称", values.name], ["所属部门", values.departmentId], ["公开 JD", values.jd], ["筛选条件", values.mustHave], ["招聘流程", values.process]].map(([label, value]) => <div className={value ? "check-row done" : "check-row"} key={label}>{value ? <Check size={15} /> : <Clock3 size={15} />}<span>{label}</span></div>)}</aside>
         </div>
       </fieldset>
-      {confirmExit && <JobDialog onClose={() => setConfirmExit(false)} onDiscard={onBack} onSave={() => { setConfirmExit(false); void submit(false); }} saving={saving} />}
+      {confirmExit && <JobDialog onClose={() => setConfirmExit(false)} onDiscard={() => { onDraftClear(); onDiscard(); }} onSave={() => { setConfirmExit(false); void submit(false); }} saving={saving} />}
     </div>
   );
 }
@@ -292,7 +297,7 @@ function JobDetail({ state, lifecycleState, refreshState, onBack, onEdit, onImpo
   );
 }
 
-export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate, onManageDepartments }) {
+export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate, onManageDepartments, initialDraft, onDraftChange, onDraftClear }) {
   const [detailState, setDetailState] = useState({ status: "idle", job: null, candidates: null });
   const [lifecycleState, setLifecycleState] = useState({ status: "idle", error: "", conflict: false });
   const [refreshState, setRefreshState] = useState({ error: "", retrying: false, kind: "updated" });
@@ -322,7 +327,7 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
         candidateController.listCandidates({ jobId: summary.id, limit: 20 }, { signal: controller.signal }),
       ]);
       if (detailRequestRef.current !== controller || requestId !== detailSequenceRef.current) return;
-      const job = jobController.mergeDefinition(summary, definition, listState);
+      const job = { ...jobController.mergeDefinition(summary, definition, listState), ...(summary.formMode === "edit" ? { formMode: "edit" } : {}) };
       setSelectedJob(job);
       setDetailState({ status: "ready", job, candidates: { status: "ready", records: candidatePage.records, nextCursor: candidatePage.nextCursor, filters: { q: "", stage: "全部阶段" }, error: "" } });
     } catch (error) {
@@ -334,7 +339,7 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
   }, [candidateController, jobController, listState.departments, listState.owners, setSelectedJob]);
 
   useEffect(() => {
-    if (mode !== "detail" || !selectedJob?.id) return;
+    if ((mode !== "detail" && !(mode === "form" && selectedJob?.formMode === "edit")) || !selectedJob?.id) return;
     if (skipNextDetailLoadRef.current) {
       skipNextDetailLoadRef.current = false;
       return;
@@ -481,7 +486,8 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
     }));
   }
 
-  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} departments={formDepartments} owners={formOwners.records} ownersStatus={formOwners.status} onBack={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} onManageDepartments={onManageDepartments} onRetryOwners={() => setOwnerDirectoryVersion((current) => current + 1)} />;
+  if (mode === "form" && selectedJob?.formMode === "edit" && ["idle", "loading"].includes(detailState.status)) return <div className="job-request-state" role="status">正在加载职位详情…</div>;
+  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} initialDraft={initialDraft} departments={formDepartments} owners={formOwners.records} ownersStatus={formOwners.status} onBack={() => { setSelectedJob(null); setMode("list"); }} onDiscard={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} onManageDepartments={onManageDepartments} onDraftChange={onDraftChange} onDraftClear={onDraftClear} onRetryOwners={() => setOwnerDirectoryVersion((current) => current + 1)} />;
   if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} refreshState={refreshState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onRetryRefresh={retryMutationRefresh} onLoadCandidates={loadCandidates} onTransition={transition} />;
   return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
 }
