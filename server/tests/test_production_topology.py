@@ -21,6 +21,7 @@ PRODUCTION_COMPOSE = ROOT / "deploy" / "compose.production.yaml"
 OBSERVABILITY_COMPOSE = ROOT / "deploy" / "compose.observability.yaml"
 ENV_EXAMPLE = ROOT / "deploy" / ".env.example"
 NGINX_TEMPLATE = ROOT / "deploy" / "nginx" / "production.conf.template"
+LOCAL_NGINX_CONFIG = ROOT / "deploy" / "nginx" / "default.conf"
 SECURITY_HEADERS = ROOT / "deploy" / "nginx" / "snippets" / "security-headers.conf"
 PRODUCTION_PREFLIGHT = ROOT / "deploy" / "production-preflight.sh"
 FRONTEND_DOCKERFILE = ROOT / "deploy" / "nginx" / "Dockerfile"
@@ -556,6 +557,27 @@ def test_production_nginx_contract_is_https_only_and_keeps_metrics_private() -> 
     )
     for directive in required_headers:
         assert directive in headers
+
+
+def test_nginx_configs_serve_pdf_worker_modules_as_javascript() -> None:
+    for path in (LOCAL_NGINX_CONFIG, NGINX_TEMPLATE):
+        config = path.read_text(encoding="utf-8")
+        assert r"location ~* \.mjs$" in config
+        assert "application/javascript mjs;" in config
+
+
+def test_nginx_security_headers_allow_authorized_pdf_blob_reads() -> None:
+    local = LOCAL_NGINX_CONFIG.read_text(encoding="utf-8")
+    production = SECURITY_HEADERS.read_text(encoding="utf-8")
+    assert "connect-src 'self' blob:" in local
+    assert "connect-src 'self' blob:" in production
+
+
+def test_nginx_security_headers_allow_pdf_wasm_without_javascript_eval() -> None:
+    for path in (LOCAL_NGINX_CONFIG, SECURITY_HEADERS):
+        config = path.read_text(encoding="utf-8")
+        assert "script-src 'self' 'wasm-unsafe-eval'" in config
+        assert "script-src 'self' 'unsafe-eval'" not in config
 
 
 def test_rendered_production_nginx_passes_nginx_t_with_disposable_certificate(
