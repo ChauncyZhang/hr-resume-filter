@@ -28,6 +28,7 @@ from server.app.screening.rules import RuleSnapshotError,normalize_rule_content
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.http import content_disposition
 from server.app.recruiting.storage import MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, StorageObjectTooLarge, StorageReadFailed
+from server.app.recruiting.resume_profile import extract_resume_profile
 from server.app.recruiting.schemas import (
     ApplicationCollection, ApplicationResource, CandidateCollection, CandidateResource,
     FunnelResource, JobCollection, JobDefinitionCommand, JobDefinitionResource, JobOwnerOptionCollection, JobResource, NoteCollection, NoteResource,
@@ -1091,7 +1092,7 @@ def resumes(candidate_id: UUID, request: Request):
             Resume.candidate_id == candidate_id,
             _resume_application_scope(principal, RecruitingAction.READ),
         ).order_by(Resume.version_number)).all()
-        return {"data": [{"id": str(row.id), "candidate_id": str(row.candidate_id), "version_number": row.version_number, "created_at": row.created_at.isoformat()} for row in rows], "meta": {"count": len(rows)}}
+        return {"data": [{"id": str(row.id), "candidate_id": str(row.candidate_id), "version_number": row.version_number, "created_at": row.created_at.isoformat(), "profile": extract_resume_profile(row.parsed_text or "")} for row in rows], "meta": {"count": len(rows)}}
 
 
 def _load_resume(db, principal: Principal, resume_id: UUID, action: RecruitingAction):

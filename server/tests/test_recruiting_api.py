@@ -146,7 +146,13 @@ def seed_same_candidate_cross_job(app, recruiter_id):
         allowed_file = FileObject(organization_id=recruiter.organization_id, storage_key="private/resume", original_filename="allowed.pdf", mime_type="application/pdf", size_bytes=12, sha256="1" * 64, uploaded_by=recruiter_id)
         denied_file = FileObject(organization_id=recruiter.organization_id, storage_key="private/denied", original_filename="denied.pdf", mime_type="application/pdf", size_bytes=12, sha256="2" * 64, uploaded_by=recruiter_id)
         db.add_all([job_allowed, job_denied, candidate, allowed_file, denied_file]); db.flush()
-        allowed_resume = Resume(organization_id=recruiter.organization_id, candidate_id=candidate.id, file_object_id=allowed_file.id, version_number=1, parsed_text="allowed preview")
+        allowed_resume = Resume(
+            organization_id=recruiter.organization_id,
+            candidate_id=candidate.id,
+            file_object_id=allowed_file.id,
+            version_number=1,
+            parsed_text="个人简介\n企业级 AI 平台负责人\n专业技能\nPython、RAG\n工作经历\n负责 Agent 平台交付\n教育经历\n浙江大学 计算机本科",
+        )
         denied_resume = Resume(organization_id=recruiter.organization_id, candidate_id=candidate.id, file_object_id=denied_file.id, version_number=2, parsed_text="denied preview")
         db.add_all([allowed_resume, denied_resume]); db.flush()
         allowed_application = Application(organization_id=recruiter.organization_id, candidate_id=candidate.id, job_id=job_allowed.id, resume_id=allowed_resume.id, owner_id=recruiter_id)
@@ -621,9 +627,17 @@ def test_resume_access_is_scoped_to_an_authorized_application_for_the_target_res
         listed = client.get(f"/api/v1/candidates/{ids['candidate_id']}/resumes")
         assert listed.status_code == 200
         assert [row["id"] for row in listed.json()["data"]] == [ids["allowed_resume_id"]]
+        assert listed.json()["data"][0]["profile"] == {
+            "summary": "企业级 AI 平台负责人",
+            "skills": ["Python", "RAG"],
+            "experience": "负责 Agent 平台交付",
+            "education": "浙江大学 计算机本科",
+            "status": "ready",
+        }
 
         preview = client.get(f"/api/v1/resumes/{ids['allowed_resume_id']}/preview")
-        assert preview.status_code == 200 and preview.json()["data"]["text"] == "allowed preview"
+        assert preview.status_code == 200
+        assert preview.json()["data"]["text"].startswith("个人简介\n企业级 AI 平台负责人")
         assert client.get(f"/api/v1/resumes/{ids['denied_resume_id']}/preview").status_code == 404
         assert client.post(f"/api/v1/resumes/{ids['denied_resume_id']}/download-tickets", headers=headers).status_code == 404
 

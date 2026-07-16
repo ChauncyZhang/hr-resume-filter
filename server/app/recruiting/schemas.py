@@ -194,11 +194,20 @@ class NoteOut(ApiModel):
     created_at: str | None = None
 
 
+class ResumeProfileOut(ApiModel):
+    summary: str | None
+    skills: list[str]
+    experience: str | None
+    education: str | None
+    status: Literal["ready", "partial", "unavailable"]
+
+
 class ResumeOut(ApiModel):
     id: str
     candidate_id: str
     version_number: int
     created_at: str
+    profile: ResumeProfileOut
 
 
 class TimelineEventOut(ApiModel):

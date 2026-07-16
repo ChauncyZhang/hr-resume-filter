@@ -151,6 +151,8 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
   const parsedConclusion = parseConclusion(application?.human_conclusion);
   const actorOwnsApplication = application?.owner_id && application.owner_id === context.actor?.id;
   const matched = safeString(evidence.matched);
+  const profile = resume?.profile && typeof resume.profile === "object" ? resume.profile : {};
+  const structuredSkills = safeArray(profile.skills).map((item) => safeString(item)).filter(Boolean);
 
   return {
     id: candidateId,
@@ -174,10 +176,10 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
     missing: safeString(evidence.missing, "暂无缺失项"),
     risk: safeString(evidence.risk, "暂无已记录风险"),
     llmReason: safeString(evidence.llmReason, "本次筛选未返回 LLM 摘要。"),
-    summary: safeString(evidence.llmReason, "候选人结构化摘要将在后续解析能力中补充。"),
-    skills: matched ? matched.split("、").filter(Boolean) : [],
-    education: "结构化教育经历待补充",
-    experience: "结构化工作经历待补充",
+    summary: safeString(profile.summary, safeString(evidence.llmReason, "简历中未识别到明确的个人简介。")),
+    skills: structuredSkills.length ? structuredSkills : (matched ? matched.split("、").filter(Boolean) : []),
+    education: safeString(profile.education, "简历中未识别到教育经历。"),
+    experience: safeString(profile.experience, "简历中未识别到工作经历。"),
     tags: [],
     notes: safeArray(notes).map((item) => ({ id: safeString(item?.id), body: safeString(item?.body), authorId: safeString(item?.author_id), createdAt: safeString(item?.created_at) })).filter((item) => item.id && item.body),
     timeline: safeArray(timeline).map((item) => normalizeTimelineEvent(item, context.actor)).filter((item) => item.id),

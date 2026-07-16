@@ -197,7 +197,13 @@ test("candidate review loads the exact selected application when the same candid
       ]);
       if (path === `/api/v1/candidates/${candidateId}/resumes`) return response([
         { id: "resume-old", candidate_id: candidateId, version_number: 1, created_at: "2026-07-12T08:00:00+00:00" },
-        { id: "resume-1", candidate_id: candidateId, version_number: 1, created_at: "2026-07-13T08:00:00+00:00" },
+        { id: "resume-1", candidate_id: candidateId, version_number: 1, created_at: "2026-07-13T08:00:00+00:00", profile: {
+          summary: "负责企业级 RAG 和 Agent 平台交付。",
+          skills: ["Python", "RAG", "Agent"],
+          experience: "5 年大模型应用研发经验",
+          education: "浙江大学 · 计算机本科",
+          status: "ready",
+        } },
       ]);
       if (path === `/api/v1/candidates/${candidateId}/notes?application_id=application-1`) return response([
         { id: "note-1", body: "优先确认到岗时间", author_id: "user-1", created_at: "2026-07-13T09:10:00+00:00" },
@@ -231,6 +237,10 @@ test("candidate review loads the exact selected application when the same candid
   assert.equal(review.timeline[0].actor, "张小北");
   assert.equal(review.timeline[1].action, "更新职位申请");
   assert.equal(review.ruleScore, 81);
+  assert.equal(review.summary, "负责企业级 RAG 和 Agent 平台交付。");
+  assert.deepEqual(review.skills, ["Python", "RAG", "Agent"]);
+  assert.equal(review.experience, "5 年大模型应用研发经验");
+  assert.equal(review.education, "浙江大学 · 计算机本科");
   assert.deepEqual(review.applications.map((item) => [item.id, item.position, item.state]), [
     ["application-other", "平台工程师", "已淘汰"],
     ["application-older", "AI 工程师", "已淘汰"],
