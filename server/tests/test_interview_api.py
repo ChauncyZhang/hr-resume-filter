@@ -50,6 +50,7 @@ def test_interview_openapi_registers_the_phase_4_contract(tmp_path) -> None:
     expected = {
         "/api/v1/applications/{application_id}/interview-participant-options": {"get"},
         "/api/v1/interview-conflicts": {"post"},
+        "/api/v1/interview-availability": {"get"},
         "/api/v1/interviews": {"get", "post"},
         "/api/v1/interviews/{interview_id}": {"get", "patch"},
         "/api/v1/interviews/{interview_id}/conflicts": {"post"},
@@ -63,6 +64,106 @@ def test_interview_openapi_registers_the_phase_4_contract(tmp_path) -> None:
         "/api/v1/me/tasks": {"get"},
     }
     assert {path: set(schema["paths"].get(path, {})) for path in expected} == expected
+
+
+def test_interview_availability_is_privacy_safe_and_honors_exclude_and_buffer(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    with TestClient(app) as client:
+        created, headers = create_interview(client, seed, payload=interview_payload(seed, starts_at=start))
+        interview_id = created.json()["data"]["id"]
+        params = {
+            "from": (start - timedelta(hours=1)).isoformat(),
+            "to": (start + timedelta(hours=2)).isoformat(),
+            "participant_ids": str(seed["interviewer_id"]),
+            "timezone": "Asia/Shanghai",
+            "buffer": 15,
+        }
+        response = client.get("/api/v1/interview-availability", params=params, headers=headers)
+        excluded = client.get("/api/v1/interview-availability", params={**params, "exclude": interview_id}, headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json()["data"]["participants"] == [{
+        "participant_id": str(seed["interviewer_id"]),
+        "status": "confirmed",
+        "busy": [{"starts_at": start.isoformat(), "ends_at": (start + timedelta(minutes=45)).isoformat()}],
+    }]
+    assert response.json()["data"]["buffer_minutes"] == 15
+    assert excluded.json()["data"]["participants"][0]["busy"] == []
+    assert "candidate" not in response.text.lower()
+    assert "round" not in response.text.lower()
+
+
+def test_interview_availability_rejects_unknown_participants_and_invalid_ranges(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    with TestClient(app) as client:
+        headers = login(client, "interview-admin@example.test")
+        unknown = client.get("/api/v1/interview-availability", params={
+            "from": "2026-07-20T08:00:00Z", "to": "2026-07-20T09:00:00Z",
+            "participant_ids": "99999999-9999-4999-8999-999999999999", "timezone": "Asia/Shanghai", "buffer": 15,
+        }, headers=headers)
+        invalid = client.get("/api/v1/interview-availability", params={
+            "from": "2026-07-20T09:00:00Z", "to": "2026-07-20T08:00:00Z",
+            "participant_ids": str(seed["interviewer_id"]), "timezone": "Asia/Shanghai", "buffer": 15,
+        }, headers=headers)
+
+    assert unknown.status_code == 422
+    assert invalid.status_code == 422
+
+
+def test_interview_availability_provider_failure_is_not_reported_as_free(tmp_path) -> None:
+    class FailingProvider:
+        def availability(self, **_kwargs):
+            raise RuntimeError("calendar provider unavailable")
+
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    app.state.interview_availability_provider = FailingProvider()
+    with TestClient(app) as client:
+        response = client.get("/api/v1/interview-availability", params={
+            "from": "2026-07-20T08:00:00Z", "to": "2026-07-20T09:00:00Z",
+            "participant_ids": str(seed["interviewer_id"]), "timezone": "Asia/Shanghai", "buffer": 15,
+        }, headers=login(client, "interview-admin@example.test"))
+
+    assert response.status_code == 503
+    assert response.json()["code"] == "availability_unavailable"
+    assert "available" not in response.json()
+
+
+def test_interview_availability_strips_provider_event_details(tmp_path) -> None:
+    class DetailedProvider:
+        def availability(self, **kwargs):
+            participant_id = kwargs["participant_ids"][0]
+            return [{
+                "participant_id": str(participant_id),
+                "status": "confirmed",
+                "display_name": "Secret Person",
+                "busy": [{
+                    "starts_at": "2026-07-20T08:00:00+00:00",
+                    "ends_at": "2026-07-20T09:00:00+00:00",
+                    "title": "Candidate interview secret",
+                }],
+            }]
+
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    app.state.interview_availability_provider = DetailedProvider()
+    with TestClient(app) as client:
+        response = client.get("/api/v1/interview-availability", params={
+            "from": "2026-07-20T08:00:00Z", "to": "2026-07-20T10:00:00Z",
+            "participant_ids": str(seed["interviewer_id"]), "timezone": "Asia/Shanghai", "buffer": 15,
+        }, headers=login(client, "interview-admin@example.test"))
+
+    assert response.status_code == 200
+    assert "Secret Person" not in response.text
+    assert "Candidate interview secret" not in response.text
+    assert response.json()["data"]["participants"][0]["busy"] == [{
+        "starts_at": "2026-07-20T08:00:00+00:00",
+        "ends_at": "2026-07-20T09:00:00+00:00",
+    }]
 
 
 def test_interview_participant_options_return_only_active_tenant_users_with_eligible_roles(tmp_path) -> None:

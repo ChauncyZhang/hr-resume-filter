@@ -103,6 +103,34 @@ test("lists interviews from the server envelope and maps display fields", async 
   assert.equal(result.nextCursor, "CURSOR-2");
 });
 
+test("loads every interview page in a requested calendar range", async () => {
+  const second = apiInterview({ id: "77777777-7777-4777-8777-777777777777" });
+  const { client, calls } = queuedClient([
+    { data: [apiInterview()], meta: { next_cursor: "NEXT" } },
+    { data: [second], meta: { next_cursor: null } },
+  ]);
+  const controller = createInterviewController({ client });
+
+  const records = await controller.listRange({ from: "2026-07-13", to: "2026-07-19", limit: 100 });
+
+  assert.equal(records.length, 2);
+  assert.deepEqual(calls.map((call) => call.path), [
+    "/api/v1/interviews?from=2026-07-13T00%3A00%3A00%2B08%3A00&to=2026-07-19T23%3A59%3A59%2B08%3A00&limit=100",
+    "/api/v1/interviews?from=2026-07-13T00%3A00%3A00%2B08%3A00&to=2026-07-19T23%3A59%3A59%2B08%3A00&cursor=NEXT&limit=100",
+  ]);
+});
+
+test("requests privacy-safe availability with range, participants, buffer, timezone, and exclude", async () => {
+  const { client, calls } = queuedClient([{ data: { participants: [] } }]);
+  const controller = createInterviewController({ client });
+
+  await controller.availability({
+    from: "2026-07-13", to: "2026-07-19", participantIds: [USER_ID], timezone: "Asia/Shanghai", buffer: 15, exclude: INTERVIEW_ID,
+  });
+
+  assert.equal(calls[0].path, `/api/v1/interview-availability?from=2026-07-13T00%3A00%3A00%2B08%3A00&to=2026-07-19T23%3A59%3A59%2B08%3A00&participant_ids=${USER_ID}&timezone=Asia%2FShanghai&buffer=15&exclude=${INTERVIEW_ID}`);
+});
+
 test("gets one interview and propagates abort errors unchanged", async () => {
   const abortError = new DOMException("aborted", "AbortError");
   const first = queuedClient([{ data: apiInterview({ status: "confirmed" }) }]);

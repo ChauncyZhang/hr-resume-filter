@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
 const interviewSource = readFileSync(new URL("./InterviewViews.jsx", import.meta.url), "utf8");
+const scheduleSource = readFileSync(new URL("./ScheduleWorkspace.jsx", import.meta.url), "utf8");
 
 test("schedule candidate loading follows every server cursor", () => {
   assert.match(appSource, /let cursor = ""/);
@@ -24,9 +25,8 @@ test("candidate detail scheduling preserves a server-backed candidate id", () =>
 });
 
 test("schedule form hydrates an asynchronously loaded candidate without replacing a user selection", () => {
-  assert.match(interviewSource, /const loadedCandidate = candidates\.find/);
-  assert.match(interviewSource, /shouldHydrateScheduleCandidate\(current\.candidateId, candidateId\)/);
-  assert.match(interviewSource, /position: current\.position \|\| loadedCandidate\.position/);
+  assert.match(scheduleSource, /resolveScheduleCandidateId\(record, candidateId, fallback\)/);
+  assert.match(scheduleSource, /candidateId: resolveScheduleCandidateId/);
 });
 
 test("schedule and feedback back links describe the actual origin", () => {

@@ -336,6 +336,46 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
     };
   }
 
+  function rangeTimestamp(date, end = false, timezone = "Asia/Shanghai") {
+    return `${date}T${end ? "23:59:59" : "00:00:00"}${timezoneOffset(timezone)}`;
+  }
+
+  async function listRange(filters = {}, { signal } = {}) {
+    const records = [];
+    let cursor = "";
+    do {
+      const page = await list({
+        ...filters,
+        from: rangeTimestamp(filters.from, false, filters.timezone),
+        to: rangeTimestamp(filters.to, true, filters.timezone),
+        cursor: cursor || undefined,
+        limit: Number.isInteger(filters.limit) ? filters.limit : 100,
+      }, { signal });
+      records.push(...page.records);
+      cursor = page.nextCursor || "";
+    } while (cursor);
+    return records;
+  }
+
+  async function availability(filters = {}, { signal } = {}) {
+    const params = new URLSearchParams();
+    params.set("from", rangeTimestamp(filters.from, false, filters.timezone));
+    params.set("to", rangeTimestamp(filters.to, true, filters.timezone));
+    safeArray(filters.participantIds).forEach((id) => params.append("participant_ids", requireId(id, "INTERVIEW_PARTICIPANT_ID_REQUIRED")));
+    params.set("timezone", safeString(filters.timezone, "Asia/Shanghai"));
+    params.set("buffer", String(Number.isInteger(filters.buffer) ? filters.buffer : 15));
+    if (safeString(filters.exclude)) params.set("exclude", filters.exclude);
+    const response = await client.request(`/api/v1/interview-availability?${params}`, signalOption(signal));
+    return {
+      participants: safeArray(response?.data?.participants).map((participant) => ({
+        participantId: safeString(participant?.participant_id),
+        status: participant?.status === "confirmed" ? "confirmed" : "unknown",
+        busy: safeArray(participant?.busy).map((range) => ({ startsAt: safeString(range?.starts_at), endsAt: safeString(range?.ends_at) })),
+      })),
+      bufferMinutes: Number.isInteger(response?.data?.buffer_minutes) ? response.data.buffer_minutes : 15,
+    };
+  }
+
   async function get(interviewId, { signal } = {}) {
     const id = requireId(interviewId, "INTERVIEW_ID_REQUIRED");
     const response = await client.request(`/api/v1/interviews/${id}`, signalOption(signal));
@@ -451,7 +491,7 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
     return normalizeMaterials(response?.data);
   }
 
-  return { list, get, save, checkConflicts, transition, downloadCalendar, getMyFeedback, saveMyFeedback, submitMyFeedback, amendFeedback, listMyTasks, listParticipantOptions, listFeedbacks, getMaterials };
+  return { list, listRange, availability, get, save, checkConflicts, transition, downloadCalendar, getMyFeedback, saveMyFeedback, submitMyFeedback, amendFeedback, listMyTasks, listParticipantOptions, listFeedbacks, getMaterials };
 }
 
 export const interviewController = createInterviewController();

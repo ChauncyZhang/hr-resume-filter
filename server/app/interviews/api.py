@@ -3,6 +3,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -14,6 +15,7 @@ from server.app.identity.models import AuditLog, Job, JobCollaborator, User, Use
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.interviews.domain import CalendarContact, build_calendar_invitation
+from server.app.interviews.availability import INTERNAL_AVAILABILITY_PROVIDER, privacy_safe_availability
 from server.app.llm.redaction import redact_screening_text
 from server.app.interviews.models import (
     Interview,
@@ -589,6 +591,64 @@ def list_interview_participant_options(application_id: UUID, request: Request):
         response = JSONResponse({"data": options, "meta": {"count": len(options)}})
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+@router.get("/interview-availability", response_model=DataResource)
+def get_interview_availability(
+    request: Request,
+    date_from: datetime = Query(alias="from"),
+    date_to: datetime = Query(alias="to"),
+    participant_ids: list[str] = Query(),
+    timezone_name: str = Query(alias="timezone"),
+    buffer: int = Query(15, ge=0, le=240),
+    exclude: UUID | None = None,
+):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse):
+        return principal
+    if not principal.roles.intersection({"recruiting_admin", "recruiter", "hiring_manager"}):
+        return _denied(request)
+    try:
+        ZoneInfo(timezone_name)
+        parsed_ids = [UUID(value) for item in participant_ids for value in item.split(",") if value]
+    except (ValueError, ZoneInfoNotFoundError):
+        return problem(request, 422, "validation_failed", "The request could not be completed.")
+    if (
+        not parsed_ids
+        or len(parsed_ids) > 20
+        or len(set(parsed_ids)) != len(parsed_ids)
+        or date_to <= date_from
+        or date_to - date_from > timedelta(days=93)
+    ):
+        return problem(request, 422, "validation_failed", "The request could not be completed.")
+    with request.app.state.identity_store.sync_session() as db:
+        if not _validate_participants(db, principal.organization_id, parsed_ids):
+            return problem(request, 422, "validation_failed", "The request could not be completed.")
+        provider = getattr(request.app.state, "interview_availability_provider", INTERNAL_AVAILABILITY_PROVIDER)
+        try:
+            provider_rows = provider.availability(
+                db=db,
+                organization_id=principal.organization_id,
+                participant_ids=parsed_ids,
+                starts_at=date_from,
+                ends_at=date_to,
+                buffer_minutes=buffer,
+                exclude_interview_id=exclude,
+            )
+            participants = privacy_safe_availability(provider_rows, parsed_ids)
+        except Exception:
+            return problem(request, 503, "availability_unavailable", "Availability could not be confirmed.")
+    response = JSONResponse({
+        "data": {
+            "from": _aware(date_from).isoformat(),
+            "to": _aware(date_to).isoformat(),
+            "timezone": timezone_name,
+            "buffer_minutes": buffer,
+            "participants": participants,
+        }
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @router.get("/interviews", response_model=DataCollection)
