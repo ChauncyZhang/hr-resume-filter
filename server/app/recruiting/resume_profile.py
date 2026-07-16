@@ -16,6 +16,11 @@ _HEADING_LOOKUP = {
 _CONTACT_PATTERN = re.compile(r"(?:\b1[3-9]\d{9}\b|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})")
 _BULLET_PATTERN = re.compile(r"^[\s\-•·▪●○◆◇►▸*]+")
 _SKILL_PREFIX = re.compile(r"^(?:熟练(?:掌握|使用)?|掌握|熟悉|了解|擅长|技能|技术栈)\s*[:：]?\s*", re.I)
+_NON_SKILL_LABELS = {"工具", "技术工具", "软件工具"}
+_CJK_COMPACT_TERMS = (
+    "平台产品经理", "产品经理", "项目经理", "技术负责人", "智能制造",
+    "软件工程师", "算法工程师", "前端工程师", "后端工程师", "大模型工程师",
+)
 _KNOWN_SKILLS = (
     "Python", "Java", "C++", "C#", "Golang", "Go", "JavaScript", "TypeScript", "React", "Vue",
     "PyTorch", "TensorFlow", "Transformers", "HuggingFace", "FastAPI", "Django", "Flask", "Spring Boot",
@@ -27,7 +32,10 @@ _KNOWN_SKILLS = (
 
 
 def _clean_line(value: str) -> str:
-    return re.sub(r"\s+", " ", _BULLET_PATTERN.sub("", value)).strip()
+    cleaned = re.sub(r"\s+", " ", _BULLET_PATTERN.sub("", value)).strip()
+    for term in _CJK_COMPACT_TERMS:
+        cleaned = re.sub(r"\s*".join(map(re.escape, term)), term, cleaned)
+    return cleaned
 
 
 def _section_heading(line: str) -> tuple[str | None, str]:
@@ -42,7 +50,14 @@ def _section_heading(line: str) -> tuple[str | None, str]:
 
 
 def _join_lines(lines: Iterable[str], *, limit: int) -> str | None:
-    values = [line for line in lines if line and not _CONTACT_PATTERN.search(line)]
+    values: list[str] = []
+    for line in lines:
+        for segment in re.split(r"[；;]", line):
+            value = segment.strip()
+            compact = re.sub(r"\s+", "", value).casefold()
+            if not value or _CONTACT_PATTERN.search(value) or "website:" in compact or "website：" in compact or "www." in compact:
+                continue
+            values.append(value)
     if not values:
         return None
     return "；".join(values)[:limit].rstrip("；")
@@ -66,8 +81,10 @@ def _skills_from_sections(lines: list[str], full_text: str) -> list[str]:
         cleaned = _SKILL_PREFIX.sub("", line)
         for token in re.split(r"[、,，;；/|]+", cleaned):
             value = token.strip(" .。()（）")
-            if value and len(value) <= 40 and not _CONTACT_PATTERN.search(value):
-                tokens.append(value)
+            compact = re.sub(r"\s+", "", value).casefold()
+            normalized = next((skill for skill in _KNOWN_SKILLS if re.sub(r"\s+", "", skill).casefold() == compact), value)
+            if normalized and normalized not in _NON_SKILL_LABELS and len(normalized) <= 40 and not _CONTACT_PATTERN.search(normalized):
+                tokens.append(normalized)
     if not tokens:
         for skill in _KNOWN_SKILLS:
             if re.search(rf"(?<![A-Za-z0-9+#]){re.escape(skill)}(?![A-Za-z0-9+#])", full_text, re.I):
@@ -95,8 +112,8 @@ def extract_resume_profile(text: str) -> dict[str, object]:
             sections[current].append(line)
 
     full_text = "\n".join(cleaned_lines)
-    summary = _join_lines(sections["summary"][:3], limit=320)
     experience = _join_lines(sections["experience"][:8], limit=600)
+    summary = _join_lines(sections["summary"][:3], limit=320) or _join_lines(sections["experience"][:2], limit=320)
     education = _join_lines(sections["education"][:5], limit=400)
     skills = _skills_from_sections(sections["skills"], full_text)
     populated = sum((bool(summary), bool(skills), bool(experience), bool(education)))

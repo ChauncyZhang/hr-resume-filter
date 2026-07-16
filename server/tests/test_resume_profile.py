@@ -36,3 +36,21 @@ def test_extract_resume_profile_reports_partial_data_instead_of_placeholder_copy
     assert profile["experience"] is None
     assert profile["education"] is None
     assert profile["status"] == "partial"
+
+
+def test_extract_resume_profile_uses_experience_as_summary_and_repairs_pdf_skill_spacing() -> None:
+    profile = extract_resume_profile(
+        """
+        技能
+        用户调研、工具、Py thon、Ja v aScrip t
+        工作经历
+        平台 产品经 理，小米科技 | 2024.08 - 至今
+        负责 AI Agent 产品设计与交付
+        教育经历
+        景观建筑硕士；W ebsite: www.sno wguo.c om；密歇根安娜堡大学；2021.09 - 2024.05
+        """
+    )
+
+    assert profile["summary"] == "平台产品经理，小米科技 | 2024.08 - 至今；负责 AI Agent 产品设计与交付"
+    assert profile["skills"] == ["用户调研", "Python", "JavaScript"]
+    assert profile["education"] == "景观建筑硕士；密歇根安娜堡大学；2021.09 - 2024.05"
