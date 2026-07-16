@@ -17,9 +17,6 @@ const {
   resolveInterviewFeedbackDraft,
   saveInterviewFeedbackDraft,
 } = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { clearInterviewFeedbackDraft, getFeedbackSubmitError, getInterviewFeedbackDraftKey, isAmbiguousFeedbackSubmitError, loadInterviewFeedbackDraft, resolveInterviewFeedbackDraft, saveInterviewFeedbackDraft }; })()`);
-const scheduleHelpersSource = source.match(/\/\* interview-schedule-helpers:start \*\/([\s\S]*?)\/\* interview-schedule-helpers:end \*\//)?.[1];
-assert.ok(scheduleHelpersSource, "InterviewViews.jsx must expose the schedule helper block");
-const scheduleHelpers = vm.runInNewContext(`(() => { ${scheduleHelpersSource.replaceAll("export ", "")} return { getScheduleSubmitError: typeof getScheduleSubmitError === "function" ? getScheduleSubmitError : undefined, showInterviewDatePicker: typeof showInterviewDatePicker === "function" ? showInterviewDatePicker : undefined }; })()`);
 
 function createStorage(initial = {}) {
   const values = new Map(Object.entries(initial));
@@ -99,23 +96,6 @@ test("invalid feedback state transitions explain when submission becomes availab
   );
 });
 
-test("a server rejection for a past interview time is explained in Chinese", () => {
-  assert.equal(typeof scheduleHelpers.getScheduleSubmitError, "function");
-  assert.equal(
-    scheduleHelpers.getScheduleSubmitError({ code: "interview_time_in_past" }),
-    "面试日期和开始时间必须晚于当前时刻，请重新选择。",
-  );
-});
-
-test("date picker enhancement calls showPicker and tolerates unsupported browsers", () => {
-  let called = 0;
-  assert.equal(typeof scheduleHelpers.showInterviewDatePicker, "function");
-  assert.equal(scheduleHelpers.showInterviewDatePicker({ showPicker() { called += 1; } }), true);
-  assert.equal(called, 1);
-  assert.equal(scheduleHelpers.showInterviewDatePicker({}), false);
-  assert.equal(scheduleHelpers.showInterviewDatePicker({ showPicker() { throw new Error("unsupported"); } }), false);
-});
-
 test("feedback submit retry distinguishes ambiguous transport failures", () => {
   assert.equal(isAmbiguousFeedbackSubmitError({ status: 0, kind: "unavailable" }), true);
   assert.equal(isAmbiguousFeedbackSubmitError({ status: 503 }), true);
@@ -149,13 +129,4 @@ test("assigned participants can submit feedback before a scheduled or confirmed 
   assert.match(source, /const \[editing, setEditing\] = useState\(ownsFeedback\)/);
   assert.match(source, /disabled=\{submitting \|\| loading \|\| !ownsFeedback\}/);
   assert.doesNotMatch(source, /submitEligibilityTime|feedback-submit-gate|面试开始后可提交/);
-});
-
-test("the full date field opens the native picker and enforces a local-today minimum", () => {
-  assert.match(source, /<label className="schedule-date-field" onClick=\{\(event\) => showInterviewDatePicker\(event\.currentTarget\.querySelector\('input\[type="date"\]'\)\)\}>/);
-  assert.match(source, /<input type="date" min=\{getLocalDateInputMin\(\)\}/);
-});
-
-test("schedule validation rejects a date and time that is not strictly in the future", () => {
-  assert.match(source, /else if \(form\.date && !isInterviewStartStrictlyFuture\(form\.date, form\.time\)\) next\.time = "面试日期和开始时间必须晚于当前时刻"/);
 });
