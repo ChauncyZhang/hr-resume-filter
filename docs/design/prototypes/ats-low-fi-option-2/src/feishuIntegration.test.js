@@ -75,3 +75,15 @@ test("Login Settings and Profile expose only the requested Feishu entry points",
   assert.match(profile, /飞书账号/);
   assert.doesNotMatch(interviews, /Feishu|飞书/);
 });
+
+test("Feishu settings keep the enable control and actions in one responsive footer", async () => {
+  const [settings, styles] = await Promise.all([
+    readFile(new URL("./FeishuIntegrationSettings.jsx", import.meta.url), "utf8"),
+    readFile(new URL("./product-theme-admin.css", import.meta.url), "utf8"),
+  ]);
+  assert.match(settings, /className="feishu-form-footer"/);
+  assert.match(settings, /className="feishu-enabled-control"/);
+  assert.match(settings, /className="feishu-form-actions"/);
+  assert.match(styles, /\.settings-page \.feishu-form-footer\s*\{/);
+  assert.match(styles, /\.feishu-enabled-control input\[type="checkbox"\]/);
+});

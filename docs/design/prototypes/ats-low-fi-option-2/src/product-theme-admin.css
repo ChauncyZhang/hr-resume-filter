@@ -752,6 +752,43 @@
 .settings-page .password-settings-form > .profile-success,
 .settings-page .password-settings-form > div:last-child { grid-column: 1 / -1; }
 
+.settings-page .feishu-form-footer {
+  min-height: 58px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-page .password-settings-form .feishu-enabled-control {
+  width: fit-content;
+  min-height: 38px;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.settings-page .password-settings-form .feishu-enabled-control input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-height: 18px;
+  margin: 0;
+  flex: 0 0 auto;
+  accent-color: var(--blue);
+}
+
+.settings-page .feishu-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .settings-page .settings-form label,
 .settings-page .password-settings-form label,
 .settings-drawer .password-settings-form label,
@@ -1095,6 +1132,9 @@
   .settings-page .password-settings-form > .settings-error,
   .settings-page .password-settings-form > .profile-success,
   .settings-page .password-settings-form > div:last-child { grid-column: auto; }
+  .settings-page .feishu-form-footer { align-items: stretch; flex-direction: column; }
+  .settings-page .feishu-form-actions { justify-content: stretch; }
+  .settings-page .feishu-form-actions .button { flex: 1; justify-content: center; }
   .settings-page .settings-sticky-actions { margin: 16px -13px -15px; padding: 12px 13px; }
 
   .login-page,

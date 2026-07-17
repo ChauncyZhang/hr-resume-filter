@@ -49,6 +49,10 @@ async function openAuthenticatedPage(viewport) {
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [{ id: "user-1", display_name: "Admin", email: "admin@example.test", department_id: "dep-1", department_name: "技术部", roles: ["recruiting_admin"], status: "active" }] }) });
       return;
     }
+    if (pathname === "/api/v1/settings/integrations/feishu") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { enabled: false, configured: false, app_id: "", redirect_uri: "", calendar_id: "" } }) });
+      return;
+    }
     await route.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ status: 503 }) });
   });
   const page = await context.newPage();
@@ -160,6 +164,43 @@ test("audit controls align at desktop width and stack without overflow on narrow
         assert.ok(boxes.every((box) => box.left >= 0 && box.right <= viewport.width), `mobile audit control leaves viewport: ${JSON.stringify(boxes)}`);
       }
       await assertNoHorizontalOverflow(page, `${viewport.width}px audit`);
+    } finally {
+      await context.close();
+    }
+  }
+});
+
+test("Feishu enable control stays compact and aligned with responsive actions", { timeout: 60_000 }, async () => {
+  for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
+    const { context, page } = await openAuthenticatedPage(viewport);
+    try {
+      if (viewport.width <= 840) await page.getByRole("button", { name: "打开主导航", exact: true }).click();
+      await page.getByRole("button", { name: "设置", exact: true }).click();
+      await page.getByRole("button", { name: "飞书集成", exact: true }).click();
+      const footer = page.locator(".feishu-form-footer");
+      await footer.waitFor();
+      const geometry = await footer.evaluate((element) => {
+        const control = element.querySelector(".feishu-enabled-control").getBoundingClientRect();
+        const checkbox = element.querySelector('input[type="checkbox"]').getBoundingClientRect();
+        const actions = element.querySelector(".feishu-form-actions").getBoundingClientRect();
+        const footerBox = element.getBoundingClientRect();
+        return {
+          control: { top: control.top, bottom: control.bottom, left: control.left, right: control.right },
+          checkbox: { width: checkbox.width, height: checkbox.height, top: checkbox.top, bottom: checkbox.bottom },
+          actions: { top: actions.top, bottom: actions.bottom, left: actions.left, right: actions.right },
+          footer: { top: footerBox.top, bottom: footerBox.bottom, left: footerBox.left, right: footerBox.right },
+        };
+      });
+      assert.ok(geometry.checkbox.width <= 18 && geometry.checkbox.height <= 18, `checkbox is oversized: ${JSON.stringify(geometry)}`);
+      assert.ok(geometry.checkbox.top >= geometry.control.top && geometry.checkbox.bottom <= geometry.control.bottom, `checkbox leaves its label: ${JSON.stringify(geometry)}`);
+      if (viewport.width === 1280) {
+        assert.ok(geometry.actions.left > geometry.control.right, `desktop footer items overlap: ${JSON.stringify(geometry)}`);
+        assert.ok(geometry.actions.top < geometry.control.bottom && geometry.actions.bottom > geometry.control.top, `desktop footer items are not aligned: ${JSON.stringify(geometry)}`);
+      } else {
+        assert.ok(geometry.actions.top > geometry.control.bottom, `mobile footer did not stack: ${JSON.stringify(geometry)}`);
+      }
+      assert.ok(geometry.control.left >= geometry.footer.left && geometry.actions.right <= geometry.footer.right, `footer content overflows: ${JSON.stringify(geometry)}`);
+      await assertNoHorizontalOverflow(page, `${viewport.width}px Feishu settings`);
     } finally {
       await context.close();
     }

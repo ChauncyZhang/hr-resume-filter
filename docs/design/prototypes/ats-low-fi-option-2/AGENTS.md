@@ -18,3 +18,4 @@ Durable product rules from HR usability review:
 - Cross-module links must encode an explicit in-app return target when the user is expected to continue the originating workflow. Do not depend only on component memory or browser history for returning from candidate, interview, or settings details.
 - Keep each page-level primary action in the shared topbar action slot; do not position equivalent actions inside page-specific content headers.
 - Board and list density changes must preserve visible, clickable candidate records; never hide operational data to make stage columns fit.
+- Binary settings controls must keep compact checkbox or toggle dimensions and align with their labels and related actions; generic text-input sizing must never stretch them.
