@@ -35,7 +35,11 @@ export function FeishuIntegrationSettings({ onNotify = () => {}, client = apiCli
   }
   async function testConnection() {
     setStatus("testing"); setMessage("");
-    try { const result = await client.testFeishuConnection(); setMessage(result?.ok ? "连接测试成功" : "连接测试失败"); setStatus("ready"); }
+    try {
+      const next = normalizeFeishuConfig(await client.testFeishuConnection());
+      const succeeded = next.lastTestStatus === "succeeded";
+      setConfig(next); setMessage(succeeded ? "连接测试成功" : "连接测试失败"); setStatus(succeeded ? "ready" : "error");
+    }
     catch { setMessage("连接测试失败，现有招聘功能不受影响。"); setStatus("error"); }
   }
 
