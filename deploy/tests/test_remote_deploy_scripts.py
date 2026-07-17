@@ -36,6 +36,13 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "remote-rollback.sh" in POWERSHELL
 
 
+def test_container_test_gate_excludes_contracts_that_require_host_tools() -> None:
+    assert "--ignore=server/tests/test_backup_restore_contract.py" in POWERSHELL
+    assert "--ignore=server/tests/test_observability_preflight.py" in POWERSHELL
+    assert "--ignore=server/tests/test_production_topology.py" in POWERSHELL
+    assert "--ignore=server/tests/test_observability_topology.py" in POWERSHELL
+
+
 def test_remote_release_preserves_project_identity_and_rolls_back_services() -> None:
     assert "docker compose -p beyondcandidate" in REMOTE_SHELL
     assert 'previous_release=$(readlink -f "$app_root/current")' in REMOTE_SHELL

@@ -116,7 +116,12 @@ try {
         if ($Scope -eq "all") {
             $testImage = "beyondcandidate-server-test:$releaseId"
             Invoke-Native docker build --target test -t $testImage -f (Join-Path $repositoryRoot "server\Dockerfile") $repositoryRoot
-            Invoke-Native docker run --rm $testImage python -m pytest server/tests --ignore=server/tests/test_production_topology.py --ignore=server/tests/test_observability_topology.py -q
+            Invoke-Native docker run --rm $testImage python -m pytest server/tests `
+                --ignore=server/tests/test_backup_restore_contract.py `
+                --ignore=server/tests/test_observability_preflight.py `
+                --ignore=server/tests/test_production_topology.py `
+                --ignore=server/tests/test_observability_topology.py `
+                -q
         }
     }
 
