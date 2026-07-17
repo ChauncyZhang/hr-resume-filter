@@ -303,6 +303,45 @@ test("safe error mapping uses only known codes and never response detail", () =>
   assert.equal(getLlmSettingsErrorMessage(unknown).includes("password"), false);
 });
 
+test("system admin can add a provider and reload the available provider list", async () => {
+  const createdConfig = {
+    ...systemConfig,
+    available_providers: { approved: ["model-a"], bigmodel: ["glm-5.2"] },
+    provider_options: [{ provider_id: "bigmodel", display_name: "智谱 BigModel", base_url: "https://open.bigmodel.cn/api/paas/v4", models: ["glm-5.2"], source: "organization" }],
+  };
+  const client = createClient((path, options, count) => {
+    if (path.endsWith("/providers")) return { data: { provider_id: "bigmodel" } };
+    return { data: count === 1 ? systemConfig : createdConfig };
+  });
+  const controller = createLlmSettingsController({ client, createIdempotencyKey: () => "provider-key" });
+  await controller.load();
+
+  const succeeded = await controller.createProvider({
+    provider_id: "bigmodel",
+    display_name: "智谱 BigModel",
+    base_url: "https://open.bigmodel.cn/api/paas/v4",
+    models: ["glm-5.2"],
+  });
+
+  assert.equal(succeeded, true);
+  assert.equal(client.calls[1].path, "/api/v1/settings/llm/providers");
+  assert.equal(client.calls[1].options.method, "POST");
+  assert.equal(client.calls[1].options.idempotencyKey, "provider-key");
+  assert.deepEqual(controller.getState().config.available_providers.bigmodel, ["glm-5.2"]);
+  assert.equal(controller.getState().message, "Provider 已添加，可以继续配置模型和 API Key。");
+});
+
+test("adding a provider does not discard an unsaved AI configuration", async () => {
+  const client = createClient(() => ({ data: systemConfig }));
+  const controller = createLlmSettingsController({ client });
+  await controller.load();
+  controller.updateDraft({ model: "model-b" });
+
+  assert.equal(await controller.createProvider({ provider_id: "other" }), false);
+  assert.equal(client.calls.length, 1);
+  assert.equal(controller.getState().draft.model, "model-b");
+});
+
 test("dispose prevents updates and notifications after an in-flight request settles", async () => {
   let resolveRequest;
   const client = createClient(() => new Promise((resolve) => { resolveRequest = resolve; }));

@@ -843,6 +843,25 @@
   background: rgba(255, 255, 255, .96);
 }
 
+.provider-empty {
+  margin: 16px 20px 0;
+  padding: 18px;
+  border: 1px dashed #c8d4dc;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  background: #fafbfc;
+}
+.provider-empty > div { min-width: 0; flex: 1; }
+.provider-empty strong { display: block; color: var(--text); }
+.provider-empty p { margin: 4px 0 0; }
+.provider-drawer-backdrop { position: fixed; z-index: 89; inset: 0; background: rgba(20, 35, 50, .24); }
+.provider-create-drawer small { color: var(--muted); line-height: 1.5; }
+.provider-create-drawer textarea { min-height: 132px; }
+.provider-create-drawer .settings-error { margin: 0; }
+
 .settings-page .organization-state,
 .settings-page .governance-loading,
 .settings-page .governance-empty,

@@ -15,6 +15,36 @@ production traffic. The production traffic decision remains external.
 
 ## Preflight and launch
 
+### Current single-server release command
+
+For the current SSH-managed trial server, run the checked-in PowerShell entrypoint from a clean
+Windows worktree. It builds versioned images locally, transfers a source snapshot and image
+archives over SSH, keeps the previous release directory as the rollback point, preserves the
+server-owned `.env` and TLS overlay, uses the fixed `beyondcandidate` Compose project name, and
+verifies container health plus the public HTTPS browser boundary before reporting success.
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File deploy\deploy-remote.ps1 `
+  -RemoteHost root@120.79.184.221 `
+  -Domain hr.aurora-tek.cn `
+  -Scope all
+```
+
+For a frontend-only change that requires no backend image or migration:
+
+```powershell
+PowerShell -ExecutionPolicy Bypass -File deploy\deploy-remote.ps1 -Scope frontend
+```
+
+The command rejects a dirty worktree by default. `-AllowDirty` is reserved for an explicitly
+approved emergency release and marks the release ID as dirty. `-SkipTests` is also an emergency
+override, not the normal path. `-ValidateOnly` checks local prerequisites and release identity
+without building or changing the server.
+
+This single-host archive transfer is the current operational path for the trial deployment. It
+does not replace the immutable registry/digest and progressive rollout process required below
+for a multi-host or formally production-ready launch.
+
 Before any launch, verify approved DNS and TLS certificates, host and remote
 storage capacity, clock synchronization, Docker/Compose versions, immutable
 image digests, secret-file ownership, remote TLS, PostgreSQL/MinIO reachability,

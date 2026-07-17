@@ -41,7 +41,7 @@ class Gateway:
         self.inspect = inspect
         self.calls = []
 
-    async def evaluate(self, provider_id, model, api_key, request):
+    async def evaluate(self, provider_id, model, api_key, request, **kwargs):
         if self.inspect:
             self.inspect()
         self.calls.append((provider_id, model, api_key, request))

@@ -8,7 +8,7 @@ from server.tests.test_screening_api import app_and_seed,login
 
 class Gateway:
     def __init__(self): self.calls=[]
-    async def test_connection(self,provider,model,key): self.calls.append((provider,model,key)); return 12
+    async def test_connection(self,provider,model,key,**kwargs): self.calls.append((provider,model,key)); return 12
 
 def test_llm_settings_role_key_preservation_and_fixed_connection_test(tmp_path):
     app,_,_=app_and_seed(tmp_path); app.state.llm_allowlist=ProviderAllowlist({"approved":{"base_url":"https://provider.example/v1","models":["model-a"]}},resolver=lambda *args,**kwargs:[(2,1,6,"",("8.8.8.8",443))]); gateway=Gateway(); app.state.llm_gateway=gateway
@@ -52,3 +52,38 @@ def test_llm_settings_reject_unapproved_provider_and_require_key(tmp_path):
         system=login(client,"system@example.test")
         denied=client.put("/api/v1/settings/llm",json={"provider_id":"other","model":"model-a","enabled":False},headers={**system,"If-Match":'"0"',"Idempotency-Key":"other"}); assert denied.status_code==422
         missing=client.put("/api/v1/settings/llm",json={"provider_id":"approved","model":"model-a","enabled":True},headers={**system,"If-Match":'"0"',"Idempotency-Key":"missing"}); assert missing.status_code==422 and missing.json()["code"]=="api_key_required"
+
+def test_system_admin_can_add_an_organization_provider_and_use_it(tmp_path):
+    app,_,_=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        system=login(client,"system@example.test")
+        payload={"provider_id":"bigmodel","display_name":"智谱 BigModel","base_url":"https://open.bigmodel.cn/api/paas/v4","models":["glm-4.5","glm-5.2"]}
+        created=client.post("/api/v1/settings/llm/providers",json=payload,headers={**system,"Idempotency-Key":"provider-create"})
+        assert created.status_code==201,created.text
+        assert created.json()["data"]=={**payload,"source":"organization"}
+        providers=client.get("/api/v1/settings/llm/providers",headers=system)
+        assert providers.status_code==200 and providers.json()["data"]==[{**payload,"source":"organization"}]
+        config=client.get("/api/v1/settings/llm",headers=system).json()["data"]
+        assert config["available_providers"]=={"bigmodel":["glm-4.5","glm-5.2"]}
+        assert config["provider_options"]==[{**payload,"source":"organization"}]
+        saved=client.put("/api/v1/settings/llm",json={"provider_id":"bigmodel","model":"glm-5.2","enabled":False},headers={**system,"If-Match":'"0"',"Idempotency-Key":"config-save"})
+        assert saved.status_code==200,saved.text
+        replay=client.post("/api/v1/settings/llm/providers",json=payload,headers={**system,"Idempotency-Key":"provider-create"})
+        assert replay.status_code==201 and replay.json()==created.json()
+
+def test_provider_creation_rejects_unsafe_urls_duplicates_and_non_system_users(tmp_path):
+    app,_,_=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        system=login(client,"system@example.test")
+        unsafe={"provider_id":"private","display_name":"Private","base_url":"https://127.0.0.1/v1","models":["model"]}
+        rejected=client.post("/api/v1/settings/llm/providers",json=unsafe,headers={**system,"Idempotency-Key":"unsafe"})
+        assert rejected.status_code==422 and rejected.json()["code"]=="provider_address_forbidden"
+        valid={**unsafe,"provider_id":"approved","base_url":"https://provider.example/v1"}
+        first=client.post("/api/v1/settings/llm/providers",json=valid,headers={**system,"Idempotency-Key":"first"})
+        assert first.status_code==201
+        duplicate=client.post("/api/v1/settings/llm/providers",json=valid,headers={**system,"Idempotency-Key":"second"})
+        assert duplicate.status_code==409 and duplicate.json()["code"]=="provider_already_exists"
+        client.post("/api/v1/auth/logout",headers=system)
+        admin=login(client,"admin@example.test")
+        denied=client.post("/api/v1/settings/llm/providers",json={**valid,"provider_id":"other"},headers={**admin,"Idempotency-Key":"denied"})
+        assert denied.status_code==404

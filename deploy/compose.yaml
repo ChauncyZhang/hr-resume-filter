@@ -44,7 +44,7 @@ x-app-service: &app-service
     clamav:
       condition: service_healthy
   restart: unless-stopped
-  networks: [private]
+  networks: [private, provider-egress]
 
 services:
   proxy:
@@ -217,6 +217,7 @@ services:
 
 networks:
   edge:
+  provider-egress:
   private:
     internal: true
 
