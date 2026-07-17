@@ -71,7 +71,7 @@ async function run() {
   assert.equal(boundary.readiness.status, 200, "/health/ready must return 200");
   assert.match(boundary.readiness.contentType, /application\/json/i);
   assert.equal(boundary.me.status, 401, "/api/v1/me must return unauthenticated JSON");
-  assert.match(boundary.me.contentType, /application\/json/i);
+  assert.match(boundary.me.contentType, /application\/(?:problem\+)?json/i);
   assert.equal(boundary.overflow, false, "login page must not overflow horizontally");
   assert.deepEqual(telemetry, [], "production smoke observed browser runtime failures");
   process.stdout.write("production browser smoke: HTTPS frontend and API boundary passed\n");
