@@ -116,3 +116,9 @@ test("Feishu settings keep the enable control and actions in one responsive foot
   assert.match(styles, /\.settings-page \.feishu-form-footer\s*\{/);
   assert.match(styles, /\.feishu-enabled-control input\[type="checkbox"\]/);
 });
+
+test("Feishu connection test reads the persisted test status instead of a missing ok field", async () => {
+  const settings = await readFile(new URL("./FeishuIntegrationSettings.jsx", import.meta.url), "utf8");
+  assert.match(settings, /next\.lastTestStatus === "succeeded"/);
+  assert.doesNotMatch(settings, /result\?\.ok/);
+});
