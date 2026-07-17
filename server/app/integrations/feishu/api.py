@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
 from fastapi import APIRouter, Query, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -25,6 +25,13 @@ from server.app.integrations.feishu.sync import mark_provider_change
 
 
 router = APIRouter(prefix="/api/v1")
+
+
+def _app_redirect(*, status: str | None = None, error: str | None = None) -> RedirectResponse:
+    query = urlencode({key: value for key, value in {"feishu_status": status, "feishu_error": error}.items() if value})
+    response = RedirectResponse(url=f"/?{query}" if query else "/", status_code=303)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 class StrictModel(BaseModel):
@@ -271,7 +278,7 @@ def oauth_callback(request: Request, code: str = Query(min_length=1, max_length=
                     normalized_email = identity.email.strip().casefold() if identity.email else None
                     invited = db.scalar(select(User).where(User.organization_id == organization_id, User.normalized_email == normalized_email, User.status == UserStatus.INVITED).with_for_update()) if normalized_email else None
                     if invited is None:
-                        return problem(request, 403, "feishu_account_not_invited_or_bound", "The Feishu account is not invited or linked.")
+                        return _app_redirect(error="feishu_account_not_invited_or_bound")
                     invited.status = UserStatus.ACTIVE
                     user_id = invited.id
             if existing is not None and existing.user_id != user_id:
@@ -290,13 +297,11 @@ def oauth_callback(request: Request, code: str = Query(min_length=1, max_length=
         return problem(request, 409, "feishu_identity_already_bound", "The Feishu identity is already linked.")
 
     if purpose == "bind":
-        response = JSONResponse({"data": {"authenticated": True, "bound": True}})
+        response = _app_redirect(status="bound")
     else:
-        token, csrf = request.app.state.identity_service.issue_session(user_id, trace_id=request.state.trace_id, network=request.client.host if request.client else None, event="authentication.feishu_login")
-        response = JSONResponse({"data": {"authenticated": True, "bound": True}})
+        token, _csrf = request.app.state.identity_service.issue_session(user_id, trace_id=request.state.trace_id, network=request.client.host if request.client else None, event="authentication.feishu_login")
+        response = _app_redirect(status="connected")
         response.set_cookie(cookie_name(request), token, httponly=True, secure=request.app.state.settings.environment == "production", samesite="lax", path="/")
-        response.headers["X-CSRF-Token"] = csrf
-    response.headers["Cache-Control"] = "no-store"
     return response
 
 

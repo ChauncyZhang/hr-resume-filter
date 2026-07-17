@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Building2, LoaderCircle, LockKeyhole, LogIn, LogOut, Mail, MessageCircle, ShieldX } from "lucide-react";
 import { apiClient } from "./apiClient.js";
 import { getSessionMessage } from "./session.js";
-import { getFeishuLoginErrorMessage, startFeishuAuthorization } from "./feishuIntegration.js";
+import { getFeishuCallbackErrorCode, getFeishuLoginErrorMessage, startFeishuAuthorization } from "./feishuIntegration.js";
 import "./product-theme-admin.css";
 
 export function SessionLoadingView() {
@@ -39,6 +39,8 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
   const [feishuStatus, setFeishuStatus] = useState("idle");
   const [feishuError, setFeishuError] = useState("");
   const message = getSessionMessage(error);
+  const callbackErrorCode = getFeishuCallbackErrorCode();
+  const callbackError = callbackErrorCode ? getFeishuLoginErrorMessage({ code: callbackErrorCode }) : "";
 
   useEffect(() => {
     if (initialEmail) setForm((current) => ({ ...current, email: initialEmail }));
@@ -140,8 +142,8 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
             </div>
           </label>
 
-          <div className="login-message" role={message ? "alert" : "status"} aria-live="polite">
-            {message || (authContextStatus === "loading" ? "正在读取部署配置…" : "")}
+          <div className="login-message" role={message || callbackError ? "alert" : "status"} aria-live="polite">
+            {message || callbackError || (authContextStatus === "loading" ? "正在读取部署配置…" : "")}
           </div>
           <button className="button primary login-submit" type="submit" disabled={submitting || authContextStatus === "loading"}>
             {submitting ? <LoaderCircle className="spin" size={17} aria-hidden="true" /> : <LogIn size={17} aria-hidden="true" />}

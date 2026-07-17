@@ -42,7 +42,14 @@ export function getFeishuLoginErrorMessage(error) {
   if (error?.code === "feishu_disabled") {
     return "当前组织尚未启用飞书登录，请联系管理员前往“设置 → 飞书集成”完成配置并启用。";
   }
+  if (error?.code === "feishu_account_not_invited_or_bound") {
+    return "当前飞书账号尚未绑定。已有账号请先使用密码登录，再到“个人设置 → 飞书账号”完成绑定；新用户请联系管理员邀请。";
+  }
   return "飞书登录服务暂时不可用，请稍后重试。";
+}
+
+export function getFeishuCallbackErrorCode(search = globalThis.location?.search || "") {
+  return safeString(new URLSearchParams(search).get("feishu_error")).trim();
 }
 
 export function getFeishuConfigErrorMessage(error) {

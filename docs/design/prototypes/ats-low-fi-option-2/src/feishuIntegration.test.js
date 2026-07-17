@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createApiClient } from "./apiClient.js";
-import { buildFeishuConfigPayload, getFeishuConfigErrorMessage, getFeishuLoginErrorMessage, normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
+import { buildFeishuConfigPayload, getFeishuCallbackErrorCode, getFeishuConfigErrorMessage, getFeishuLoginErrorMessage, normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
 
 function response(body, status = 200, headers = {}) {
   return new Response(body == null ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
@@ -92,6 +92,18 @@ test("Feishu login errors explain when an administrator must enable the integrat
   assert.equal(getFeishuLoginErrorMessage({ code: "service_unavailable" }), "飞书登录服务暂时不可用，请稍后重试。");
 });
 
+test("Feishu callback errors guide unbound users back to a safe account-linking flow", () => {
+  assert.equal(
+    getFeishuCallbackErrorCode("?feishu_error=feishu_account_not_invited_or_bound"),
+    "feishu_account_not_invited_or_bound",
+  );
+  assert.equal(
+    getFeishuLoginErrorMessage({ code: "feishu_account_not_invited_or_bound" }),
+    "当前飞书账号尚未绑定。已有账号请先使用密码登录，再到“个人设置 → 飞书账号”完成绑定；新用户请联系管理员邀请。",
+  );
+  assert.equal(getFeishuCallbackErrorCode("?other=value"), "");
+});
+
 test("Login Settings and Profile expose only the requested Feishu entry points", async () => {
   const [login, settings, profile, interviews] = await Promise.all([
     readFile(new URL("./LoginView.jsx", import.meta.url), "utf8"),
@@ -100,6 +112,7 @@ test("Login Settings and Profile expose only the requested Feishu entry points",
     readFile(new URL("./InterviewViews.jsx", import.meta.url), "utf8"),
   ]);
   assert.match(login, /飞书登录/);
+  assert.match(login, /getFeishuCallbackErrorCode/);
   assert.match(settings, /飞书集成/);
   assert.match(profile, /飞书账号/);
   assert.doesNotMatch(interviews, /Feishu|飞书/);

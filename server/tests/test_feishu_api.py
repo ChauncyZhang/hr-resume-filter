@@ -169,11 +169,17 @@ def test_oauth_login_activates_only_a_preinvited_user_and_consumes_state_once(fe
     assert state in authorized.json()["data"]["authorization_url"]
 
     callback = client.get(
-        "/api/v1/auth/feishu/callback", params={"code": "oauth-code", "state": state}
+        "/api/v1/auth/feishu/callback",
+        params={"code": "oauth-code", "state": state},
+        follow_redirects=False,
     )
-    assert callback.status_code == 200
-    assert callback.json()["data"] == {"authenticated": True, "bound": True}
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/?feishu_status=connected"
     assert "hr_session=" in callback.headers["set-cookie"]
+    me = client.get("/api/v1/me", headers={"Sec-Fetch-Site": "same-origin"})
+    assert me.status_code == 200
+    assert me.json()["data"]["id"] == str(invited_id)
+    assert me.headers["x-csrf-token"]
     replay = client.get(
         "/api/v1/auth/feishu/callback", params={"code": "oauth-code", "state": state}
     )
@@ -210,9 +216,10 @@ def test_oauth_never_registers_or_email_matches_an_active_unbound_user(feishu_ap
     response = client.get(
         "/api/v1/auth/feishu/callback",
         params={"code": "unknown-code", "state": authorized["state"]},
+        follow_redirects=False,
     )
-    assert response.status_code == 403
-    assert response.json()["code"] == "feishu_account_not_invited_or_bound"
+    assert response.status_code == 303
+    assert response.headers["location"] == "/?feishu_error=feishu_account_not_invited_or_bound"
     with app.state.identity_store.sync_session() as db:
         assert db.query(User).count() == 1
         assert db.query(FeishuIdentityBinding).count() == 0
@@ -234,9 +241,12 @@ def test_authenticated_user_can_bind_read_status_and_unbind(feishu_app) -> None:
     )
     state = authorized.json()["data"]["state"]
     callback = client.get(
-        "/api/v1/auth/feishu/callback", params={"code": "bind-code", "state": state}
+        "/api/v1/auth/feishu/callback",
+        params={"code": "bind-code", "state": state},
+        follow_redirects=False,
     )
-    assert callback.status_code == 200
+    assert callback.status_code == 303
+    assert callback.headers["location"] == "/?feishu_status=bound"
     status = client.get(
         "/api/v1/me/integrations/feishu", headers={"Sec-Fetch-Site": "same-origin"}
     )
