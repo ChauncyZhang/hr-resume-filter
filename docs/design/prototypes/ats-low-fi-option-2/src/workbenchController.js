@@ -7,6 +7,7 @@ const STAGES = {
   interview_pending: "待安排",
   interviewing: "面试中",
   decision: "待决策",
+  passed: "已通过",
 };
 
 function safeString(value, fallback = "") {
@@ -107,7 +108,7 @@ function validateEnvelope(response) {
     || interviews.pending_feedback.length !== 0
   ) throw invalidResponse();
   const jobIds = new Set(payload.jobs.map((job) => job.id));
-  const taskStages = ["contact", "interview_pending", "decision"];
+  const taskStages = ["review", "interview_pending", "decision", "passed"];
   if (!taskStages.every((stage) => (
     isStageGroup(taskGroups[stage], stage, jobIds)
     && taskGroups[stage].count === payload.jobs.reduce((total, job) => total + job.stages[stage].count, 0)
@@ -190,9 +191,10 @@ function normalizeWorkbench(payload) {
     generatedAt: safeString(payload?.generated_at),
     jobs,
     tasks: {
-      contact: normalizeTaskGroup(tasks.contact, "contact", jobNames),
+      review: normalizeTaskGroup(tasks.review, "review", jobNames),
       interviewPending: normalizeTaskGroup(tasks.interview_pending, "interview_pending", jobNames),
       decision: normalizeTaskGroup(tasks.decision, "decision", jobNames),
+      passed: normalizeTaskGroup(tasks.passed, "passed", jobNames),
     },
     interviews: {
       available: interviewsAvailable,

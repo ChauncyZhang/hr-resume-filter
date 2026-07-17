@@ -130,6 +130,17 @@ backup-tool, schema-head, and manifest versions. Apply forward-only migrations;
 never downgrade the database as rollback. Keep traffic bounded until error,
 latency, queue, storage, and governance signals remain healthy.
 
+After every forward migration, reconcile the application role against the new
+schema before starting API or worker processes:
+
+```sh
+docker compose --env-file deploy/.env -f deploy/compose.yaml exec -T postgres sh /docker-entrypoint-initdb.d/10-provision-app-role.sh
+```
+
+Do not continue to readiness or traffic checks if this command fails. PostgreSQL
+initialization scripts only run automatically when a new database volume is
+created; they do not grant access to tables added by a later migration.
+
 The application rollback path is the last compatible immutable application
 image against the forward-migrated schema. Define that compatibility before
 launch. If compatibility is not proved, stop rollout and recover forward rather

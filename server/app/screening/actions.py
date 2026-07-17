@@ -118,7 +118,7 @@ def apply_bulk_action(db,organization_id,run_id,payload,actor_user_id,trace_id):
     for item in rows:
         application=by_id[item.application_id]; expected=requested[item.id]
         target="review" if payload.command=="advance_to_review" else "new" if payload.command=="undo_advance_to_new" else "rejected"
-        if payload.command!="undo_advance_to_new" and application.stage==target and application.version==expected+1: decisions.append((item,application,"already_applied",target)); continue
+        if payload.command=="advance_to_review" and application.stage==target and application.version in {expected,expected+1}: decisions.append((item,application,"already_applied",target)); continue
         if application.version!=expected: raise ScreeningBulkConflict
         if payload.command=="advance_to_review" and application.stage!="new": raise ScreeningBulkConflict
         if payload.command=="undo_advance_to_new":

@@ -202,17 +202,18 @@ def test_recruiting_openapi_registers_complete_task_3b_contract_without_secret_f
         "/api/v1/candidates/{candidate_id}/notes": {"get", "post"},
         "/api/v1/candidates/{candidate_id}/resumes": {"get"},
         "/api/v1/resumes/{resume_id}/preview": {"get"},
+        "/api/v1/resumes/{resume_id}/file": {"get"},
         "/api/v1/resumes/{resume_id}/download-tickets": {"post"},
         "/api/v1/download-tickets/consume": {"post"},
         "/api/v1/candidates/{candidate_id}/applications": {"get"},
         "/api/v1/jobs/{job_id}/applications": {"post"},
         "/api/v1/applications/{application_id}": {"patch"},
-        "/api/v1/applications/{application_id}/transitions": {"post"},
+        "/api/v1/applications/{application_id}/workflow-actions": {"post"},
     }
     assert {path: set(schema["paths"].get(path, {})) for path in expected} == expected
     for path, methods in expected.items():
         for method in methods:
-            if path == "/api/v1/download-tickets/consume":
+            if path in {"/api/v1/resumes/{resume_id}/file", "/api/v1/download-tickets/consume"}:
                 assert schema["paths"][path][method]["responses"]["200"]["content"]["application/octet-stream"]["schema"]
                 continue
             responses = schema["paths"][path][method]["responses"]
@@ -315,6 +316,13 @@ def test_admin_happy_path_preconditions_idempotency_and_private_download(tmp_pat
         preview = client.get(f"/api/v1/resumes/{resume_id}/preview")
         assert preview.status_code == 200 and preview.headers["cache-control"] == "no-store"
         assert preview.json()["data"]["text"] == "must-not-leak"
+        file_preview = client.get(f"/api/v1/resumes/{resume_id}/file")
+        assert file_preview.status_code == 200 and file_preview.content == b"private-file"
+        assert file_preview.headers["cache-control"] == "no-store"
+        assert file_preview.headers["content-type"].startswith("application/pdf")
+        assert file_preview.headers["content-disposition"].startswith("inline;")
+        assert file_preview.headers["x-content-type-options"] == "nosniff"
+        assert app.state.resume_storage.last_spool.closed
         with app.state.identity_store.sync_session() as db:
             stored_resume = db.get(Resume, UUID(resume_id))
             stored_resume.parsed_text = "x" * (1024 * 1024 + 1)
@@ -639,6 +647,8 @@ def test_resume_access_is_scoped_to_an_authorized_application_for_the_target_res
         assert preview.status_code == 200
         assert preview.json()["data"]["text"].startswith("个人简介\n企业级 AI 平台负责人")
         assert client.get(f"/api/v1/resumes/{ids['denied_resume_id']}/preview").status_code == 404
+        assert client.get(f"/api/v1/resumes/{ids['allowed_resume_id']}/file").status_code == 200
+        assert client.get(f"/api/v1/resumes/{ids['denied_resume_id']}/file").status_code == 404
         assert client.post(f"/api/v1/resumes/{ids['denied_resume_id']}/download-tickets", headers=headers).status_code == 404
 
         first_ticket = client.post(f"/api/v1/resumes/{ids['allowed_resume_id']}/download-tickets", headers=headers)
@@ -736,7 +746,7 @@ def test_application_stage_timeline_summary_includes_safe_transition_reason(tmp_
         db.add_all([job, candidate, file]); db.flush()
         resume = Resume(organization_id=admin.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1)
         db.add(resume); db.flush()
-        application = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=job.id, resume_id=resume.id, owner_id=recruiter_id, human_conclusion="建议推进：技术能力符合")
+        application = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=job.id, resume_id=resume.id, owner_id=recruiter_id, stage="review", human_conclusion="建议推进：技术能力符合")
         db.add(application); db.commit()
         application_id, candidate_id = str(application.id), str(candidate.id)
 
@@ -744,8 +754,8 @@ def test_application_stage_timeline_summary_includes_safe_transition_reason(tmp_
     with TestClient(app) as client:
         headers = login(client, "admin@example.test")
         changed = client.post(
-            f"/api/v1/applications/{application_id}/transitions",
-            json={"target": "rejected", "reason_text": reason},
+            f"/api/v1/applications/{application_id}/workflow-actions",
+            json={"action": "review_rejected", "reason_text": reason},
             headers={**headers, "If-Match": '"1"', "Idempotency-Key": "reject-with-reason"},
         )
         assert changed.status_code == 200
@@ -753,7 +763,7 @@ def test_application_stage_timeline_summary_includes_safe_transition_reason(tmp_
 
     assert timeline.status_code == 200
     stage_event = next(event for event in timeline.json()["data"] if event["event_type"] == "application.stage_changed")
-    assert stage_event["summary"] == f"Application stage changed from new to rejected: {reason}"
+    assert stage_event["summary"] == f"Application stage changed from review to rejected: {reason}"
     with app.state.identity_store.sync_session() as db:
         assert db.query(ApplicationStageEvent).one().payload["reason_text"] == reason
         assert db.get(Application, UUID(application_id)).human_conclusion == "建议推进：技术能力符合"
@@ -1100,7 +1110,7 @@ def test_candidate_list_cursor_uses_selected_application_time_and_candidate_id_t
             db.add_all([candidate, file]); db.flush()
             resume = Resume(organization_id=admin.organization_id, candidate_id=candidate.id, file_object_id=file.id, version_number=1)
             db.add(resume); db.flush()
-            application = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=job.id, resume_id=resume.id, owner_id=admin_id, stage="new", updated_at=application_time)
+            application = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=job.id, resume_id=resume.id, owner_id=admin_id, stage="review" if index == 3 else "new", updated_at=application_time)
             db.add(application); db.flush()
             expected_rows.append((application_time, candidate.id, application.id))
             if index == 3:
@@ -1115,8 +1125,8 @@ def test_candidate_list_cursor_uses_selected_application_time_and_candidate_id_t
         second = client.get("/api/v1/candidates", params={"limit": 2, "cursor": first.json()["meta"]["next_cursor"]})
         third = client.get("/api/v1/candidates", params={"limit": 2, "cursor": second.json()["meta"]["next_cursor"]}) if second.json()["meta"]["next_cursor"] else None
         transitioned = client.post(
-            f"/api/v1/applications/{transition_target[1]}/transitions",
-            json={"target": "review"},
+            f"/api/v1/applications/{transition_target[1]}/workflow-actions",
+            json={"action": "review_approved"},
             headers={**headers, "If-Match": '"1"', "Idempotency-Key": "candidate-list-reorder"},
         )
         refreshed = client.get("/api/v1/candidates", params={"limit": 2})

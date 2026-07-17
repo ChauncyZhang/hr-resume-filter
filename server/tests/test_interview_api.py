@@ -827,7 +827,7 @@ def test_create_interview_is_idempotent_checks_conflicts_and_scopes_interviewer_
         assert database.scalar(select(InterviewParticipant).where(InterviewParticipant.interview_id == interview_id)) is not None
 
 
-def test_create_interview_advances_an_earlier_application_stage_atomically(tmp_path) -> None:
+def test_create_interview_rejects_an_application_that_has_not_completed_review(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
     with app.state.identity_store.sync_session() as database:
@@ -836,16 +836,23 @@ def test_create_interview_advances_an_earlier_application_stage_atomically(tmp_p
         database.commit()
 
     with TestClient(app) as client:
-        created, _ = create_interview(client, seed, key="create-from-new-application")
+        response = client.post(
+            "/api/v1/interviews",
+            json=interview_payload(seed),
+            headers={
+                **login(client, "interview-admin@example.test"),
+                "Idempotency-Key": "create-from-new-application",
+            },
+        )
 
-    assert created.status_code == 201
+    assert response.status_code == 409
+    assert response.json()["code"] == "invalid_state_transition"
     with app.state.identity_store.sync_session() as database:
         application = database.get(Application, seed["application_id"])
-        assert application.stage == "interviewing"
-        assert application.version == 5
+        assert application.stage == "new"
         assert database.scalar(
             select(Interview).where(Interview.application_id == seed["application_id"])
-        ) is not None
+        ) is None
 
 
 def test_revoked_recruiting_role_removes_historical_assignment_access(tmp_path) -> None:

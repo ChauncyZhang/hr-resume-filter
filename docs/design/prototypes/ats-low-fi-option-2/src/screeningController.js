@@ -35,6 +35,34 @@ function normalizeRunStatus(status) {
   return "running";
 }
 
+function sourceLabel(source) {
+  return source === "upload" ? "本地上传" : source === "manual" ? "手动创建" : safeString(source);
+}
+
+export function normalizeScreeningRunSummary(run) {
+  const safeRun = isRecord(run) ? run : {};
+  return {
+    id: safeString(safeRun.id),
+    jobId: safeString(safeRun.job_id),
+    position: safeString(safeRun.job_title) || "职位信息不可用",
+    creator: safeString(safeRun.created_by_name) || "发起人不可用",
+    source: sourceLabel(safeRun.source),
+    status: normalizeRunStatus(safeRun.status),
+    completed: safeCount(safeRun.processed_count),
+    total: safeCount(safeRun.total_count),
+    succeeded: safeCount(safeRun.succeeded_count),
+    failed: safeCount(safeRun.failed_count),
+    reviewTotal: safeCount(safeRun.review_total_count),
+    reviewed: safeCount(safeRun.reviewed_count),
+    reviewPending: safeCount(safeRun.review_pending_count),
+    reviewApproved: safeCount(safeRun.review_approved_count),
+    reviewRejected: safeCount(safeRun.review_rejected_count),
+    reviewStatus: safeString(safeRun.review_status) || "not_applicable",
+    createdAt: safeString(safeRun.created_at),
+    serverBacked: true,
+  };
+}
+
 function normalizeFile(item) {
   const ruleResult = isRecord(item?.rule_result) ? item.rule_result : null;
   const llmEvaluation = isRecord(item?.llm_evaluation) ? item.llm_evaluation : null;
@@ -78,6 +106,7 @@ function normalizeFile(item) {
     error,
     application_stage: safeString(item?.application_stage) || null,
     application_version: Number.isInteger(item?.application_version) ? item.application_version : null,
+    humanReviewed: item?.human_reviewed === true,
     llmStatus: safeString(item?.llm_status),
     retryable: item?.retryable === true,
     llmRetryable: item?.llm_retryable === true,
@@ -86,13 +115,9 @@ function normalizeFile(item) {
 
 export function normalizeScreeningTask(run, items) {
   const safeRun = isRecord(run) ? run : {};
+  const summary = normalizeScreeningRunSummary(safeRun);
   return {
-    id: safeString(safeRun.id),
-    jobId: safeString(safeRun.job_id),
-    source: safeString(safeRun.source),
-    status: normalizeRunStatus(safeRun.status),
-    completed: safeCount(safeRun.processed_count),
-    total: safeCount(safeRun.total_count),
+    ...summary,
     files: Array.isArray(items) ? items.filter((item) => isRecord(item) && safeString(item.id)).map(normalizeFile) : [],
   };
 }
@@ -149,6 +174,18 @@ export function createScreeningController({
         .filter(isRecord)
         .map((job) => ({ id: safeString(job.id), title: safeString(job.title) }))
         .filter((job) => job.id && job.title);
+  }
+
+  async function listRuns({ signal } = {}) {
+    const runs = [];
+    let cursor = "";
+    do {
+      const path = `/api/v1/screening-runs?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
+      const response = await client.request(path, withSignal(signal));
+      if (Array.isArray(response?.data)) runs.push(...response.data);
+      cursor = safeString(response?.meta?.next_cursor);
+    } while (cursor);
+    return runs.filter((run) => isRecord(run) && safeString(run.id)).map(normalizeScreeningRunSummary);
   }
 
   async function createRun(jobId, { signal } = {}) {
@@ -261,7 +298,7 @@ export function createScreeningController({
     }
   }
 
-  return { listJobs, createRun, uploadFiles, startRun, getRun, getItems, retryItem, bulkAction, undoBulkAction, pollRun };
+  return { listJobs, listRuns, createRun, uploadFiles, startRun, getRun, getItems, retryItem, bulkAction, undoBulkAction, pollRun };
 }
 
 export const screeningController = createScreeningController();

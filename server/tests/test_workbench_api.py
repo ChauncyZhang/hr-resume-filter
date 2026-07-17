@@ -191,7 +191,7 @@ def test_workbench_contract_filters_terminal_rows_and_caps_newest_items(tmp_path
     assert set(job) == {"id", "title", "department_name", "status", "updated_at", "active_count", "stages"}
     assert job["department_name"] == "Engineering"
     assert job["status"] == "open"
-    assert job["active_count"] == 17
+    assert job["active_count"] == 18
     assert list(job["stages"]) == [
         "new",
         "review",
@@ -199,10 +199,12 @@ def test_workbench_contract_filters_terminal_rows_and_caps_newest_items(tmp_path
         "interview_pending",
         "interviewing",
         "decision",
+        "passed",
     ]
     assert job["stages"]["new"]["count"] == 7
     assert [item["application_id"] for item in job["stages"]["new"]["items"]] == expected_new_ids
     assert job["stages"]["contact"]["count"] == 6
+    assert job["stages"]["passed"]["count"] == 1
     assert all(len(stage["items"]) <= 5 for stage in job["stages"].values())
     candidate_item = job["stages"]["new"]["items"][0]
     assert set(candidate_item) == {
@@ -223,14 +225,11 @@ def test_workbench_contract_filters_terminal_rows_and_caps_newest_items(tmp_path
         "upcoming": [],
         "pending_feedback": [],
     }
-    assert list(body["data"]["tasks"]) == ["contact", "interview_pending", "decision"]
-    assert body["data"]["tasks"]["contact"]["count"] == 8
-    assert [
-        item["application_id"] for item in body["data"]["tasks"]["contact"]["items"]
-    ] == expected_contact_ids
-    assert len(body["data"]["tasks"]["contact"]["items"]) <= 5
+    assert list(body["data"]["tasks"]) == ["review", "interview_pending", "decision", "passed"]
+    assert body["data"]["tasks"]["review"]["count"] == 1
     assert body["data"]["tasks"]["interview_pending"]["count"] == 1
     assert body["data"]["tasks"]["decision"]["count"] == 1
+    assert body["data"]["tasks"]["passed"]["count"] == 1
 
 
 def test_workbench_empty_state_is_stable(tmp_path, monkeypatch) -> None:
@@ -250,9 +249,10 @@ def test_workbench_empty_state_is_stable(tmp_path, monkeypatch) -> None:
         "generated_at": None,
         "jobs": [],
         "tasks": {
-            "contact": {"count": 0, "items": []},
+            "review": {"count": 0, "items": []},
             "interview_pending": {"count": 0, "items": []},
             "decision": {"count": 0, "items": []},
+            "passed": {"count": 0, "items": []},
         },
         "interviews": {"available": False, "upcoming": [], "pending_feedback": []},
     }
@@ -284,11 +284,11 @@ def test_workbench_requires_authentication(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("role", "access_role"),
-    [("recruiter", "job_recruiter"), ("hiring_manager", "job_manager")],
+    ("role", "access_role", "expected_review_tasks"),
+    [("recruiter", "job_recruiter", 0), ("hiring_manager", "job_manager", 1)],
 )
 def test_workbench_is_collaborator_scoped_and_cross_tenant_non_disclosing(
-    tmp_path, monkeypatch, role, access_role
+    tmp_path, monkeypatch, role, access_role, expected_review_tasks
 ) -> None:
     app = make_app(tmp_path)
     base = datetime(2026, 7, 1, tzinfo=timezone.utc)
@@ -309,9 +309,9 @@ def test_workbench_is_collaborator_scoped_and_cross_tenant_non_disclosing(
             user_id=actor.id,
             access_role=access_role,
         ))
-        seed_application(db, allowed, owner, 1, "contact", base)
-        seed_application(db, hidden, owner, 2, "contact", base + timedelta(hours=1))
-        seed_application(db, cross_tenant, other_owner, 3, "contact", base + timedelta(hours=2))
+        seed_application(db, allowed, owner, 1, "review", base)
+        seed_application(db, hidden, owner, 2, "review", base + timedelta(hours=1))
+        seed_application(db, cross_tenant, other_owner, 3, "review", base + timedelta(hours=2))
         db.commit()
         actor_principal = principal(actor, role)
 
@@ -321,8 +321,8 @@ def test_workbench_is_collaborator_scoped_and_cross_tenant_non_disclosing(
 
     assert response.status_code == 200
     assert [job["title"] for job in response.json()["data"]["jobs"]] == ["Allowed"]
-    assert response.json()["data"]["tasks"]["contact"]["count"] == 1
-    assert len(response.json()["data"]["tasks"]["contact"]["items"]) == 1
+    assert response.json()["data"]["tasks"]["review"]["count"] == expected_review_tasks
+    assert len(response.json()["data"]["tasks"]["review"]["items"]) == expected_review_tasks
     assert "Hidden" not in response.text
 
 
@@ -392,7 +392,7 @@ def test_workbench_openapi_enforces_bounded_non_sensitive_contract(tmp_path) -> 
 
     candidate = components["WorkbenchCandidateOut"]["properties"]
     assert candidate["stage"]["enum"] == [
-        "new", "review", "contact", "interview_pending", "interviewing", "decision"
+        "new", "review", "contact", "interview_pending", "interviewing", "decision", "passed"
     ]
     assert components["WorkbenchStageOut"]["properties"]["count"]["minimum"] == 0
     assert components["WorkbenchStageOut"]["properties"]["items"]["maxItems"] == 5

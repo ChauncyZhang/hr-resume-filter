@@ -3,6 +3,7 @@ import { CheckCircle2, KeyRound, Link2, UserRound, X } from "lucide-react";
 import { apiClient } from "./apiClient.js";
 import { createDialogFocusManager } from "./SettingsViews.jsx";
 import { normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
+import "./product-theme-admin.css";
 
 export function ProfileSettings({ user, role, onClose, client = apiClient }) {
   const drawerRef = useRef(null);

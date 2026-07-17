@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   BriefcaseBusiness,
+  Building2,
   CalendarDays,
   Check,
+  Columns3,
   ChevronDown,
   ChevronRight,
   CircleAlert,
@@ -15,6 +17,7 @@ import {
   Menu,
   MoreHorizontal,
   Plus,
+  Search,
   Settings,
   SlidersHorizontal,
   Users,
@@ -23,7 +26,7 @@ import {
   X,
 } from "lucide-react";
 import { JobsWorkspace } from "./JobViews.jsx";
-import { ImportWizard, ScreeningTaskView } from "./ScreeningViews.jsx";
+import { ImportWizard, ScreeningTaskCenter, ScreeningTaskView } from "./ScreeningViews.jsx";
 import { CandidatesWorkspace, initialCandidateRecords } from "./CandidateViews.jsx";
 import { InterviewsWorkspace } from "./InterviewViews.jsx";
 import { TalentPoolWorkspace } from "./TalentPoolViews.jsx";
@@ -34,6 +37,7 @@ import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate,
 import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { InviteAcceptView } from "./InviteAcceptView.jsx";
 import { ProfileSettings } from "./ProfileSettings.jsx";
+import { NotificationMenu } from "./NotificationMenu.jsx";
 import {
   candidateDetailPath,
   candidateListPath,
@@ -42,12 +46,13 @@ import {
   readJobCreateDraft,
   routeForNav,
   safeNavigateBack,
+  screeningTaskPath,
   settingsPath,
   writeJobCreateDraft,
 } from "./appRouter.js";
 import { apiClient } from "./apiClient.js";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
-import { screeningController as defaultScreeningController } from "./screeningController.js";
+import { normalizeScreeningTask, screeningController as defaultScreeningController } from "./screeningController.js";
 import { candidateController as defaultCandidateController } from "./candidateController.js";
 import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
@@ -68,10 +73,12 @@ import {
   succeedJobRequest,
 } from "./jobWorkspaceState.js";
 import { getRecentScreeningTaskStorageKey, LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY, parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
+import { buildWorkbenchNotificationGroups, countWorkbenchNotifications } from "./workbenchNotifications.js";
 
 const navItems = [
   ["工作台", Home],
   ["职位", BriefcaseBusiness],
+  ["筛选任务", FileText],
   ["候选人", Users],
   ["面试", CalendarDays],
   ["人才库", UserRoundSearch],
@@ -86,6 +93,7 @@ const stageMeta = [
   "待安排",
   "面试中",
   "待决策",
+  "已通过",
 ];
 
 const emptyStages = stageMeta.map(() => []);
@@ -199,6 +207,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   const [activeJob, setActiveJob] = useState("AI 工程师");
   const [menuOpen, setMenuOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
+  const [pageActionHost, setPageActionHost] = useState(null);
   const settingsOrganizationTab = route.section === "组织与权限" ? route.tab : "成员";
   const [drawerViewport, setDrawerViewport] = useState(false);
   const menuButtonRef = useRef(null);
@@ -207,6 +216,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   const [modal, setModal] = useState(null);
   const [selectedCandidate, setSelectedCandidate] = useState(null);
   const [toast, setToast] = useState("");
+  const [globalSearch, setGlobalSearch] = useState("");
   const [workbenchState, setWorkbenchState] = useState({ status: currentRole === "面试官" ? "unavailable" : "loading", data: null, error: "" });
   const [activeWorkbenchJobId, setActiveWorkbenchJobId] = useState(null);
   const workbenchLoadRef = useRef(null);
@@ -273,6 +283,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   const [importOpen, setImportOpen] = useState(false);
   const [screeningTask, setScreeningTask] = useState(null);
   const [screeningViewState, setScreeningViewState] = useState(null);
+  const [screeningLoadState, setScreeningLoadState] = useState({ status: "idle", error: "" });
   const [recentTask, setRecentTask] = useState(() => {
     return recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null;
   });
@@ -284,11 +295,19 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   const stages = activeWorkbenchJob ? stageMeta.map((stage) => activeWorkbenchJob.stages[stage]?.items || []) : emptyStages;
   const visibleStageMeta = stageMeta.map((name, index) => [name, activeWorkbenchJob?.stages[name]?.count || 0, stages[index].length]);
   const emptyTaskGroup = { count: 0, items: [] };
-  const workbenchTasks = workbenchState.data?.tasks || { contact: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup };
+  const workbenchTasks = workbenchState.data?.tasks || { review: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup, passed: emptyTaskGroup };
+  const notificationGroups = useMemo(() => buildWorkbenchNotificationGroups(workbenchTasks, currentRole), [currentRole, workbenchTasks]);
+  const notificationCount = useMemo(() => countWorkbenchNotifications(notificationGroups), [notificationGroups]);
   const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
   const allowedSettingsSections = useMemo(() => getAllowedSettingsSections(currentRole), [currentRole]);
   const roleIdentity = getSessionIdentity(session.user, currentRole);
+  const greetingName = roleIdentity.name.trim().split(/\s+/)[0] || roleIdentity.name;
   const interviewRecords = interviewState.records;
+  const todayKey = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  const todayInterviewCount = interviewRecords.filter((record) => record.date === todayKey).length;
+  const feedbackCompletedCount = interviewRecords.filter((record) => record.feedbackStatus === "已提交").length;
+  const feedbackCompletionRate = interviewRecords.length ? Math.round((feedbackCompletedCount / interviewRecords.length) * 100) : 0;
+  const workbenchCandidateCount = visibleStageMeta.reduce((total, [, count]) => total + count, 0);
   const selectedInterview = interviewRecords.find((record) => record.id === selectedInterviewId) || null;
   const selectedCandidateWithInterviews = useMemo(() => selectedCandidate ? { ...selectedCandidate, interviews: deriveCandidateInterviews(selectedCandidate.id, interviewRecords) } : null, [interviewRecords, selectedCandidate]);
   const interviewCandidates = useMemo(() => {
@@ -516,6 +535,35 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   }, [candidateDetailState, candidateRecords, route.id, route.kind, route.mode, route.searchParams]);
 
   useEffect(() => {
+    if (route.kind !== "screening") return undefined;
+    if (route.mode === "list") {
+      setScreeningTask(null);
+      setScreeningLoadState({ status: "idle", error: "" });
+      return undefined;
+    }
+    if (!route.id) return undefined;
+    if (screeningTask?.id === route.id && Array.isArray(screeningTask.files)) {
+      setScreeningLoadState({ status: "ready", error: "" });
+      return undefined;
+    }
+    const abortController = new AbortController();
+    setScreeningTask(null);
+    setScreeningLoadState({ status: "loading", error: "" });
+    void Promise.all([
+      screeningController.getRun(route.id, { signal: abortController.signal }),
+      screeningController.getItems(route.id, { signal: abortController.signal }),
+    ]).then(([run, items]) => {
+      if (abortController.signal.aborted) return;
+      const task = normalizeScreeningTask(run, items);
+      setScreeningTask({ ...task, note: "服务端保存的批量筛选任务" });
+      setScreeningLoadState({ status: "ready", error: "" });
+    }).catch((error) => {
+      if (error?.name !== "AbortError" && !abortController.signal.aborted) setScreeningLoadState({ status: "error", error: "筛选任务加载失败，请检查权限或网络后重试。" });
+    });
+    return () => abortController.abort();
+  }, [route.id, route.kind, route.mode, screeningController, screeningTask?.id]);
+
+  useEffect(() => {
     if (route.kind !== "interviews") return;
     updateSelectedInterviewId(route.id || null);
     setScheduleCandidateId(route.candidateId || null);
@@ -618,7 +666,10 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
 
   useEffect(() => {
     window.localStorage.removeItem(LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY);
-    setRecentTask(recentTaskStorageKey ? parseRecentScreeningTask(window.localStorage.getItem(recentTaskStorageKey)) : null);
+    const stored = recentTaskStorageKey ? window.localStorage.getItem(recentTaskStorageKey) : null;
+    const parsed = parseRecentScreeningTask(stored);
+    setRecentTask(parsed);
+    if (recentTaskStorageKey && stored && !parsed) window.localStorage.removeItem(recentTaskStorageKey);
   }, [recentTaskStorageKey]);
 
   useEffect(() => () => candidateLoadRef.current?.abort(), []);
@@ -634,9 +685,14 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   }
 
   const persistRecentServerTask = useCallback((task) => {
-    setRecentTask(task);
     const serialized = serializeRecentScreeningTask(task);
-    if (recentTaskStorageKey && serialized) window.localStorage.setItem(recentTaskStorageKey, serialized);
+    if (!serialized) {
+      setRecentTask(null);
+      if (recentTaskStorageKey) window.localStorage.removeItem(recentTaskStorageKey);
+      return;
+    }
+    setRecentTask(task);
+    if (recentTaskStorageKey) window.localStorage.setItem(recentTaskStorageKey, serialized);
   }, [recentTaskStorageKey]);
 
   const handleTaskChange = useCallback((task) => {
@@ -710,8 +766,9 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
     if (summary.serverBacked === true) {
       if (!summary.candidateId) return;
       setCandidateOrigin(activeNav === "候选人" && !screeningTask ? null : { activeNav, screeningTask, screeningViewState: nextScreeningViewState });
+      const returnTo = screeningTask?.id ? screeningTaskPath(screeningTask.id, { query: nextScreeningViewState?.query, status: nextScreeningViewState?.filter }) : undefined;
       setScreeningTask(null);
-      navigate(candidateDetailPath(summary));
+      navigate(candidateDetailPath(summary, "档案与简历", returnTo));
       void loadServerCandidate({ candidateId: summary.candidateId, applicationId: summary.applicationId, jobId: summary.jobId, position: summary.position, evidence: summary.evidence });
       return;
     }
@@ -742,6 +799,15 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   }
 
   function requestBackFromCandidateDetail() {
+    if (route.returnTo) {
+      candidateLoadRef.current?.abort();
+      candidateLoadRef.current = null;
+      setSelectedCandidate(null);
+      setCandidateDetailState(null);
+      setCandidateOrigin(null);
+      navigate(route.returnTo, { replace: true });
+      return false;
+    }
     const fallback = candidateOrigin ? routeForNav(candidateOrigin.activeNav) : "/candidates";
     candidateLoadRef.current?.abort();
     candidateLoadRef.current = null;
@@ -787,6 +853,9 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   }
 
   function requestBackFromInterview() {
+    if (interviewOrigin?.activeNav === "候选人" && candidateDetailState?.context) {
+      void loadServerCandidate(candidateDetailState.context);
+    }
     const fallback = interviewOrigin ? routeForNav(interviewOrigin.activeNav) : "/interviews";
     return safeNavigateBack(navigate, fallback);
   }
@@ -862,7 +931,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
                   setSelectedCandidate(null);
                 } else if (label === "面试") {
                   updateSelectedInterviewId(null);
-                } else if (!['工作台', '报表', '设置'].includes(label)) {
+                } else if (!['工作台', '筛选任务', '报表', '设置'].includes(label)) {
                   notify(`${label}模块将在后续原型中展开`);
                 }
               }}
@@ -882,11 +951,17 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
       <main className="workspace">
         <header className="topbar">
           <IconButton buttonRef={menuButtonRef} label={menuOpen ? "关闭主导航" : "打开主导航"} className="mobile-menu" aria-controls="primary-navigation" aria-expanded={menuOpen} onClick={() => menuOpen ? closeNavigation() : setMenuOpen(true)}><Menu size={21} /></IconButton>
-          <h1>{screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav === "人才库" && talentMode === "detail" ? "人才库详情" : activeNav}</h1>
+          <div className="topbar-heading">
+            <h1>{!screeningTask && activeNav === "工作台" ? <><span className="sr-only">工作台</span><span aria-hidden="true">早上好，{greetingName}</span></> : screeningTask ? "筛选任务" : activeNav === "职位" ? (jobMode === "detail" ? "职位详情" : jobMode === "form" ? (selectedJob ? "编辑职位" : "新建职位") : "职位") : activeNav === "候选人" && candidateMode === "detail" ? "候选人详情" : activeNav === "面试" && interviewMode === "schedule" ? (selectedInterview ? "改期面试" : "安排面试") : activeNav === "面试" && interviewMode === "feedback" ? "面试反馈" : activeNav === "人才库" && talentMode === "detail" ? "人才库详情" : activeNav}</h1>
+            {!screeningTask && activeNav === "工作台" && <p>这里是今天最需要关注的招聘进展</p>}
+          </div>
           <div className="top-actions">
             {!screeningTask && activeNav === "设置" && route.returnTo && <button className="button secondary" type="button" onClick={() => navigate(route.returnTo)}>返回职位编辑</button>}
+            {!screeningTask && activeNav === "工作台" && <button className="organization-context" type="button" onClick={() => navigate(settingsPath("组织与权限", "部门"))}><Building2 size={16} /><span>当前组织</span><ChevronDown size={15} /></button>}
+            {!screeningTask && activeNav === "工作台" && <label className="global-search"><Search size={17} /><input aria-label="全局搜索候选人或职位" value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && globalSearch.trim()) navigate(candidateListPath({ q: globalSearch })); }} placeholder="搜索职位、候选人或关键字" /><kbd>⌘ K</kbd></label>}
+            {!screeningTask && activeNav === "工作台" && <NotificationMenu groups={notificationGroups} total={notificationCount} onOpenCandidate={openCandidate} onOpenGroup={(stage) => navigate(candidateListPath({ stage }))} />}
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
-            {!screeningTask && (activeNav === "工作台" || (activeNav === "职位" && jobMode === "list")) && canPerformAction(currentRole, "新建职位") && <button className={activeNav === "职位" ? "button primary" : "button secondary"} type="button" onClick={openJobForm}><Plus size={17} />新建职位</button>}
+            <span className="page-primary-action-host" ref={setPageActionHost} />
             <IconButton label="个人设置" className="mobile-profile-action" onClick={() => setProfileOpen(true)}><UserRound size={18} /></IconButton>
             <IconButton label={session.loggingOut ? "正在退出" : "退出登录"} className="logout-action" disabled={session.loggingOut} onClick={() => { clearJobCreateDraft(window.sessionStorage, jobDraftUserId); void onLogout().catch(() => {}); }}><LogOut size={18} /></IconButton>
           </div>
@@ -903,7 +978,14 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
         {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "loading" && !workbenchState.data && <WorkbenchSkeleton />}
         {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "error" && !workbenchState.data && <div className="workbench-status error" role="alert"><CircleAlert size={22} /><div><strong>工作台暂时无法加载</strong><p>{workbenchState.error}</p></div><button className="button secondary" type="button" onClick={() => void loadWorkbench()}>重试</button></div>}
         {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && workbenchState.status === "ready" && workbenchJobs.length === 0 && <div className="workbench-status empty"><BriefcaseBusiness size={24} /><div><strong>暂无在招职位</strong><p>{canPerformAction(currentRole, "新建职位") ? "发布职位并导入简历后，这里会显示真实招聘进展。" : "暂无被授权的在招职位，请联系招聘负责人确认职位协作范围。"}</p></div></div>}
-        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && activeWorkbenchJob && <div className="page-body" aria-busy={workbenchState.status === "loading"}>
+        {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && activeWorkbenchJob && <>
+        <section className="dashboard-metrics" aria-label="招聘关键指标">
+          <button type="button" onClick={() => navigate("/jobs")}><span className="metric-icon blue"><BriefcaseBusiness size={20} /></span><span><small>在招职位</small><strong>{workbenchJobs.length}</strong><em>当前可见职位</em></span></button>
+          <button type="button" onClick={() => navigate(candidateListPath({ stage: "待复核" }))}><span className="metric-icon orange"><FileText size={20} /></span><span><small>待评审</small><strong>{workbenchTasks.review.count}</strong><em>等待用人经理处理</em></span></button>
+          <button type="button" onClick={() => navigate("/interviews")}><span className="metric-icon green"><CalendarDays size={20} /></span><span><small>今日面试</small><strong>{todayInterviewCount}</strong><em>未来共 {interviewRecords.length} 场</em></span></button>
+          <button type="button" onClick={() => navigate(candidateListPath({ stage: "已通过" }))}><span className="metric-icon amber"><UserRound size={20} /></span><span><small>待录用确认</small><strong>{workbenchTasks.passed.count}</strong><em>完成确认即结束流程</em></span></button>
+        </section>
+        <div className="page-body dashboard-body" aria-busy={workbenchState.status === "loading"}>
           <section className="main-column">
             {workbenchState.status === "error" && <div className="workbench-inline-error" role="alert"><CircleAlert size={17} /><span>{workbenchState.error}，当前展示上次成功数据。</span><button type="button" onClick={() => void loadWorkbench()}>重新加载</button></div>}
             <div className="job-switcher">
@@ -922,7 +1004,10 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
               <header className="pipeline-header">
                 <div><h2>{activeWorkbenchJob.name}</h2><span>{activeWorkbenchJob.department}</span></div>
                 <div className="pipeline-tools">
-                  <button type="button" className="text-tool" onClick={() => setView((value) => value === "board" ? "list" : "board")}><LayoutList size={16} />{view === "board" ? "视图" : "看板"}</button>
+                  <div className="segmented-control pipeline-view-toggle" aria-label="招聘流程视图">
+                    <button type="button" aria-pressed={view === "board"} className={view === "board" ? "active" : ""} onClick={() => setView("board")}><Columns3 size={16} />看板</button>
+                    <button type="button" aria-pressed={view === "list"} className={view === "list" ? "active" : ""} onClick={() => setView("list")}><LayoutList size={16} />列表</button>
+                  </div>
                   <IconButton label="更多操作" onClick={() => notify("已打开职位操作菜单")}><MoreHorizontal size={19} /></IconButton>
                 </div>
               </header>
@@ -956,37 +1041,48 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
               )}
 
             </section>
+            <section className="rail-section calendar-card dashboard-calendar">
+              <header><h3>未来 7 天面试</h3><button type="button" onClick={() => navigate("/interviews")}>查看日历<ChevronRight size={14} /></button></header>
+              {interviewRecords.slice(0, 5).map((record) => <button className="calendar-interview-item" type="button" key={record.id} onClick={() => navigate("/interviews")}><span className="calendar-interview-title" title={record.candidate}><strong>{record.candidate}</strong><small>{record.position}</small></span><span className="calendar-interview-meta"><span className="calendar-interview-round">{record.round}</span><span>{record.dateLabel} {record.time}</span><span>{record.interviewers.join("、")}</span></span></button>)}
+              {interviewState.status === "ready" && interviewRecords.length === 0 && <div className="calendar-empty-slot">未来暂无面试安排</div>}
+              {interviewState.status === "error" && interviewRecords.length === 0 && <div className="calendar-empty-slot">面试日历加载失败</div>}
+            </section>
             <footer className="updated">更新时间：{workbenchState.data?.generatedAt ? new Date(workbenchState.data.generatedAt).toLocaleString("zh-CN", { hour12: false }) : "刚刚"} <button type="button" onClick={() => void loadWorkbench()}>刷新</button></footer>
           </section>
 
           <aside className="right-rail">
-            <section className="rail-section">
-              <header><h3>待处理事项</h3><IconButton label="更多"><MoreHorizontal size={18} /></IconButton></header>
-              <div className="rail-group">
-                <div className="rail-group-title"><span className="status-dot red" />待沟通（{workbenchTasks.contact.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待沟通" }))}>查看全部</button></div>
-                {workbenchTasks.contact.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
-                {workbenchTasks.contact.count === 0 && <p>暂无待沟通候选人</p>}
-              </div>
-              <div className="rail-group">
+            <section className="rail-section dashboard-tasks">
+              <header><h3>今日待办</h3><button type="button" onClick={() => navigate("/candidates")}>查看全部<ChevronRight size={14} /></button></header>
+              {canPerformAction(currentRole, "评审候选人") && <div className="rail-group">
+                <div className="rail-group-title"><span className="status-dot red" />待用人经理评审（{workbenchTasks.review.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待复核" }))}>查看全部</button></div>
+                {workbenchTasks.review.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.review.count === 0 && <p>暂无待评审候选人</p>}
+              </div>}
+              {canPerformAction(currentRole, "安排面试") && <div className="rail-group">
                 <div className="rail-group-title"><span className="status-dot orange" />待安排面试（{workbenchTasks.interviewPending.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待安排" }))}>查看全部</button></div>
                 {workbenchTasks.interviewPending.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
                 {workbenchTasks.interviewPending.count === 0 && <p>暂无待安排面试</p>}
-              </div>
-              <div className="rail-group compact">
+              </div>}
+              {canPerformAction(currentRole, "确认录用决策") && <div className="rail-group compact">
                 <div className="rail-group-title"><span className="status-dot blue" />待决策（{workbenchTasks.decision.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待决策" }))}>查看全部</button></div>
                 {workbenchTasks.decision.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
                 {workbenchTasks.decision.count === 0 && <p>暂无待决策候选人</p>}
-              </div>
+              </div>}
+              {canPerformAction(currentRole, "确认录用结果") && <div className="rail-group compact">
+                <div className="rail-group-title"><span className="status-dot green" />待录用确认（{workbenchTasks.passed.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "已通过" }))}>查看全部</button></div>
+                {workbenchTasks.passed.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.passed.count === 0 && <p>暂无待录用确认候选人</p>}
+              </div>}
             </section>
 
-            <section className="rail-section calendar-card">
-              <header><h3>面试日历（未来 7 天）</h3></header>
-              {interviewRecords.slice(0, 4).map((record) => <button className="rail-item" type="button" key={record.id} onClick={() => navigate("/interviews")}><strong>{record.candidate} · {record.round}</strong><small>{record.dateLabel} {record.time} · {record.interviewers.join("、")}</small></button>)}
-              {interviewState.status === "ready" && interviewRecords.length === 0 && <div className="calendar-empty-slot">未来暂无面试安排</div>}
-              {interviewState.status === "error" && interviewRecords.length === 0 && <div className="calendar-empty-slot">面试日历加载失败</div>}
+            <section className="rail-section dashboard-efficiency">
+              <header><h3>招聘效率</h3><span>实时</span></header>
+              <div><small>当前流程候选人</small><strong>{workbenchCandidateCount}</strong><span>覆盖 {visibleStageMeta.filter(([, count]) => count > 0).length} 个阶段</span></div>
+              <div><small>面试反馈完成率</small><strong>{feedbackCompletionRate}%</strong><span className="efficiency-progress"><i style={{ width: `${feedbackCompletionRate}%` }} /></span></div>
+              <div><small>已通过待确认</small><strong>{workbenchTasks.passed.count}</strong><span>自动进入录用确认任务</span></div>
             </section>
           </aside>
-        </div>}
+        </div></>}
 
         {!screeningTask && activeNav === "职位" && (
           <JobsWorkspace
@@ -1006,37 +1102,43 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
             onDraftChange={(draft) => writeJobCreateDraft(window.sessionStorage, jobDraftUserId, draft)}
             onDraftClear={() => clearJobCreateDraft(window.sessionStorage, jobDraftUserId)}
             onManageDepartments={() => navigate(settingsPath("组织与权限", "部门", location.pathname + location.search))}
+            pageActionHost={pageActionHost}
+            onCreateJob={canPerformAction(currentRole, "新建职位") ? openJobForm : null}
           />
         )}
 
+        {!screeningTask && activeNav === "筛选任务" && route.mode === "list" && <ScreeningTaskCenter controller={screeningController} pageActionHost={pageActionHost} onImport={() => setImportOpen(true)} onOpenTask={(task) => { setScreeningLoadState({ status: "loading", error: "" }); navigate(screeningTaskPath(task.id)); }} />}
+        {!screeningTask && activeNav === "筛选任务" && route.mode === "detail" && screeningLoadState.status === "loading" && <div className="workbench-status" role="status"><FileText size={22} /><div><strong>正在加载筛选任务</strong><p>正在获取最新进度和逐份结果。</p></div></div>}
+        {!screeningTask && activeNav === "筛选任务" && route.mode === "detail" && screeningLoadState.status === "error" && <div className="workbench-status error" role="alert"><CircleAlert size={22} /><div><strong>筛选任务无法加载</strong><p>{screeningLoadState.error}</p></div><button className="button secondary" type="button" onClick={() => navigate("/screening/tasks", { replace: true })}>返回任务列表</button></div>}
+
         {!screeningTask && activeNav === "候选人" && (
-          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidateWithInterviews} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={requestBackFromCandidateDetail} detailBackLabel={candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin?.activeNav === "人才库" ? "返回人才库" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} filters={candidatePreset || {}} onFiltersChange={(filters) => navigate(candidateListPath(filters), { replace: true })} detailTab={route.tab} onDetailTabChange={(tab) => selectedCandidateWithInterviews && navigate(candidateDetailPath(selectedCandidateWithInterviews, tab), { replace: true })} actorName={roleIdentity.name} currentRole={currentRole} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} />
+          <CandidatesWorkspace mode={candidateMode} setMode={setCandidateMode} selectedCandidate={selectedCandidateWithInterviews} setSelectedCandidate={setSelectedCandidate} records={candidateRecords} setRecords={updateCandidateRecords} onNotify={notify} onBackDetail={requestBackFromCandidateDetail} detailBackLabel={route.returnTo?.startsWith("/screening/tasks/") ? "返回筛选任务" : candidateOrigin?.activeNav === "工作台" ? "返回工作台" : candidateOrigin?.activeNav === "人才库" ? "返回人才库" : candidateOrigin ? "返回筛选任务" : "返回候选人列表"} onOpenCandidate={openCandidate} onScheduleInterview={(candidate) => openScheduleInterview(candidate)} onOpenInterviewFeedback={openFeedbackInterview} onAddToTalentPool={addCandidatesToTalentPool} filters={candidatePreset || {}} onFiltersChange={(filters) => navigate(candidateListPath(filters), { replace: true })} detailTab={route.tab} onDetailTabChange={(tab) => selectedCandidateWithInterviews && navigate(candidateDetailPath(selectedCandidateWithInterviews, tab, route.returnTo), { replace: true })} actorName={roleIdentity.name} currentRole={currentRole} controller={candidateController} detailState={candidateDetailState} onRetryDetail={() => candidateDetailState?.context ? loadServerCandidate(candidateDetailState.context) : Promise.resolve()} pageActionHost={pageActionHost} onImport={() => setImportOpen(true)} />
         )}
 
         {!screeningTask && activeNav === "面试" && (
-          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterviewId={selectedInterviewId} setSelectedInterviewId={updateSelectedInterviewId} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} status={interviewState.status} error={interviewState.error} onRetry={() => void loadInterviews()} nextCursor={interviewState.nextCursor} loadingMore={interviewState.loadingMore} onLoadMore={() => void loadInterviews({ cursor: interviewState.nextCursor, append: true })} candidates={interviewCandidates} onNotify={notify} onBack={requestBackFromInterview} backLabel={interviewOrigin?.activeNav === "候选人" ? "返回候选人详情" : interviewOrigin?.activeNav === "工作台" ? "返回工作台" : interviewOrigin?.activeNav === "人才库" ? "返回人才库" : "返回面试列表"} onOpenSubView={() => {}} onRecordsChanged={refreshInterviewsAfterMutation} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} actorId={session.user?.id} controller={interviewController} />
+          <InterviewsWorkspace mode={interviewMode} setMode={setInterviewMode} selectedInterviewId={selectedInterviewId} setSelectedInterviewId={updateSelectedInterviewId} scheduleCandidateId={scheduleCandidateId} records={interviewRecords} status={interviewState.status} error={interviewState.error} onRetry={() => void loadInterviews()} nextCursor={interviewState.nextCursor} loadingMore={interviewState.loadingMore} onLoadMore={() => void loadInterviews({ cursor: interviewState.nextCursor, append: true })} candidates={interviewCandidates} onNotify={notify} onBack={requestBackFromInterview} backLabel={interviewOrigin?.activeNav === "候选人" ? "返回候选人详情" : interviewOrigin?.activeNav === "工作台" ? "返回工作台" : interviewOrigin?.activeNav === "人才库" ? "返回人才库" : "返回面试列表"} onOpenSubView={() => {}} onRecordsChanged={refreshInterviewsAfterMutation} canSchedule={canPerformAction(currentRole, "安排面试")} actorName={roleIdentity.name} actorId={session.user?.id} controller={interviewController} pageActionHost={pageActionHost} />
         )}
 
         {!screeningTask && activeNav === "人才库" && (
-          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={updateSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} onNotify={notify} controller={talentController} actorId={session.user?.id} />
+          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={updateSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} onNotify={notify} controller={talentController} actorId={session.user?.id} pageActionHost={pageActionHost} />
         )}
 
         {!screeningTask && activeNav === "报表" && (
-          <ReportWorkspace positions={positionRecords} currentRole={currentRole} onDrillDown={drillDownReport} onNotify={notify} controller={reportController} />
+          <ReportWorkspace positions={positionRecords} currentRole={currentRole} onDrillDown={drillDownReport} onNotify={notify} controller={reportController} pageActionHost={pageActionHost} />
         )}
 
         {!screeningTask && activeNav === "设置" && (
-          <SettingsWorkspace currentRole={currentRole} onNotify={notify} section={route.section} organizationTab={settingsOrganizationTab} templateTab={route.section === "流程与评价模板" ? route.tab : undefined} onRouteChange={(section, tab) => navigate(settingsPath(section, tab, route.returnTo))} />
+          <SettingsWorkspace currentRole={currentRole} onNotify={notify} section={route.section} organizationTab={settingsOrganizationTab} templateTab={route.section === "流程与评价模板" ? route.tab : undefined} onRouteChange={(section, tab) => navigate(settingsPath(section, tab, route.returnTo))} pageActionHost={pageActionHost} />
         )}
 
-        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "候选人" && activeNav !== "面试" && activeNav !== "人才库" && activeNav !== "报表" && activeNav !== "设置" && (
+        {!screeningTask && activeNav !== "工作台" && activeNav !== "职位" && activeNav !== "筛选任务" && activeNav !== "候选人" && activeNav !== "面试" && activeNav !== "人才库" && activeNav !== "报表" && activeNav !== "设置" && (
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
-        {screeningTask && <ScreeningTaskView task={screeningTask} initialViewState={screeningViewState} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => setScreeningTask(null)} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
+        {screeningTask && route.kind === "screening" && <ScreeningTaskView task={screeningTask} initialViewState={{ taskId: screeningTask.id, query: route.query || screeningViewState?.query || "", filter: route.status || screeningViewState?.filter || "全部", selected: screeningViewState?.selected || [] }} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => navigate("/screening/tasks")} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
       </main>
 
-      {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); }} onRunCreated={persistRecentServerTask} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); }} onNotify={notify} actorName={roleIdentity.name} />}
+      {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); navigate(screeningTaskPath(task.id)); }} onRunCreated={persistRecentServerTask} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); navigate(screeningTaskPath(task.id)); }} onNotify={notify} actorName={roleIdentity.name} />}
       {profileOpen && <ProfileSettings user={session.user} role={currentRole} client={accountClient} onClose={() => setProfileOpen(false)} />}
 
       {talentAddDialog && (

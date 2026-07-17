@@ -3,6 +3,7 @@ import { Building2, LoaderCircle, LockKeyhole, LogIn, LogOut, Mail, MessageCircl
 import { apiClient } from "./apiClient.js";
 import { getSessionMessage } from "./session.js";
 import { getFeishuLoginErrorMessage, startFeishuAuthorization } from "./feishuIntegration.js";
+import "./product-theme-admin.css";
 
 export function SessionLoadingView() {
   return (

@@ -33,3 +33,10 @@ test("schedule and feedback back links describe the actual origin", () => {
   assert.match(interviewSource, /backLabel/);
   assert.match(interviewSource, /\{backLabel\}/);
 });
+
+test("returning from an interview mutation reloads the originating candidate detail", () => {
+  assert.match(
+    appSource,
+    /function requestBackFromInterview\(\)[\s\S]*?interviewOrigin\?\.activeNav === "候选人"[\s\S]*?loadServerCandidate\(candidateDetailState\.context\)/,
+  );
+});

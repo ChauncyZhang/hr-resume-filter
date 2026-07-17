@@ -58,6 +58,17 @@ test("final save does not override a newly detected soft conflict", () => {
   assert.match(source, /const finalConflict = await onCheckConflicts/);
 });
 
+test("past slots on the current day are unavailable in the selected timezone", () => {
+  assert.ok(helpersSource, "ScheduleWorkspace.jsx must expose the interview schedule helper block");
+  const { isScheduleSlotInPast } = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { isScheduleSlotInPast }; })()`);
+  const now = Date.parse("2026-07-16T15:40:00Z");
+
+  assert.equal(isScheduleSlotInPast("2026-07-16", "23:30", "Asia/Shanghai", now), true);
+  assert.equal(isScheduleSlotInPast("2026-07-16", "23:40", "Asia/Shanghai", now), true);
+  assert.equal(isScheduleSlotInPast("2026-07-16", "23:41", "Asia/Shanghai", now), false);
+  assert.equal(isScheduleSlotInPast("2026-07-17", "09:00", "Asia/Shanghai", now), false);
+});
+
 test("reschedules keep the existing candidate visible and immutable", () => {
   assert.match(source, /const recordCandidate = record \? \{ id: record\.candidateId, candidateId: record\.candidateId, name: record\.candidate/);
   assert.match(source, /disabled=\{Boolean\(record\)\}/);

@@ -53,24 +53,36 @@ stopped and the worker loop was changed to retry safely without logging exceptio
 ### GREEN
 
 ```powershell
-python -m pytest server/tests -q
+docker build --target test -t ux09-server-test -f server/Dockerfile .
+docker run --rm ux09-server-test
 ```
 
-Observed: `14 passed in 0.66s`.
+Observed under Python 3.12.11 with the pinned dependencies: `15 passed in 0.57s`.
+
+Audit regression RED:
+
+```powershell
+python -m pytest server/tests/test_settings.py::test_production_rejects_insecure_cors_origin -q
+```
+
+Observed: failed because production accepted an `http://` CORS origin. After requiring HTTPS
+origins in production, the focused test passed.
 
 ## Verification commands and output summary
 
-- `python -m pytest server/tests -q` -> 14 passed.
+- `docker info --format '{{.ServerVersion}}'` -> Docker Engine 29.4.3 available.
+- `docker build --target test -t ux09-server-test -f server/Dockerfile .` -> Python 3.12.11
+  test image built with the pinned runtime and development dependencies.
+- `docker run --rm ux09-server-test` -> 15 passed in 0.57s.
 - `docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet`
   -> exit 0.
 - `docker compose --env-file deploy/.env.example -f deploy/compose.yaml build api`
-  -> Python 3.12 image and pinned production dependencies built successfully.
-- `docker run --rm ux09-api python -m alembic -c server/alembic.ini upgrade head --sql`
+  -> the explicit `runtime` target built successfully; image user is `65532:65532`.
+- `docker run --rm ux09-server-test python -m alembic -c server/alembic.ini upgrade head --sql`
   -> empty baseline SQL generated successfully.
-- `docker compose --env-file deploy/.env.example -f deploy/compose.yaml up -d` -> all six
-  required services created; PostgreSQL, MinIO, and API became healthy. The stack was stopped
-  with `docker compose ... down` after inspection.
-- `git diff --check` -> no errors; Git emitted only the pre-existing CSV line-ending warning.
+- Rendered Compose topology inspection -> only `proxy` publishes one port and joins `edge`;
+  all six services join `private`, which is marked internal.
+- `git diff --cached --check` -> no errors before the final commit.
 
 ## Self-review findings addressed
 
@@ -79,21 +91,112 @@ Observed: `14 passed in 0.66s`.
 - Preserved `/api/` when Nginx forwards requests.
 - Added a public edge network only to the proxy while dependencies remain on an internal
   network.
+- Added an explicit Python 3.12 Docker test target and pinned the Compose application build to
+  the non-root runtime target so test dependencies/root execution cannot leak into production.
+- Rejected non-HTTPS CORS origins in production while preserving localhost HTTP development.
 - Kept the worker alive across transient readiness failures so it can receive SIGTERM and
   recover when dependencies return.
 - Excluded the unrelated application and local virtual environment from Docker build context.
 
 ## Commit
 
-Implementation commit: `8f5a3e6` (`Bootstrap UX-09 server runtime`).
+Implementation commits:
+
+- `8f5a3e6` (`Bootstrap UX-09 server runtime`).
+- `69c5333` (`Harden UX-09 runtime verification`) — final audited Task 1 commit.
 
 ## Concerns
 
-- The host only has Python 3.14, so the pinned Python 3.12 dependencies could not be installed
-  in the local virtual environment; unit tests ran with the host's compatible FastAPI/Pydantic
-  packages, while the production dependency set was verified by the successful Python 3.12
-  Docker build.
-- Compose startup was not repeated after the final proxy edge-network and worker retry fixes,
-  per the instruction to stop long-running commands. Compose syntax and all local tests pass.
 - The private MinIO bucket must be provisioned before `/health/ready` becomes 200; this is
   documented and the application deliberately does not create public bucket policy.
+- This audit validated deterministic tests, image construction, migration SQL, and rendered
+  topology. It did not repeat a stateful six-service startup because the brief specifically
+  requires Compose syntax validation and the readiness behavior is dependency-injected in tests.
+
+## Review fixes: 2026-07-12
+
+Commit: `4089199` (`Address UX-09 runtime review findings`).
+
+### RED evidence
+
+```powershell
+python -m pytest server/tests/test_settings.py::test_production_rejects_database_url_without_password server/tests/test_observability.py::test_redact_matches_sensitive_key_fragments server/tests/test_health.py::test_ready_health_times_out_hanging_probes server/tests/test_worker.py::test_worker_entrypoint_configures_structured_logging server/tests/test_worker.py::test_worker_shutdown_is_bounded_when_probe_hangs -q
+```
+
+Observed: 6 failures. Production accepted missing database passwords; redaction missed compound
+sensitive keys; readiness timeout settings and worker deadlines did not exist; and the worker
+entrypoint did not expose structured logging initialization.
+
+### GREEN evidence
+
+The same focused command passed: `6 passed in 0.79s`.
+
+```powershell
+docker build --target test -t ux09-server-test -f server/Dockerfile .
+docker run --rm ux09-server-test
+docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet
+git diff --check
+```
+
+Observed: the Python 3.12.11 image built successfully; the complete suite passed with
+`21 passed in 0.65s`; Compose config exited 0; and `git diff --check` reported no whitespace
+errors, only the pre-existing `app/sample/candidates.csv` line-ending warning.
+
+### Fix summary
+
+- Production settings now require a non-empty database URL password.
+- API and worker readiness checks share a configurable positive deadline; hanging probes are
+  cancelled and the worker can complete SIGTERM shutdown within the bound.
+- Worker startup configures the shared structured, recursively redacted JSON logger.
+- Redaction matches sensitive fragments in compound key names.
+- Backup files are published atomically only after successful non-empty dumps, and health now
+  requires a non-empty backup artifact newer than 25 hours.
+- Removed the six reported trailing blank lines.
+
+## Second review fixes: 2026-07-12
+
+Commit: `07a8a76` (`Bound UX-09 storage readiness`).
+
+### RED evidence
+
+```powershell
+docker build --target test -t ux09-server-test-red -f server/Dockerfile .
+docker run --rm ux09-server-test-red python -m pytest server/tests/test_settings.py::test_production_rejects_decoded_placeholder_database_password server/tests/test_probes.py server/tests/test_storage.py -q
+```
+
+Observed: collection failed because structured concurrent `check_readiness` did not exist.
+Running the credential and real-storage groups separately produced `8 failed, 2 passed`:
+decoded/compound placeholders were accepted, the storage factory had no timeout parameters,
+and the real MinIO probe had no short network deadline.
+
+### GREEN evidence
+
+```powershell
+docker run --rm ux09-server-test python -m pytest server/tests/test_settings.py::test_production_rejects_decoded_placeholder_database_password server/tests/test_probes.py server/tests/test_storage.py -q
+```
+
+Observed: `11 passed in 0.42s` under Python 3.12.11.
+
+```powershell
+docker build --target test -t ux09-server-test -f server/Dockerfile .
+docker run --rm ux09-server-test
+docker compose --env-file deploy/.env.example -f deploy/compose.yaml config --quiet
+git diff --check
+```
+
+Observed: full Python 3.12 suite `32 passed in 0.68s`; Compose config exited 0; and
+`git diff --check` reported no Task 1 whitespace errors, only the pre-existing CSV
+line-ending warning.
+
+### Fix summary
+
+- Production validation now structurally parses the database URL, percent-decodes the password,
+  and rejects values equal to or containing `secret`, `password`, `change-me`, `changeme`,
+  `placeholder`, or `example`.
+- Readiness probes run in an `asyncio.TaskGroup`, so a failing async probe cancels its sibling.
+- The real MinIO client now uses explicit 1-second connect, 3-second read, and 4-second total
+  urllib3 deadlines with retries disabled. A socket-level test verifies the synchronous
+  `bucket_exists` operation returns within its configured read bound.
+- Worker shutdown remains bounded by the 5-second readiness deadline. Documentation explicitly
+  states async cancellation does not instantly terminate an OS thread; the underlying MinIO
+  network timeout is the finite thread-operation bound.

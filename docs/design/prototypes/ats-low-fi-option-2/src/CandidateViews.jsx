@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import "./product-theme-people.css";
 import {
   ArrowLeft,
   BriefcaseBusiness,
@@ -12,6 +13,7 @@ import {
   FileText,
   Filter,
   GraduationCap,
+  Import,
   Mail,
   MessageSquareText,
   Phone,
@@ -29,7 +31,10 @@ import {
 import { mergeCandidateRecords, resolveCandidateJobPreset } from "./candidateController.js";
 import { canAddCandidateToTalentPool } from "./talentController.js";
 import { createCandidateGovernanceController } from "./candidateGovernance.js";
-import { canManageCandidateLegalHold, canReadCandidateGovernance, canRequestCandidateDeletion } from "./roleCapabilities.js";
+import { canManageCandidateLegalHold, canPerformAction, canReadCandidateGovernance, canRequestCandidateDeletion } from "./roleCapabilities.js";
+import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
+
+const PdfResumeViewer = lazy(() => import("./PdfResumeViewer.jsx").then((module) => ({ default: module.PdfResumeViewer })));
 
 const baseTimeline = [
   { time: "今天 10:30", actor: "系统", action: "完成规则评分与 LLM 辅助评估" },
@@ -45,26 +50,48 @@ export const initialCandidateRecords = [
   { id: "CAN-006", name: "刘洋", role: "前端工程师", company: "小米", position: "前端工程师", stage: "待决策", score: 77, ruleScore: 79, llmScore: 75, recommendation: "人工复核", source: "BOSS 直聘", owner: "刘思远", city: "北京", phone: "188****4090", email: "liu***@mail.com", lastActivity: "07-10 15:20", tags: ["React"], skills: ["React", "TypeScript", "CSS"], education: "北京工业大学 · 软件工程本科", experience: "5 年前端工程经验", summary: "有复杂后台和设计系统建设经验。", matched: "React、TypeScript、CSS", missing: "数据可视化", risk: "管理经验较少", llmReason: "技术能力符合，岗位级别需要综合面试反馈。", humanConclusion: "需要补充", notes: [], version: 1, timeline: baseTimeline, applications: [{ position: "前端工程师", state: "待决策", created: "2026-07-01", source: "BOSS 直聘" }], interviews: [{ round: "技术面", time: "2026-07-09 10:00", interviewer: "赵强", result: "推荐", feedback: "工程能力扎实。" }] },
 ];
 
-const transitions = {
-  新简历: ["待复核", "已淘汰"],
-  待复核: ["待沟通", "已淘汰"],
-  待沟通: ["待安排", "已淘汰", "已撤回"],
-  待安排: ["面试中", "已淘汰", "已撤回"],
-  面试中: ["待决策", "已淘汰", "已撤回"],
-  待决策: ["已录用", "已淘汰"],
-  已录用: [],
-  已淘汰: [],
-  已撤回: [],
+const workflowActions = {
+  review_approved: { label: "通过评审", title: "确认通过简历评审", description: "提交后，候选人将自动进入待安排面试，HR 会在工作台收到待办。", target: "待安排", capability: "评审候选人" },
+  review_rejected: { label: "不通过", title: "确认评审不通过", description: "请记录不通过原因，提交后将进入已淘汰。", target: "已淘汰", capability: "评审候选人", reasonRequired: true },
+  hiring_approved: { label: "通过面试", title: "确认通过面试决策", description: "提交后，候选人将进入待录用确认，HR 会在工作台收到待办。", target: "已通过", capability: "确认录用决策" },
+  hiring_rejected: { label: "不录用", title: "确认本次不录用", description: "请记录决策原因，提交后将进入已淘汰。", target: "已淘汰", capability: "确认录用决策", reasonRequired: true },
+  offer_accepted: { label: "确认已录用", title: "确认候选人已录用", description: "请仅在候选人已接受录用后确认。提交后流程结束。", target: "已录用", capability: "确认录用结果" },
+  offer_declined: { label: "候选人放弃", title: "确认候选人放弃", description: "请记录候选人放弃原因，提交后流程结束。", target: "已撤回", capability: "确认录用结果", reasonRequired: true },
 };
 
-const serverTransitions = {
-  ...transitions,
-  待决策: ["已通过", "已淘汰"],
-  已通过: ["已录用", "已淘汰"],
+const stageWorkflowActions = {
+  待复核: ["review_approved", "review_rejected"],
+  待决策: ["hiring_approved", "hiring_rejected"],
+  已通过: ["offer_accepted", "offer_declined"],
 };
 
-export function candidateTransitionOptions(stage, serverBacked) {
-  return (serverBacked ? serverTransitions : transitions)[stage] || [];
+export function candidateWorkflowActions(stage, role) {
+  return (stageWorkflowActions[stage] || [])
+    .map((id) => ({ id, ...workflowActions[id] }))
+    .filter((item) => canPerformAction(role, item.capability));
+}
+
+export function candidateNextStep(stage) {
+  return ({
+    新简历: "筛选完成后自动提交评审",
+    待复核: "等待用人经理评审",
+    待沟通: "HR 安排面试",
+    待安排: "HR 安排面试",
+    面试中: "等待面试官提交反馈",
+    待决策: "等待用人经理作出决策",
+    已通过: "HR 确认录用结果",
+    已录用: "流程已完成",
+    已淘汰: "流程已结束",
+    已撤回: "流程已结束",
+  })[stage] || "等待流程更新";
+}
+
+export function canScheduleCandidateInterview(stage, role, scheduleAvailable) {
+  return stage === "待安排" && canPerformAction(role, "安排面试") && Boolean(scheduleAvailable);
+}
+
+export function candidateStageFilterOptions() {
+  return ["新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"];
 }
 
 export function candidateDetailTabs(serverBacked) {
@@ -89,7 +116,7 @@ function StageTag({ stage }) {
   return <span className={`candidate-stage ${terminal ? "terminal" : ""}`}>{stage}</span>;
 }
 
-function CandidateList({ controller, onOpen, filters = {}, onFiltersChange = () => {} }) {
+function CandidateList({ controller, onOpen, filters = {}, onFiltersChange = () => {}, onImport, pageActionHost }) {
   const [query, setQuery] = useState(filters.q || "");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [position, setPosition] = useState(filters.jobId || "全部职位");
@@ -191,12 +218,13 @@ function CandidateList({ controller, onOpen, filters = {}, onFiltersChange = () 
   }
 
   return <div className="candidate-page candidate-list-page">
-    <div className="candidate-page-heading"><div><h2>候选人</h2><p>跨职位搜索和查看候选人。</p></div><span>已加载 {records.length} 人</span></div>
+    <PagePrimaryAction host={pageActionHost}>{onImport && <button className="button primary" type="button" onClick={onImport}><Import size={17} />导入简历</button>}</PagePrimaryAction>
+    <div className="candidate-page-heading"><div><h2>全部候选人</h2><p>跨职位搜索和查看候选人。</p></div><span>已加载 {records.length} 人</span></div>
     <section className="candidate-list-panel">
       <div className="candidate-filters">
         <label className="candidate-search"><Search size={17} /><input aria-label="搜索候选人" value={query} onChange={(event) => { const q = event.target.value; setQuery(q); onFiltersChange({ ...filters, q }); }} placeholder="搜索姓名、当前职称、邮箱或手机号" /></label>
         <label><select aria-label="职位筛选" value={position} onChange={(event) => { const jobId = event.target.value; setPosition(jobId); onFiltersChange({ ...filters, jobId }); }}><option>全部职位</option>{jobs.map((job) => <option key={job.id} value={job.id}>{job.title}</option>)}</select><ChevronDown size={14} /></label>
-        <label><select aria-label="阶段筛选" value={stage} onChange={(event) => { const value = event.target.value; setStage(value); onFiltersChange({ ...filters, stage: value }); }}><option>全部阶段</option>{Object.keys(transitions).map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label>
+        <label><select aria-label="阶段筛选" value={stage} onChange={(event) => { const value = event.target.value; setStage(value); onFiltersChange({ ...filters, stage: value }); }}><option>全部阶段</option>{candidateStageFilterOptions().map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label>
         <label><select aria-label="负责人筛选" value={owner} onChange={(event) => { const ownerId = event.target.value; setOwner(ownerId); onFiltersChange({ ...filters, ownerId }); }}><option>全部负责人</option>{ownerOptions.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label>
         <label><select aria-label="分数筛选" value={minScore} onChange={(event) => { const value = event.target.value; setMinScore(value); onFiltersChange({ ...filters, minScore: value }); }}><option>不限分数</option><option value="80">80 分以上</option><option value="70">70 分以上</option></select><ChevronDown size={14} /></label>
         <button className="button secondary compact" type="button" onClick={() => onFiltersChange({ q: "", jobId: "全部职位", stage: "全部阶段", ownerId: "全部负责人", minScore: "不限分数" })}><X size={15} />清空</button>
@@ -213,38 +241,50 @@ function CandidateList({ controller, onOpen, filters = {}, onFiltersChange = () 
   </div>;
 }
 
-function TransitionDialog({ candidate, onClose, onCommit, onConflictRefresh, serverBacked = false, submitting = false, actionError = "", conflict = false }) {
-  const options = candidateTransitionOptions(candidate.stage, serverBacked);
-  const [target, setTarget] = useState(options[0] || "");
+function WorkflowActionDialog({ candidate, action, onClose, onCommit, onConflictRefresh, serverBacked = false, submitting = false, actionError = "", conflict = false }) {
   const [reason, setReason] = useState("");
   const [error, setError] = useState("");
   const [fixtureConflict, setFixtureConflict] = useState(false);
 
   async function submit(force = false) {
-    if (target === "已淘汰" && !reason.trim()) { setError("淘汰候选人必须填写原因"); return; }
+    if (action.reasonRequired && !reason.trim()) { setError("请填写本次操作原因"); return; }
     if (!serverBacked && candidate.version === 2 && !force) { setFixtureConflict(true); return; }
-    await onCommit(target, reason);
+    await onCommit(action, reason);
   }
 
-  return <div className="candidate-dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="candidate-dialog" role="dialog" aria-modal="true" aria-label="推进候选人状态" onMouseDown={(event) => event.stopPropagation()}>
-    <header><div><h3>推进候选人</h3><p>{candidate.name} · {candidate.position}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}><X size={19} /></button></header>
+  return <div className="candidate-dialog-backdrop" role="presentation" onMouseDown={onClose}><section className="candidate-dialog" role="dialog" aria-modal="true" aria-label={action.title} onMouseDown={(event) => event.stopPropagation()}>
+    <header><div><h3>{action.title}</h3><p>{candidate.name} · {candidate.position}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}><X size={19} /></button></header>
     {(conflict || fixtureConflict) ? <div className="conflict-state" role="alert"><CircleAlert size={23} /><h4>候选人状态已被其他成员更新</h4><p>{serverBacked ? "你的修改没有覆盖服务端记录。请加载最新详情并重新确认。" : "服务端最新状态为“待沟通”，负责人为张小北。你的修改尚未覆盖该更新。"}</p><div><button className="button secondary" type="button" onClick={() => onConflictRefresh(serverBacked ? undefined : "待沟通")}>{serverBacked ? "刷新最新详情" : "使用最新状态"}</button>{!serverBacked && <button className="button primary" type="button" onClick={() => submit(true)}>基于最新状态重新应用</button>}</div></div> : <>
-      <div className="candidate-dialog-body"><div className="transition-current"><span>当前状态</span><StageTag stage={candidate.stage} /></div><label>下一状态<select value={target} disabled={submitting} onChange={(event) => { setTarget(event.target.value); setError(""); }}>{options.map((item) => <option key={item}>{item}</option>)}</select></label><label>操作原因{target === "已淘汰" && <span className="required-label">必填</span>}<textarea rows="4" value={reason} disabled={submitting} onChange={(event) => { setReason(event.target.value); setError(""); }} placeholder={target === "已淘汰" ? "请选择或填写淘汰原因" : "补充本次状态变更说明（选填）"} /></label><div className="transition-impact"><ShieldCheck size={16} /><span>提交后将写入候选人时间线，并保留规则、LLM 和人工结论。</span></div>{(error || actionError) && <p className="field-error" role="alert"><CircleAlert size={14} />{error || actionError}</p>}</div>
-      <footer><button className="button secondary" type="button" disabled={submitting} onClick={onClose}>取消</button><button className="button primary" type="button" disabled={submitting || !target} onClick={() => void submit(false)}>{submitting ? "正在推进" : "确认推进"}</button></footer>
+      <div className="candidate-dialog-body"><div className="transition-current"><span>当前状态</span><StageTag stage={candidate.stage} /></div><p className="workflow-action-description">{action.description}</p><label>操作原因{action.reasonRequired && <span className="required-label">必填</span>}<textarea rows="4" value={reason} disabled={submitting} onChange={(event) => { setReason(event.target.value); setError(""); }} placeholder={action.reasonRequired ? "请填写具体原因" : "补充说明（选填）"} /></label><div className="transition-impact"><ShieldCheck size={16} /><span>状态将由本次业务动作自动更新，并写入候选人时间线。</span></div>{(error || actionError) && <p className="field-error" role="alert"><CircleAlert size={14} />{error || actionError}</p>}</div>
+      <footer><button className="button secondary" type="button" disabled={submitting} onClick={onClose}>取消</button><button className="button primary" type="button" disabled={submitting} onClick={() => void submit(false)}>{submitting ? "正在提交" : action.label}</button></footer>
     </>}
   </section></div>;
 }
 
-function ResumePreview({ candidate, preview, loading, error, onClose, onRetry, onDownload }) {
-  return <aside className="resume-preview-drawer" role="dialog" aria-modal="true" aria-label="简历预览">
-    <header><div><FileText size={21} /><div><h2>简历预览</h2><p>{resumeDisplayName(candidate.resume)}</p></div></div><button className="icon-button" type="button" aria-label="关闭简历预览" onClick={onClose}><X size={19} /></button></header>
-    <div className="resume-preview-body">
-      {loading && <div className="candidate-detail-state" role="status"><LoaderCircle className="spin" size={24} /><strong>正在加载简历预览</strong></div>}
-      {error && <div className="candidate-detail-state error" role="alert"><CircleAlert size={24} /><strong>{error}</strong><button className="button secondary" type="button" onClick={onRetry}><RotateCcw size={15} />重试预览</button></div>}
-      {!loading && !error && <article className="resume-preview-page"><pre>{preview?.text || "服务端未返回可预览文本。"}</pre></article>}
-    </div>
-    <footer><button className="button secondary" type="button" onClick={onClose}>关闭</button><button className="button primary" type="button" onClick={onDownload}><Download size={15} />下载原文件</button></footer>
-  </aside>;
+function ResumePreview({ candidate, file, status, error, downloading, onClose, onRetry, onDownload }) {
+  const dialogRef = useRef(null);
+  const restoreRef = useRef(typeof document === "undefined" ? null : document.activeElement);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog || typeof document === "undefined") return undefined;
+    dialog.querySelector("[data-resume-initial-focus]")?.focus();
+    return () => restoreRef.current?.isConnected !== false && restoreRef.current?.focus?.();
+  }, []);
+  function handleKeyDown(event) {
+    if (event.key === "Escape") { event.preventDefault(); onClose(); return; }
+    if (event.key !== "Tab") return;
+    const controls = [...dialogRef.current.querySelectorAll("button")].filter((item) => !item.disabled);
+    const first = controls[0]; const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  }
+  return <div className="resume-preview-backdrop" role="presentation" onMouseDown={onClose}>
+    <section ref={dialogRef} className="resume-preview-modal" role="dialog" aria-modal="true" aria-labelledby="candidate-resume-preview-title" onMouseDown={(event) => event.stopPropagation()} onKeyDown={handleKeyDown}>
+      <header><div><FileText size={21} /><div><h2 id="candidate-resume-preview-title">简历预览</h2><p>{resumeDisplayName(candidate.resume)}</p></div></div><button className="icon-button" type="button" data-resume-initial-focus aria-label="关闭简历预览" onClick={onClose}><X size={19} /></button></header>
+      <div className="resume-preview-reader"><Suspense fallback={<div className="pdf-viewer-state" role="status">正在加载 PDF 阅读器</div>}><PdfResumeViewer file={file} status={status} error={error} onRetry={onRetry} onDownload={onDownload} downloading={downloading} /></Suspense></div>
+      <footer><button className="button secondary" type="button" onClick={onClose}>关闭</button></footer>
+    </section>
+  </div>;
 }
 
 const governanceCountLabels = [
@@ -321,7 +361,7 @@ function CandidateGovernance({ candidate, role, onNotify }) {
 
 function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotify, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, actorName, controller, onRefresh, activeTab = "档案与简历", onTabChange = () => {} }) {
   const tab = candidateDetailTabs(candidate.serverBacked).includes(activeTab) ? activeTab : "档案与简历";
-  const [transitionOpen, setTransitionOpen] = useState(false);
+  const [selectedWorkflowAction, setSelectedWorkflowAction] = useState(null);
   const [note, setNote] = useState("");
   const [tagInput, setTagInput] = useState("");
   const [conclusion, setConclusion] = useState(candidate.humanConclusion || "");
@@ -330,11 +370,19 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
   const [actionError, setActionError] = useState("");
   const [conflict, setConflict] = useState(false);
   const [previewState, setPreviewState] = useState(null);
+  const previewRequestRef = useRef(null);
 
   useEffect(() => {
     setConclusion(candidate.humanConclusion || "");
     setConclusionReason(candidate.humanConclusionReason || "");
   }, [candidate.humanConclusion, candidate.humanConclusionReason, candidate.id]);
+
+  useEffect(() => {
+    const url = previewState?.file?.url;
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [previewState?.file?.url]);
+
+  useEffect(() => () => previewRequestRef.current?.abort(), [candidate.id]);
 
   function update(patch) { onUpdate({ ...candidate, ...patch }); }
 
@@ -370,14 +418,14 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
     update({ tags: [...candidate.tags, value] }); setTagInput(""); onNotify("标签已添加");
   }
 
-  async function commitTransition(target, reason) {
+  async function commitWorkflowAction(action, reason) {
     if (candidate.serverBacked) {
-      const saved = await runServerAction("transition", () => controller.transition(candidate.application, target, reason), `候选人已推进到${target}`);
-      if (saved) setTransitionOpen(false);
+      const saved = await runServerAction("workflow", () => controller.workflowAction(candidate.application, action.id, reason), `${action.label}已提交`);
+      if (saved) setSelectedWorkflowAction(null);
       return;
     }
-    update({ stage: target, version: candidate.version + 1, lastActivity: "刚刚", applications: candidate.applications.map((item, index) => index === 0 ? { ...item, state: target } : item), timeline: [{ time: "刚刚", actor: actorName, action: `${candidate.stage} → ${target}${reason ? `；原因：${reason}` : ""}` }, ...candidate.timeline] });
-    setTransitionOpen(false); onNotify(`候选人已推进到${target}`);
+    update({ stage: action.target, version: candidate.version + 1, lastActivity: "刚刚", applications: candidate.applications.map((item, index) => index === 0 ? { ...item, state: action.target } : item), timeline: [{ time: "刚刚", actor: actorName, action: `${action.label}${reason ? `；原因：${reason}` : ""}` }, ...candidate.timeline] });
+    setSelectedWorkflowAction(null); onNotify(`${action.label}已提交`);
   }
 
   async function saveConclusion() {
@@ -391,13 +439,25 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
 
   async function loadPreview() {
     if (!candidate.resume?.id) return;
-    setPreviewState({ loading: true, error: "", data: null });
+    previewRequestRef.current?.abort();
+    const abortController = new AbortController();
+    previewRequestRef.current = abortController;
+    setPreviewState({ status: "loading", error: "", file: null });
     try {
-      const data = await controller.previewResume(candidate.resume.id);
-      setPreviewState({ loading: false, error: "", data });
-    } catch {
-      setPreviewState({ loading: false, error: "简历预览加载失败，请重试。", data: null });
+      const result = await controller.getResumeFile(candidate.resume.id, { signal: abortController.signal });
+      if (abortController.signal.aborted) return;
+      setPreviewState({ status: "ready", error: "", file: { ...result, url: URL.createObjectURL(result.blob) } });
+    } catch (error) {
+      if (error?.name !== "AbortError") setPreviewState({ status: "error", error: "原始简历加载失败，请重试。", file: null });
+    } finally {
+      if (previewRequestRef.current === abortController) previewRequestRef.current = null;
     }
+  }
+
+  function closePreview() {
+    previewRequestRef.current?.abort();
+    previewRequestRef.current = null;
+    setPreviewState(null);
   }
 
   async function downloadResume() {
@@ -418,30 +478,32 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
     }
   }
 
-  const next = (!candidate.serverBacked || candidate.application) ? candidateTransitionOptions(candidate.stage, candidate.serverBacked)[0] : null;
+  const availableWorkflowActions = candidate.application || !candidate.serverBacked ? candidateWorkflowActions(candidate.stage, role) : [];
+  const nextStep = candidateNextStep(candidate.stage);
+  const canScheduleCurrent = canScheduleCandidateInterview(candidate.stage, role, onScheduleInterview);
   const tabs = candidateDetailTabs(candidate.serverBacked);
   const notes = candidate.notes || [];
   const profileLine = [candidate.role, candidate.company, candidate.city].filter(Boolean).join(" · ");
   return <div className="candidate-page candidate-detail-page">
     <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />{backLabel || "返回候选人列表"}</button>
-    <section className="candidate-detail-hero"><div className="candidate-profile"><span>{candidate.name.slice(-1)}</span><div><div><h2>{candidate.name}</h2><StageTag stage={candidate.stage} /></div><p>{profileLine}</p><div className="masked-contacts"><span><Phone size={13} />{candidate.phone}</span><span><Mail size={13} />{candidate.email}</span></div></div></div><div className="candidate-detail-actions">{!candidate.serverBacked && <button className="button secondary" type="button" onClick={() => onNotify("联系方式已复制，操作已记录") }><ClipboardCopy size={16} />复制联系信息</button>}<button className="button secondary" type="button" disabled={candidate.serverBacked && (!candidate.resume?.id || pendingAction === "download")} onClick={() => void downloadResume()}><Download size={16} />{pendingAction === "download" ? "下载中" : "下载简历"}</button>{canAddCandidateToTalentPool(candidate) && onAddToTalentPool && <button className="button secondary" type="button" onClick={() => onAddToTalentPool([candidate.id])}><BriefcaseBusiness size={16} />加入人才库</button>}{next && <button className="button primary" type="button" onClick={() => { setActionError(""); setConflict(false); setTransitionOpen(true); }}><UserRoundCheck size={16} />推进候选人</button>}</div></section>
-    {actionError && !transitionOpen && <div className="candidate-action-error" role="alert"><CircleAlert size={16} /><span>{actionError}</span>{conflict && <button type="button" onClick={() => void onRefresh()}>刷新最新详情</button>}</div>}
+    <section className="candidate-detail-hero"><div className="candidate-profile"><span>{candidate.name.slice(-1)}</span><div><div><h2>{candidate.name}</h2><StageTag stage={candidate.stage} /></div><p>{profileLine}</p><div className="masked-contacts"><span><Phone size={13} />{candidate.phone}</span><span><Mail size={13} />{candidate.email}</span></div></div></div><div className="candidate-detail-actions">{!candidate.serverBacked && <button className="button secondary" type="button" onClick={() => onNotify("联系方式已复制，操作已记录") }><ClipboardCopy size={16} />复制联系信息</button>}<button className="button secondary" type="button" disabled={candidate.serverBacked && (!candidate.resume?.id || pendingAction === "download")} onClick={() => void downloadResume()}><Download size={16} />{pendingAction === "download" ? "下载中" : "下载简历"}</button>{canAddCandidateToTalentPool(candidate) && onAddToTalentPool && <button className="button secondary" type="button" onClick={() => onAddToTalentPool([candidate.id])}><BriefcaseBusiness size={16} />加入人才库</button>}{canScheduleCurrent && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}{availableWorkflowActions.map((action) => <button className={`button ${action.reasonRequired ? "secondary" : "primary"}`} type="button" key={action.id} onClick={() => { setActionError(""); setConflict(false); setSelectedWorkflowAction(action); }}><UserRoundCheck size={16} />{action.label}</button>)}</div></section>
+    {actionError && !selectedWorkflowAction && <div className="candidate-action-error" role="alert"><CircleAlert size={16} /><span>{actionError}</span>{conflict && <button type="button" onClick={() => void onRefresh()}>刷新最新详情</button>}</div>}
     <div className="candidate-detail-layout"><main className="candidate-detail-main"><section className="candidate-detail-panel"><div className="candidate-detail-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => onTabChange(item)}>{item}</button>)}</div>
       {tab === "档案与简历" && <div className="candidate-tab-content profile-tab"><section><h3>候选人摘要</h3><p>{candidate.summary}</p></section><section><h3>技能</h3><div className="candidate-skill-tags">{candidate.skills.length ? candidate.skills.map((item) => <span key={item}>{item}</span>) : <span>暂无结构化技能</span>}</div></section><div className="profile-facts"><div><BriefcaseBusiness size={18} /><span><strong>工作经验</strong><small>{candidate.experience}</small></span></div><div><GraduationCap size={18} /><span><strong>教育经历</strong><small>{candidate.education}</small></span></div><div className="resume-detail-row"><FileText size={18} /><span><strong>当前简历</strong><small>{candidate.serverBacked ? resumeDisplayName(candidate.resume) : `${candidate.name}_简历.pdf · 解析质量良好`}</small>{candidate.serverBacked && candidate.resume?.id && <span className="resume-inline-actions"><button type="button" onClick={() => void loadPreview()}><Eye size={14} />预览</button><button type="button" onClick={() => void downloadResume()}><Download size={14} />下载</button></span>}</span></div></div></div>}
       {tab === "职位申请" && <div className="candidate-tab-content"><div className="applications-table"><div><span>职位</span><span>状态</span><span>{candidate.serverBacked ? "最近更新" : "申请日期"}</span><span>来源</span></div>{candidate.applications.map((item) => <div key={`${item.position}-${item.created}`}><strong>{item.position}</strong><StageTag stage={item.state} /><span>{item.created}</span><span>{item.source}</span></div>)}</div></div>}
       {tab === "筛选证据" && <div className="candidate-tab-content evidence-grid"><section className="rule-evidence"><header><FileText size={18} /><div><h3>规则评分</h3><span>{candidate.serverBacked ? "本次筛选结果" : "岗位规则 v3 · 今天 10:30"}</span></div><strong>{candidate.ruleScore ?? "—"}</strong></header><p>命中：{candidate.matched}</p><p>缺失：{candidate.missing}</p><p>风险：{candidate.risk}</p></section><section className="llm-evidence"><header><Sparkles size={18} /><div><h3>LLM 辅助评分</h3><span>{candidate.serverBacked ? "本次筛选结果" : "OpenAI 兼容接口 · 今天 10:30"}</span></div><strong>{candidate.llmScore ?? "—"}</strong></header><p>{candidate.llmReason}</p><small>此内容为 AI 辅助建议，不替代人工结论。</small></section><section className="human-evidence"><header><UserRoundCheck size={18} /><div><h3>人工结论</h3><span>由招聘团队维护</span></div></header><div className="conclusion-options">{["建议推进", "需要补充", "暂不合适"].map((item) => <button type="button" disabled={pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} key={item} className={conclusion === item ? "active" : ""} onClick={() => setConclusion(item)}>{item}</button>)}</div><textarea rows="3" disabled={pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} value={conclusionReason} onChange={(event) => setConclusionReason(event.target.value)} placeholder="补充人工判断依据" /><button className="button primary" type="button" disabled={!conclusion || pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} onClick={() => void saveConclusion()}>{pendingAction === "conclusion" ? "保存中" : "保存人工结论"}</button></section></div>}
-      {tab === "面试与反馈" && <div className="candidate-tab-content"><div className="candidate-interview-toolbar"><div><h3>面试记录</h3><span>安排、通知和反馈统一记录在候选人时间线中。</span></div>{onScheduleInterview && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}</div>{candidate.interviews.length ? <div className="interview-feedback-list">{candidate.interviews.map((item) => <section key={item.time}><header><div><strong>{item.round}</strong><span>{item.time}</span></div><span className="feedback-result">{item.result}</span></header><p>面试官：{item.interviewer}</p><blockquote>{item.feedback}</blockquote>{onOpenInterviewFeedback && item.interviewId && <button className="button secondary" type="button" onClick={() => onOpenInterviewFeedback(item.interviewId)}>查看面试详情</button>}</section>)}</div> : <div className="candidate-empty compact"><MessageSquareText size={23} /><strong>暂无面试记录</strong><span>可以直接为该候选人创建第一场面试。</span>{onScheduleInterview && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}</div>}</div>}
+      {tab === "面试与反馈" && <div className="candidate-tab-content"><div className="candidate-interview-toolbar"><div><h3>面试记录</h3><span>安排、通知和反馈统一记录在候选人时间线中。</span></div>{canScheduleCurrent && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}</div>{candidate.interviews.length ? <div className="interview-feedback-list">{candidate.interviews.map((item) => <section key={item.time}><header><div><strong>{item.round}</strong><span>{item.time}</span></div><span className="feedback-result">{item.result}</span></header><p>面试官：{item.interviewer}</p><blockquote>{item.feedback}</blockquote>{onOpenInterviewFeedback && item.interviewId && <button className="button secondary" type="button" onClick={() => onOpenInterviewFeedback(item.interviewId)}>查看面试详情</button>}</section>)}</div> : <div className="candidate-empty compact"><MessageSquareText size={23} /><strong>暂无面试记录</strong><span>{candidate.stage === "待安排" ? "可以为该候选人创建第一场面试。" : "面试将在 HR 完成安排后显示。"}</span>{canScheduleCurrent && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}</div>}</div>}
       {tab === "时间线" && <div className="candidate-tab-content candidate-timeline">{candidate.timeline.map((item, index) => <div key={`${item.time}-${index}`}><span /><div><strong>{item.action}</strong><p>{item.actor} · {item.time}</p></div></div>)}{candidate.timeline.length === 0 && <div className="candidate-muted">暂无可见时间线记录</div>}</div>}
-    </section></main><aside className="candidate-context"><section><h3>当前申请</h3><dl><div><dt>应聘职位</dt><dd>{candidate.position}</dd></div><div><dt>当前状态</dt><dd><StageTag stage={candidate.stage} /></dd></div><div><dt>负责人</dt><dd>{candidate.owner}</dd></div><div><dt>下一步</dt><dd>{next || "流程已结束"}</dd></div><div><dt>最近进展</dt><dd>{candidate.lastActivity || "未记录"}</dd></div></dl>{next && <button className="button primary full" type="button" onClick={() => { setActionError(""); setConflict(false); setTransitionOpen(true); }}>推进到{next}</button>}</section><CandidateGovernance candidate={candidate} role={role} onNotify={onNotify} />{!candidate.serverBacked && <section><h3>标签</h3><div className="context-tags">{candidate.tags.map((item) => <span key={item}>{item}</span>)}</div><div className="inline-add"><input value={tagInput} onChange={(event) => setTagInput(event.target.value)} placeholder="添加标签" /><button type="button" aria-label="添加标签" onClick={addTag}><Plus size={15} /></button></div></section>}<section><h3>招聘备注</h3>{notes.map((item, index) => <p className="saved-note" key={typeof item === "object" ? item.id : `${item}-${index}`}>{typeof item === "object" ? item.body : item}</p>)}{notes.length === 0 && <p className="candidate-muted">暂无招聘备注</p>}<textarea rows="4" disabled={pendingAction === "note"} value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录沟通重点或后续事项" /><button className="button secondary full" type="button" disabled={!note.trim() || pendingAction === "note"} onClick={() => void addNote()}>{pendingAction === "note" ? "保存中" : "保存备注"}</button></section></aside></div>
-    {transitionOpen && <TransitionDialog candidate={candidate} serverBacked={candidate.serverBacked} submitting={pendingAction === "transition"} actionError={actionError} conflict={conflict} onClose={() => setTransitionOpen(false)} onCommit={commitTransition} onConflictRefresh={(latestStage) => { if (candidate.serverBacked) { void onRefresh(); setTransitionOpen(false); return; } update({ stage: latestStage, version: 3, lastActivity: "刚刚", timeline: [{ time: "刚刚", actor: "系统", action: `检测到其他成员已将状态更新为${latestStage}` }, ...candidate.timeline] }); setTransitionOpen(false); onNotify("已刷新为服务端最新状态"); }} />}
-    {previewState && <ResumePreview candidate={candidate} preview={previewState.data} loading={previewState.loading} error={previewState.error} onClose={() => setPreviewState(null)} onRetry={() => void loadPreview()} onDownload={() => void downloadResume()} />}
+    </section></main><aside className="candidate-context"><section><h3>当前申请</h3><dl><div><dt>应聘职位</dt><dd>{candidate.position}</dd></div><div><dt>当前状态</dt><dd><StageTag stage={candidate.stage} /></dd></div><div><dt>负责人</dt><dd>{candidate.owner}</dd></div><div><dt>下一步</dt><dd>{nextStep}</dd></div><div><dt>最近进展</dt><dd>{candidate.lastActivity || "未记录"}</dd></div></dl><p className="candidate-auto-stage-note">状态会在完成业务动作后自动更新，无需手动维护。</p></section><CandidateGovernance candidate={candidate} role={role} onNotify={onNotify} />{!candidate.serverBacked && <section><h3>标签</h3><div className="context-tags">{candidate.tags.map((item) => <span key={item}>{item}</span>)}</div><div className="inline-add"><input value={tagInput} onChange={(event) => setTagInput(event.target.value)} placeholder="添加标签" /><button type="button" aria-label="添加标签" onClick={addTag}><Plus size={15} /></button></div></section>}<section><h3>招聘备注</h3>{notes.map((item, index) => <p className="saved-note" key={typeof item === "object" ? item.id : `${item}-${index}`}>{typeof item === "object" ? item.body : item}</p>)}{notes.length === 0 && <p className="candidate-muted">暂无招聘备注</p>}<textarea rows="4" disabled={pendingAction === "note"} value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录沟通重点或后续事项" /><button className="button secondary full" type="button" disabled={!note.trim() || pendingAction === "note"} onClick={() => void addNote()}>{pendingAction === "note" ? "保存中" : "保存备注"}</button></section></aside></div>
+    {selectedWorkflowAction && <WorkflowActionDialog candidate={candidate} action={selectedWorkflowAction} serverBacked={candidate.serverBacked} submitting={pendingAction === "workflow"} actionError={actionError} conflict={conflict} onClose={() => setSelectedWorkflowAction(null)} onCommit={commitWorkflowAction} onConflictRefresh={(latestStage) => { if (candidate.serverBacked) { void onRefresh(); setSelectedWorkflowAction(null); return; } update({ stage: latestStage, version: 3, lastActivity: "刚刚", timeline: [{ time: "刚刚", actor: "系统", action: `检测到其他成员已更新流程` }, ...candidate.timeline] }); setSelectedWorkflowAction(null); onNotify("已刷新为服务端最新状态"); }} />}
+    {previewState && <ResumePreview candidate={candidate} file={previewState.file} status={previewState.status} error={previewState.error} downloading={pendingAction === "download"} onClose={closePreview} onRetry={() => void loadPreview()} onDownload={() => void downloadResume()} />}
   </div>;
 }
 
-export function CandidatesWorkspace({ mode, setMode, selectedCandidate, setSelectedCandidate, records, setRecords, onNotify, onBackDetail, detailBackLabel, onOpenCandidate, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, filters, onFiltersChange, detailTab, onDetailTabChange, actorName = "张小北", currentRole, controller, detailState, onRetryDetail }) {
+export function CandidatesWorkspace({ mode, setMode, selectedCandidate, setSelectedCandidate, records, setRecords, onNotify, onBackDetail, detailBackLabel, onOpenCandidate, onScheduleInterview, onOpenInterviewFeedback, onAddToTalentPool, filters, onFiltersChange, detailTab, onDetailTabChange, actorName = "张小北", currentRole, controller, detailState, onRetryDetail, pageActionHost, onImport }) {
   function updateCandidate(updated) { if (!updated.serverBacked) setRecords((current) => current.map((item) => item.id === updated.id ? updated : item)); setSelectedCandidate(updated); }
   if (mode === "detail" && detailState?.status === "loading") return <div className="candidate-page"><button className="back-link" type="button" onClick={onBackDetail}><ArrowLeft size={17} />{detailBackLabel}</button><div className="candidate-detail-state" role="status"><LoaderCircle className="spin" size={28} /><strong>正在加载候选人详情</strong><span>将从服务端读取候选人、申请、简历和时间线。</span></div></div>;
   if (mode === "detail" && detailState?.status === "error") return <div className="candidate-page"><button className="back-link" type="button" onClick={onBackDetail}><ArrowLeft size={17} />{detailBackLabel}</button><div className="candidate-detail-state error" role="alert"><CircleAlert size={28} /><strong>候选人详情加载失败</strong><span>{detailState.error}</span><button className="button primary" type="button" onClick={onRetryDetail}><RotateCcw size={16} />重试加载</button></div></div>;
   if (mode === "detail" && selectedCandidate) return <CandidateDetail candidate={selectedCandidate} role={currentRole} onBack={onBackDetail || (() => { setSelectedCandidate(null); setMode("list"); })} backLabel={detailBackLabel} onUpdate={updateCandidate} onNotify={onNotify} onScheduleInterview={onScheduleInterview} onOpenInterviewFeedback={onOpenInterviewFeedback} onAddToTalentPool={onAddToTalentPool} actorName={actorName} controller={controller} onRefresh={onRetryDetail} activeTab={detailTab} onTabChange={onDetailTabChange} />;
-  return <CandidateList controller={controller} onOpen={onOpenCandidate} filters={filters} onFiltersChange={onFiltersChange} />;
+  return <CandidateList controller={controller} onOpen={onOpenCandidate} filters={filters} onFiltersChange={onFiltersChange} onImport={onImport} pageActionHost={pageActionHost} />;
 }

@@ -64,7 +64,7 @@ ETAG = re.compile(r'^"(0|[1-9][0-9]*)"$')
 REQUIRED_RATINGS = {"professional_ability", "problem_solving", "communication", "role_fit"}
 INTERVIEW_ACCESS_ROLES = frozenset({"recruiting_admin", "recruiter", "hiring_manager", "interviewer"})
 INTERVIEW_PARTICIPANT_ROLES = ("recruiting_admin", "recruiter", "hiring_manager", "interviewer")
-INTERVIEW_SCHEDULABLE_STAGES = frozenset({"new", "review", "contact", "interview_pending", "interviewing"})
+INTERVIEW_SCHEDULABLE_STAGES = frozenset({"interview_pending", "interviewing"})
 
 
 class ScheduleConflict(Exception):

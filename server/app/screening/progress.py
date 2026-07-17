@@ -21,6 +21,8 @@ def summarize_progress(items, total_count):
 def aggregate_run(db, run):
     from datetime import datetime,timezone
     from sqlalchemy import select
+    from server.app.recruiting.models import Application
+    from server.app.recruiting.service import transition_application_record
     from server.app.screening.models import ScreeningItem
 
     items = list(db.scalars(select(ScreeningItem).where(ScreeningItem.organization_id == run.organization_id, ScreeningItem.run_id == run.id)))
@@ -33,3 +35,27 @@ def aggregate_run(db, run):
     if status in {"completed","partial","failed","cancelled"}: run.finished_at=run.finished_at or datetime.now(timezone.utc)
     else: run.finished_at=None
     if previous!=(processed,succeeded,failed,status): run.version+=1
+
+    completed_application_ids = [
+        item.application_id
+        for item in items
+        if item.status == "scored"
+        and item.llm_status in LLM_TERMINAL
+        and item.application_id is not None
+    ]
+    if completed_application_ids:
+        applications = list(db.scalars(select(Application).where(
+            Application.organization_id == run.organization_id,
+            Application.id.in_(completed_application_ids),
+            Application.stage == "new",
+        )))
+        for application in applications:
+            transition_application_record(
+                db,
+                run.organization_id,
+                application.id,
+                "review",
+                expected_version=application.version,
+                actor_user_id=run.created_by,
+                trace_id=f"screening:auto-review:{run.id}",
+            )

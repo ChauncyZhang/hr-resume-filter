@@ -70,7 +70,7 @@ def test_job_definition_api_rule_boundaries_parse_and_score_without_truncation(t
         assert stored.status=="scored" and stored.safe_error_code is None
         assert result.required_hits==must_have and result.bonus_hits==nice_to_have
 
-def test_clean_parse_then_score_is_replay_safe_and_never_auto_advances(tmp_path):
+def test_clean_parse_then_score_is_replay_safe_and_auto_sends_completed_resume_to_review(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path)
     asyncio.run(pipeline.parse_item(job))
     with app.state.identity_store.sync_session() as db: first_started=db.get(ScreeningItem,uuid.UUID(item["id"])).started_at
@@ -84,7 +84,7 @@ def test_clean_parse_then_score_is_replay_safe_and_never_auto_advances(tmp_path)
     with app.state.identity_store.sync_session() as db:
         assert db.scalar(select(func.count(Candidate.id)))==1 and db.scalar(select(func.count(Resume.id)))==1 and db.scalar(select(func.count(Application.id)))==1 and db.scalar(select(func.count(ScreeningResult.id)))==1
         application=db.scalar(select(Application)); result=db.scalar(select(ScreeningResult)); completed=db.get(ScreeningRun,uuid.UUID(run["id"]))
-        assert application.stage=="new" and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1 and db.scalar(select(ScreeningItem.finished_at)).isoformat()
+        assert application.stage=="review" and application.version==2 and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1 and db.scalar(select(ScreeningItem.finished_at)).isoformat()
 
 def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))

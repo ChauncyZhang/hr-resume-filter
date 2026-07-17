@@ -28,6 +28,7 @@ const settingsRoutes = Object.freeze({
 const navRoutes = Object.freeze({
   工作台: "/workbench",
   职位: "/jobs",
+  筛选任务: "/screening/tasks",
   候选人: "/candidates",
   面试: "/interviews",
   人才库: "/talent",
@@ -54,6 +55,13 @@ export function parseAppRoute(location) {
   if (pathname === "/jobs/new") return { ...base, kind: "jobs", nav: "职位", mode: "new" };
   let match = pathname.match(/^\/jobs\/([^/]+)(?:\/(edit))?$/);
   if (match) return { ...base, kind: "jobs", nav: "职位", mode: match[2] ? "edit" : "detail", id: decodeURIComponent(match[1]) };
+
+  if (pathname === "/screening/tasks") return { ...base, kind: "screening", nav: "筛选任务", mode: "list" };
+  match = pathname.match(/^\/screening\/tasks\/([^/]+)$/);
+  if (match) {
+    const statusBySlug = { processing: "处理中", success: "成功", partial: "部分成功", failed: "失败" };
+    return { ...base, kind: "screening", nav: "筛选任务", mode: "detail", id: decodeURIComponent(match[1]), query: searchParams.get("q")?.trim() || "", status: statusBySlug[searchParams.get("status")] || "全部" };
+  }
 
   if (pathname === "/candidates") {
     return {
@@ -114,15 +122,26 @@ export function candidateListPath(filters = {}) {
   return `/candidates${search ? `?${search}` : ""}`;
 }
 
-export function candidateDetailPath(candidate, tab = "档案与简历") {
+export function candidateDetailPath(candidate, tab = "档案与简历", returnTo) {
   const id = candidate?.candidateId || candidate?.id;
   const params = new URLSearchParams();
   const slug = candidateTabSlugs[tab];
   if (slug && slug !== "profile") params.set("tab", slug);
   if (candidate?.applicationId) params.set("application", candidate.applicationId);
   if (candidate?.jobId) params.set("job", candidate.jobId);
+  if (returnTo?.startsWith("/") && !returnTo.startsWith("//")) params.set("return", returnTo);
   const search = params.toString();
   return `/candidates/${encodeURIComponent(id)}${search ? `?${search}` : ""}`;
+}
+
+export function screeningTaskPath(id, viewState = {}) {
+  const params = new URLSearchParams();
+  const query = viewState.query?.trim();
+  const statusSlugs = { "处理中": "processing", "成功": "success", "部分成功": "partial", "失败": "failed" };
+  if (query) params.set("q", query);
+  if (statusSlugs[viewState.status]) params.set("status", statusSlugs[viewState.status]);
+  const search = params.toString();
+  return `/screening/tasks/${encodeURIComponent(id)}${search ? `?${search}` : ""}`;
 }
 
 export function settingsPath(section, tab, returnTo) {

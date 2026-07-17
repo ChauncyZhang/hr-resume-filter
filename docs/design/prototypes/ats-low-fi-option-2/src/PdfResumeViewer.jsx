@@ -96,7 +96,7 @@ export function PdfResumeViewer({ file, status, error, onRetry, onDownload, down
       </div>
     </header>
     <div className="pdf-viewer-viewport" ref={viewportRef} tabIndex="0">
-      {status === "loading" && <div className="pdf-viewer-state" role="status" aria-live="polite"><RefreshCw className="spin" size={24} /><strong>正在加载原始简历</strong><span>文件仅在本次已授权面试范围内读取。</span></div>}
+      {status === "loading" && <div className="pdf-viewer-state" role="status" aria-live="polite"><RefreshCw className="spin" size={24} /><strong>正在加载原始简历</strong><span>文件仅在当前授权范围内读取。</span></div>}
       {status === "error" && <div className="pdf-viewer-state error" role="alert"><FileText size={25} /><strong>原始简历暂时无法加载</strong><span>{error}</span><button className="button secondary" type="button" onClick={onRetry}><RefreshCw size={15} />重试</button></div>}
       {status === "ready" && showPdf && <Document
         file={file.url}

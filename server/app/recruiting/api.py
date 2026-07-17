@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, literal, or_, select
 from sqlalchemy.orm import aliased
 
 from server.app.governance.retention import recalculate_candidate_retention
@@ -40,10 +40,10 @@ from server.app.recruiting.service import (
     InvalidStateTransition, ResourceVersionConflict, SystemClock, SystemTokens,
     TicketInvalid, consume_download_ticket_record, create_application_record,
     create_job_definition_record,
-    issue_download_ticket_record, persisted_idempotent, transition_application_record,
+    issue_download_ticket_record, persisted_idempotent,
     lock_active_candidate, lock_job_for_version_write,
     transition_job_record, patch_job_record, patch_candidate_record, patch_application_record,
-    replace_job_definition_record,
+    replace_job_definition_record, apply_application_workflow_action_record,
 )
 
 
@@ -55,8 +55,19 @@ router = APIRouter(prefix="/api/v1", responses=PROBLEM_RESPONSES)
 ETAG = re.compile(r'^"([1-9][0-9]*)"$')
 AUTH = RecruitingAuthorizationService()
 JOB_STATUSES = ("draft", "open", "paused", "closed", "archived")
-WORKBENCH_STAGES = ("new", "review", "contact", "interview_pending", "interviewing", "decision")
-WORKBENCH_TASK_STAGES = ("contact", "interview_pending", "decision")
+WORKBENCH_STAGES = ("new", "review", "contact", "interview_pending", "interviewing", "decision", "passed")
+WORKBENCH_TASK_STAGES = ("review", "interview_pending", "decision", "passed")
+WORKBENCH_TASK_ACTIONS = {
+    "review": RecruitingAction.RECOMMEND,
+    "interview_pending": RecruitingAction.TRANSITION,
+    "decision": RecruitingAction.RECOMMEND,
+    "passed": RecruitingAction.TRANSITION,
+}
+
+
+def _job_permission_projection(principal: Principal, action: RecruitingAction, label: str):
+    predicate = AUTH.job_predicate(principal, action, Job)
+    return literal(predicate).label(label) if isinstance(predicate, bool) else predicate.label(label)
 
 
 class StrictModel(BaseModel):
@@ -81,6 +92,18 @@ class JobPatch(StrictModel):
 class Transition(StrictModel):
     target: str = Field(min_length=1, max_length=32)
     reason_code: str | None = Field(default=None, max_length=64)
+    reason_text: str | None = Field(default=None, max_length=1000)
+
+
+class WorkflowAction(StrictModel):
+    action: Literal[
+        "review_approved",
+        "review_rejected",
+        "hiring_approved",
+        "hiring_rejected",
+        "offer_accepted",
+        "offer_declined",
+    ]
     reason_text: str | None = Field(default=None, max_length=1000)
 
 
@@ -548,6 +571,8 @@ def get_workbench(request: Request, response: Response):
                 Candidate.display_name,
                 Candidate.current_title,
                 Candidate.location,
+                _job_permission_projection(principal, RecruitingAction.RECOMMEND, "can_recommend"),
+                _job_permission_projection(principal, RecruitingAction.TRANSITION, "can_transition"),
             ).join(
                 Candidate,
                 and_(
@@ -573,7 +598,13 @@ def get_workbench(request: Request, response: Response):
                 item = _workbench_candidate_data(row)
                 if len(stage["items"]) < 5:
                     stage["items"].append(item)
-                if row.stage in tasks:
+                task_action = WORKBENCH_TASK_ACTIONS.get(row.stage)
+                can_handle_task = (
+                    row.can_recommend if task_action == RecruitingAction.RECOMMEND
+                    else row.can_transition if task_action == RecruitingAction.TRANSITION
+                    else False
+                )
+                if row.stage in tasks and can_handle_task:
                     task = tasks[row.stage]
                     task["count"] += 1
                     if len(task["items"]) < 5:
@@ -1117,6 +1148,58 @@ def preview(resume_id: UUID, request: Request):
         response = JSONResponse({"data": {"resume_id": str(resume.id), "text": content}}); response.headers["Cache-Control"] = "no-store"; return response
 
 
+@router.get(
+    "/resumes/{resume_id}/file",
+    responses={200: {"content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}}},
+)
+def preview_file(resume_id: UUID, request: Request):
+    principal = _principal(request)
+    if isinstance(principal, JSONResponse): return principal
+    with request.app.state.identity_store.sync_session() as db:
+        resume = _load_resume(db, principal, resume_id, RecruitingAction.PREVIEW)
+        if resume is None: return _denied(request)
+        file = resume.__table__.metadata.tables["file_objects"]
+        row = db.execute(select(file.c.storage_key, file.c.mime_type, file.c.original_filename).where(
+            file.c.organization_id == principal.organization_id,
+            file.c.id == resume.file_object_id,
+        )).one_or_none()
+        if row is None: return _denied(request)
+        spool = None
+        try:
+            spool = request.app.state.resume_storage.open_download(row.storage_key, MAX_DOWNLOAD_BYTES)
+            disposition = content_disposition(row.original_filename).replace("attachment;", "inline;", 1)
+        except (StorageReadFailed, StorageObjectTooLarge, ValueError):
+            if spool is not None: spool.close()
+            db.rollback()
+            return problem(request, 503, "attachment_unavailable", "The attachment is temporarily unavailable.")
+        db.add(AuditLog(
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            event_type="resume.previewed",
+            outcome="success",
+            trace_id=request.state.trace_id,
+            metadata_json={"resume_id": str(resume.id), "disposition": "inline"},
+        ))
+        try:
+            db.commit()
+        except Exception:
+            spool.close()
+            raise
+
+        def stream_spool():
+            try:
+                while chunk := spool.read(64 * 1024):
+                    yield chunk
+            finally:
+                spool.close()
+
+        return StreamingResponse(stream_spool(), media_type=row.mime_type, headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": disposition,
+            "X-Content-Type-Options": "nosniff",
+        })
+
+
 @router.post("/resumes/{resume_id}/download-tickets", status_code=201, response_model=TicketResource)
 def issue_ticket(resume_id: UUID, request: Request):
     principal = _principal(request)
@@ -1227,16 +1310,35 @@ def patch_application(application_id: UUID, payload: ApplicationPatch, request: 
             db.rollback(); return _problem_for(request, error)
 
 
-@router.post("/applications/{application_id}/transitions", response_model=ApplicationResource)
-def transition_application(application_id: UUID, payload: Transition, request: Request, if_match: str | None = Header(None), idempotency_key: str | None = Header(None)):
+@router.post("/applications/{application_id}/workflow-actions", response_model=ApplicationResource)
+def apply_application_workflow_action(application_id: UUID, payload: WorkflowAction, request: Request, if_match: str | None = Header(None), idempotency_key: str | None = Header(None)):
     principal = _principal(request); expected = _expected_version(request, if_match); key = _idempotency(request, idempotency_key)
     for value in (principal, expected, key):
         if isinstance(value, JSONResponse): return value
+    required_action = RecruitingAction.TRANSITION if payload.action.startswith("offer_") else RecruitingAction.RECOMMEND
     with request.app.state.identity_store.sync_session() as db:
-        if _load_application(db, principal, application_id, RecruitingAction.TRANSITION) is None: return _denied(request)
+        if _load_application(db, principal, application_id, required_action) is None: return _denied(request)
         try:
             def action():
-                item = transition_application_record(db, principal.organization_id, application_id, payload.target, expected_version=expected, actor_user_id=principal.user_id, trace_id=request.state.trace_id, reason_code=payload.reason_code, reason_text=payload.reason_text)
+                item = apply_application_workflow_action_record(
+                    db,
+                    principal.organization_id,
+                    application_id,
+                    payload.action,
+                    expected_version=expected,
+                    actor_user_id=principal.user_id,
+                    trace_id=request.state.trace_id,
+                    reason_text=payload.reason_text,
+                )
                 return 200, {"data": _application_data(item)}
-            status, body = persisted_idempotent(db, principal.organization_id, principal.user_id, "application.transition", key, {"application_id": application_id, **payload.model_dump()}, action); db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
+            status, body = persisted_idempotent(
+                db,
+                principal.organization_id,
+                principal.user_id,
+                "application.workflow_action",
+                key,
+                {"application_id": application_id, **payload.model_dump()},
+                action,
+            )
+            db.commit(); response = JSONResponse(body, status_code=status); response.headers["ETag"] = f'"{body["data"]["version"]}"'; return response
         except Exception as error: db.rollback(); return _problem_for(request, error)

@@ -73,51 +73,44 @@ def scored_item(tmp_path):
         stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); score=type("Job",(),{"payload":{"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(aggregate.jd_version_id),"rule_version_id":str(aggregate.rule_version_id),"rule_engine_version":"rule-v1"},"attempts":1,"max_attempts":3})()
     asyncio.run(pipeline.score_item(score)); return app,run,item
 
-def test_bulk_advance_is_atomic_versioned_and_does_not_duplicate_evidence(tmp_path):
+def test_bulk_advance_treats_auto_submitted_review_as_already_applied(tmp_path):
     app,run,item=scored_item(tmp_path)
     with app.state.identity_store.sync_session() as db: application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
     payload={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version}]}
     with TestClient(app) as client:
-        headers=login(client,"admin@example.test"); first=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk"}); assert first.status_code==200 and first.json()["data"]["applied_count"]==1
-        assert first.json()["data"]["applications"]==[{"id":str(application_id),"item_id":item["id"],"stage":"review","version":version+1,"result":"applied"}]
+        headers=login(client,"admin@example.test"); first=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk"}); assert first.status_code==200 and first.json()["data"]["already_applied_count"]==1
+        assert first.json()["data"]["applications"]==[{"id":str(application_id),"item_id":item["id"],"stage":"review","version":version,"result":"already_applied"}]
         replay=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk"}); assert replay.json()==first.json()
         again=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"bulk-new"}); assert again.status_code==200 and again.json()["data"]["already_applied_count"]==1
-        cannot_undo_already=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"undo-already"})
+        cannot_undo_already=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"undo-already"})
         assert cannot_undo_already.status_code==409
     with app.state.identity_store.sync_session() as db:
         assert db.get(Application,application_id).stage=="review" and db.scalar(select(func.count(ApplicationStageEvent.id)))==1 and db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.stage_changed"))==1
 
-def test_bulk_advance_can_be_immediately_undone_with_append_only_evidence_and_replay(tmp_path):
+def test_auto_submitted_review_cannot_be_undone_as_a_bulk_advance(tmp_path):
     app,run,item=scored_item(tmp_path)
     with app.state.identity_store.sync_session() as db:
         application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
-    advance={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version}]}
     with TestClient(app) as client:
         headers=login(client,"admin@example.test")
-        advanced=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=advance,headers={**headers,"Idempotency-Key":"advance-for-undo"})
-        undo_item={"item_id":advanced.json()["data"]["applications"][0]["item_id"],"expected_application_version":version+1}
+        undo_item={"item_id":item["id"],"expected_application_version":version}
         undo=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[undo_item]},headers={**headers,"Idempotency-Key":"undo"})
-        assert undo.status_code==200
-        assert undo.json()["data"]=={"command":"undo_advance_to_new","applied_count":1,"already_applied_count":0,"applications":[{"id":str(application_id),"item_id":item["id"],"stage":"new","version":version+2,"result":"applied"}]}
-        replay=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[undo_item]},headers={**headers,"Idempotency-Key":"undo"})
-        assert replay.json()==undo.json()
+        assert undo.status_code==409
     with app.state.identity_store.sync_session() as db:
         application=db.get(Application,application_id)
         events=list(db.scalars(select(ApplicationStageEvent).where(ApplicationStageEvent.application_id==application_id).order_by(ApplicationStageEvent.created_at,ApplicationStageEvent.id)))
-        assert application.stage=="new" and application.version==version+2
-        assert [(event.event_type,event.payload["from_stage"],event.payload["to_stage"]) for event in events]==[("application.stage_changed","new","review"),("application.bulk_advance_undone","review","new")]
-        assert events[-1].payload["undo"] is True and events[-1].payload["item_id"]==item["id"]
-        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.bulk_advanced"))==1
-        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.bulk_advance_undone"))==1
+        assert application.stage=="review" and application.version==version
+        assert [(event.event_type,event.payload["from_stage"],event.payload["to_stage"]) for event in events]==[("application.stage_changed","new","review")]
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.bulk_advanced"))==0
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.bulk_advance_undone"))==0
 
 def test_bulk_undo_rejects_non_bulk_review_and_changed_state(tmp_path):
     app,run,item=scored_item(tmp_path)
     with app.state.identity_store.sync_session() as db:
         application=db.get(Application,db.get(ScreeningItem,uuid.UUID(item["id"])).application_id); application_id,version=application.id,application.version
-        transition_application_record(db,application.organization_id,application.id,"review",expected_version=version,actor_user_id=application.owner_id,trace_id="normal-review"); db.commit()
     with TestClient(app) as client:
         headers=login(client,"admin@example.test")
-        arbitrary=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"arbitrary-undo"})
+        arbitrary=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"arbitrary-undo"})
         assert arbitrary.status_code==409
 
     other=tmp_path/"changed"; other.mkdir(); app,run,item=scored_item(other)
@@ -128,7 +121,7 @@ def test_bulk_undo_rejects_non_bulk_review_and_changed_state(tmp_path):
         client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"advance-changed"})
         with app.state.identity_store.sync_session() as db:
             application=db.get(Application,application_id)
-            transition_application_record(db,application.organization_id,application.id,"contact",expected_version=version+1,actor_user_id=application.owner_id,trace_id="contact"); db.commit()
+            transition_application_record(db,application.organization_id,application.id,"contact",expected_version=version,actor_user_id=application.owner_id,trace_id="contact"); db.commit()
         conflict=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"stale-undo"})
         assert conflict.status_code==409
     with app.state.identity_store.sync_session() as db:
@@ -146,7 +139,7 @@ def test_bulk_reject_validation_and_all_or_nothing_stale_version(tmp_path):
     with TestClient(app) as client:
         headers=login(client,"admin@example.test"); missing=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"reject","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"missing"}); assert missing.status_code==422
         stale=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":version+1}]},headers={**headers,"Idempotency-Key":"stale"}); assert stale.status_code==409
-    with app.state.identity_store.sync_session() as db: assert db.get(Application,application.id).stage=="new" and db.scalar(select(func.count(ApplicationStageEvent.id)))==0
+    with app.state.identity_store.sync_session() as db: assert db.get(Application,application.id).stage=="review" and db.scalar(select(func.count(ApplicationStageEvent.id)))==1
 
 def test_bulk_reject_persists_reason_in_stage_event_without_audit_text(tmp_path):
     app,run,item=scored_item(tmp_path)
@@ -158,5 +151,6 @@ def test_bulk_reject_persists_reason_in_stage_event_without_audit_text(tmp_path)
         headers=login(client,"admin@example.test"); response=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json=payload,headers={**headers,"Idempotency-Key":"reject"}); assert response.status_code==200
     with app.state.identity_store.sync_session() as db:
         assert db.get(Application,application_id).human_conclusion is None
-        assert db.scalar(select(ApplicationStageEvent)).payload["reason_text"]==reason
+        event=db.scalar(select(ApplicationStageEvent).where(ApplicationStageEvent.application_id==application_id,ApplicationStageEvent.payload["to_stage"].as_string()=="rejected"))
+        assert event.payload["reason_text"]==reason
         audit=db.scalar(select(AuditLog).where(AuditLog.event_type=="application.stage_changed")); assert reason not in str(audit.metadata_json)

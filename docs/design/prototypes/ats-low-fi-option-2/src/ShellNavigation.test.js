@@ -8,6 +8,7 @@ import { createServer } from "vite";
 const labels = {
   workbench: "工作台",
   jobs: "职位",
+  screening: "筛选任务",
   candidates: "候选人",
   interviews: "面试",
   talent: "人才库",
@@ -16,7 +17,7 @@ const labels = {
   importResume: "导入简历",
 };
 
-const recruitingNav = [labels.workbench, labels.jobs, labels.candidates, labels.interviews, labels.talent, labels.reports, labels.settings];
+const recruitingNav = [labels.workbench, labels.jobs, labels.screening, labels.candidates, labels.interviews, labels.talent, labels.reports, labels.settings];
 const interviewerNav = [labels.workbench, labels.interviews];
 const prototypeRoot = fileURLToPath(new URL("../", import.meta.url));
 
@@ -237,8 +238,8 @@ test("1280px keeps the desktop sidebar visible and filters navigation by role", 
     const workspaceBox = await workspace.boundingBox();
     assert.ok(sidebarBox && workspaceBox);
     assert.equal(sidebarBox.x, 0);
-    assert.equal(sidebarBox.width, 72);
-    assert.equal(workspaceBox.x, 72);
+    assert.equal(sidebarBox.width, 240);
+    assert.equal(workspaceBox.x, 240);
     await assertNoBodyOverflow(page, "1280px");
   } finally {
     await context.close();
@@ -252,8 +253,8 @@ test("1440px uses the full desktop sidebar", { timeout: 60_000 }, async () => {
     const sidebarBox = await page.locator(".sidebar").boundingBox();
     const workspaceBox = await page.locator(".workspace").boundingBox();
     assert.ok(sidebarBox && workspaceBox);
-    assert.equal(sidebarBox.width, 224);
-    assert.equal(workspaceBox.x, 224);
+    assert.equal(sidebarBox.width, 240);
+    assert.equal(workspaceBox.x, 240);
     const brand = page.locator(".brand");
     await assertInsideViewport(brand, viewport, "1440px brand");
     const brandBounds = await brand.evaluate((element) => {

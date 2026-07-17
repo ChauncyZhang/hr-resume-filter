@@ -8,6 +8,7 @@ import {
   readJobCreateDraft,
   routeForNav,
   safeNavigateBack,
+  screeningTaskPath,
   settingsPath,
   writeJobCreateDraft,
 } from "./appRouter.js";
@@ -19,6 +20,8 @@ test("parses every required application route from the URL", () => {
     ["/workbench", { kind: "workbench", nav: "工作台" }],
     ["/jobs", { kind: "jobs", nav: "职位", mode: "list" }],
     ["/jobs/new", { kind: "jobs", nav: "职位", mode: "new" }],
+    ["/screening/tasks", { kind: "screening", nav: "筛选任务", mode: "list" }],
+    [`/screening/tasks/${UUID_A}?q=%E6%9E%97&status=failed`, { kind: "screening", nav: "筛选任务", mode: "detail", id: UUID_A, query: "林", status: "失败" }],
     [`/jobs/${UUID_A}`, { kind: "jobs", nav: "职位", mode: "detail", id: UUID_A }],
     [`/jobs/${UUID_A}/edit`, { kind: "jobs", nav: "职位", mode: "edit", id: UUID_A }],
     ["/candidates", { kind: "candidates", nav: "候选人", mode: "list" }],
@@ -63,6 +66,10 @@ test("candidate list URL keeps only meaningful key filters", () => {
 
 test("candidate detail tab and settings return target are encoded in URLs", () => {
   assert.equal(candidateDetailPath({ id: UUID_A }, "面试与反馈"), `/candidates/${UUID_A}?tab=interviews`);
+  assert.equal(
+    candidateDetailPath({ id: UUID_A }, "档案与简历", screeningTaskPath("run-1", { query: "林", status: "失败" })),
+    `/candidates/${UUID_A}?return=%2Fscreening%2Ftasks%2Frun-1%3Fq%3D%25E6%259E%2597%26status%3Dfailed`,
+  );
   assert.equal(settingsPath("组织与权限", "部门", "/jobs/new"), "/settings/organization/departments?return=%2Fjobs%2Fnew");
   assert.equal(settingsPath("飞书集成"), "/settings/feishu");
   assert.equal(parseAppRoute(new URL("/settings/organization/departments?return=%2Fjobs%2Fnew", "https://ats.example.test")).returnTo, "/jobs/new");
@@ -71,6 +78,7 @@ test("candidate detail tab and settings return target are encoded in URLs", () =
 test("primary navigation maps to canonical list routes", () => {
   assert.equal(routeForNav("工作台"), "/workbench");
   assert.equal(routeForNav("职位"), "/jobs");
+  assert.equal(routeForNav("筛选任务"), "/screening/tasks");
   assert.equal(routeForNav("候选人"), "/candidates");
   assert.equal(routeForNav("面试"), "/interviews");
   assert.equal(routeForNav("人才库"), "/talent");

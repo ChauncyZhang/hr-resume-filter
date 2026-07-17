@@ -272,17 +272,17 @@ test("saving a human conclusion is versioned and never transitions the applicati
   assert.equal(saved.version, 3);
 });
 
-test("transition maps UI stages, requires a rejection reason, and sends idempotency plus version", async () => {
+test("workflow actions use semantic commands, require business reasons, and send idempotency plus version", async () => {
   const calls = [];
-  const client = { async request(path, options) { calls.push({ path, options }); return response({ id: "application-1", stage: options.body.target, version: 3 }); } };
+  const client = { async request(path, options) { calls.push({ path, options }); return response({ id: "application-1", stage: "interview_pending", version: 4 }); } };
   const controller = createCandidateController({ client, idempotencyKey: () => "transition-key" });
 
-  await assert.rejects(controller.transition({ id: "application-1", version: 2 }, "已淘汰", "   "), (error) => error?.code === "REJECTION_REASON_REQUIRED");
-  const advanced = await controller.transition({ id: "application-1", version: 2 }, "待沟通", "经验匹配");
+  await assert.rejects(controller.workflowAction({ id: "application-1", version: 2 }, "review_rejected", "   "), (error) => error?.code === "WORKFLOW_REASON_REQUIRED");
+  const advanced = await controller.workflowAction({ id: "application-1", version: 2 }, "review_approved", "经验匹配");
 
-  assert.equal(advanced.stage, "contact");
-  assert.deepEqual(calls, [{ path: "/api/v1/applications/application-1/transitions", options: {
-    method: "POST", ifMatch: '"2"', idempotencyKey: "transition-key", body: { target: "contact", reason_text: "经验匹配" },
+  assert.equal(advanced.stage, "interview_pending");
+  assert.deepEqual(calls, [{ path: "/api/v1/applications/application-1/workflow-actions", options: {
+    method: "POST", ifMatch: '"2"', idempotencyKey: "transition-key", body: { action: "review_approved", reason_text: "经验匹配" },
   } }]);
 });
 
@@ -302,9 +302,12 @@ test("notes, preview, and ticket download use the authorized server APIs", async
 
   assert.equal((await controller.addNote(candidateId, "application-1", "  电话沟通后更新  ")).body, "电话沟通后更新");
   assert.equal((await controller.previewResume("resume-1")).text, "private preview");
+  const previewFile = await controller.getResumeFile("resume-1");
   const downloaded = await controller.downloadResume("resume-1");
 
+  assert.equal(previewFile.filename, "candidate.pdf");
   assert.equal(downloaded.filename, "candidate.pdf");
   assert.deepEqual(calls[0], { kind: "json", path: `/api/v1/candidates/${candidateId}/notes`, options: { method: "POST", body: { application_id: "application-1", body: "电话沟通后更新" } } });
+  assert.deepEqual(calls.find((call) => call.path.endsWith("/file")), { kind: "download", path: "/api/v1/resumes/resume-1/file", options: {} });
   assert.deepEqual(calls.at(-1), { kind: "download", path: "/api/v1/download-tickets/consume", options: { method: "POST", body: { token: "one-time-token" } } });
 });

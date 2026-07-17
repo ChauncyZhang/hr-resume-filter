@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import "./product-theme-people.css";
 import {
   ArrowLeft,
   BriefcaseBusiness,
@@ -22,6 +23,7 @@ import {
 } from "lucide-react";
 import { buildResumeDocument } from "./resumeDocument.js";
 import { buildReactivatedCandidateSummary } from "./talentController.js";
+import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
 
 export const initialTalentPools = [
   { id: "POOL-AI", name: "AI 技术人才", purpose: "沉淀大模型、算法与 AI 应用方向的可复用候选人", suitableRoles: ["AI 工程师", "算法工程师"], owner: "张小北", visibility: "招聘团队可见", memberIds: ["CAN-001", "CAN-002", "CAN-003"], retentionDays: 730, recentActivity: "今天 10:45", activity: "张小北更新了 2 位人才的适合岗位" },
@@ -45,14 +47,201 @@ function VisibilityTag({ value }) {
   return <span className={`pool-visibility ${value.includes("仅") || value.includes("成员") ? "restricted" : "team"}`}>{value.includes("仅") || value.includes("成员") ? <LockKeyhole size={13} /> : <Users size={13} />}{value}</span>;
 }
 
-function PoolList({ pools, memberships, onOpen, onCreate, status = "ready", error = "", onRetry, nextCursor, loadingMore, onLoadMore }) {
+function PoolList({
+  pools,
+  memberships,
+  onOpen,
+  onCreate,
+  status = "ready",
+  error = "",
+  onRetry,
+  nextCursor,
+  loadingMore,
+  onLoadMore,
+  pageActionHost,
+}) {
   const [query, setQuery] = useState("");
   const [visibility, setVisibility] = useState("全部范围");
   const [createOpen, setCreateOpen] = useState(false);
-  const filtered = pools.filter((pool) => `${pool.name}${pool.purpose}${pool.suitableRoles.join("")}`.toLowerCase().includes(query.toLowerCase()) && (visibility === "全部范围" || pool.visibility === visibility));
-  const expiring = memberships.filter((item) => item.status === "即将到期").length;
-  const due = memberships.filter((item) => item.nextContact <= "2026-07-18").length;
-  return <div className="talent-page pool-list-page"><div className="talent-page-heading"><div><h2>人才库</h2><p>按关系和适合岗位沉淀人才，并在合适时机重新激活。</p></div><button className="button primary" type="button" onClick={() => setCreateOpen(true)}><FolderPlus size={17} />新建人才库</button></div><div className="pool-metrics"><div><span>可复用人才</span><strong>{new Set(memberships.map((item) => item.candidateId)).size || pools.reduce((sum, pool) => sum + (pool.memberCount || 0), 0)}</strong><small>跨 {pools.length} 个人才库</small></div><div><span>即将到期</span><strong>{expiring}</strong><small>需要确认保留期限</small></div><div><span>待跟进</span><strong>{due}</strong><small>未来 7 天</small></div><div><span>已同步人才</span><strong>{pools.reduce((sum, pool) => sum + (pool.memberCount || 0), 0)}</strong><small>按当前授权范围</small></div></div><section className="pool-list-panel"><div className="pool-toolbar"><label className="pool-search"><Search size={16} /><input aria-label="搜索人才库" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人才库名称、用途或适合岗位" /></label><label className="pool-select"><select aria-label="可见范围筛选" value={visibility} onChange={(event) => setVisibility(event.target.value)}><option>全部范围</option><option>招聘团队可见</option><option>指定成员可见</option><option>仅自己可见</option></select><ChevronDown size={14} /></label></div>{status === "loading" && pools.length === 0 ? <div className="talent-empty" role="status"><RefreshCw size={24} /><strong>正在加载人才库</strong></div> : status === "error" && pools.length === 0 ? <div className="talent-empty" role="alert"><CircleAlert size={24} /><strong>人才库加载失败</strong><span>{error}</span><button className="button secondary" type="button" onClick={onRetry}>重试</button></div> : <div className="pool-table"><div className="pool-table-head"><span>人才库</span><span>适合岗位</span><span>负责人</span><span>可见范围</span><span>人才数</span><span>默认保留</span><span>最近活动</span><span /></div>{filtered.map((pool) => <button className="pool-table-row" type="button" key={pool.id} onClick={() => onOpen(pool.id)}><span className="pool-name-cell"><span><BriefcaseBusiness size={17} /></span><span><strong>{pool.name}</strong><small>{pool.purpose}</small></span></span><span>{pool.suitableRoles.join("、")}</span><span>{pool.owner}</span><span><VisibilityTag value={pool.visibility} /></span><span><strong>{pool.memberCount ?? pool.memberIds.length}</strong> 人</span><span>{pool.retentionDays} 天</span><span><strong>{pool.recentActivity}</strong><small>{pool.activity}</small></span><ChevronRight size={17} /></button>)}{filtered.length === 0 && <div className="talent-empty"><BriefcaseBusiness size={24} /><strong>没有符合条件的人才库</strong><span>调整搜索或可见范围后重试。</span></div>}{nextCursor && <div className="talent-load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "正在加载" : "加载更多人才库"}</button></div>}</div>}</section>{createOpen && <CreatePoolDialog onClose={() => setCreateOpen(false)} onCreate={async (pool) => { const created = await onCreate(pool); if (created) setCreateOpen(false); }} />}</div>;
+  const filtered = pools.filter(
+    (pool) =>
+      `${pool.name}${pool.purpose}${pool.suitableRoles.join("")}`
+        .toLowerCase()
+        .includes(query.toLowerCase()) &&
+      (visibility === "全部范围" || pool.visibility === visibility),
+  );
+  const expiring = memberships.filter(
+    (item) => item.status === "即将到期",
+  ).length;
+  const due = memberships.filter(
+    (item) => item.nextContact <= "2026-07-18",
+  ).length;
+  return (
+    <div className="talent-page pool-list-page">
+      <PagePrimaryAction host={pageActionHost}>
+        <button
+          className="button primary"
+          type="button"
+          onClick={() => setCreateOpen(true)}
+        >
+          <FolderPlus size={17} />
+          新建人才库
+        </button>
+      </PagePrimaryAction>
+      <div className="talent-page-heading">
+        <div>
+          <h2>人才库管理</h2>
+          <p>按关系和适合岗位沉淀人才，并在合适时机重新激活。</p>
+        </div>
+      </div>
+      <div className="pool-metrics">
+        <div>
+          <span>可复用人才</span>
+          <strong>
+            {new Set(memberships.map((item) => item.candidateId)).size ||
+              pools.reduce((sum, pool) => sum + (pool.memberCount || 0), 0)}
+          </strong>
+          <small>跨 {pools.length} 个人才库</small>
+        </div>
+        <div>
+          <span>即将到期</span>
+          <strong>{expiring}</strong>
+          <small>需要确认保留期限</small>
+        </div>
+        <div>
+          <span>待跟进</span>
+          <strong>{due}</strong>
+          <small>未来 7 天</small>
+        </div>
+        <div>
+          <span>已同步人才</span>
+          <strong>
+            {pools.reduce((sum, pool) => sum + (pool.memberCount || 0), 0)}
+          </strong>
+          <small>按当前授权范围</small>
+        </div>
+      </div>
+      <section className="pool-list-panel">
+        <div className="pool-toolbar">
+          <label className="pool-search">
+            <Search size={16} />
+            <input
+              aria-label="搜索人才库"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="搜索人才库名称、用途或适合岗位"
+            />
+          </label>
+          <label className="pool-select">
+            <select
+              aria-label="可见范围筛选"
+              value={visibility}
+              onChange={(event) => setVisibility(event.target.value)}
+            >
+              <option>全部范围</option>
+              <option>招聘团队可见</option>
+              <option>指定成员可见</option>
+              <option>仅自己可见</option>
+            </select>
+            <ChevronDown size={14} />
+          </label>
+        </div>
+        {status === "loading" && pools.length === 0 ? (
+          <div className="talent-empty" role="status">
+            <RefreshCw size={24} />
+            <strong>正在加载人才库</strong>
+          </div>
+        ) : status === "error" && pools.length === 0 ? (
+          <div className="talent-empty" role="alert">
+            <CircleAlert size={24} />
+            <strong>人才库加载失败</strong>
+            <span>{error}</span>
+            <button
+              className="button secondary"
+              type="button"
+              onClick={onRetry}
+            >
+              重试
+            </button>
+          </div>
+        ) : (
+          <div className="pool-table">
+            <div className="pool-table-head">
+              <span>人才库</span>
+              <span>适合岗位</span>
+              <span>负责人</span>
+              <span>可见范围</span>
+              <span>人才数</span>
+              <span>默认保留</span>
+              <span>最近活动</span>
+              <span />
+            </div>
+            {filtered.map((pool) => (
+              <button
+                className="pool-table-row"
+                type="button"
+                key={pool.id}
+                onClick={() => onOpen(pool.id)}
+              >
+                <span className="pool-name-cell">
+                  <span>
+                    <BriefcaseBusiness size={17} />
+                  </span>
+                  <span>
+                    <strong>{pool.name}</strong>
+                    <small>{pool.purpose}</small>
+                  </span>
+                </span>
+                <span>{pool.suitableRoles.join("、")}</span>
+                <span>{pool.owner}</span>
+                <span>
+                  <VisibilityTag value={pool.visibility} />
+                </span>
+                <span>
+                  <strong>{pool.memberCount ?? pool.memberIds.length}</strong>{" "}
+                  人
+                </span>
+                <span>{pool.retentionDays} 天</span>
+                <span>
+                  <strong>{pool.recentActivity}</strong>
+                  <small>{pool.activity}</small>
+                </span>
+                <ChevronRight size={17} />
+              </button>
+            ))}
+            {filtered.length === 0 && (
+              <div className="talent-empty">
+                <BriefcaseBusiness size={24} />
+                <strong>没有符合条件的人才库</strong>
+                <span>调整搜索或可见范围后重试。</span>
+              </div>
+            )}
+            {nextCursor && (
+              <div className="talent-load-more">
+                <button
+                  className="button secondary"
+                  type="button"
+                  disabled={loadingMore}
+                  onClick={onLoadMore}
+                >
+                  {loadingMore ? "正在加载" : "加载更多人才库"}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+      {createOpen && (
+        <CreatePoolDialog
+          onClose={() => setCreateOpen(false)}
+          onCreate={async (pool) => {
+            const created = await onCreate(pool);
+            if (created) setCreateOpen(false);
+          }}
+        />
+      )}
+    </div>
+  );
 }
 
 function CreatePoolDialog({ onClose, onCreate }) {
@@ -75,7 +264,7 @@ function ReactivateDrawer({ member, candidate, pool, positions, onClose, onReact
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState("");
   async function submit() { setSubmitting(true); setSubmitError(""); try { const result = await onReactivate(member.id, position, pool.id, resume); if (result) setCreated({ ...result, position: position.name }); } catch (error) { setSubmitError(error?.code === "active_application_exists" ? "该职位已有进行中的申请，请从候选人档案继续处理。" : "重新激活失败，请刷新后重试"); } finally { setSubmitting(false); } }
-  return <aside className="reactivate-drawer" aria-label="重新激活候选人"><header><div><h2>加入职位</h2><p>{candidate.name} · 来自 {pool.name}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}><X size={20} /></button></header>{created ? <div className="reactivation-success"><CheckCircle2 size={34} /><h3>已创建新的职位申请</h3><p>{candidate.name} 已重新激活到“{created.position}”，历史申请和人才库关系均已保留。</p><dl><div><dt>新申请状态</dt><dd>新简历</dd></div><div><dt>来源</dt><dd>人才库重新激活</dd></div><div><dt>关联人才库</dt><dd>{pool.name}</dd></div></dl><button className="button primary full" type="button" onClick={() => onOpenCandidate(buildReactivatedCandidateSummary(candidate, created, position))}>去新申请</button><button className="button secondary full" type="button" onClick={onClose}>返回人才库</button></div> : <div className="reactivate-body"><section className="reactivate-summary"><span>{candidate.name.slice(-1)}</span><div><h3>{candidate.name}</h3><p>{candidate.role} · {candidate.company} · {candidate.city}</p><small>{candidate.summary}</small></div></section><label>目标职位<select aria-label="目标职位" value={positionId} onChange={(event) => setPositionId(event.target.value)}>{authorized.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.department}</option>)}</select></label>{conflict && <div className="reactivate-conflict"><CircleAlert size={19} /><div><strong>该职位已有进行中的申请</strong><p>当前状态为“{conflict.state}”，不能重复创建。请进入现有申请继续处理。</p></div><button type="button" onClick={() => onOpenCandidate(candidate)}>查看现有申请</button></div>}{!conflict && history.length > 0 && <div className="reactivate-warning"><History size={18} /><div><strong>发现 {history.length} 条历史终态申请</strong><p>新申请会关联历史记录，但不会覆盖原结论。</p></div></div>}<section className="reactivate-preview"><h3>新申请预览</h3><dl><div><dt>候选人</dt><dd>{candidate.name}</dd></div><div><dt>目标职位</dt><dd>{position?.name || "无可用职位"}</dd></div><div><dt>初始状态</dt><dd>新简历</dd></div><div><dt>来源</dt><dd>人才库重新激活</dd></div><div><dt>负责人</dt><dd>{position?.owner || "-"}</dd></div><div><dt>简历</dt><dd>来源申请简历</dd></div></dl></section>{submitError && <p className="field-error" role="alert">{submitError}</p>}</div>} {!created && <footer><button className="button secondary" type="button" disabled={submitting} onClick={onClose}>取消</button><button className="button primary" type="button" disabled={submitting || !position || Boolean(conflict)} onClick={() => void submit()}>{submitting ? "正在创建" : "创建新申请"}</button></footer>}</aside>;
+  return <aside className="reactivate-drawer" aria-label="重新激活候选人"><header><div><h2>重新激活到职位</h2><p>{candidate.name} · 来自 {pool.name}</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}><X size={20} /></button></header>{created ? <div className="reactivation-success"><CheckCircle2 size={34} /><h3>已创建新的职位申请</h3><p>{candidate.name} 已重新激活到“{created.position}”，历史申请和人才库关系均已保留。</p><dl><div><dt>新申请状态</dt><dd>新简历</dd></div><div><dt>来源</dt><dd>人才库重新激活</dd></div><div><dt>关联人才库</dt><dd>{pool.name}</dd></div></dl><button className="button primary full" type="button" onClick={() => onOpenCandidate(buildReactivatedCandidateSummary(candidate, created, position))}>去新申请</button><button className="button secondary full" type="button" onClick={onClose}>返回人才库</button></div> : <div className="reactivate-body"><section className="reactivate-summary"><span>{candidate.name.slice(-1)}</span><div><h3>{candidate.name}</h3><p>{candidate.role} · {candidate.company} · {candidate.city}</p><small>{candidate.summary}</small></div></section><label>目标职位<select aria-label="目标职位" value={positionId} onChange={(event) => setPositionId(event.target.value)}>{authorized.map((item) => <option value={item.id} key={item.id}>{item.name} · {item.department}</option>)}</select></label>{conflict && <div className="reactivate-conflict"><CircleAlert size={19} /><div><strong>该职位已有进行中的申请</strong><p>当前状态为“{conflict.state}”，不能重复创建。请进入现有申请继续处理。</p></div><button type="button" onClick={() => onOpenCandidate(candidate)}>查看现有申请</button></div>}{!conflict && history.length > 0 && <div className="reactivate-warning"><History size={18} /><div><strong>发现 {history.length} 条历史终态申请</strong><p>新申请会关联历史记录，但不会覆盖原结论。</p></div></div>}<section className="reactivate-preview"><h3>新申请预览</h3><dl><div><dt>候选人</dt><dd>{candidate.name}</dd></div><div><dt>目标职位</dt><dd>{position?.name || "无可用职位"}</dd></div><div><dt>初始状态</dt><dd>新简历</dd></div><div><dt>来源</dt><dd>人才库重新激活</dd></div><div><dt>负责人</dt><dd>{position?.owner || "-"}</dd></div><div><dt>简历</dt><dd>来源申请简历</dd></div></dl></section>{submitError && <p className="field-error" role="alert">{submitError}</p>}</div>} {!created && <footer><button className="button secondary" type="button" disabled={submitting} onClick={onClose}>取消</button><button className="button primary" type="button" disabled={submitting || !position || Boolean(conflict)} onClick={() => void submit()}>{submitting ? "正在创建" : "确认创建新申请"}</button></footer>}</aside>;
 }
 
 function ResumeFileActions({ document, onPreview, onDownload }) {
@@ -86,15 +275,21 @@ function ResumePreviewDrawer({ candidate, document, onClose, onDownload }) {
   return <aside className="resume-preview-drawer" aria-label="简历预览"><header><div><FileCheck2 size={22} /><div><h2>简历预览</h2><p>{document.fileName.replace(/\.txt$/, ".pdf")}</p></div></div><button className="icon-button" type="button" aria-label="关闭简历预览" onClick={onClose}><X size={20} /></button></header><div className="resume-preview-meta"><span>PDF</span><span>{document.pages.length} 页</span><span>解析质量良好</span><span>原型预览</span></div><div className="resume-preview-body">{document.pages.map((page) => <article className="resume-preview-page" key={page.number}><header><span>{candidate.name} · 简历</span><small>{page.number} / {document.pages.length}</small></header><h3>{page.title}</h3><pre>{page.content}</pre></article>)}</div><footer><button className="button secondary" type="button" onClick={onClose}>关闭预览</button><button className="button primary" type="button" onClick={onDownload}><Download size={16} />下载简历</button></footer></aside>;
 }
 
-function MemberDrawer({ member, candidate, pool, pools, onClose, onUpdate, onMove, onRemove, positions, onReactivateCandidate, onOpenCandidate, onNotify }) {
+function MemberDrawer({ member, candidate, pool, pools, onClose, onUpdate, onMove, onRemove, positions, onReactivateCandidate, onOpenCandidate, onNotify, initialReactivateOpen = false }) {
   const [tagInput, setTagInput] = useState("");
+  const [tags, setTags] = useState(member.tags);
+  const [selectedRoles, setSelectedRoles] = useState(member.suitableRoles);
   const [danger, setDanger] = useState(null);
   const [dangerReason, setDangerReason] = useState("");
-  const [reactivateOpen, setReactivateOpen] = useState(false);
+  const [reactivateOpen, setReactivateOpen] = useState(initialReactivateOpen);
   const [resumePreviewOpen, setResumePreviewOpen] = useState(false);
   const resumeDocument = candidate.serverBacked ? null : buildResumeDocument(candidate);
-  function addTag() { const value = tagInput.trim(); if (!value || member.tags.includes(value)) return; onUpdate({ ...member, tags: [...member.tags, value] }); setTagInput(""); }
-  function updateSuitableRoles(value) { const suitableRoles = value.split(/[、,，]/).map((item) => item.trim()).filter(Boolean); onUpdate({ ...member, suitableRoles }); }
+  const selectablePositions = positions.filter((item) => item.name && !["已关闭", "已归档", "closed", "archived"].includes(item.status));
+  useEffect(() => { setTags(member.tags); setSelectedRoles(member.suitableRoles); }, [member.id, member.tags, member.suitableRoles]);
+  function saveTags(next) { setTags(next); onUpdate({ ...member, tags: next, suitableRoles: selectedRoles }); }
+  function addTag() { const value = tagInput.trim(); if (!value || tags.includes(value)) return; saveTags([...tags, value]); setTagInput(""); }
+  function removeTag(value) { saveTags(tags.filter((item) => item !== value)); }
+  function updateSuitableRole(value, selected) { const next = selected ? [...new Set([...selectedRoles, value])] : selectedRoles.filter((item) => item !== value); setSelectedRoles(next); onUpdate({ ...member, suitableRoles: next, tags }); }
   function downloadResume() {
     try {
       const url = URL.createObjectURL(new Blob([resumeDocument.downloadText], { type: resumeDocument.mimeType }));
@@ -108,18 +303,18 @@ function MemberDrawer({ member, candidate, pool, pools, onClose, onUpdate, onMov
       onNotify("简历下载失败，请稍后重试");
     }
   }
-  return <><aside className="talent-member-drawer" aria-label="人才详情"><header><div><span>{candidate.name.slice(-1)}</span><div><h2>{candidate.name}</h2><p>{candidate.role} · {candidate.company}</p></div></div><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}><X size={20} /></button></header><div className="talent-member-body"><section><h3>候选人摘要</h3><p>{candidate.summary}</p>{candidate.serverBacked ? <p className="field-hint">联系方式和原始简历请从候选人档案按权限查看。</p> : <dl><div><dt>手机</dt><dd>{candidate.phone}</dd></div><div><dt>邮箱</dt><dd>{candidate.email}</dd></div><div className="resume-detail-row"><dt>当前简历</dt><dd><ResumeFileActions document={resumeDocument} onPreview={() => setResumePreviewOpen(true)} onDownload={downloadResume} /></dd></div></dl>}</section><section><h3>人才库信息</h3><dl><div><dt>所在人才库</dt><dd>{pool.name}</dd></div><div><dt>加入原因</dt><dd>{member.reason}</dd></div><div><dt>来源</dt><dd>{member.source}</dd></div><div><dt>加入日期</dt><dd>{member.joinedAt}</dd></div><div><dt>最近互动</dt><dd>{member.recentInteraction}</dd></div></dl><label>保留至<input type="date" value={member.retentionUntil} onChange={(event) => onUpdate({ ...member, retentionUntil: event.target.value, status: "正常" })} /></label></section><section><h3>适合岗位</h3><div className="member-tags">{member.suitableRoles.map((item) => <span key={item}>{item}</span>)}</div><label>编辑适合岗位<input defaultValue={member.suitableRoles.join("、")} onBlur={(event) => updateSuitableRoles(event.target.value)} placeholder="使用顿号或逗号分隔" /></label></section><section><h3>标签</h3><div className="member-tags">{member.tags.map((item) => <span key={item}>{item}</span>)}</div><div className="member-inline-add"><input value={tagInput} onChange={(event) => setTagInput(event.target.value)} placeholder="添加标签" /><button type="button" aria-label="添加标签" onClick={addTag}><Plus size={15} /></button></div></section><section><h3>跟进设置</h3><label>下次联系<input type="date" value={member.nextContact} onChange={(event) => onUpdate({ ...member, nextContact: event.target.value })} /></label></section><section><h3>历史申请</h3>{candidate.applications.map((item) => <div className="member-application" key={`${item.position}-${item.created}`}><strong>{item.position}</strong><span>{item.state}</span><small>{item.created} · {item.source}</small></div>)}</section><section className="membership-actions"><h3>成员关系</h3>{!member.serverBacked && <label>移动到<select defaultValue="" onChange={(event) => { if (event.target.value) onMove(member, event.target.value); }}><option value="">选择目标人才库</option>{pools.filter((item) => item.id !== pool.id).map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}<button type="button" onClick={() => onRemove(member)}>从当前人才库移出</button><button className="danger-text" type="button" onClick={() => setDanger("永久不再联系")}>永久不再联系</button><button className="danger-text" type="button" onClick={() => setDanger("黑名单")}>加入黑名单</button></section></div><footer><button className="button secondary" type="button" onClick={() => onOpenCandidate(candidate)}>候选人档案</button><button className="button primary" type="button" onClick={() => setReactivateOpen(true)}>加入职位</button></footer></aside>{danger && <div className="talent-dialog-backdrop"><section className="talent-dialog danger-confirm"><header><div><h3>{danger}</h3><p>该操作与“暂不适合”不同，会限制后续联系和激活。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setDanger(null)}><X size={19} /></button></header><div className="talent-dialog-body"><div className="danger-impact"><ShieldAlert size={22} /><span>执行后候选人仍保留审计记录，但不会出现在普通人才搜索和推荐结果中。</span></div><label>操作原因<textarea rows="4" value={dangerReason} onChange={(event) => setDangerReason(event.target.value)} placeholder="必须说明原因" /></label></div><footer><button className="button secondary" type="button" onClick={() => setDanger(null)}>取消</button><button className="button danger" type="button" disabled={!dangerReason.trim()} onClick={() => { onUpdate({ ...member, status: danger, latestConclusion: `${danger}：${dangerReason}` }); setDanger(null); }}>确认{danger}</button></footer></section></div>}{reactivateOpen && <ReactivateDrawer member={member} candidate={candidate} pool={pool} positions={positions} onClose={() => setReactivateOpen(false)} onReactivate={onReactivateCandidate} onOpenCandidate={onOpenCandidate} />}{resumePreviewOpen && resumeDocument && <ResumePreviewDrawer candidate={candidate} document={resumeDocument} onClose={() => setResumePreviewOpen(false)} onDownload={downloadResume} />}</>;
+  return <><aside className="talent-member-drawer" aria-label="人才详情"><header><div><span>{candidate.name.slice(-1)}</span><div><h2>{candidate.name}</h2><p>{candidate.role} · {candidate.company}</p></div></div><button className="icon-button" type="button" aria-label="关闭" onClick={onClose}><X size={20} /></button></header><div className="talent-member-body"><section><h3>候选人摘要</h3><p>{candidate.summary}</p>{candidate.serverBacked ? <p className="field-hint">联系方式和原始简历请从候选人档案按权限查看。</p> : <dl><div><dt>手机</dt><dd>{candidate.phone}</dd></div><div><dt>邮箱</dt><dd>{candidate.email}</dd></div><div className="resume-detail-row"><dt>当前简历</dt><dd><ResumeFileActions document={resumeDocument} onPreview={() => setResumePreviewOpen(true)} onDownload={downloadResume} /></dd></div></dl>}</section><section><h3>人才库信息</h3><dl><div><dt>所在人才库</dt><dd>{pool.name}</dd></div><div><dt>加入原因</dt><dd>{member.reason}</dd></div><div><dt>来源</dt><dd>{member.source}</dd></div><div><dt>加入日期</dt><dd>{member.joinedAt}</dd></div><div><dt>最近互动</dt><dd>{member.recentInteraction}</dd></div></dl><label>保留至<input type="date" value={member.retentionUntil} onChange={(event) => onUpdate({ ...member, suitableRoles: selectedRoles, tags, retentionUntil: event.target.value, status: "正常" })} /></label></section><section><h3>推荐岗位</h3><div className="member-tags">{selectedRoles.map((item) => <span className="member-removable-tag" key={item}>{item}<button type="button" aria-label={`移除推荐岗位：${item}`} onClick={() => updateSuitableRole(item, false)}><X size={12} /></button></span>)}</div><div className="member-position-picker" aria-label="推荐岗位">{selectablePositions.length > 0 ? selectablePositions.map((item) => <label key={item.id || item.name}><input type="checkbox" checked={selectedRoles.includes(item.name)} onChange={(event) => updateSuitableRole(item.name, event.target.checked)} /><span><strong>{item.name}</strong><small>{[item.department, item.status].filter(Boolean).join(" · ")}</small></span></label>) : <p>暂无可选择的职位</p>}</div></section><section><h3>人才标签</h3><div className="member-tags">{tags.map((item) => <span className="member-removable-tag" key={item}>{item}<button type="button" aria-label={`移除标签：${item}`} onClick={() => removeTag(item)}><X size={12} /></button></span>)}</div><div className="member-inline-add"><input value={tagInput} onChange={(event) => setTagInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addTag(); } }} placeholder="输入标签名称" /><button type="button" aria-label="添加标签" onClick={addTag}><Plus size={15} /></button></div></section><section><h3>跟进设置</h3><label>下次联系<input type="date" value={member.nextContact} onChange={(event) => onUpdate({ ...member, suitableRoles: selectedRoles, tags, nextContact: event.target.value })} /></label></section><section><h3>历史申请</h3>{candidate.applications.map((item) => <div className="member-application" key={`${item.position}-${item.created}`}><strong>{item.position}</strong><span>{item.state}</span><small>{item.created} · {item.source}</small></div>)}</section><section className="membership-actions"><h3>成员关系</h3>{!member.serverBacked && <label>移动到<select defaultValue="" onChange={(event) => { if (event.target.value) onMove(member, event.target.value); }}><option value="">选择目标人才库</option>{pools.filter((item) => item.id !== pool.id).map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>}<button type="button" onClick={() => onRemove(member)}>从当前人才库移出</button><button className="danger-text" type="button" onClick={() => setDanger("永久不再联系")}>永久不再联系</button><button className="danger-text" type="button" onClick={() => setDanger("黑名单")}>加入黑名单</button></section></div><footer><button className="button secondary" type="button" onClick={() => onOpenCandidate(candidate)}>候选人档案</button><button className="button primary" type="button" onClick={() => setReactivateOpen(true)}>重新激活到职位</button></footer></aside>{danger && <div className="talent-dialog-backdrop"><section className="talent-dialog danger-confirm"><header><div><h3>{danger}</h3><p>该操作与“暂不适合”不同，会限制后续联系和激活。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setDanger(null)}><X size={19} /></button></header><div className="talent-dialog-body"><div className="danger-impact"><ShieldAlert size={22} /><span>执行后候选人仍保留审计记录，但不会出现在普通人才搜索和推荐结果中。</span></div><label>操作原因<textarea rows="4" value={dangerReason} onChange={(event) => setDangerReason(event.target.value)} placeholder="必须说明原因" /></label></div><footer><button className="button secondary" type="button" onClick={() => setDanger(null)}>取消</button><button className="button danger" type="button" disabled={!dangerReason.trim()} onClick={() => { onUpdate({ ...member, suitableRoles: selectedRoles, tags, status: danger, latestConclusion: `${danger}：${dangerReason}` }); setDanger(null); }}>确认{danger}</button></footer></section></div>}{reactivateOpen && <ReactivateDrawer member={member} candidate={candidate} pool={pool} positions={positions} onClose={() => setReactivateOpen(false)} onReactivate={onReactivateCandidate} onOpenCandidate={onOpenCandidate} />}{resumePreviewOpen && resumeDocument && <ResumePreviewDrawer candidate={candidate} document={resumeDocument} onClose={() => setResumePreviewOpen(false)} onDownload={downloadResume} />}</>;
 }
 
 function PoolDetail({ pool, pools, memberships, candidates, positions, onBack, onUpdateMember, onMove, onRemove, onReactivateCandidate, onOpenCandidate, onNotify, status = "ready", error = "", onRetry, nextCursor, loadingMore, onLoadMore }) {
-  const [query, setQuery] = useState(""); const [role, setRole] = useState("全部适合岗位"); const [city, setCity] = useState("全部城市"); const [owner, setOwner] = useState("全部跟进人"); const [followup, setFollowup] = useState("全部跟进"); const [selectedMemberId, setSelectedMemberId] = useState(null);
+  const [query, setQuery] = useState(""); const [role, setRole] = useState("全部适合岗位"); const [city, setCity] = useState("全部城市"); const [owner, setOwner] = useState("全部跟进人"); const [followup, setFollowup] = useState("全部跟进"); const [selectedMemberId, setSelectedMemberId] = useState(null); const [reactivateMemberId, setReactivateMemberId] = useState(null);
   const poolMembers = memberships.filter((item) => item.poolId === pool.id).map((member) => ({ member, candidate: candidates.find((item) => item.id === member.candidateId) || member.candidate })).filter((item) => item.candidate);
   const filtered = poolMembers.filter(({ member, candidate }) => `${candidate.name}${candidate.role}${candidate.phone}${candidate.email}${member.tags.join("")}${member.suitableRoles.join("")}`.toLowerCase().includes(query.toLowerCase()) && (role === "全部适合岗位" || member.suitableRoles.includes(role)) && (city === "全部城市" || candidate.city === city) && (owner === "全部跟进人" || member.owner === owner) && (followup === "全部跟进" || (followup === "7 天内联系" && member.nextContact <= "2026-07-19") || (followup === "即将到期" && member.status === "即将到期")));
   const selected = poolMembers.find((item) => item.member.id === selectedMemberId);
-  return <div className="talent-page pool-detail-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回人才库</button><section className="pool-detail-hero"><div><span><BriefcaseBusiness size={20} /></span><div><div><h2>{pool.name}</h2><VisibilityTag value={pool.visibility} /></div><p>{pool.purpose}</p><small>负责人：{pool.owner} · 默认保留 {pool.retentionDays} 天 · 最近活动 {pool.recentActivity}</small></div></div><strong>{pool.memberCount ?? poolMembers.length}<small>人才</small></strong></section><section className="pool-detail-panel"><div className="pool-detail-toolbar"><label className="pool-search"><Search size={16} /><input aria-label="搜索人才" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索姓名、技能或标签" /></label><label className="pool-select"><select aria-label="适合岗位筛选" value={role} onChange={(event) => setRole(event.target.value)}><option>全部适合岗位</option>{[...new Set(poolMembers.flatMap((item) => item.member.suitableRoles))].map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label><label className="pool-select"><select aria-label="城市筛选" value={city} onChange={(event) => setCity(event.target.value)}><option>全部城市</option>{[...new Set(poolMembers.map((item) => item.candidate.city))].map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label><label className="pool-select"><select aria-label="跟进人筛选" value={owner} onChange={(event) => setOwner(event.target.value)}><option>全部跟进人</option>{[...new Set(poolMembers.map((item) => item.member.owner))].map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label><label className="pool-select"><select aria-label="跟进状态筛选" value={followup} onChange={(event) => setFollowup(event.target.value)}><option>全部跟进</option><option>7 天内联系</option><option>即将到期</option></select><ChevronDown size={14} /></label></div>{status === "loading" && memberships.length === 0 ? <div className="talent-empty" role="status"><RefreshCw size={24} /><strong>正在加载人才</strong></div> : status === "error" && memberships.length === 0 ? <div className="talent-empty" role="alert"><CircleAlert size={24} /><strong>人才列表加载失败</strong><span>{error}</span><button className="button secondary" type="button" onClick={onRetry}>重试</button></div> : <div className="talent-table"><div className="talent-table-head"><span>人才</span><span>适合岗位</span><span>技能与标签</span><span>历史职位/结论</span><span>跟进人</span><span>下次联系</span><span>保留期限</span><span>操作</span></div>{filtered.map(({ member, candidate }) => <div className="talent-table-row" key={member.id}><button className="talent-person" type="button" onClick={() => setSelectedMemberId(member.id)}><span>{candidate.name.slice(-1)}</span><span><strong>{candidate.name}</strong><small>{candidate.role} · {candidate.city}</small></span></button><span>{member.suitableRoles.join("、")}</span><span><div className="talent-row-tags">{[...candidate.skills.slice(0, 2), ...member.tags.slice(0, 1)].map((item) => <small key={item}>{item}</small>)}</div></span><span><strong>{candidate.applications.map((item) => item.position).join("、")}</strong><small>{member.latestConclusion}</small></span><span>{member.owner}</span><span><strong>{member.nextContact || "未设置"}</strong><small>{member.recentInteraction}</small></span><span className={member.status === "即将到期" ? "retention-warning" : ""}>{member.retentionUntil}<small>{member.status}</small></span><span><button className="button primary small" type="button" onClick={() => setSelectedMemberId(member.id)}>加入职位</button></span></div>)}{filtered.length === 0 && <div className="talent-empty"><Search size={24} /><strong>没有符合条件的人才</strong><span>调整筛选条件后重试。</span></div>}{nextCursor && <div className="talent-load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "正在加载" : "加载更多人才"}</button></div>}</div>}</section>{selected && <MemberDrawer member={selected.member} candidate={selected.candidate} pool={pool} pools={pools} positions={positions} onClose={() => setSelectedMemberId(null)} onUpdate={onUpdateMember} onMove={onMove} onRemove={(member) => { onRemove(member); setSelectedMemberId(null); }} onReactivateCandidate={onReactivateCandidate} onOpenCandidate={onOpenCandidate} onNotify={onNotify} />}</div>;
+  return <div className="talent-page pool-detail-page"><button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回人才库</button><section className="pool-detail-hero"><div><span><BriefcaseBusiness size={20} /></span><div><div><h2>{pool.name}</h2><VisibilityTag value={pool.visibility} /></div><p>{pool.purpose}</p><small>负责人：{pool.owner} · 默认保留 {pool.retentionDays} 天 · 最近活动 {pool.recentActivity}</small></div></div><strong>{pool.memberCount ?? poolMembers.length}<small>人才</small></strong></section><section className="pool-detail-panel"><div className="pool-detail-toolbar"><label className="pool-search"><Search size={16} /><input aria-label="搜索人才" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索姓名、技能或标签" /></label><label className="pool-select"><select aria-label="适合岗位筛选" value={role} onChange={(event) => setRole(event.target.value)}><option>全部适合岗位</option>{[...new Set(poolMembers.flatMap((item) => item.member.suitableRoles))].map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label><label className="pool-select"><select aria-label="城市筛选" value={city} onChange={(event) => setCity(event.target.value)}><option>全部城市</option>{[...new Set(poolMembers.map((item) => item.candidate.city))].map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label><label className="pool-select"><select aria-label="跟进人筛选" value={owner} onChange={(event) => setOwner(event.target.value)}><option>全部跟进人</option>{[...new Set(poolMembers.map((item) => item.member.owner))].map((item) => <option key={item}>{item}</option>)}</select><ChevronDown size={14} /></label><label className="pool-select"><select aria-label="跟进状态筛选" value={followup} onChange={(event) => setFollowup(event.target.value)}><option>全部跟进</option><option>7 天内联系</option><option>即将到期</option></select><ChevronDown size={14} /></label></div>{status === "loading" && memberships.length === 0 ? <div className="talent-empty" role="status"><RefreshCw size={24} /><strong>正在加载人才</strong></div> : status === "error" && memberships.length === 0 ? <div className="talent-empty" role="alert"><CircleAlert size={24} /><strong>人才列表加载失败</strong><span>{error}</span><button className="button secondary" type="button" onClick={onRetry}>重试</button></div> : <div className="talent-table"><div className="talent-table-head"><span>人才</span><span>适合岗位</span><span>技能与标签</span><span>历史职位/结论</span><span>跟进人</span><span>下次联系</span><span>保留期限</span><span>操作</span></div>{filtered.map(({ member, candidate }) => <div className="talent-table-row" key={member.id}><button className="talent-person" type="button" onClick={() => setSelectedMemberId(member.id)}><span>{candidate.name.slice(-1)}</span><span><strong>{candidate.name}</strong><small>{candidate.role} · {candidate.city}</small></span></button><span>{member.suitableRoles.join("、")}</span><span><div className="talent-row-tags">{[...candidate.skills.slice(0, 2), ...member.tags.slice(0, 1)].map((item) => <small key={item}>{item}</small>)}</div></span><span><strong>{candidate.applications.map((item) => item.position).join("、")}</strong><small>{member.latestConclusion}</small></span><span>{member.owner}</span><span><strong>{member.nextContact || "未设置"}</strong><small>{member.recentInteraction}</small></span><span className={member.status === "即将到期" ? "retention-warning" : ""}>{member.retentionUntil}<small>{member.status}</small></span><span><button className="button primary small" type="button" onClick={() => { setSelectedMemberId(member.id); setReactivateMemberId(member.id); }}>重新激活</button></span></div>)}{filtered.length === 0 && <div className="talent-empty"><Search size={24} /><strong>没有符合条件的人才</strong><span>调整筛选条件后重试。</span></div>}{nextCursor && <div className="talent-load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "正在加载" : "加载更多人才"}</button></div>}</div>}</section>{selected && <MemberDrawer key={selected.member.id} member={selected.member} candidate={selected.candidate} pool={pool} pools={pools} positions={positions} initialReactivateOpen={selected.member.id === reactivateMemberId} onClose={() => { setSelectedMemberId(null); setReactivateMemberId(null); }} onUpdate={onUpdateMember} onMove={onMove} onRemove={(member) => { onRemove(member); setSelectedMemberId(null); setReactivateMemberId(null); }} onReactivateCandidate={onReactivateCandidate} onOpenCandidate={onOpenCandidate} onNotify={onNotify} />}</div>;
 }
 
-export function TalentPoolWorkspace({ mode, setMode, selectedPoolId, setSelectedPoolId, pools = [], setPools, memberships = [], setMemberships, candidates, positions, onReactivateCandidate, onOpenCandidate, onNotify, controller, actorId }) {
+export function TalentPoolWorkspace({ mode, setMode, selectedPoolId, setSelectedPoolId, pools = [], setPools, memberships = [], setMemberships, candidates, positions, onReactivateCandidate, onOpenCandidate, onNotify, controller, actorId, pageActionHost }) {
   const serverBacked = Boolean(controller);
   const [serverState, setServerState] = useState({ poolStatus: serverBacked ? "loading" : "ready", pools: [], poolCursor: null, loadingPools: false, memberStatus: "idle", memberships: [], memberCursor: null, loadingMembers: false, error: "" });
   const activePools = serverBacked ? serverState.pools : pools;
@@ -158,5 +353,5 @@ export function TalentPoolWorkspace({ mode, setMode, selectedPoolId, setSelected
   async function removeMember(member) { if (!serverBacked) { setMemberships((current) => current.filter((item) => item.id !== member.id)); return; } try { await controller.removeMembership(member, "由招聘人员从人才库移出"); setServerState((current) => ({ ...current, memberships: current.memberships.filter((item) => item.id !== member.id), pools: current.pools.map((pool) => pool.id === member.poolId ? { ...pool, memberCount: Math.max(0, pool.memberCount - 1) } : pool) })); onNotify("已从人才库移出"); } catch { onNotify("移出失败，请刷新后重试"); } }
   async function reactivate(memberId, position) { if (!serverBacked) return onReactivateCandidate(memberId, position); return controller.reactivate(memberId, position.id); }
   if (mode === "detail" && selectedPool) return <PoolDetail pool={selectedPool} pools={activePools} memberships={activeMemberships} candidates={candidates} positions={positions} onBack={() => { setSelectedPoolId(null); setMode("list"); }} onUpdateMember={updateMember} onMove={moveMember} onRemove={removeMember} onReactivateCandidate={reactivate} onOpenCandidate={onOpenCandidate} onNotify={onNotify} status={serverState.memberStatus} error={serverState.error} onRetry={() => void loadMembers(selectedPool.id)} nextCursor={serverState.memberCursor} loadingMore={serverState.loadingMembers} onLoadMore={() => void loadMembers(selectedPool.id, { cursor: serverState.memberCursor, append: true })} />;
-  return <PoolList pools={activePools} memberships={activeMemberships} onOpen={openPool} onCreate={createPool} status={serverState.poolStatus} error={serverState.error} onRetry={() => void loadPools()} nextCursor={serverState.poolCursor} loadingMore={serverState.loadingPools} onLoadMore={() => void loadPools({ cursor: serverState.poolCursor, append: true })} />;
+  return <PoolList pools={activePools} memberships={activeMemberships} onOpen={openPool} onCreate={createPool} status={serverState.poolStatus} error={serverState.error} onRetry={() => void loadPools()} nextCursor={serverState.poolCursor} loadingMore={serverState.loadingPools} onLoadMore={() => void loadPools({ cursor: serverState.poolCursor, append: true })} pageActionHost={pageActionHost} />;
 }

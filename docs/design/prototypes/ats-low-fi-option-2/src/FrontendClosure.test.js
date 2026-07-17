@@ -7,6 +7,41 @@ import { createServer } from "vite";
 const prototypeRoot = fileURLToPath(new URL("../", import.meta.url));
 const departments = [{ id: "00000000-0000-4000-8000-000000000201", name: "技术部", parent_id: null, member_count: 6, job_count: 3 }];
 const users = [{ id: "user-1", display_name: "Admin", email: "admin@example.test", department_id: departments[0].id, department_name: "技术部", roles: ["recruiting_admin"], status: "active" }];
+const notificationJobId = "10000000-0000-4000-8000-000000000001";
+
+function notificationCandidate(stage, index, name) {
+  return {
+    application_id: `20000000-0000-4000-8000-00000000000${index}`,
+    candidate_id: `30000000-0000-4000-8000-00000000000${index}`,
+    job_id: notificationJobId,
+    display_name: name,
+    current_title: "AI 工程师",
+    location: "北京",
+    source: "upload",
+    stage,
+    updated_at: "2026-07-17T03:00:00Z",
+  };
+}
+
+function notificationWorkbench() {
+  const review = notificationCandidate("review", 1, "陈曦");
+  const passed = notificationCandidate("passed", 2, "李嘉杨");
+  const empty = { count: 0, items: [] };
+  return {
+    generated_at: "2026-07-17T04:00:00Z",
+    jobs: [{
+      id: notificationJobId,
+      title: "AI 工程师",
+      department_name: "技术部",
+      status: "open",
+      updated_at: "2026-07-17T03:30:00Z",
+      active_count: 2,
+      stages: { new: empty, review: { count: 1, items: [review] }, contact: empty, interview_pending: empty, interviewing: empty, decision: empty, passed: { count: 1, items: [passed] } },
+    }],
+    tasks: { review: { count: 1, items: [review] }, interview_pending: empty, decision: empty, passed: { count: 1, items: [passed] } },
+    interviews: { available: false, upcoming: [], pending_feedback: [] },
+  };
+}
 let browser;
 let vite;
 let baseUrl;
@@ -23,7 +58,7 @@ after(async () => {
   await vite?.close();
 });
 
-async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = false, roles = ["recruiting_admin"], onRequest } = {}) {
+async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = false, roles = ["recruiting_admin"], workbench = null, onRequest } = {}) {
   const context = await browser.newContext({ viewport });
   await context.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -43,6 +78,7 @@ async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = f
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: users }) });
     }
     if (pathname === "/api/v1/jobs") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], meta: { departments: [], owners: [], status_counts: {}, next_cursor: null } }) });
+    if (pathname === "/api/v1/workbench" && workbench) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: workbench }) });
     if (pathname === "/api/v1/auth/invitations/accept") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { email: "invitee@example.test" } }) });
     if (pathname === "/api/v1/me/password") return route.fulfill({ status: 204, body: "" });
     return route.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ status: 503 }) });
@@ -50,6 +86,25 @@ async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = f
   const page = await context.newPage();
   return { context, page };
 }
+
+test("notification bell opens actionable tasks and candidate navigation", { timeout: 60_000 }, async () => {
+  const { context, page } = await openPage({ workbench: notificationWorkbench() });
+  try {
+    await page.goto(baseUrl);
+    const trigger = page.getByRole("button", { name: "查看 2 项待处理事项", exact: true });
+    await trigger.waitFor();
+    await trigger.click();
+    const panel = page.getByRole("dialog", { name: "待处理事项", exact: true });
+    await panel.waitFor();
+    const bounds = await panel.boundingBox();
+    assert.ok(bounds && bounds.x >= 0 && bounds.y > 0);
+    assert.ok(bounds.x + bounds.width <= 1280);
+    assert.ok(bounds.y + bounds.height <= 800);
+    await panel.getByRole("button", { name: /陈曦/ }).click();
+    await page.waitForURL(/\/candidates\/30000000-0000-4000-8000-000000000001/);
+    assert.equal(await panel.count(), 0);
+  } finally { await context.close(); }
+});
 
 test("organization settings load real data, restrict invite roles, and show the one-time invitation link", { timeout: 60_000 }, async () => {
   let inviteRequest;

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import re
 import secrets
@@ -53,6 +54,19 @@ def _requires_no_store(path: str) -> bool:
 
 def _new_trace_id() -> str:
     return secrets.token_hex(16)
+
+
+def _contact_lookup_key(value: str) -> bytes:
+    raw = value.encode()
+    if len(raw) == 32:
+        return raw
+    try:
+        decoded = base64.urlsafe_b64decode(raw)
+    except (ValueError, base64.binascii.Error):
+        raise ValueError("invalid contact lookup secret") from None
+    if len(decoded) != 32:
+        raise ValueError("contact lookup secret must decode to 32 bytes")
+    return decoded
 
 
 def create_app(
@@ -123,7 +137,7 @@ def create_app(
     )
     app.state.contact_cipher = ContactCipher(
         settings.contact_encryption_key.get_secret_value().encode(),
-        settings.contact_lookup_secret.get_secret_value().encode(),
+        _contact_lookup_key(settings.contact_lookup_secret.get_secret_value()),
     ) if settings.contact_encryption_key.get_secret_value() != "change-me" else ContactCipher(
         b"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=", b"fedcba9876543210fedcba9876543210"
     )

@@ -234,7 +234,7 @@ class PreviewOut(ApiModel):
     text: str
 
 
-WorkbenchStage = Literal["new", "review", "contact", "interview_pending", "interviewing", "decision"]
+WorkbenchStage = Literal["new", "review", "contact", "interview_pending", "interviewing", "decision", "passed"]
 
 
 class WorkbenchCandidateOut(ApiModel):
@@ -261,6 +261,7 @@ class WorkbenchStagesOut(ApiModel):
     interview_pending: WorkbenchStageOut
     interviewing: WorkbenchStageOut
     decision: WorkbenchStageOut
+    passed: WorkbenchStageOut
 
 
 class WorkbenchJobOut(ApiModel):
@@ -274,9 +275,10 @@ class WorkbenchJobOut(ApiModel):
 
 
 class WorkbenchTasksOut(ApiModel):
-    contact: WorkbenchStageOut
+    review: WorkbenchStageOut
     interview_pending: WorkbenchStageOut
     decision: WorkbenchStageOut
+    passed: WorkbenchStageOut
 
 
 class WorkbenchInterviewsOut(ApiModel):

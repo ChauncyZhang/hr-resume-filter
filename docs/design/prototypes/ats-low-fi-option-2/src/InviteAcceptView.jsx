@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CheckCircle2, LoaderCircle, LockKeyhole } from "lucide-react";
 import { apiClient } from "./apiClient.js";
+import "./product-theme-admin.css";
 
 export function InviteAcceptView({ token, onAccepted, client = apiClient }) {
   const [form, setForm] = useState({ password: "", confirmation: "" });

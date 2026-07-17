@@ -2,6 +2,7 @@ import { normalizeScreeningTask } from "./screeningController.js";
 
 const SAFE_METADATA_KEYS = ["position", "source", "note", "creator", "createdAt"];
 const LEGAL_SOURCES = new Set(["BOSS 直聘", "猎聘", "智联招聘", "员工内推", "人才库重新激活", "其他合法来源", "本地上传"]);
+const RESUMABLE_RUN_STATUSES = new Set(["running"]);
 export const LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY = "ats_recent_screening_task";
 const RECENT_SCREENING_TASK_STORAGE_KEY_PREFIX = `${LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY}:user:`;
 
@@ -12,6 +13,12 @@ function isRecord(value) {
 export function getRecentScreeningTaskStorageKey(authenticatedUser) {
   if (typeof authenticatedUser?.id !== "string" || !authenticatedUser.id.trim()) return null;
   return `${RECENT_SCREENING_TASK_STORAGE_KEY_PREFIX}${encodeURIComponent(authenticatedUser.id.trim())}`;
+}
+
+export function isResumableRecentScreeningTask(task) {
+  return isRecord(task)
+    && task.serverBacked === true
+    && RESUMABLE_RUN_STATUSES.has(task.status);
 }
 
 function codedError(code, message) {
@@ -40,19 +47,19 @@ function isValidMetadata(value) {
 }
 
 export function serializeRecentScreeningTask(task) {
-  if (!isRecord(task) || task.serverBacked !== true || typeof task.id !== "string" || !task.id || typeof task.jobId !== "string" || !task.jobId || !isValidMetadata(task)) {
+  if (!isResumableRecentScreeningTask(task) || typeof task.id !== "string" || !task.id || typeof task.jobId !== "string" || !task.jobId || !isValidMetadata(task)) {
     return "";
   }
-  return JSON.stringify({ id: task.id, jobId: task.jobId, serverBacked: true, ...safeMetadata(task) });
+  return JSON.stringify({ id: task.id, jobId: task.jobId, serverBacked: true, status: task.status, ...safeMetadata(task) });
 }
 
 export function parseRecentScreeningTask(raw) {
   try {
     const value = JSON.parse(raw);
-    const allowedKeys = new Set(["id", "jobId", "serverBacked", "llmEnabled", ...SAFE_METADATA_KEYS]);
+    const allowedKeys = new Set(["id", "jobId", "serverBacked", "status", "llmEnabled", ...SAFE_METADATA_KEYS]);
     if (!isRecord(value) || Object.keys(value).some((key) => !allowedKeys.has(key))) return null;
-    if (value.serverBacked !== true || typeof value.id !== "string" || !value.id || typeof value.jobId !== "string" || !value.jobId || !isValidMetadata(value)) return null;
-    return { id: value.id, jobId: value.jobId, serverBacked: true, ...safeMetadata(value) };
+    if (!isResumableRecentScreeningTask(value) || typeof value.id !== "string" || !value.id || typeof value.jobId !== "string" || !value.jobId || !isValidMetadata(value)) return null;
+    return { id: value.id, jobId: value.jobId, serverBacked: true, status: value.status, ...safeMetadata(value) };
   } catch {
     return null;
   }
@@ -71,7 +78,7 @@ export function createScreeningWorkflow(controller) {
     try {
       const run = await controller.createRun(jobId, { signal });
       if (!run?.id) throw codedError("INVALID_RUN", "screening run was not created");
-      onRunCreated({ id: run.id, jobId, serverBacked: true, ...safeMetadata(metadata) });
+      onRunCreated({ id: run.id, jobId, serverBacked: true, status: "running", ...safeMetadata(metadata) });
       if (signal?.aborted) return null;
 
       const selectedFiles = Array.from(files ?? []);

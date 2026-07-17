@@ -10,7 +10,7 @@ from server.app.identity.models import Job, JobCollaborator, Organization, User,
 from server.app.identity.security import PasswordService
 from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.main import create_app
-from server.app.recruiting.models import Candidate, CandidateContact, FileObject, JobJdVersion, Resume, ScreeningRuleVersion
+from server.app.recruiting.models import Application, Candidate, CandidateContact, FileObject, JobJdVersion, Resume, ScreeningRuleVersion
 from server.app.screening.storage import StorageWriteFailed
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.queue.models import BackgroundJob
@@ -41,6 +41,62 @@ def app_and_seed(tmp_path):
 
 def login(client,email,organization_slug="acme"):
     response=client.post("/api/v1/auth/login",json={"organization_slug":organization_slug,"email":email,"password":"correct"},headers={"Origin":"https://hr.example.test"}); assert response.status_code==200; return {"Origin":"https://hr.example.test","X-CSRF-Token":response.headers["X-CSRF-Token"]}
+
+def test_screening_runs_are_listed_with_display_context_and_job_scope(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        admin_headers=login(client,"admin@example.test")
+        created=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**admin_headers,"Idempotency-Key":"run-list"})
+        assert created.status_code==201
+        listing=client.get("/api/v1/screening-runs?limit=50",headers=admin_headers)
+        assert listing.status_code==200
+        listed=listing.json()["data"]
+        assert len(listed)==1
+        assert {key:listed[0][key] for key in ("id","job_id","status","total_count")}=={key:created.json()["data"][key] for key in ("id","job_id","status","total_count")}
+        assert listed[0]["job_title"]=="Engineer" and listed[0]["created_by_name"]=="Admin"
+        assert listing.json()["meta"]=={"limit":50,"next_cursor":None}
+
+        client.post("/api/v1/auth/logout",headers=admin_headers)
+        system_headers=login(client,"system@example.test")
+        denied=client.get("/api/v1/screening-runs?limit=50",headers=system_headers)
+        assert denied.status_code==200 and denied.json()["data"]==[]
+
+def test_screening_review_progress_updates_after_human_conclusion(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"review-run"}).json()["data"]
+        item=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("review.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":"review-item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            candidate,_=enrich_item(db,item["id"],"Review Candidate")
+            stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,stored.run_id)
+            resume=Resume(organization_id=stored.organization_id,candidate_id=candidate.id,file_object_id=stored.file_object_id,version_number=1,parsed_text="Python")
+            db.add(resume); db.flush()
+            application=Application(organization_id=stored.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="new",source="screening")
+            db.add(application); db.flush()
+            stored.resume_id=resume.id; stored.application_id=application.id
+            aggregate.status="completed"; aggregate.total_count=1; aggregate.processed_count=1; aggregate.succeeded_count=1
+            db.commit(); application_id=str(application.id)
+
+        before=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers).json()["data"]
+        assert {key:before[key] for key in ("review_total_count","reviewed_count","review_pending_count","review_status")}=={"review_total_count":1,"reviewed_count":0,"review_pending_count":1,"review_status":"pending"}
+
+        saved=client.patch(f"/api/v1/applications/{application_id}",json={"human_conclusion":"建议推进"},headers={**headers,"If-Match":'"1"'})
+        assert saved.status_code==200
+        detail=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers).json()["data"]
+        listing=client.get("/api/v1/screening-runs?limit=50",headers=headers).json()["data"][0]
+        rows=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers).json()["data"]
+        expected={"review_total_count":1,"reviewed_count":1,"review_pending_count":0,"review_status":"completed"}
+        assert {key:detail[key] for key in expected}==expected
+        assert {key:listing[key] for key in expected}==expected
+        assert rows[0]["human_reviewed"] is True
+
+        advanced=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"advance_to_review","items":[{"item_id":item["id"],"expected_application_version":2}]},headers={**headers,"Idempotency-Key":"submit-review"})
+        assert advanced.status_code==200
+        approved=client.post(f"/api/v1/applications/{application_id}/workflow-actions",json={"action":"review_approved"},headers={**headers,"If-Match":'"3"',"Idempotency-Key":"approve-review"})
+        assert approved.status_code==200
+        after_approval=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers).json()["data"]
+        assert after_approval["reviewed_count"]==1 and after_approval["review_approved_count"]==1 and after_approval["review_status"]=="completed"
 
 def json_keys_and_scalar_values(value):
     keys=set(); values=[]

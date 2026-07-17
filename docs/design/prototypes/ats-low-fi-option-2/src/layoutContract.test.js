@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const styles = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+const reportViews = readFileSync(new URL("./ReportViews.jsx", import.meta.url), "utf8");
 
 function declarationsFor(selector, source = styles) {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -32,6 +33,19 @@ test("import screening modal centers step markers and keeps paired fields top-al
 
 test("schedule validation messages do not stretch the paired form control", () => {
   assert.match(declarationsFor(".schedule-grid > label"), /align-content:\s*start/);
+});
+
+test("report cards use independent columns and stable full-width funnel rows", () => {
+  assert.equal((reportViews.match(/className="report-column"/g) || []).length, 2);
+  assert.equal((reportViews.match(/<table>/g) || []).length, 0);
+  assert.match(reportViews, /"--funnel-fill":\s*`\$\{Math\.max\(0, item\.currentCount \/ maxStageCount \* 100\)\}%`/);
+  assert.match(declarationsFor(".report-column"), /min-width:\s*0/);
+  assert.match(declarationsFor(".report-column"), /display:\s*grid/);
+  assert.match(declarationsFor(".report-column"), /gap:\s*10px/);
+  assert.match(declarationsFor(".report-funnel button"), /width:\s*100%/);
+  assert.match(declarationsFor(".report-funnel button"), /position:\s*relative/);
+  assert.match(declarationsFor(".report-funnel button::before"), /width:\s*var\(--funnel-fill\)/);
+  assert.match(styles, /\.duration-bars > div\s*\{[^}]*min-height:\s*39px/);
 });
 
 test("audit toolbar remains full-width and step labels stay contained on mobile", () => {

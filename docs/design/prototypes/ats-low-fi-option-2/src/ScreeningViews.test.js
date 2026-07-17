@@ -52,7 +52,7 @@ test("format examples can never advance into the real task flow", () => {
 });
 
 test("server candidate labels never present a derived name as verified", () => {
-  assert.equal(helpers.candidateDisplayName({ candidate: "张三" }, true), "张三（待核验）");
+  assert.equal(helpers.candidateDisplayName({ candidate: "张三" }, true), "张三（姓名待核验）");
   assert.equal(helpers.candidateDisplayName({ candidate: "" }, true), "候选人姓名待核验");
   assert.equal(helpers.candidateDisplayName({ candidate: "张三" }, false), "张三");
 });
@@ -89,11 +89,44 @@ test("server malware rejection is explicit and never offers retry", () => {
   assert.match(message, /已拒绝/);
 });
 
-test("server task metadata is explicitly labeled as a local record", () => {
+test("server task metadata uses persisted source and creator context", () => {
   const line = helpers.taskMetadataLine({ id: "run-1", source: "BOSS 直聘", creator: "张小北", createdAt: "刚刚", serverBacked: true });
 
-  assert.match(line, /来源备注（本机）/);
-  assert.match(line, /发起人记录（本机）/);
+  assert.match(line, /来源 BOSS 直聘/);
+  assert.match(line, /发起人 张小北/);
+});
+
+test("task status follows human review progress after file processing completes", () => {
+  assert.equal(helpers.taskLifecycleLabel({ status: "running", reviewTotal: 5, reviewed: 0 }), "处理中");
+  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 0 }), "待人工审核");
+  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 2 }), "审核中 2/5");
+  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 5 }), "人工审核完成");
+});
+
+test("screening rows describe the actual review state instead of a fixed submitted label", () => {
+  assert.equal(helpers.humanReviewLabel({ status: "running" }), "等待处理");
+  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "new", humanReviewed: false }), "待HR审核");
+  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "new", humanReviewed: true }), "HR已审核");
+  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "review", humanReviewed: true }), "待用人经理评审");
+  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "interview_pending", humanReviewed: true }), "评审通过");
+  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "rejected", humanReviewed: true }), "已淘汰");
+});
+
+test("review breakdown separates HR completion from manager submission and decision", () => {
+  assert.deepEqual(helpers.reviewBreakdown({ files: [
+    { status: "success", application_stage: "new", humanReviewed: true },
+    { status: "success", application_stage: "review", humanReviewed: true },
+    { status: "success", application_stage: "interview_pending", humanReviewed: true },
+    { status: "success", application_stage: "contact", humanReviewed: true },
+    { status: "success", application_stage: "rejected", humanReviewed: true },
+    { status: "failed", application_stage: null, humanReviewed: false },
+  ] }), {
+    pendingHr: 0,
+    readyToSubmit: 1,
+    waitingManager: 1,
+    approved: 2,
+    rejected: 1,
+  });
 });
 
 test("only completed server rows with a new positive-version application can advance", () => {
@@ -213,6 +246,11 @@ test("server candidate detail exposes the connected interview path and reports c
   assert.doesNotMatch(candidateHelpers.candidateMutationError(new Error("database internal.example")), /database|internal/);
   assert.equal(candidateHelpers.resumeDisplayName({ original_filename: "真实简历.pdf" }), "真实简历.pdf");
   assert.equal(candidateHelpers.resumeDisplayName(null), "暂无可用简历");
-  assert.deepEqual(candidateHelpers.candidateTransitionOptions("待决策", true), ["已通过", "已淘汰"]);
-  assert.deepEqual(candidateHelpers.candidateTransitionOptions("待决策", false), ["已录用", "已淘汰"]);
+  assert.deepEqual(candidateHelpers.candidateStageFilterOptions(), ["新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"]);
+  assert.deepEqual(candidateHelpers.candidateWorkflowActions("待决策", "用人经理").map((item) => item.id), ["hiring_approved", "hiring_rejected"]);
+  assert.deepEqual(candidateHelpers.candidateWorkflowActions("待安排", "HR 招聘专员"), []);
+  assert.equal(candidateHelpers.candidateNextStep("面试中"), "等待面试官提交反馈");
+  assert.equal(candidateHelpers.canScheduleCandidateInterview("待安排", "HR 招聘专员", true), true);
+  assert.equal(candidateHelpers.canScheduleCandidateInterview("待复核", "HR 招聘专员", true), false);
+  assert.equal(candidateHelpers.canScheduleCandidateInterview("待安排", "用人经理", true), false);
 });

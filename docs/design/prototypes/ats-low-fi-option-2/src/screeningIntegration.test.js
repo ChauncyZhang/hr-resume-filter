@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   createScreeningWorkflow,
   getRecentScreeningTaskStorageKey,
+  isResumableRecentScreeningTask,
   mergeServerTaskMetadata,
   parseRecentScreeningTask,
   pollServerTask,
@@ -21,6 +22,7 @@ const recoverableTask = {
   id: "run-recoverable",
   jobId: "job-1",
   serverBacked: true,
+  status: "running",
   ...metadata,
 };
 
@@ -59,6 +61,7 @@ test("recent task persistence keeps only safe server metadata", () => {
     id: "run-1",
     jobId: "job-1",
     serverBacked: true,
+    status: "running",
     ...metadata,
     llmEnabled: true,
     files: [{ id: "item-1", candidate: "敏感姓名" }],
@@ -69,6 +72,7 @@ test("recent task persistence keeps only safe server metadata", () => {
     id: "run-1",
     jobId: "job-1",
     serverBacked: true,
+    status: "running",
     ...metadata,
   });
   assert.deepEqual(parseRecentScreeningTask(raw), JSON.parse(raw));
@@ -79,6 +83,21 @@ test("recent task persistence keeps only safe server metadata", () => {
   assert.equal(parseRecentScreeningTask(JSON.stringify({ ...JSON.parse(raw), files: [] })), null);
   assert.equal(parseRecentScreeningTask("not-json"), null);
   assert.equal(parseRecentScreeningTask(JSON.stringify({ id: "run-1", serverBacked: true })), null);
+});
+
+test("only an active screening run remains resumable from the import dialog", () => {
+  assert.equal(isResumableRecentScreeningTask(recoverableTask), true);
+  for (const status of ["complete", "partial", "failed", "cancelled", undefined]) {
+    const task = { ...recoverableTask, status };
+    assert.equal(isResumableRecentScreeningTask(task), false);
+    assert.equal(serializeRecentScreeningTask(task), "");
+  }
+  assert.equal(parseRecentScreeningTask(JSON.stringify({
+    id: "legacy-run",
+    jobId: "job-1",
+    serverBacked: true,
+    ...metadata,
+  })), null);
 });
 
 test("workflow creates once, uploads real files sequentially, tolerates partial failures, and reports progress", async () => {

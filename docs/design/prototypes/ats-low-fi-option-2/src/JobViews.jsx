@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import "./product-theme-jobs-screening.css";
 import {
   ArrowLeft,
   Bot,
@@ -15,6 +16,7 @@ import {
   Import,
   ListFilter,
   Pencil,
+  Plus,
   Search,
   Users,
   X,
@@ -26,6 +28,7 @@ import {
   getJobSaveSuccessMessage,
 } from "./jobController.js";
 import { commitJobMutation, getJobDefinitionErrors, retryJobRefresh } from "./jobWorkspaceState.js";
+import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
 
 // Legacy workflow scenarios still import this fixture. The authenticated job
 // workspace never uses it as list or detail data.
@@ -71,7 +74,7 @@ function StatusTag({ children }) {
   return <span className={`job-status ${className}`}>{children || "状态未知"}</span>;
 }
 
-function JobList({ state, onLoad, onOpen }) {
+function JobList({ state, onLoad, onOpen, onCreate, pageActionHost }) {
   const [query, setQuery] = useState(state.filters.q);
   const firstQueryRender = useRef(true);
 
@@ -95,6 +98,7 @@ function JobList({ state, onLoad, onOpen }) {
 
   return (
     <div className="job-page job-list-page">
+      <PagePrimaryAction host={pageActionHost}>{onCreate && <button className="button primary" type="button" onClick={onCreate}><Plus size={17} />新建职位</button>}</PagePrimaryAction>
       <div className="job-page-heading"><div><h2>职位管理</h2><p>统一维护招聘职位、负责人和候选人推进情况。</p></div></div>
       <div className="job-status-tabs" role="tablist" aria-label="职位状态">
         {JOB_STATUSES.map((item) => <button key={item} role="tab" aria-selected={state.filters.status === item} type="button" className={state.filters.status === item ? "active" : ""} onClick={() => updateFilters({ status: item })}>{item}<span>{item === "全部" ? total : state.statusCounts[item] || 0}</span></button>)}
@@ -137,7 +141,7 @@ function JobDialog({ onClose, onDiscard, onSave, saving }) {
   return <div className="job-confirm-backdrop" role="presentation" onMouseDown={onClose}><section className="job-confirm" role="dialog" aria-modal="true" aria-label="保存未完成的职位" onMouseDown={(event) => event.stopPropagation()}><header><CircleAlert size={21} /><h3>职位尚未保存</h3></header><p>你填写的内容还没有保存。可以先保存为草稿，或者放弃本次修改。</p><footer><button className="button secondary" type="button" onClick={onClose} disabled={saving}>继续编辑</button><button className="button danger-text" type="button" onClick={onDiscard} disabled={saving}>放弃修改</button><button className="button primary" type="button" onClick={onSave} disabled={saving}>保存草稿</button></footer></section></div>;
 }
 
-function JobForm({ initialJob, initialDraft, departments, owners, ownersStatus, onBack, onDiscard, onSubmit, onRetryConflictRefresh, onManageDepartments, onDraftChange, onDraftClear = () => {}, onRetryOwners }) {
+function JobForm({ initialJob, initialDraft, departments, owners, ownersStatus, onBack, onDiscard, onSubmit, onRetryConflictRefresh, onManageDepartments, onDraftChange, onDraftClear = () => {}, onRetryOwners, pageActionHost }) {
   const actions = getJobFormActions(initialJob);
   const [values, setValues] = useState({
     name: initialJob?.name || initialDraft?.name || "",
@@ -217,8 +221,9 @@ function JobForm({ initialJob, initialDraft, departments, owners, ownersStatus, 
   const completion = [values.name, values.departmentId, values.jd, values.mustHave, values.process].filter(Boolean).length;
   return (
     <div className="job-page job-form-page">
+      <PagePrimaryAction host={pageActionHost}><>{actions.secondary && <button className="button secondary" type="button" onClick={() => submit(actions.secondary.publish)} disabled={saving}>{saving ? "正在保存…" : actions.secondary.label}</button>}<button className="button primary" type="button" onClick={() => submit(actions.primary.publish)} disabled={saving}>{saving ? "正在保存…" : actions.primary.label}</button></></PagePrimaryAction>
       <button className="back-link" type="button" onClick={() => dirty ? setConfirmExit(true) : onBack()} disabled={saving}><ArrowLeft size={17} />返回职位列表</button>
-      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div><div>{actions.secondary && <button className="button secondary" type="button" onClick={() => submit(actions.secondary.publish)} disabled={saving}>{saving ? "正在保存…" : actions.secondary.label}</button>}<button className="button primary" type="button" onClick={() => submit(actions.primary.publish)} disabled={saving}>{saving ? "正在保存…" : actions.primary.label}</button></div></div>
+      <div className="job-page-heading form-heading"><div><h2>{initialJob ? "编辑职位" : "新建职位"}</h2><p>填写职位信息和筛选标准，保存后以服务端记录为准。</p></div></div>
       {submitError && <div ref={submitErrorRef} tabIndex="-1" className="job-request-state error" role="alert"><CircleAlert size={17} /><span>{submitError}</span>{conflictRefreshFailed && <button type="button" onClick={retryConflictRefresh} disabled={saving}>{saving ? "正在刷新…" : "重试刷新"}</button>}</div>}
       <fieldset className="job-form-fieldset" disabled={saving}>
         <div className="job-form-layout">
@@ -297,7 +302,7 @@ function JobDetail({ state, lifecycleState, refreshState, onBack, onEdit, onImpo
   );
 }
 
-export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate, onManageDepartments, initialDraft, onDraftChange, onDraftClear }) {
+export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, listState, onLoadJobs, jobController, candidateController, onRefreshJobMutation, onNotify, onImport, onOpenCandidate, onManageDepartments, initialDraft, onDraftChange, onDraftClear, pageActionHost, onCreateJob }) {
   const [detailState, setDetailState] = useState({ status: "idle", job: null, candidates: null });
   const [lifecycleState, setLifecycleState] = useState({ status: "idle", error: "", conflict: false });
   const [refreshState, setRefreshState] = useState({ error: "", retrying: false, kind: "updated" });
@@ -487,7 +492,7 @@ export function JobsWorkspace({ mode, setMode, selectedJob, setSelectedJob, list
   }
 
   if (mode === "form" && selectedJob?.formMode === "edit" && ["idle", "loading"].includes(detailState.status)) return <div className="job-request-state" role="status">正在加载职位详情…</div>;
-  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} initialDraft={initialDraft} departments={formDepartments} owners={formOwners.records} ownersStatus={formOwners.status} onBack={() => { setSelectedJob(null); setMode("list"); }} onDiscard={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} onManageDepartments={onManageDepartments} onDraftChange={onDraftChange} onDraftClear={onDraftClear} onRetryOwners={() => setOwnerDirectoryVersion((current) => current + 1)} />;
+  if (mode === "form") return <JobForm initialJob={selectedJob?.formMode === "edit" ? selectedJob : null} initialDraft={initialDraft} departments={formDepartments} owners={formOwners.records} ownersStatus={formOwners.status} onBack={() => { setSelectedJob(null); setMode("list"); }} onDiscard={() => { setSelectedJob(null); setMode("list"); }} onSubmit={saveDefinition} onRetryConflictRefresh={retryEditConflictRefresh} onManageDepartments={onManageDepartments} onDraftChange={onDraftChange} onDraftClear={onDraftClear} onRetryOwners={() => setOwnerDirectoryVersion((current) => current + 1)} pageActionHost={pageActionHost} />;
   if (mode === "detail" && selectedJob) return <JobDetail state={detailState} lifecycleState={lifecycleState} refreshState={refreshState} onBack={() => { detailRequestRef.current?.abort(); candidateRequestRef.current?.abort(); setSelectedJob(null); setMode("list"); }} onEdit={() => { setSelectedJob((current) => ({ ...current, formMode: "edit" })); setMode("form"); }} onImport={onImport} onOpenCandidate={onOpenCandidate} onReload={() => loadDetail(selectedJob)} onRetryRefresh={retryMutationRefresh} onLoadCandidates={loadCandidates} onTransition={transition} />;
-  return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} />;
+  return <JobList state={listState} onLoad={onLoadJobs} onOpen={(job) => { setSelectedJob(job); setMode("detail"); }} onCreate={onCreateJob} pageActionHost={pageActionHost} />;
 }

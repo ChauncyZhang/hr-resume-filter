@@ -3,6 +3,8 @@ from pydantic import ValidationError
 from pydantic import SecretStr
 
 from server.app.core.settings import Settings
+from server.app.main import _contact_lookup_key
+from server.app.recruiting.security import ContactCipher
 
 
 def production_settings(**overrides: object) -> Settings:
@@ -150,6 +152,17 @@ def test_production_accepts_deployment_supplied_contact_secrets() -> None:
     assert isinstance(settings.contact_encryption_key, SecretStr)
     assert isinstance(settings.feishu_config_encryption_key, SecretStr)
     assert "AAECAw" not in repr(settings)
+
+
+def test_production_contact_secrets_initialize_contact_cipher() -> None:
+    settings = production_settings()
+
+    cipher = ContactCipher(
+        settings.contact_encryption_key.get_secret_value().encode(),
+        _contact_lookup_key(settings.contact_lookup_secret.get_secret_value()),
+    )
+
+    assert cipher.protect("email", "candidate@example.com").masked_value == "c***@example.com"
 
 
 @pytest.mark.parametrize("value", ["short", "not base64!", "+" * 43 + "=", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "Y2hhbmdlLW1l", "MDEyMzQ1Njc4OWFiY2RlZg=="])

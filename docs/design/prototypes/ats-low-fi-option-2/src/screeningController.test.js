@@ -82,6 +82,54 @@ test("lists every job page using the server cursor and the same abort signal", a
   ]);
 });
 
+test("lists screening tasks from the server and preserves job and creator context", async () => {
+  const client = createClient([{
+    data: [{
+      id: "run-1",
+      job_id: "job-1",
+      job_title: "AI 工程师",
+      created_by_name: "张小北",
+      source: "upload",
+      status: "completed",
+      total_count: 5,
+      processed_count: 5,
+      succeeded_count: 4,
+      failed_count: 1,
+      review_total_count: 5,
+      reviewed_count: 2,
+      review_pending_count: 3,
+      review_approved_count: 1,
+      review_rejected_count: 0,
+      review_status: "in_progress",
+      created_at: "2026-07-17T08:00:00+00:00",
+    }],
+    meta: { limit: 50, next_cursor: null },
+  }]);
+  const controller = createScreeningController({ client });
+
+  assert.deepEqual(await controller.listRuns(), [{
+    id: "run-1",
+    jobId: "job-1",
+    position: "AI 工程师",
+    creator: "张小北",
+    source: "本地上传",
+    status: "complete",
+    completed: 5,
+    total: 5,
+    succeeded: 4,
+    failed: 1,
+    reviewTotal: 5,
+    reviewed: 2,
+    reviewPending: 3,
+    reviewApproved: 1,
+    reviewRejected: 0,
+    reviewStatus: "in_progress",
+    createdAt: "2026-07-17T08:00:00+00:00",
+    serverBacked: true,
+  }]);
+  assert.equal(client.calls[0].path, "/api/v1/screening-runs?limit=50");
+});
+
 test("drops malformed job and item records without creating blank UI rows", async () => {
   const client = createClient([{ data: [null, { id: 7, title: "bad" }, { id: "", title: "blank" }, { id: "job-1", title: "AI 工程师" }] }]);
   const controller = createScreeningController({ client });
@@ -214,6 +262,7 @@ test("maps candidate, rule, LLM, risk, and application fields while retaining ru
     error: "provider_rate_limited",
     application_stage: "screening",
     application_version: 4,
+    humanReviewed: false,
     llmStatus: "failed",
     retryable: true,
     llmRetryable: true,
@@ -234,6 +283,16 @@ test("marks rule failures failed and completed rule/LLM combinations successful"
   assert.equal(files[1].llmScore, 76);
   assert.equal(files[2].llmStatus, "skipped");
   assert.equal(files[3].llmStatus, "not_requested");
+});
+
+test("normalizes the server human-review marker on each screening result", () => {
+  const [pending, reviewed] = normalizeScreeningTask(run({ status: "completed", processed_count: 2, total_count: 2 }), [
+    item({ id: "pending", status: "scored", rule_result: { score: 80 }, human_reviewed: false, application_stage: "new" }),
+    item({ id: "reviewed", status: "scored", rule_result: { score: 82 }, human_reviewed: true, application_stage: "review" }),
+  ]).files;
+
+  assert.equal(pending.humanReviewed, false);
+  assert.equal(reviewed.humanReviewed, true);
 });
 
 test("malformed optional result fields normalize to safe null and empty display values", () => {

@@ -191,7 +191,7 @@ def test_manual_llm_retry_requeues_current_dependencies_and_is_idempotent(tmp_pa
             "prompt_version_id": str(prompt_id),
         }
         assert item.llm_started_at is None and item.llm_finished_at is None and item.finished_at is None
-        assert db.get(Application, application_id).stage == "new"
+        assert db.get(Application, application_id).stage == "review"
         assert db.scalar(select(func.count(RuleResult.id))) == rule_count
         audit = db.scalar(select(AuditLog).where(AuditLog.event_type == "screening.item_retried"))
         assert audit.outcome == "success"
@@ -290,8 +290,8 @@ def test_success_commits_running_before_provider_and_is_replay_safe(tmp_path):
         assert evaluation.score == 91 and evaluation.interview_questions == ["Describe a scaling incident"]
         persisted = repr((invocation.usage, invocation.safe_error_code, evaluation.summary, evaluation.strengths))
         assert "sk-private" not in persisted and "Python backend role" not in persisted
-        assert db.scalar(select(Application)).stage == "new"
-        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 0
+        assert db.scalar(select(Application)).stage == "review"
+        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 1
 
 
 @pytest.mark.parametrize(
@@ -456,4 +456,4 @@ def test_llm_dead_letter_preserves_rule_result_and_is_idempotent(tmp_path):
         item=db.get(ScreeningItem,uuid.UUID(job.payload["screening_item_id"])); run=db.get(ScreeningRun,item.run_id)
         assert item.status=="scored" and item.llm_status=="failed" and item.llm_safe_error_code=="llm_handler_failed" and item.finished_at
         assert run.status=="partial" and run.succeeded_count==1 and run.failed_count==0 and run.finished_at and run.version>=2
-        assert db.get(Application,item.application_id).stage=="new" and db.scalar(select(func.count(RuleResult.id)))==1
+        assert db.get(Application,item.application_id).stage=="review" and db.scalar(select(func.count(RuleResult.id)))==1

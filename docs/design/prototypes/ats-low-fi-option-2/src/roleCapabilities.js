@@ -1,4 +1,4 @@
-const RECRUITING_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "人才库", "报表", "设置"];
+const RECRUITING_NAV_ITEMS = ["工作台", "职位", "筛选任务", "候选人", "面试", "人才库", "报表", "设置"];
 const INTERVIEWER_NAV_ITEMS = ["工作台", "面试"];
 const HIRING_MANAGER_NAV_ITEMS = ["工作台", "职位", "候选人", "面试", "报表"];
 const ALL_SETTINGS_SECTIONS = ["组织与权限", "流程与评价模板", "AI 设置", "飞书集成", "审计与数据治理"];
@@ -14,12 +14,15 @@ const RECRUITING_ACTIONS = [
   "新建职位",
   "编辑职位",
   "候选人搜索",
-  "推进候选人",
+  "评审候选人",
+  "确认录用决策",
+  "确认录用结果",
   "安排面试",
   "提交面试反馈",
   "管理人才库",
   "查看报表",
 ];
+const HR_RECRUITING_ACTIONS = RECRUITING_ACTIONS.filter((action) => !["评审候选人", "确认录用决策"].includes(action));
 
 const ROLE_CAPABILITIES = {
   系统管理员: {
@@ -37,19 +40,19 @@ const ROLE_CAPABILITIES = {
   "HR 招聘专员": {
     identity: { name: "张小北", title: "HR 招聘专员" },
     navItems: RECRUITING_NAV_ITEMS,
-    actions: RECRUITING_ACTIONS,
+    actions: HR_RECRUITING_ACTIONS,
     settingsAccess: "有限",
   },
   HR: {
     identity: { name: "张小北", title: "HR 招聘专员" },
     navItems: RECRUITING_NAV_ITEMS,
-    actions: RECRUITING_ACTIONS,
+    actions: HR_RECRUITING_ACTIONS,
     settingsAccess: "有限",
   },
   用人经理: {
     identity: { name: "用人经理", title: "用人经理" },
     navItems: HIRING_MANAGER_NAV_ITEMS,
-    actions: ["候选人搜索", "提交面试反馈", "查看报表"],
+    actions: ["候选人搜索", "评审候选人", "确认录用决策", "提交面试反馈", "查看报表"],
     settingsAccess: "无",
   },
   面试官: {

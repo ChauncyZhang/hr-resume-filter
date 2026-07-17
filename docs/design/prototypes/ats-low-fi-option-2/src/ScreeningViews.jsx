@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import "./product-theme-jobs-screening.css";
 import {
   ArrowLeft,
   Bot,
@@ -22,7 +23,8 @@ import {
   X,
 } from "lucide-react";
 import { screeningController as defaultScreeningController } from "./screeningController.js";
-import { createScreeningWorkflow, pollServerTask } from "./screeningIntegration.js";
+import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
+import { createScreeningWorkflow, isResumableRecentScreeningTask, pollServerTask } from "./screeningIntegration.js";
 
 const demoFiles = [
   { id: "f1", name: "AI工程师_李嘉明.pdf", size: "1.4 MB", type: "PDF", valid: true },
@@ -53,6 +55,46 @@ export function statusLabel(status) {
   }[status] || status;
 }
 
+export function taskLifecycleLabel(task) {
+  if (task?.status === "running" || task?.status === "cancelled" || task?.status === "failed") return statusLabel(task.status);
+  const total = Number.isInteger(task?.reviewTotal) ? task.reviewTotal : 0;
+  const reviewed = Number.isInteger(task?.reviewed) ? task.reviewed : 0;
+  if (total <= 0) return statusLabel(task?.status);
+  if (reviewed <= 0) return "待人工审核";
+  if (reviewed < total) return `审核中 ${reviewed}/${total}`;
+  return "人工审核完成";
+}
+
+export function humanReviewLabel(file) {
+  if (!["success", "partial"].includes(file?.status)) return file?.status === "failed" || file?.status === "cancelled" ? "未进入审核" : "等待处理";
+  const stage = file?.application_stage;
+  if (stage === "rejected" || stage === "withdrawn") return "已淘汰";
+  if (["contact", "interview_pending", "interviewing", "decision", "passed", "hired"].includes(stage)) return "评审通过";
+  if (stage === "review" && file?.humanReviewed) return "待用人经理评审";
+  if (file?.humanReviewed) return "HR已审核";
+  return "待HR审核";
+}
+
+export function reviewBreakdown(task) {
+  return (task?.files || [])
+    .filter((file) => ["success", "partial"].includes(file?.status))
+    .reduce((counts, file) => {
+      const stage = file?.application_stage;
+      if (!file?.humanReviewed) counts.pendingHr += 1;
+      else if (stage === "new") counts.readyToSubmit += 1;
+      else if (stage === "review") counts.waitingManager += 1;
+      else if (["rejected", "withdrawn"].includes(stage)) counts.rejected += 1;
+      else if (["contact", "interview_pending", "interviewing", "decision", "passed", "hired"].includes(stage)) counts.approved += 1;
+      return counts;
+    }, { pendingHr: 0, readyToSubmit: 0, waitingManager: 0, approved: 0, rejected: 0 });
+}
+
+function lifecycleStatusClass(task) {
+  if (task?.status === "running") return "running";
+  if (task?.status === "failed" || task?.status === "cancelled") return fileStatusClass(task.status);
+  return task?.reviewTotal > 0 && task?.reviewed < task.reviewTotal ? "partial" : "success";
+}
+
 function fileStatusClass(status) {
   return status === "success" ? "success" : status === "partial" ? "partial" : status === "failed" ? "failed" : status === "cancelled" ? "cancelled" : "running";
 }
@@ -77,7 +119,7 @@ export function canAdvanceFromFiles(files) {
 
 export function candidateDisplayName(file, serverBacked) {
   if (!serverBacked) return file.candidate || "待识别候选人";
-  return file.candidate ? `${file.candidate}（待核验）` : "候选人姓名待核验";
+  return file.candidate ? `${file.candidate}（姓名待核验）` : "候选人姓名待核验";
 }
 
 export function canOpenCandidateReview(file, serverBacked) {
@@ -113,7 +155,7 @@ export function serverIssueMessage(file) {
 
 export function taskMetadataLine(task) {
   if (!task.serverBacked) return `${task.id} · ${task.source} · 发起人 ${task.creator} · ${task.createdAt}`;
-  return `${task.id} · 来源备注（本机）${task.source} · 发起人记录（本机）${task.creator} · ${task.createdAt}`;
+  return `${task.id} · 来源 ${task.source} · 发起人 ${task.creator} · ${taskCreatedAt(task.createdAt)}`;
 }
 
 export function isAdvanceSelectable(file, serverBacked) {
@@ -322,7 +364,7 @@ export function ImportWizard({ activeJob, recentTask, onClose, onCreateTask, onR
 
         <div className="screening-modal-body">
           {step === 1 && <div className="wizard-section">
-            {recentTask?.serverBacked && <button className="recent-task-banner" type="button" onClick={() => onResumeTask({ ...recentTask, status: "running", completed: 0, total: 0, files: [] })}><Clock3 size={18} /><span><strong>继续最近的筛选任务</strong><small>{recentTask.id} · {recentTask.position} · 打开后获取最新进度</small></span><ChevronRight size={17} /></button>}
+            {isResumableRecentScreeningTask(recentTask) && <button className="recent-task-banner" type="button" onClick={() => onResumeTask({ ...recentTask, completed: 0, total: 0, files: [] })}><Clock3 size={18} /><span><strong>继续进行中的筛选任务</strong><small>{recentTask.id} · {recentTask.position} · 打开后获取最新进度</small></span><ChevronRight size={17} /></button>}
             <div className="wizard-grid">
               <label>目标职位<select value={position} disabled={jobsState !== "ready"} onChange={(event) => setPosition(event.target.value)} aria-describedby="server-jobs-state"><option value="">{jobsState === "loading" ? "正在加载可用职位…" : jobsState === "error" ? "职位加载失败，请关闭后重试" : jobsState === "empty" ? "暂无可用职位" : "请选择职位"}</option>{serverJobs.map((job) => <option key={job.id} value={job.id}>{jobOptionLabel(job, serverJobs)}</option>)}</select><small id="server-jobs-state" className="field-state" aria-live="polite">{jobsState === "error" ? "无法获取授权职位，当前不能继续。" : jobsState === "empty" ? "当前账号没有可用于筛选的职位。" : ""}</small></label>
               <label>简历来源<select value={source} onChange={(event) => setSource(event.target.value)}><option>BOSS 直聘</option><option>猎聘</option><option>智联招聘</option><option>员工内推</option><option>人才库重新激活</option><option>其他合法来源</option></select></label>
@@ -349,7 +391,7 @@ export function ImportWizard({ activeJob, recentTask, onClose, onCreateTask, onR
               <label><span><FileText size={18} /><span><strong>规则评分</strong><small>根据职位必须条件、加分项和风险规则评分</small></span></span><input type="checkbox" checked readOnly /></label>
               <label><span><Bot size={18} /><span><strong>LLM 语义评估</strong><small>是否启用由系统设置决定；LLM 部分失败时仍保留规则结果</small></span></span><span>由系统设置决定</span></label>
             </div>
-            <p className="background-task-note"><Clock3 size={16} />创建后可离开页面，任务会在后台继续；再次进入可通过任务 ID 恢复进度。</p>
+            <p className="background-task-note"><Clock3 size={16} />创建后可离开页面，任务会在后台继续；可随时从“筛选任务”重新进入。</p>
           </div>}
           {error && <p className="wizard-error"><CircleAlert size={15} />{error}</p>}
         </div>
@@ -358,6 +400,55 @@ export function ImportWizard({ activeJob, recentTask, onClose, onCreateTask, onR
           <button className="button secondary" type="button" disabled={submitting} onClick={step === 1 ? onClose : () => setStep((current) => current - 1)}>{step === 1 ? "取消" : "上一步"}</button>
           {step < 3 ? <button className="button primary" type="button" disabled={submitting || (step === 1 && jobsState !== "ready") || (step === 2 && !canAdvanceFromFiles(files))} onClick={next}>下一步</button> : <button className="button primary" type="button" disabled={submitting || !canAdvanceFromFiles(files)} onClick={createTask}><Import size={16} />{submitting ? `正在上传 ${uploadProgress.completed}/${uploadProgress.total}` : "创建筛选任务"}</button>}
         </footer>
+      </section>
+    </div>
+  );
+}
+
+function taskCreatedAt(value) {
+  if (!value) return "时间不可用";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "时间不可用" : date.toLocaleString("zh-CN", { hour12: false });
+}
+
+export function ScreeningTaskCenter({ controller = defaultScreeningController, onOpenTask, onImport, pageActionHost }) {
+  const [state, setState] = useState({ status: "loading", tasks: [], error: "" });
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    const abortController = new AbortController();
+    setState((current) => ({ ...current, status: "loading", error: "" }));
+    void controller.listRuns({ signal: abortController.signal }).then((tasks) => {
+      if (!abortController.signal.aborted) setState({ status: "ready", tasks, error: "" });
+    }).catch((error) => {
+      if (error?.name !== "AbortError" && !abortController.signal.aborted) setState((current) => ({ ...current, status: "error", error: "筛选任务加载失败，请检查网络后重试。" }));
+    });
+    return () => abortController.abort();
+  }, [controller, reload]);
+
+  return (
+    <div className="screening-center-page">
+      <PagePrimaryAction host={pageActionHost}><button className="button primary" type="button" onClick={onImport}><Import size={17} />导入并筛选简历</button></PagePrimaryAction>
+      <section className="screening-center-intro">
+        <div><h2>简历筛选任务</h2><p>集中查看批量简历的处理进度、逐份结果和失败重试，并从结果进入候选人人工复核。</p></div>
+      </section>
+
+      <section className="screening-task-list" aria-busy={state.status === "loading"}>
+        <header><div><h3>全部任务</h3><span>{state.tasks.length} 个批次</span></div><button className="button secondary" type="button" disabled={state.status === "loading"} onClick={() => setReload((value) => value + 1)}><RotateCcw size={16} />刷新</button></header>
+        {state.status === "loading" && state.tasks.length === 0 && <div className="screening-center-state" role="status"><LoaderCircle size={22} className="spin" /><strong>正在加载筛选任务</strong></div>}
+        {state.status === "error" && <div className="screening-center-state error" role="alert"><CircleAlert size={22} /><div><strong>暂时无法加载任务</strong><span>{state.error}</span></div><button className="button secondary" type="button" onClick={() => setReload((value) => value + 1)}>重试</button></div>}
+        {state.status === "ready" && state.tasks.length === 0 && <div className="screening-center-state empty"><FileText size={24} /><div><strong>还没有筛选任务</strong><span>导入一批简历后，处理进度和结果会保存在这里。</span></div></div>}
+        {state.tasks.length > 0 && <div className="screening-task-list-table">
+          <div className="screening-task-list-head"><span>任务 / 职位</span><span>状态</span><span>处理进度</span><span>结果</span><span>发起信息</span><span /></div>
+          {state.tasks.map((task) => <button className="screening-task-list-row" type="button" key={task.id} onClick={() => onOpenTask(task)}>
+            <span><strong>{task.position}</strong><small>{task.id}</small></span>
+            <span><i className={`task-status ${lifecycleStatusClass(task)}`}>{taskLifecycleLabel(task)}</i></span>
+            <span><strong>{task.completed}/{task.total}</strong><small>{task.total > 0 ? `${Math.round((task.completed / task.total) * 100)}%` : "等待文件"}</small></span>
+            <span><strong>{task.succeeded} 成功</strong><small>{task.failed} 失败</small></span>
+            <span><strong>{task.creator}</strong><small>{task.source} · {taskCreatedAt(task.createdAt)}</small></span>
+            <ChevronRight size={18} />
+          </button>)}
+        </div>}
       </section>
     </div>
   );
@@ -441,6 +532,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     部分成功: task.files.filter((file) => file.status === "partial").length,
     失败: task.files.filter((file) => file.status === "failed").length,
   }), [task.files]);
+  const review = useMemo(() => reviewBreakdown(task), [task]);
 
   const filtered = useMemo(() => task.files.filter((file) => {
     const matchQuery = !query || `${file.name}${file.candidate}`.toLowerCase().includes(query.toLowerCase());
@@ -547,9 +639,9 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
 
   return (
     <div className="screening-task-page">
-      <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回来源页面</button>
+      <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回筛选任务</button>
       <section className="task-overview">
-        <div className="task-title-row"><span className={`task-state-icon ${task.status}`} >{task.status === "running" ? <LoaderCircle size={21} /> : task.status === "complete" ? <CircleCheck size={21} /> : <CircleAlert size={21} />}</span><div><div><h2>{task.position} · 简历筛选任务</h2><span className={`task-status ${fileStatusClass(task.status)}`}>{statusLabel(task.status)}</span></div><p>{taskMetadataLine(task)}</p></div></div>
+        <div className="task-title-row"><span className={`task-state-icon ${task.status}`} >{task.status === "running" ? <LoaderCircle size={21} /> : task.status === "complete" ? <CircleCheck size={21} /> : <CircleAlert size={21} />}</span><div><div><h2>{task.position} · 简历筛选任务</h2><span className={`task-status ${lifecycleStatusClass(task)}`}>{taskLifecycleLabel(task)}</span></div><p>{taskMetadataLine(task)}</p></div></div>
         {task.serverBacked ? <button className="button secondary" type="button" disabled title="服务端导出尚未实现"><Download size={16} />导出结果（暂不可用）</button> : <button className="button secondary" type="button" onClick={() => onNotify("筛选结果导出任务已创建")}><Download size={16} />导出结果</button>}
       </section>
 
@@ -559,24 +651,23 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
       </section>
 
       {pollError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{pollError}</span><button type="button" onClick={() => setPollAttempt((value) => value + 1)}>重试获取</button></div>}
-      {task.status === "running" && <p className="task-background-tip"><Clock3 size={15} />任务正在后台处理，可以安全离开此页面；稍后通过任务 ID 恢复。</p>}
+      {task.status === "running" && <p className="task-background-tip"><Clock3 size={15} />任务正在后台处理，可以安全离开此页面；稍后从“筛选任务”继续查看。</p>}
       {(counts.失败 > 0 || counts.部分成功 > 0) && task.status !== "running" && <div className="partial-warning"><CircleAlert size={18} /><div><strong>部分文件需要处理</strong><span>单文件失败没有影响其他简历。可在对应行查看原因并单独重试。</span></div></div>}
 
       <section className="task-results-panel">
         <header className="results-header"><div><h3>逐文件结果</h3><span>{task.serverBacked ? `本机批次备注：${task.note}` : task.note}</span></div><div className="result-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索候选人或文件名" /></div></header>
         <div className="result-status-tabs">{["全部", "处理中", "成功", "部分成功", "失败"].map((item) => <button key={item} type="button" className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item}<span>{counts[item]}</span></button>)}</div>
 
-        {task.serverBacked && selected.length > 0 && <div className="bulk-action-bar"><strong>已选择 {selected.length} 项</strong><button type="button" disabled={bulkSubmitting} onClick={advanceToReview}><UserRoundCheck size={15} />{bulkSubmitting ? "推进中" : "推进到待复核"}</button><button type="button" disabled={bulkSubmitting} aria-label="清除选择" onClick={() => setSelected([])}><X size={16} /></button></div>}
-        {undoAction.visible && <div className="bulk-action-bar"><strong>本次批量推进可立即撤销</strong><button type="button" disabled={undoAction.disabled} onClick={undoBulkAdvance}><RotateCcw size={15} />{undoAction.label}</button></div>}
+        {task.serverBacked && <div className="screening-auto-review-note"><UserRoundCheck size={17} /><div><strong>{review.pendingHr === 0 && task.reviewTotal > 0 ? `HR初筛已完成 ${task.reviewed}/${task.reviewTotal}` : `HR初筛进度 ${task.reviewed}/${task.reviewTotal}`}</strong><span>待HR审核 {review.pendingHr} 份 · 待提交用人经理 {review.readyToSubmit} 份 · 待用人经理评审 {review.waitingManager} 份 · 评审通过 {review.approved} 份 · 已淘汰 {review.rejected} 份</span></div></div>}
         {bulkError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{bulkError}</span></div>}
 
         <div className="screening-table">
-          <div className="screening-table-head"><label><input type="checkbox" disabled={bulkSubmitting || selectableIds.length === 0} aria-label="选择全部可推进结果" checked={allSelected} onChange={() => setSelected(allSelected ? selected.filter((id) => !selectableIds.includes(id)) : [...new Set([...selected, ...selectableIds])])} /></label><span>候选人 / 文件</span><span>状态</span><span>建议</span><span>规则分</span><span>LLM 分</span><span>命中 / 缺失</span><span>风险与操作</span></div>
+          <div className="screening-table-head"><span>审核状态</span><span>候选人 / 文件</span><span>处理状态</span><span>AI初筛建议</span><span>规则分</span><span>LLM 分</span><span>命中 / 缺失</span><span>风险与操作</span></div>
           {filtered.map((file) => <div className="screening-row" key={file.id}>
-            <label><input type="checkbox" disabled={bulkSubmitting || !isAdvanceSelectable(file, task.serverBacked)} aria-label={`选择 ${file.candidate || file.name}`} checked={selected.includes(file.id)} onChange={() => setSelected((current) => current.includes(file.id) ? current.filter((id) => id !== file.id) : [...current, file.id])} /></label>
+            <span className={`screening-auto-state ${file.humanReviewed ? "reviewed" : "pending"}`}>{file.humanReviewed && <Check size={14} />}{humanReviewLabel(file)}</span>
             <button className="screening-identity" type="button" disabled={!canOpenCandidateReview(file, task.serverBacked)} title={!canOpenCandidateReview(file, task.serverBacked) ? (task.serverBacked && !file.candidateId ? "服务端尚未生成候选人记录" : "处理成功后可查看候选人") : undefined} onClick={() => onOpenCandidate(task.serverBacked ? { serverBacked: true, ...candidateReviewContext(file, task) } : { name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ruleScore: file.ruleScore, llmScore: file.llmScore, recommendation: file.recommendation, matched: file.matched, missing: file.missing, risk: file.risk }, { taskId: task.id, query, filter, selected })}><strong>{candidateDisplayName(file, task.serverBacked)}</strong><small>{file.name}</small></button>
             <span><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{(file.status === "failed" || file.status === "cancelled") && <X size={13} />}{statusLabel(file.status)}</span></span>
-            <span className="recommendation-cell">{file.status === "queued" ? "等待处理" : file.status === "cancelled" ? "未处理" : file.recommendation}</span>
+            <span className="recommendation-cell" title="这是系统筛选时生成的原始建议，不代表当前人工审核状态">{file.status === "queued" ? "等待处理" : file.status === "cancelled" ? "未处理" : file.recommendation}</span>
             <span className="score-source"><strong>{file.status === "queued" ? "—" : (file.ruleScore ?? "—")}</strong><small>规则</small></span>
             <span className="score-source llm"><strong>{file.status === "queued" ? "—" : (file.llmScore ?? "—")}</strong><small>LLM</small></span>
             <span className="evidence-cell"><strong>{file.status === "queued" ? "等待处理" : (file.matched || "—")}</strong><small>缺失：{file.status === "queued" ? "—" : (file.missing || "—")}</small></span>

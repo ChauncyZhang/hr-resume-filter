@@ -173,6 +173,79 @@ def transition_application_record(db, organization_id, application_id, target, *
     return _apply_application_transition(db, application, target, actor_user_id=actor_user_id, trace_id=trace_id, reason_code=reason_code, reason_text=reason_text)
 
 
+APPLICATION_WORKFLOW_ACTIONS = {
+    "review_approved": ("review", "interview_pending"),
+    "review_rejected": ("review", "rejected"),
+    "hiring_approved": ("decision", "passed"),
+    "hiring_rejected": ("decision", "rejected"),
+    "offer_accepted": ("passed", "hired"),
+    "offer_declined": ("passed", "withdrawn"),
+}
+
+
+def apply_application_workflow_action_record(
+    db,
+    organization_id,
+    application_id,
+    action,
+    *,
+    expected_version,
+    actor_user_id,
+    trace_id,
+    reason_text=None,
+):
+    from server.app.recruiting.models import Application
+
+    source, target = APPLICATION_WORKFLOW_ACTIONS[action]
+    candidate_id = db.scalar(
+        select(Application.candidate_id).where(
+            Application.organization_id == organization_id,
+            Application.id == application_id,
+        )
+    )
+    if candidate_id is None:
+        raise ResourceVersionConflict
+    lock_active_candidate(db, organization_id, candidate_id)
+    application = db.scalar(
+        select(Application)
+        .where(
+            Application.organization_id == organization_id,
+            Application.id == application_id,
+        )
+        .with_for_update()
+    )
+    if application is None or application.version != expected_version:
+        raise ResourceVersionConflict
+    if application.stage != source:
+        raise InvalidStateTransition
+    if action in {"review_rejected", "hiring_rejected", "offer_declined"} and not (reason_text and reason_text.strip()):
+        raise InvalidStateTransition
+
+    if target in RecruitingService.TERMINAL:
+        return _apply_application_transition(
+            db,
+            application,
+            target,
+            actor_user_id=actor_user_id,
+            trace_id=trace_id,
+            reason_text=reason_text,
+        )
+
+    target_index = RecruitingService.APPLICATION_PATH.index(target)
+    while application.stage != target:
+        source_index = RecruitingService.APPLICATION_PATH.index(application.stage)
+        if source_index >= target_index:
+            raise InvalidStateTransition
+        application = _apply_application_transition(
+            db,
+            application,
+            RecruitingService.APPLICATION_PATH[source_index + 1],
+            actor_user_id=actor_user_id,
+            trace_id=trace_id,
+        )
+    return application
+
+
 def undo_bulk_advance_record(db, application, *, expected_version, actor_user_id, trace_id, run_id, item_id):
     from server.app.identity.models import AuditLog
     from server.app.recruiting.models import ApplicationStageEvent

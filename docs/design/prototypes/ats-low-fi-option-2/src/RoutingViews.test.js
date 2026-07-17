@@ -22,7 +22,7 @@ test("candidate list filters and detail tab are controlled by route props", asyn
 
 test("settings section and nested tabs are controlled by route props", async () => {
   const contents = await source("SettingsViews.jsx");
-  assert.match(contents, /function OrganizationSettings\(\{[^\n]*activeTab[^\n]*onTabChange/);
+  assert.match(contents, /function OrganizationSettings\(\{[\s\S]{0,300}\bactiveTab\b[\s\S]{0,150}\bonTabChange\b/);
   assert.match(contents, /function TemplateSettings\(\{[^\n]*activeTab[^\n]*onTabChange/);
   assert.match(contents, /export function SettingsWorkspace\(\{[^\n]*section[^\n]*templateTab[^\n]*onRouteChange/);
 });

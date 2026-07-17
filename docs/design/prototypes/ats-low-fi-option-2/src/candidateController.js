@@ -276,14 +276,15 @@ export function createCandidateController({ client = apiClient, idempotencyKey =
     return result?.data;
   }
 
-  async function transition(application, target, reason = "", { signal } = {}) {
-    const apiTarget = UI_TO_API_STAGE[target];
+  async function workflowAction(application, action, reason = "", { signal } = {}) {
     const detail = safeString(reason).trim();
-    if (!application?.id || !Number.isInteger(application.version) || !apiTarget) throw codedError("TRANSITION_INVALID", "transition invalid");
-    if (apiTarget === "rejected" && !detail) throw codedError("REJECTION_REASON_REQUIRED", "rejection reason required");
-    const body = { target: apiTarget };
+    const supported = new Set(["review_approved", "review_rejected", "hiring_approved", "hiring_rejected", "offer_accepted", "offer_declined"]);
+    const reasonRequired = new Set(["review_rejected", "hiring_rejected", "offer_declined"]);
+    if (!application?.id || !Number.isInteger(application.version) || !supported.has(action)) throw codedError("WORKFLOW_ACTION_INVALID", "workflow action invalid");
+    if (reasonRequired.has(action) && !detail) throw codedError("WORKFLOW_REASON_REQUIRED", "workflow reason required");
+    const body = { action };
     if (detail) body.reason_text = detail;
-    const result = await client.request(`/api/v1/applications/${application.id}/transitions`, {
+    const result = await client.request(`/api/v1/applications/${application.id}/workflow-actions`, {
       method: "POST", ifMatch: `"${application.version}"`, idempotencyKey: idempotencyKey(), body, ...signalOption(signal),
     });
     return result?.data;
@@ -302,12 +303,16 @@ export function createCandidateController({ client = apiClient, idempotencyKey =
     return result?.data;
   }
 
+  async function getResumeFile(resumeId, { signal } = {}) {
+    return client.download(`/api/v1/resumes/${resumeId}/file`, signalOption(signal));
+  }
+
   async function downloadResume(resumeId, { signal } = {}) {
     const ticket = await client.request(`/api/v1/resumes/${resumeId}/download-tickets`, { method: "POST", ...signalOption(signal) });
     return client.download("/api/v1/download-tickets/consume", { method: "POST", body: { token: ticket?.data?.token }, ...signalOption(signal) });
   }
 
-  return { listCandidates, listJobs, loadReview, saveConclusion, transition, addNote, previewResume, downloadResume };
+  return { listCandidates, listJobs, loadReview, saveConclusion, workflowAction, addNote, previewResume, getResumeFile, downloadResume };
 }
 
 export const candidateController = createCandidateController();
