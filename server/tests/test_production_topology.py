@@ -229,6 +229,28 @@ def test_merged_production_topology_has_one_https_host_entry(tmp_path: Path) -> 
     assert port["protocol"] == "tcp"
 
 
+def test_only_application_services_receive_provider_egress(tmp_path: Path) -> None:
+    cert_path = tmp_path / "tls.crt"
+    key_path = tmp_path / "tls.key"
+    cert_path.touch()
+    key_path.touch()
+
+    model = _merged_compose(cert_path, key_path)
+
+    assert model["networks"]["private"]["internal"] is True
+    assert model["networks"]["provider-egress"].get("internal", False) is False
+    assert set(model["services"]["api"]["networks"]) == {
+        "private",
+        "provider-egress",
+    }
+    assert set(model["services"]["worker"]["networks"]) == {
+        "private",
+        "provider-egress",
+    }
+    for service_name in ("postgres", "minio", "minio-provision", "clamav"):
+        assert set(model["services"][service_name]["networks"]) == {"private"}
+
+
 def test_default_organization_identity_is_wired_only_to_api(tmp_path: Path) -> None:
     cert_path = tmp_path / "tls.crt"
     key_path = tmp_path / "tls.key"

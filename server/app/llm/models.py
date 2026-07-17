@@ -17,6 +17,13 @@ class LlmProviderConfig(Base):
     last_test_status:Mapped[str|None]=mapped_column(String(20)); last_test_error_code:Mapped[str|None]=mapped_column(String(64)); last_test_latency_ms:Mapped[int|None]=mapped_column(Integer); last_tested_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True))
     __table_args__=(UniqueConstraint("organization_id"),UniqueConstraint("organization_id","id"),ForeignKeyConstraint(["organization_id","created_by"],["users.organization_id","users.id"]),ForeignKeyConstraint(["organization_id","updated_by"],["users.organization_id","users.id"]),CheckConstraint("version>=1",name="ck_llm_provider_configs_version"),CheckConstraint("not enabled or encrypted_api_key is not null",name="ck_llm_provider_configs_enabled_key"),CheckConstraint("last_test_status is null or last_test_status in ('succeeded','failed')",name="ck_llm_provider_configs_test_status"),CheckConstraint("last_test_latency_ms is null or last_test_latency_ms>=0",name="ck_llm_provider_configs_latency"))
 
+class LlmProvider(Base):
+    __tablename__="llm_providers"
+    id:Mapped[uuid.UUID]=mapped_column(Uuid,primary_key=True,default=uuid.uuid4); organization_id:Mapped[uuid.UUID]=mapped_column(Uuid,nullable=False)
+    provider_id:Mapped[str]=mapped_column(String(64)); display_name:Mapped[str]=mapped_column(String(100)); base_url:Mapped[str]=mapped_column(String(2048)); models:Mapped[list]=mapped_column(JSON_DOCUMENT,default=list)
+    created_by:Mapped[uuid.UUID]=mapped_column(Uuid); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)
+    __table_args__=(UniqueConstraint("organization_id","provider_id"),UniqueConstraint("organization_id","id"),ForeignKeyConstraint(["organization_id","created_by"],["users.organization_id","users.id"]),CheckConstraint("length(models)>0",name="ck_llm_providers_models"))
+
 class PromptVersion(Base):
     __tablename__="prompt_versions"
     id:Mapped[uuid.UUID]=mapped_column(Uuid,primary_key=True,default=uuid.uuid4); organization_id:Mapped[uuid.UUID]=mapped_column(Uuid,nullable=False); name:Mapped[str]=mapped_column(String(100)); version_number:Mapped[int]=mapped_column(Integer); content:Mapped[dict]=mapped_column(JSON_DOCUMENT); content_hash:Mapped[str]=mapped_column(String(64)); created_by:Mapped[uuid.UUID]=mapped_column(Uuid); created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=now)

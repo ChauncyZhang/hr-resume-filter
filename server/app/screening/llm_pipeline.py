@@ -94,7 +94,7 @@ class LlmScreeningPipeline:
             return self._finish_failure(job, ids, queue_job_id, attempt_no, input_sha256, "llm_key_decryption_failed", False)
 
         try:
-            evaluation = await self.gateway.evaluate(provider_id, model, api_key, request)
+            evaluation = await self.gateway.evaluate(provider_id, model, api_key, request, organization_id=ids["organization_id"])
         except GatewayError as error:
             code = error.safe_code
             return self._finish_failure(job, ids, queue_job_id, attempt_no, input_sha256, code, code in _TRANSIENT_ERRORS and attempt_no < max_attempts)

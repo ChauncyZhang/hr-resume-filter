@@ -7,6 +7,7 @@ from server.app.llm.screening import SCREENING_SYSTEM_PROMPT,ScreeningEvaluation
 
 FIXED_PROBE_SYSTEM="Return the requested health-check JSON only."
 FIXED_PROBE_USER='Return {"status":"ok"}. This is a configuration test with no recruiting data.'
+FIXED_PROBE_MAX_TOKENS=256
 class GatewayError(RuntimeError):
     def __init__(self,safe_code:str): self.safe_code=safe_code; super().__init__(safe_code)
 
@@ -39,11 +40,11 @@ class OpenAiCompatibleGateway:
     def __init__(self,allowlist:ProviderAllowlist,transport:GatewayTransport|None=None,*,total_timeout:float=15,max_response_bytes:int=64*1024,max_concurrency:int=4):
         if max_concurrency<1: raise ValueError("max_concurrency must be positive")
         self.allowlist=allowlist; self.transport=transport or PinnedHttpsTransport(); self.total_timeout=total_timeout; self.max_response_bytes=max_response_bytes; self._semaphore=asyncio.Semaphore(max_concurrency)
-    async def test_connection(self,provider_id:str,model:str,api_key:str)->int:
+    async def test_connection(self,provider_id:str,model:str,api_key:str,*,organization_id=None)->int:
         started=time.monotonic()
         try:
-            spec=self.allowlist.require(provider_id,model); addresses=self.allowlist.resolve_public(spec); address=addresses[0]
-            payload=json.dumps({"model":model,"messages":[{"role":"system","content":FIXED_PROBE_SYSTEM},{"role":"user","content":FIXED_PROBE_USER}],"temperature":0,"max_tokens":20},separators=(",",":"),ensure_ascii=True).encode()
+            spec=self.allowlist.require(provider_id,model,organization_id=organization_id); addresses=self.allowlist.resolve_public(spec); address=addresses[0]
+            payload=json.dumps({"model":model,"messages":[{"role":"system","content":FIXED_PROBE_SYSTEM},{"role":"user","content":FIXED_PROBE_USER}],"temperature":0,"max_tokens":FIXED_PROBE_MAX_TOKENS},separators=(",",":"),ensure_ascii=True).encode()
             path=(spec.base_path or "")+"/chat/completions"; headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","Accept":"application/json"}
             async def send():
                 async with self._semaphore:
@@ -66,11 +67,11 @@ class OpenAiCompatibleGateway:
         except (ValueError,KeyError,IndexError,TypeError,json.JSONDecodeError): raise GatewayError("provider_response_invalid") from None
         return max(0,int((time.monotonic()-started)*1000))
 
-    async def evaluate(self,provider_id:str,model:str,api_key:str,request:ScreeningRequest)->ScreeningEvaluation:
+    async def evaluate(self,provider_id:str,model:str,api_key:str,request:ScreeningRequest,*,organization_id=None)->ScreeningEvaluation:
         if not isinstance(request,ScreeningRequest): raise GatewayError("screening_request_invalid")
         started=time.monotonic()
         try:
-            spec=self.allowlist.require(provider_id,model); address=self.allowlist.resolve_public(spec)[0]
+            spec=self.allowlist.require(provider_id,model,organization_id=organization_id); address=self.allowlist.resolve_public(spec)[0]
             payload=json.dumps({"model":model,"messages":[{"role":"system","content":SCREENING_SYSTEM_PROMPT},{"role":"user","content":request.provider_content()}],"temperature":0,"max_tokens":800,"response_format":{"type":"json_object"}},separators=(",",":"),ensure_ascii=False).encode()
             path=(spec.base_path or "")+"/chat/completions"; headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","Accept":"application/json"}
             async def send():

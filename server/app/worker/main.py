@@ -99,7 +99,9 @@ def build_screening_handlers(settings,storage_client,bucket):
     pipeline=ScreeningPipeline(sessions,PipelineStorage(storage_client,bucket),scanner,settings)
     llm_key=settings.llm_config_encryption_key.get_secret_value()
     if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
-    allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
+    from server.app.llm.registry import DatabaseProviderCatalog
+    deployed_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
+    allowlist=DatabaseProviderCatalog(sessions,deployed_allowlist,allow_http=settings.environment!="production")
     llm_pipeline=LlmScreeningPipeline(sessions,OpenAiCompatibleGateway(allowlist),ApiKeyCipher(llm_key.encode()))
     report_export=ReportExportJobHandler(sessions,MinioExportStorage(storage_client,bucket))
     return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"reports.export":report_export}

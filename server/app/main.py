@@ -150,7 +150,9 @@ def create_app(
     llm_key=settings.llm_config_encryption_key.get_secret_value()
     if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
     app.state.llm_key_cipher=ApiKeyCipher(llm_key.encode())
-    app.state.llm_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
+    from server.app.llm.registry import DatabaseProviderCatalog
+    deployed_llm_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
+    app.state.llm_allowlist=DatabaseProviderCatalog(app.state.identity_store.sync_session,deployed_llm_allowlist,allow_http=settings.environment!="production")
     app.state.llm_gateway=OpenAiCompatibleGateway(app.state.llm_allowlist)
     from server.app.integrations.feishu.provider import HttpFeishuProvider
     from server.app.integrations.feishu.service import FeishuSecretCipher

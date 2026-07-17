@@ -10,6 +10,10 @@ const ERROR_MESSAGES = {
   persistence_failed: "设置暂时无法保存，请稍后重试。",
   precondition_required: "配置版本已失效，请刷新后重试。",
   provider_or_model_not_allowed: "所选 Provider 或模型不可用，请重新选择。",
+  provider_already_exists: "该 Provider 标识已存在，请换一个标识。",
+  provider_address_forbidden: "Provider 地址不能使用内网、回环或保留地址。",
+  provider_port_forbidden: "Provider 地址只能使用标准 HTTPS 端口。",
+  provider_url_forbidden: "Provider 地址格式不安全，请填写标准 HTTPS Base URL。",
   resource_not_found: "当前账号无权访问此设置。",
   service_unavailable: "服务暂时不可用，请稍后重试。",
   validation_failed: "设置内容无效，请检查后重试。",
@@ -49,7 +53,7 @@ export function getLlmSettingsErrorMessage(error) {
 }
 
 export function getTestDisabledReason(state) {
-  if (state.status === "loading" || state.status === "saving" || state.status === "testing") return "请等待当前操作完成。";
+  if (state.status === "loading" || state.status === "saving" || state.status === "testing" || state.status === "adding_provider") return "请等待当前操作完成。";
   if (state.dirty) return "请先保存当前修改，再测试已保存的配置。";
   if (!state.config?.configured) return "请先保存模型配置。";
   if (state.config.key_configured !== true) return "请先保存 API Key。";
@@ -238,6 +242,27 @@ export function createLlmSettingsController({
     }
   }
 
+  async function createProvider(provider) {
+    if (!state.config || state.dirty || ["loading", "saving", "testing", "adding_provider"].includes(state.status)) return false;
+    const requestId = ++requestSequence;
+    publish({ status: "adding_provider", error: "", message: "" });
+    try {
+      await client.request("/api/v1/settings/llm/providers", {
+        method: "POST",
+        body: provider,
+        idempotencyKey: createIdempotencyKey(),
+      });
+      if (disposed || requestId !== requestSequence) return false;
+      await load();
+      if (!disposed && state.status === "ready") publish({ message: "Provider 已添加，可以继续配置模型和 API Key。" });
+      return !disposed && state.status === "ready";
+    } catch (error) {
+      if (disposed || requestId !== requestSequence) return false;
+      publish({ status: "error", error: getLlmSettingsErrorMessage(error) });
+      return false;
+    }
+  }
+
   return {
     getState: () => state,
     subscribe(listener) {
@@ -252,6 +277,7 @@ export function createLlmSettingsController({
     discardDraft,
     save,
     testConnection,
+    createProvider,
     dispose() {
       disposed = true;
       requestSequence += 1;

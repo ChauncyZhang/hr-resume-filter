@@ -232,17 +232,22 @@ contacts, recompute lookup hashes, reconcile row counts and duplicate constraint
 both new values atomically. Online dual-key rotation is outside Phase 2.
 
 LLM provider API keys use another independent high-entropy 32-byte base64url
-`LLM_CONFIG_ENCRYPTION_KEY`. Deployment operators define the available providers and models
-with `LLM_PROVIDER_ALLOWLIST_JSON`; system administrators can select only these IDs and cannot
-submit a Base URL. For example:
+`LLM_CONFIG_ENCRYPTION_KEY`. Deployment operators may define platform-wide providers and models
+with `LLM_PROVIDER_ALLOWLIST_JSON`. System administrators can also add organization-scoped,
+OpenAI-compatible providers from **Settings > AI settings > Add Provider**. The application stores
+the Provider ID, display name, Base URL, and model allowlist in PostgreSQL; API keys remain
+encrypted separately and are never returned. For example, a platform-wide provider can still be
+defined as:
 
 ```text
 LLM_PROVIDER_ALLOWLIST_JSON={"openai":{"base_url":"https://api.openai.com/v1","models":["gpt-4.1-mini"]}}
 ```
 
-Production provider URLs must use HTTPS on port 443. Connection tests resolve and validate all
-provider addresses, pin one public address for the TLS request, reject redirects, and send only a
-constant health-check prompt. No JD or resume content is sent by the settings connection test.
+Production provider URLs must use HTTPS on port 443. Literal private, loopback, link-local, and
+reserved addresses are rejected when a provider is added. Connection tests and screening calls
+resolve and validate every DNS answer, pin one public address for the TLS request, and reject
+redirects. The settings connection test sends only a constant health-check prompt; it never sends
+JD or resume content.
 
 When LLM evaluation is enabled, an empty job allowlist applies to every job in the tenant; a
 non-empty list limits evaluation to those job IDs. Deterministic rule results remain authoritative
