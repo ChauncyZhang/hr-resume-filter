@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { createApiClient } from "./apiClient.js";
-import { getFeishuLoginErrorMessage, normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
+import { buildFeishuConfigPayload, getFeishuConfigErrorMessage, getFeishuLoginErrorMessage, normalizeFeishuConfig, normalizeFeishuBinding, startFeishuAuthorization } from "./feishuIntegration.js";
 
 function response(body, status = 200, headers = {}) {
   return new Response(body == null ? null : JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
@@ -46,6 +46,35 @@ test("Feishu projections keep only safe configuration and binding fields", () =>
   assert.equal(config.appSecretConfigured, true);
   assert.equal(JSON.stringify(config).includes("must-not-survive"), false);
   assert.deepEqual(normalizeFeishuBinding({ bound: true, union_id: "on_1", open_id: "ou_1", access_token: "no" }), { bound: true, unionId: "on_1", openId: "ou_1" });
+});
+
+test("blank optional Calendar ID falls back to the primary calendar", () => {
+  assert.deepEqual(buildFeishuConfigPayload({
+    app_id: " cli_app ",
+    app_secret: "secret-value",
+    redirect_uri: " https://hr.aurora-tek.cn/api/v1/auth/feishu/callback ",
+    calendar_id: "   ",
+    verification_token: "",
+    encrypt_key: "",
+    enabled: true,
+  }), {
+    app_id: "cli_app",
+    app_secret: "secret-value",
+    redirect_uri: "https://hr.aurora-tek.cn/api/v1/auth/feishu/callback",
+    calendar_id: "primary",
+    enabled: true,
+  });
+});
+
+test("Feishu configuration errors explain validation failures without exposing server details", () => {
+  assert.equal(
+    getFeishuConfigErrorMessage({ status: 422, code: "request_failed", detail: "private validation internals" }),
+    "配置格式不正确，请检查必填项后重试。当前输入已保留。",
+  );
+  assert.equal(
+    getFeishuConfigErrorMessage({ status: 503, code: "unexpected", detail: "database password" }),
+    "飞书配置暂时无法保存，请稍后重试。当前输入已保留。",
+  );
 });
 
 test("Feishu authorization navigates only to an HTTPS Feishu URL", async () => {

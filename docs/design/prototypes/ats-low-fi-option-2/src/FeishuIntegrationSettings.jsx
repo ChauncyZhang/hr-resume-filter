@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, RefreshCw } from "lucide-react";
 import { apiClient } from "./apiClient.js";
-import { normalizeFeishuConfig } from "./feishuIntegration.js";
+import { buildFeishuConfigPayload, getFeishuConfigErrorMessage, normalizeFeishuConfig } from "./feishuIntegration.js";
 
 const emptySecrets = { app_secret: "", verification_token: "", encrypt_key: "" };
 
@@ -27,12 +27,11 @@ export function FeishuIntegrationSettings({ onNotify = () => {}, client = apiCli
   async function save(event) {
     event.preventDefault();
     setStatus("saving"); setMessage("");
-    const body = { app_id: draft.app_id.trim(), redirect_uri: draft.redirect_uri.trim(), calendar_id: draft.calendar_id.trim() || null, enabled: draft.enabled };
-    for (const key of Object.keys(emptySecrets)) if (draft[key]) body[key] = draft[key];
+    const body = buildFeishuConfigPayload(draft);
     try {
       const next = normalizeFeishuConfig(await client.saveFeishuConfig(body));
       setConfig(next); setDraft((current) => ({ ...current, ...emptySecrets })); setStatus("ready"); onNotify("飞书配置已保存");
-    } catch { setMessage("飞书配置保存失败，已保留当前输入。"); setStatus("error"); }
+    } catch (error) { setMessage(getFeishuConfigErrorMessage(error)); setStatus("error"); }
   }
   async function testConnection() {
     setStatus("testing"); setMessage("");

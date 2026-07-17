@@ -2,6 +2,20 @@ function safeString(value) {
   return typeof value === "string" ? value : "";
 }
 
+export function buildFeishuConfigPayload(draft) {
+  const payload = {
+    app_id: safeString(draft?.app_id).trim(),
+    redirect_uri: safeString(draft?.redirect_uri).trim(),
+    calendar_id: safeString(draft?.calendar_id).trim() || "primary",
+    enabled: draft?.enabled === true,
+  };
+  for (const key of ["app_secret", "verification_token", "encrypt_key"]) {
+    const value = safeString(draft?.[key]);
+    if (value) payload[key] = value;
+  }
+  return payload;
+}
+
 export function normalizeFeishuConfig(value = {}) {
   return {
     configured: value.configured === true,
@@ -29,6 +43,16 @@ export function getFeishuLoginErrorMessage(error) {
     return "当前组织尚未启用飞书登录，请联系管理员前往“设置 → 飞书集成”完成配置并启用。";
   }
   return "飞书登录服务暂时不可用，请稍后重试。";
+}
+
+export function getFeishuConfigErrorMessage(error) {
+  if (error?.status === 422 || error?.code === "feishu_secret_required") {
+    return "配置格式不正确，请检查必填项后重试。当前输入已保留。";
+  }
+  if (error?.status === 403 || error?.code === "forbidden") {
+    return "当前账号没有管理飞书集成的权限。当前输入已保留。";
+  }
+  return "飞书配置暂时无法保存，请稍后重试。当前输入已保留。";
 }
 
 export async function startFeishuAuthorization(authorize, navigate = (url) => window.location.assign(url)) {
