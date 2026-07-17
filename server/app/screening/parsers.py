@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import BinaryIO
 
 from server.app.queue.service import normalize_safe_code
+from server.app.resume_text import sanitize_resume_text
 
 @dataclass(frozen=True)
 class ParserLimits:
@@ -76,10 +77,10 @@ def _pdf(data: bytes, limits: ParserLimits) -> ParsedDocument:
         reader = PdfReader(io.BytesIO(data), strict=True)
         if reader.is_encrypted: raise ParserError("pdf_encrypted")
         if len(reader.pages) > limits.pdf_max_pages: raise ParserError("pdf_page_limit")
-        text = _bounded("\n".join(page.extract_text() or "" for page in reader.pages), limits)
+        text = _bounded(sanitize_resume_text("\n".join(page.extract_text() or "" for page in reader.pages)), limits)
     except ParserError: raise
     except Exception: raise ParserError("pdf_malformed") from None
-    return ParsedDocument(text, "pdf-v1", "good" if text.strip() else "empty")
+    return ParsedDocument(text, "pdf-v2", "good" if text.strip() else "empty")
 
 def _docx(data: bytes, limits: ParserLimits) -> ParsedDocument:
     try:

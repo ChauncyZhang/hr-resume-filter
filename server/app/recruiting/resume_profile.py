@@ -1,6 +1,8 @@
 import re
 from collections.abc import Iterable
 
+from server.app.resume_text import sanitize_resume_text
+
 
 _SECTION_ALIASES = {
     "summary": ("个人简介", "个人总结", "自我评价", "职业概述", "profile", "summary", "aboutme"),
@@ -94,6 +96,7 @@ def _skills_from_sections(lines: list[str], full_text: str) -> list[str]:
 
 def extract_resume_profile(text: str) -> dict[str, object]:
     """Extract display-safe profile fields from parsed resume text without returning raw text."""
+    text = sanitize_resume_text(text)
     sections: dict[str, list[str]] = {name: [] for name in _SECTION_ALIASES}
     current: str | None = None
     cleaned_lines: list[str] = []

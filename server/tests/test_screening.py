@@ -82,7 +82,31 @@ def test_parser_happy_paths_use_stable_versions_and_quality() -> None:
     pdf = parse_document(io.BytesIO(pdf_bytes()), extension=".pdf", mime_type="application/pdf")
     assert txt.text == "中文 Python 5年" and txt.parser_version == "txt-v1" and txt.quality == "good"
     assert "Python 后端" in docx.text and docx.parser_version == "docx-v1"
-    assert pdf.parser_version == "pdf-v1" and pdf.quality == "empty"
+    assert pdf.parser_version == "pdf-v2" and pdf.quality == "empty"
+
+
+def test_pdf_parser_removes_repeated_standalone_obfuscation_markers(monkeypatch) -> None:
+    marker = "bf63fd04e3f2ddac1HJ-3Ni8EFBSwYm9V_6cWOGnn_HZMhll"
+    single_identifier = "0123456789abcdef-release_candidate"
+
+    class Page:
+        def extract_text(self) -> str:
+            return f"个人简介\n财务系统建设\n{marker}\n{marker}\n项目编号\n{single_identifier}"
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page()]
+
+        def __init__(self, _stream, strict: bool) -> None:
+            assert strict is True
+
+    monkeypatch.setattr("pypdf.PdfReader", Reader)
+
+    parsed = parse_document(io.BytesIO(b"%PDF-test"), extension=".pdf", mime_type="application/pdf")
+
+    assert parsed.parser_version == "pdf-v2"
+    assert marker not in parsed.text
+    assert single_identifier in parsed.text
 
 
 @pytest.mark.parametrize(("extension", "mime", "data", "code"), [

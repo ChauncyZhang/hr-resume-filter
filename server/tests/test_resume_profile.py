@@ -54,3 +54,28 @@ def test_extract_resume_profile_uses_experience_as_summary_and_repairs_pdf_skill
     assert profile["summary"] == "平台产品经理，小米科技 | 2024.08 - 至今；负责 AI Agent 产品设计与交付"
     assert profile["skills"] == ["用户调研", "Python", "JavaScript"]
     assert profile["education"] == "景观建筑硕士；密歇根安娜堡大学；2021.09 - 2024.05"
+
+
+def test_extract_resume_profile_ignores_repeated_pdf_obfuscation_markers() -> None:
+    marker = "bf63fd04e3f2ddac1HJ-3Ni8EFBSwYm9V_6cWOGnn_HZMhll"
+    profile = extract_resume_profile(
+        f"""
+        个人简介
+        负责企业财务系统搭建和流程优化。
+        {marker}
+        {marker}
+        工作经历
+        2022.01-至今 某科技公司 财务经理
+        {marker}
+        {marker}
+        教育经历
+        2014.09-2018.06 某大学 会计学 本科
+        {marker}
+        {marker}
+        """
+    )
+
+    assert profile["summary"] == "负责企业财务系统搭建和流程优化。"
+    assert profile["experience"] == "2022.01-至今 某科技公司 财务经理"
+    assert profile["education"] == "2014.09-2018.06 某大学 会计学 本科"
+    assert marker not in str(profile)
