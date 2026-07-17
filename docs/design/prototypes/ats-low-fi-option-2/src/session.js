@@ -22,6 +22,7 @@ export function mapServerRoles(roles = []) {
 export function getSessionMessage(error) {
   if (error === "expired") return "登录状态已过期，请重新登录。";
   if (error === "authentication") return "登录信息不正确或账号暂不可用，请核对后重试。";
+  if (error === "locked") return "登录失败次数过多，账号已临时锁定。";
   if (error === "unavailable") return "服务暂时无法连接，请稍后重试。";
   if (error === "logout_failed") return "退出失败，请稍后重试。";
   return "";
@@ -32,8 +33,12 @@ export function getSessionIdentity(user, role) {
   return { name: displayName || "当前用户", title: role || "未配置角色" };
 }
 
-function anonymousState(error = null, submitting = false) {
-  return { status: "anonymous", user: null, role: null, submitting, loggingOut: false, error };
+function anonymousState(error = null, submitting = false, retryAfterSeconds = null) {
+  const state = { status: "anonymous", user: null, role: null, submitting, loggingOut: false, error };
+  if (error === "locked" && Number.isInteger(retryAfterSeconds) && retryAfterSeconds > 0) {
+    state.retryAfterSeconds = retryAfterSeconds;
+  }
+  return state;
 }
 
 function authenticatedState(user, { loggingOut = false, error = null } = {}) {
@@ -43,6 +48,7 @@ function authenticatedState(user, { loggingOut = false, error = null } = {}) {
 
 function errorKind(error) {
   if (error instanceof ApiError && (error.kind === "unavailable" || error.status >= 500)) return "unavailable";
+  if (error instanceof ApiError && error.code === "account_temporarily_locked") return "locked";
   return "authentication";
 }
 
@@ -110,7 +116,8 @@ export function createSessionController(client) {
         setState(authenticatedState(user));
         return user;
       } catch (error) {
-        setState(anonymousState(errorKind(error)));
+        const kind = errorKind(error);
+        setState(anonymousState(kind, false, kind === "locked" ? error.retryAfterSeconds : null));
         throw error;
       }
     },

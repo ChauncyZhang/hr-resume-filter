@@ -936,6 +936,9 @@
 .login-page .login-input input { width: 100%; min-width: 0; height: 44px; padding: 0; border: 0; outline: 0; background: transparent; font-size: 15px; }
 .login-page .login-input:has(input:disabled) { background: #f1f1f3; }
 .login-page .login-message { min-height: 21px; color: var(--red); font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.login-page .login-message > span { min-width: 0; }
+.login-page .login-lockout-message { padding: 11px 12px; border: 1px solid #f0bdc2; border-radius: 7px; background: var(--red-soft); display: flex; align-items: flex-start; gap: 8px; }
+.login-page .login-lockout-message svg { flex: 0 0 auto; margin-top: 1px; }
 .login-page .login-submit { width: 100%; min-height: 44px; justify-content: center; }
 .login-page .login-form small { color: var(--muted); font-size: 12px; }
 .login-page .login-form .field-error { color: var(--red); }

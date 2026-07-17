@@ -121,6 +121,52 @@ test("dedicated deployment hides the organization field and submits its configur
   }
 });
 
+test("locked login shows the server countdown and switching accounts restores submit", { timeout: 60_000 }, async () => {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.route("**/api/v1/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname.replace(/\/$/, "");
+    if (pathname === "/api/v1/me") {
+      await route.fulfill({ status: 401, contentType: "application/problem+json", body: JSON.stringify({ status: 401 }) });
+      return;
+    }
+    if (pathname === "/api/v1/auth/config") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { default_organization: { slug: "acme", name: "Acme" } } }) });
+      return;
+    }
+    if (pathname === "/api/v1/auth/login") {
+      await route.fulfill({
+        status: 429,
+        contentType: "application/problem+json",
+        headers: { "Retry-After": "5" },
+        body: JSON.stringify({ status: 429, code: "account_temporarily_locked", detail: "Too many failed login attempts.", retry_after_seconds: 5 }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ status: 503 }) });
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto(baseUrl, { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "登录工作台", exact: true }).waitFor();
+    await page.locator('input[name="email"]').fill("locked@example.test");
+    await page.locator('input[name="password"]').fill("incorrect");
+    await page.getByRole("button", { name: "登录", exact: true }).click();
+
+    const notice = page.locator(".login-lockout-message");
+    await notice.waitFor();
+    assert.match(await notice.innerText(), /账号已临时锁定/);
+    assert.match(await notice.innerText(), /请于 \d{2}:\d{2}:\d{2} 后重试/);
+    assert.match(await notice.innerText(), /剩余 [1-5] 秒/);
+    assert.equal(await page.getByRole("button", { name: /请等待/ }).isDisabled(), true);
+
+    await page.locator('input[name="email"]').fill("other@example.test");
+    assert.equal(await notice.count(), 0);
+    assert.equal(await page.getByRole("button", { name: "登录", exact: true }).isEnabled(), true);
+  } finally {
+    await context.close();
+  }
+});
+
 test("invite member opens a usable server-backed invitation drawer", { timeout: 60_000 }, async () => {
   const { context, page } = await openAuthenticatedPage({ width: 1280, height: 800 });
   try {

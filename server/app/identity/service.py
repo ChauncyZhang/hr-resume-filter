@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -32,6 +33,12 @@ class TokenSource:
 
 class AuthenticationFailed(Exception):
     pass
+
+
+class AccountTemporarilyLocked(AuthenticationFailed):
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__("account temporarily locked")
+        self.retry_after_seconds = max(1, retry_after_seconds)
 
 
 class InvalidSession(Exception):
@@ -91,14 +98,24 @@ class IdentityService:
             password_valid = self.passwords.verify(
                 user.password_hash if user else self._dummy_password_hash, password
             )
+            locked_until = self._aware(user.locked_until) if user and user.locked_until else None
+            account_locked = bool(
+                user
+                and user.status == UserStatus.ACTIVE
+                and locked_until
+                and locked_until > now
+            )
             valid = bool(
                 user
                 and user.status == UserStatus.ACTIVE
-                and (user.locked_until is None or self._aware(user.locked_until) <= now)
+                and not account_locked
                 and password_valid
             )
             if not valid:
-                if user and user.status == UserStatus.ACTIVE and (user.locked_until is None or self._aware(user.locked_until) <= now):
+                retry_after_seconds = None
+                if account_locked:
+                    retry_after_seconds = math.ceil((locked_until - now).total_seconds())
+                elif user and user.status == UserStatus.ACTIVE:
                     window = self._aware(user.failed_login_window_started_at) if user.failed_login_window_started_at else None
                     if window is None or now - window > timedelta(minutes=5):
                         user.failed_login_count = 1
@@ -107,8 +124,11 @@ class IdentityService:
                         user.failed_login_count += 1
                     if user.failed_login_count >= 5:
                         user.locked_until = now + timedelta(minutes=15)
+                        retry_after_seconds = 15 * 60
                 self._audit(db, "authentication.login", "denied", organization_id=user.organization_id if user else None, user_id=user.id if user else None, trace_id=trace_id, network=network)
                 db.commit()
+                if retry_after_seconds is not None:
+                    raise AccountTemporarilyLocked(retry_after_seconds)
                 raise AuthenticationFailed
             user.failed_login_count = 0
             user.failed_login_window_started_at = None

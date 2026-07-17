@@ -73,6 +73,17 @@ test("登录失败区分通用认证失败与服务不可用", async () => {
   assert.equal(unavailable.getSnapshot().error, "unavailable");
 });
 
+test("登录锁定保留服务端剩余秒数", async () => {
+  const controller = createSessionController({
+    login: async () => { throw new ApiError({ status: 429, code: "account_temporarily_locked", retryAfterSeconds: 601 }); },
+  });
+
+  await assert.rejects(controller.login({}));
+
+  assert.equal(controller.getSnapshot().error, "locked");
+  assert.equal(controller.getSnapshot().retryAfterSeconds, 601);
+});
+
 test("退出请求失败时保留认证身份和 CSRF 并显示安全错误", async () => {
   let cleared = false;
   const controller = createSessionController({
@@ -140,6 +151,7 @@ test("服务端角色映射到独立的产品角色且按高权限优先", () =>
 test("登录界面只显示安全的通用状态文案", () => {
   assert.equal(getSessionMessage("authentication"), "登录信息不正确或账号暂不可用，请核对后重试。");
   assert.equal(getSessionMessage("unavailable"), "服务暂时无法连接，请稍后重试。");
+  assert.equal(getSessionMessage("locked"), "登录失败次数过多，账号已临时锁定。");
   assert.equal(getSessionMessage("internal trace detail"), "");
 });
 

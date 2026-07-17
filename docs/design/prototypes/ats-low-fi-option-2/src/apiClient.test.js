@@ -129,6 +129,27 @@ test("application/problem+json 被限制为安全的类型化错误字段", asyn
   });
 });
 
+test("登录锁定响应只保留安全的剩余等待秒数", async () => {
+  const client = createApiClient({ fetchImpl: async () => new Response(JSON.stringify({
+    type: "about:blank",
+    title: "Request denied",
+    status: 429,
+    detail: "Too many failed login attempts.",
+    code: "account_temporarily_locked",
+    retry_after_seconds: 601,
+    trace_id: "internal-trace",
+  }), { status: 429, headers: { "Content-Type": "application/problem+json", "Retry-After": "601" } }) });
+
+  await assert.rejects(client.login({}), (error) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 429);
+    assert.equal(error.code, "account_temporarily_locked");
+    assert.equal(error.retryAfterSeconds, 601);
+    assert.equal("trace_id" in error, false);
+    return true;
+  });
+});
+
 test("网络失败被标记为服务不可用错误且不透传底层消息", async () => {
   const client = createApiClient({ fetchImpl: async () => { throw new Error("connect ECONNREFUSED 127.0.0.1"); } });
 

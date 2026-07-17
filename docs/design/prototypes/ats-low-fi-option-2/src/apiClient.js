@@ -4,8 +4,12 @@ function safeString(value, fallback = "") {
   return typeof value === "string" ? value : fallback;
 }
 
+function safeRetryAfterSeconds(value) {
+  return Number.isInteger(value) && value > 0 && value <= 86_400 ? value : null;
+}
+
 export class ApiError extends Error {
-  constructor({ status = 0, code = "request_failed", title = "请求失败", detail = "", kind = "request" } = {}) {
+  constructor({ status = 0, code = "request_failed", title = "请求失败", detail = "", kind = "request", retryAfterSeconds = null } = {}) {
     super(kind === "unavailable" ? "服务暂时不可用" : "请求未能完成");
     this.name = "ApiError";
     this.status = Number.isInteger(status) ? status : 0;
@@ -13,6 +17,7 @@ export class ApiError extends Error {
     this.title = safeString(title, "请求失败");
     this.detail = safeString(detail);
     this.kind = kind;
+    this.retryAfterSeconds = safeRetryAfterSeconds(retryAfterSeconds);
   }
 }
 
@@ -98,6 +103,7 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
         title: isProblem ? safeString(payload?.title, "请求失败") : "请求失败",
         detail: isProblem ? safeString(payload?.detail) : "",
         kind: response.status >= 500 ? "unavailable" : "request",
+        retryAfterSeconds: isProblem ? payload?.retry_after_seconds : null,
       });
       if (notifySession) notifyUnauthorized(requestEpoch);
       throw error;

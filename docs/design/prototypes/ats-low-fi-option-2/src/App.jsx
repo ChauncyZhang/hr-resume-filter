@@ -187,7 +187,7 @@ export function App({ controller = sessionController, screeningController = defa
   if (session.status === "bootstrapping") return <SessionLoadingView />;
   if (session.status === "anonymous") {
     if (inviteToken) return <InviteAcceptView token={inviteToken} client={accountClient} onAccepted={(email) => { window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); setAcceptedEmail(email); setInviteToken(""); }} />;
-    return <LoginView error={session.error} submitting={session.submitting} initialEmail={acceptedEmail} onLogin={(credentials) => controller.login(credentials)} />;
+    return <LoginView error={session.error} retryAfterSeconds={session.retryAfterSeconds} submitting={session.submitting} initialEmail={acceptedEmail} onLogin={(credentials) => controller.login(credentials)} />;
   }
   if (session.status !== "authenticated") {
     const identity = getSessionIdentity(session.user, null);

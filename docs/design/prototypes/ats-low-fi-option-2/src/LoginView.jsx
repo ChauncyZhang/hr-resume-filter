@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Building2, LoaderCircle, LockKeyhole, LogIn, LogOut, Mail, MessageCircle, ShieldX } from "lucide-react";
+import { Building2, Clock3, LoaderCircle, LockKeyhole, LogIn, LogOut, Mail, MessageCircle, ShieldX } from "lucide-react";
 import { apiClient } from "./apiClient.js";
 import { getSessionMessage } from "./session.js";
 import { getFeishuCallbackErrorCode, getFeishuLoginErrorMessage, startFeishuAuthorization } from "./feishuIntegration.js";
@@ -33,11 +33,21 @@ export function AccessDeniedView({ displayName, error, loggingOut, onLogout }) {
   );
 }
 
-export function LoginView({ error, submitting, onLogin, initialEmail = "", loadAuthContext = apiClient.getAuthContext, client = apiClient }) {
+export function formatLockoutDuration(totalSeconds) {
+  const seconds = Math.max(0, Math.ceil(Number(totalSeconds) || 0));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes > 0 ? `${minutes} 分 ${remainder} 秒` : `${remainder} 秒`;
+}
+
+export function LoginView({ error, retryAfterSeconds, submitting, onLogin, initialEmail = "", loadAuthContext = apiClient.getAuthContext, client = apiClient }) {
   const [form, setForm] = useState({ organization_slug: "", email: initialEmail, password: "" });
   const [authContextStatus, setAuthContextStatus] = useState("loading");
   const [feishuStatus, setFeishuStatus] = useState("idle");
   const [feishuError, setFeishuError] = useState("");
+  const [lockoutUntil, setLockoutUntil] = useState(null);
+  const [lockoutRemaining, setLockoutRemaining] = useState(0);
+  const [lockoutDismissed, setLockoutDismissed] = useState(false);
   const message = getSessionMessage(error);
   const callbackErrorCode = getFeishuCallbackErrorCode();
   const callbackError = callbackErrorCode ? getFeishuLoginErrorMessage({ code: callbackErrorCode }) : "";
@@ -61,7 +71,35 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
     return () => { active = false; };
   }, [loadAuthContext]);
 
+  useEffect(() => {
+    if (error !== "locked" || !Number.isInteger(retryAfterSeconds) || retryAfterSeconds <= 0) {
+      if (error !== "locked") {
+        setLockoutUntil(null);
+        setLockoutRemaining(0);
+        setLockoutDismissed(false);
+      }
+      return;
+    }
+    const until = Date.now() + retryAfterSeconds * 1000;
+    setLockoutUntil(until);
+    setLockoutRemaining(retryAfterSeconds);
+    setLockoutDismissed(false);
+  }, [error, retryAfterSeconds]);
+
+  useEffect(() => {
+    if (!lockoutUntil || lockoutDismissed) return undefined;
+    const updateRemaining = () => setLockoutRemaining(Math.max(0, Math.ceil((lockoutUntil - Date.now()) / 1000)));
+    updateRemaining();
+    const timer = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(timer);
+  }, [lockoutUntil, lockoutDismissed]);
+
   function update(field, value) {
+    if (field === "email" && value !== form.email) {
+      setLockoutDismissed(true);
+      setLockoutUntil(null);
+      setLockoutRemaining(0);
+    }
     setForm((current) => ({ ...current, [field]: value }));
   }
 
@@ -80,6 +118,17 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
     try { await startFeishuAuthorization(() => client.authorizeFeishuLogin(form.organization_slug)); }
     catch (error) { setFeishuError(getFeishuLoginErrorMessage(error)); setFeishuStatus("error"); }
   }
+
+  const lockoutActive = !lockoutDismissed && lockoutUntil !== null && lockoutRemaining > 0;
+  const lockoutExpired = !lockoutDismissed && lockoutUntil !== null && lockoutRemaining === 0;
+  const lockoutTime = lockoutUntil ? new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(new Date(lockoutUntil)) : "";
+  const loginMessage = lockoutActive
+    ? `${message} 请于 ${lockoutTime} 后重试，剩余 ${formatLockoutDuration(lockoutRemaining)}。`
+    : lockoutExpired
+      ? "锁定时间已结束，请重新登录。"
+      : lockoutDismissed
+        ? ""
+        : message;
 
   return (
     <main className="login-page">
@@ -142,12 +191,13 @@ export function LoginView({ error, submitting, onLogin, initialEmail = "", loadA
             </div>
           </label>
 
-          <div className="login-message" role={message || callbackError ? "alert" : "status"} aria-live="polite">
-            {message || callbackError || (authContextStatus === "loading" ? "正在读取部署配置…" : "")}
+          <div className={`login-message${lockoutActive ? " login-lockout-message" : ""}`} role={loginMessage || callbackError ? "alert" : "status"} aria-live="polite">
+            {lockoutActive && <Clock3 size={17} aria-hidden="true" />}
+            <span>{loginMessage || callbackError || (authContextStatus === "loading" ? "正在读取部署配置…" : "")}</span>
           </div>
-          <button className="button primary login-submit" type="submit" disabled={submitting || authContextStatus === "loading"}>
+          <button className="button primary login-submit" type="submit" disabled={submitting || authContextStatus === "loading" || lockoutActive}>
             {submitting ? <LoaderCircle className="spin" size={17} aria-hidden="true" /> : <LogIn size={17} aria-hidden="true" />}
-            {submitting ? "正在登录…" : "登录"}
+            {submitting ? "正在登录…" : lockoutActive ? `请等待 ${formatLockoutDuration(lockoutRemaining)}` : "登录"}
           </button>
           <button className="button secondary login-submit" type="button" disabled={submitting || feishuStatus === "loading" || authContextStatus === "loading" || !form.organization_slug} onClick={loginWithFeishu}><MessageCircle size={17} aria-hidden="true" />{feishuStatus === "loading" ? "正在跳转…" : "飞书登录"}</button>
           {feishuStatus === "error" && <div className="login-message" role="alert">{feishuError}</div>}

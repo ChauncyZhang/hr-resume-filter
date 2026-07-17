@@ -164,17 +164,12 @@ def test_login_persists_only_hashes_and_sets_host_cookie(identity_app) -> None:
 
 @pytest.mark.parametrize(
     "case",
-    ["unknown_organization", "unknown_user", "wrong_password", "disabled", "locked"],
+    ["unknown_organization", "unknown_user", "wrong_password", "disabled"],
 )
 def test_login_failures_are_generic(identity_app, case) -> None:
     app, client, clock = identity_app
     if case not in {"unknown_organization", "unknown_user"}:
         user_id = seed_user(app, status=UserStatus.DISABLED if case == "disabled" else UserStatus.ACTIVE)
-        if case == "locked":
-            with app.state.identity_store.sync_session() as session:
-                user = session.get(User, user_id)
-                user.locked_until = clock.current_time() + timedelta(minutes=10)
-                session.commit()
     overrides = {
         "unknown_organization": {"organization_slug": "missing"},
         "unknown_user": {"email": "missing@example.test"},
@@ -195,10 +190,21 @@ def test_five_failures_lock_for_fifteen_minutes_and_success_resets(identity_app)
     with app.state.identity_store.sync_session() as session:
         user = session.get(User, user_id)
         assert user.failed_login_count == 0 and user.locked_until is None
-    for _ in range(5):
+    for _ in range(4):
         assert login(client, password="wrong").status_code == 401
-    assert login(client).status_code == 401
-    clock.advance(minutes=15, seconds=1)
+    locked = login(client, password="wrong")
+    assert locked.status_code == 429
+    assert locked.json()["code"] == "account_temporarily_locked"
+    assert locked.json()["retry_after_seconds"] == 900
+    assert locked.headers["Retry-After"] == "900"
+
+    clock.advance(minutes=4, seconds=59)
+    still_locked = login(client)
+    assert still_locked.status_code == 429
+    assert still_locked.json()["retry_after_seconds"] == 601
+    assert still_locked.headers["Retry-After"] == "601"
+
+    clock.advance(minutes=10, seconds=2)
     assert login(client).status_code == 200
 
 

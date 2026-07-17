@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 from server.app.identity.service import (
+    AccountTemporarilyLocked,
     AuthenticationFailed,
     CsrfFailed,
     CurrentPasswordInvalid,
@@ -41,11 +42,23 @@ class PasswordChangeRequest(BaseModel):
     new_password: str = Field(min_length=12, max_length=128)
 
 
-def problem(request: Request, status: int, code: str, detail: str) -> JSONResponse:
+def problem(
+    request: Request,
+    status: int,
+    code: str,
+    detail: str,
+    *,
+    extra: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    content = {"type": "about:blank", "title": "Request denied", "status": status, "detail": detail, "code": code, "trace_id": request.state.trace_id, "errors": []}
+    if extra:
+        content.update(extra)
     return JSONResponse(
         status_code=status,
         media_type="application/problem+json",
-        content={"type": "about:blank", "title": "Request denied", "status": status, "detail": detail, "code": code, "trace_id": request.state.trace_id, "errors": []},
+        content=content,
+        headers=headers,
     )
 
 
@@ -80,6 +93,16 @@ def login(payload: LoginRequest, request: Request):
     service: IdentityService = request.app.state.identity_service
     try:
         session_token, csrf = service.login(payload.organization_slug, payload.email, payload.password, trace_id=request.state.trace_id, network=request.headers.get("x-real-ip") or request.client.host if request.client else None)
+    except AccountTemporarilyLocked as error:
+        retry_after = error.retry_after_seconds
+        return problem(
+            request,
+            429,
+            "account_temporarily_locked",
+            "Too many failed login attempts.",
+            extra={"retry_after_seconds": retry_after},
+            headers={"Retry-After": str(retry_after)},
+        )
     except AuthenticationFailed:
         return problem(request, 401, "authentication_failed", "Invalid credentials or account unavailable.")
     response = JSONResponse({"data": {"authenticated": True}})
