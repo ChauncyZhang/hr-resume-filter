@@ -180,7 +180,7 @@ def test_pipeline_cancellation_closes_stream_and_kills_parser(tmp_path):
 @pytest.mark.parametrize(("filename","mime","content","version"),[
     ("resume.txt","text/plain",b"Python","txt-v1"),
     ("resume.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document",__import__("server.tests.test_screening",fromlist=["docx_bytes"]).docx_bytes("Python"),"docx-v1"),
-    ("resume.pdf","application/pdf",__import__("server.tests.test_screening",fromlist=["pdf_bytes"]).pdf_bytes(),"pdf-v2"),
+    ("resume.pdf","application/pdf",__import__("server.tests.test_screening",fromlist=["pdf_bytes"]).pdf_bytes(),"pdf-v3"),
 ])
 def test_pipeline_parses_each_approved_document_type(tmp_path,filename,mime,content,version):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path,content,filename,mime); asyncio.run(pipeline.parse_item(job))

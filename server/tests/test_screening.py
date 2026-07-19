@@ -82,7 +82,7 @@ def test_parser_happy_paths_use_stable_versions_and_quality() -> None:
     pdf = parse_document(io.BytesIO(pdf_bytes()), extension=".pdf", mime_type="application/pdf")
     assert txt.text == "中文 Python 5年" and txt.parser_version == "txt-v1" and txt.quality == "good"
     assert "Python 后端" in docx.text and docx.parser_version == "docx-v1"
-    assert pdf.parser_version == "pdf-v2" and pdf.quality == "empty"
+    assert pdf.parser_version == "pdf-v3" and pdf.quality == "empty"
 
 
 def test_pdf_parser_removes_repeated_standalone_obfuscation_markers(monkeypatch) -> None:
@@ -90,7 +90,10 @@ def test_pdf_parser_removes_repeated_standalone_obfuscation_markers(monkeypatch)
     single_identifier = "0123456789abcdef-release_candidate"
 
     class Page:
-        def extract_text(self) -> str:
+        def extract_text(self, visitor_text=None) -> str:
+            if visitor_text is not None:
+                for index, text in enumerate(("个人简介", "财务系统建设", marker, marker, "项目编号", single_identifier)):
+                    visitor_text(text, [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 40, 40 + index * 20], None, 13)
             return f"个人简介\n财务系统建设\n{marker}\n{marker}\n项目编号\n{single_identifier}"
 
     class Reader:
@@ -104,9 +107,44 @@ def test_pdf_parser_removes_repeated_standalone_obfuscation_markers(monkeypatch)
 
     parsed = parse_document(io.BytesIO(b"%PDF-test"), extension=".pdf", mime_type="application/pdf")
 
-    assert parsed.parser_version == "pdf-v2"
+    assert parsed.parser_version == "pdf-v3"
     assert marker not in parsed.text
     assert single_identifier in parsed.text
+
+
+def test_pdf_parser_reconstructs_two_column_reading_order(monkeypatch) -> None:
+    class Page:
+        def extract_text(self, visitor_text=None) -> str:
+            if visitor_text is not None:
+                fragments = (
+                    ("个人信息", 40, 220, 18),
+                    ("求职意向：财务经理", 40, 250, 13),
+                    ("期望城市：深圳", 40, 270, 13),
+                    ("个人优势", 258, 57, 18),
+                    ("熟练全盘账务处理。", 258, 87, 13),
+                    ("工作经历", 258, 206, 18),
+                    ("某科技公司 财务经理 2018.08-至今", 258, 237, 13),
+                    ("教育经历", 258, 500, 18),
+                    ("四川大学 大专 会计 1996-1998", 258, 531, 13),
+                )
+                for text, x, y, size in fragments:
+                    visitor_text(text, [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, x, y], None, size)
+            return "个人信息\n求职意向：财务经理\n期望城市：深圳\n熟练全盘账务处理。\n个人优势\n某科技公司 财务经理 2018.08-至今\n工作经历\n四川大学 大专 会计 1996-1998\n教育经历"
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page()]
+
+        def __init__(self, _stream, strict: bool) -> None:
+            assert strict is True
+
+    monkeypatch.setattr("pypdf.PdfReader", Reader)
+
+    parsed = parse_document(io.BytesIO(b"%PDF-test"), extension=".pdf", mime_type="application/pdf")
+
+    assert parsed.text.index("个人优势") < parsed.text.index("熟练全盘账务处理。")
+    assert parsed.text.index("工作经历") < parsed.text.index("某科技公司 财务经理 2018.08-至今")
+    assert parsed.text.index("教育经历") < parsed.text.index("四川大学 大专 会计 1996-1998")
 
 
 @pytest.mark.parametrize(("extension", "mime", "data", "code"), [
