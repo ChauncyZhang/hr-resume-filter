@@ -174,6 +174,19 @@ def test_gateway_evaluation_has_a_longer_budget_than_the_connection_probe():
     assert evaluation.result.score == 88
 
 
+def test_gateway_disables_default_thinking_for_official_glm_models():
+    transport = Transport(provider_body(valid_result()))
+    policy = ProviderAllowlist(
+        {"zai": {"base_url": "https://open.bigmodel.cn/api/paas/v4", "models": ["glm-5.2"]}},
+        resolver=resolver,
+    )
+
+    asyncio.run(OpenAiCompatibleGateway(policy, transport).evaluate("zai", "glm-5.2", "sk-secret", request()))
+
+    payload = json.loads(transport.calls[0][4])
+    assert payload["thinking"] == {"type": "disabled"}
+
+
 def test_gateway_evaluate_redacts_identifiers_echoed_by_provider():
     echoed=valid_result(summary="联系 jane@example.test 或 13800138000",questions=["地址: 上海市浦东新区"])
     evaluation=asyncio.run(gateway(Transport(provider_body(echoed))).evaluate("provider","model","secret",request()))

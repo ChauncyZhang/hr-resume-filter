@@ -73,7 +73,9 @@ class OpenAiCompatibleGateway:
         started=time.monotonic()
         try:
             spec=self.allowlist.require(provider_id,model,organization_id=organization_id); address=self.allowlist.resolve_public(spec)[0]
-            payload=json.dumps({"model":model,"messages":[{"role":"system","content":SCREENING_SYSTEM_PROMPT},{"role":"user","content":request.provider_content()}],"temperature":0,"max_tokens":800,"response_format":{"type":"json_object"}},separators=(",",":"),ensure_ascii=False).encode()
+            payload_document={"model":model,"messages":[{"role":"system","content":SCREENING_SYSTEM_PROMPT},{"role":"user","content":request.provider_content()}],"temperature":0,"max_tokens":800,"response_format":{"type":"json_object"}}
+            if spec.host=="open.bigmodel.cn" and model.casefold().startswith("glm-"): payload_document["thinking"]={"type":"disabled"}
+            payload=json.dumps(payload_document,separators=(",",":"),ensure_ascii=False).encode()
             path=(spec.base_path or "")+"/chat/completions"; headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","Accept":"application/json"}
             async def send():
                 async with self._semaphore:
