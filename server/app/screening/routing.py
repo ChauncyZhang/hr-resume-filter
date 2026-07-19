@@ -1,0 +1,229 @@
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Literal
+
+from sqlalchemy import select
+
+from server.app.governance.retention import recalculate_candidate_retention
+from server.app.identity.models import AuditLog, Job, User
+from server.app.recruiting.models import (
+    Application,
+    ApplicationStageEvent,
+    Candidate,
+)
+from server.app.recruiting.tasks import ensure_review_task
+from server.app.queue.service import normalize_safe_code
+from server.app.screening.models import ScreeningItem, ScreeningRun
+from server.app.talent.service import ensure_deferred_membership
+
+
+class ScreeningRoutingConflict(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class ScreeningOutcome:
+    recommendation: str
+    stage: Literal["review", "deferred"]
+
+
+@dataclass(frozen=True)
+class ScreeningRoutingResult:
+    recommendation: str
+    stage: str
+    score: int | None
+    routed: bool
+
+
+def derive_screening_outcome(score: int) -> ScreeningOutcome:
+    if not 0 <= score <= 100:
+        raise ValueError("score_out_of_range")
+    if score >= 85:
+        return ScreeningOutcome("优先评审", "review")
+    if score >= 60:
+        return ScreeningOutcome("建议评审", "review")
+    return ScreeningOutcome("暂缓", "deferred")
+
+
+def _requested_outcome(score, ai_status, safe_error_code):
+    if ai_status == "failed":
+        if score is not None or not safe_error_code:
+            raise ValueError("invalid_failed_screening_outcome")
+        return ScreeningOutcome("AI评分不可用", "review")
+    if ai_status != "succeeded" or score is None or safe_error_code is not None:
+        raise ValueError("invalid_screening_outcome")
+    return derive_screening_outcome(score)
+
+
+def _previous_result(db, application, fallback_outcome, fallback_score):
+    audit = db.scalar(
+        select(AuditLog)
+        .where(
+            AuditLog.organization_id == application.organization_id,
+            AuditLog.event_type == "screening.terminal_routed",
+            AuditLog.resource_type == "application",
+            AuditLog.resource_id == application.id,
+        )
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .limit(1)
+    )
+    metadata = audit.metadata_json if audit is not None else {}
+    return ScreeningRoutingResult(
+        recommendation=metadata.get("recommendation", fallback_outcome.recommendation),
+        stage=application.stage,
+        score=metadata.get("score", fallback_score),
+        routed=False,
+    )
+
+
+def route_llm_screening_terminal(
+    db,
+    *,
+    organization_id,
+    item_id,
+    actor_user_id,
+    score: int | None,
+    ai_status: str,
+    safe_error_code: str | None,
+    trace_id: str,
+    transferable_capabilities=(),
+):
+    outcome = _requested_outcome(score, ai_status, safe_error_code)
+    if ai_status == "failed":
+        safe_error_code = normalize_safe_code(safe_error_code)
+    item_identity = db.execute(
+        select(
+            ScreeningItem.candidate_id,
+            ScreeningItem.application_id,
+            ScreeningItem.run_id,
+        ).where(
+            ScreeningItem.organization_id == organization_id,
+            ScreeningItem.id == item_id,
+        )
+    ).one_or_none()
+    if (
+        item_identity is None
+        or item_identity.candidate_id is None
+        or item_identity.application_id is None
+    ):
+        raise ScreeningRoutingConflict("screening_item_unavailable")
+
+    candidate = db.scalar(
+        select(Candidate)
+        .where(
+            Candidate.organization_id == organization_id,
+            Candidate.id == item_identity.candidate_id,
+            Candidate.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if candidate is None:
+        raise ScreeningRoutingConflict("candidate_unavailable")
+    item = db.scalar(
+        select(ScreeningItem)
+        .where(
+            ScreeningItem.organization_id == organization_id,
+            ScreeningItem.id == item_id,
+            ScreeningItem.candidate_id == candidate.id,
+            ScreeningItem.application_id == item_identity.application_id,
+        )
+        .with_for_update()
+    )
+    if item is None:
+        raise ScreeningRoutingConflict("screening_item_changed")
+    application = db.scalar(
+        select(Application)
+        .where(
+            Application.organization_id == organization_id,
+            Application.id == item.application_id,
+            Application.candidate_id == candidate.id,
+        )
+        .with_for_update()
+    )
+    if application is None:
+        raise ScreeningRoutingConflict("application_unavailable")
+    if application.stage != "new":
+        return _previous_result(db, application, outcome, score)
+
+    actor_exists = db.scalar(
+        select(User.id).where(
+            User.organization_id == organization_id,
+            User.id == actor_user_id,
+        )
+    )
+    run = db.scalar(
+        select(ScreeningRun).where(
+            ScreeningRun.organization_id == organization_id,
+            ScreeningRun.id == item.run_id,
+        )
+    )
+    job = db.scalar(
+        select(Job).where(
+            Job.organization_id == organization_id,
+            Job.id == application.job_id,
+        )
+    )
+    if actor_exists is None or run is None or job is None:
+        raise ScreeningRoutingConflict("routing_context_unavailable")
+
+    application.stage = outcome.stage
+    application.version += 1
+    application.updated_at = datetime.now(timezone.utc)
+    metadata = {
+        "application_id": str(application.id),
+        "item_id": str(item.id),
+        "from_stage": "new",
+        "to_stage": outcome.stage,
+        "ai_status": ai_status,
+        "recommendation": outcome.recommendation,
+        "score": score,
+        "safe_error_code": safe_error_code,
+    }
+    db.add(
+        ApplicationStageEvent(
+            organization_id=organization_id,
+            application_id=application.id,
+            actor_user_id=actor_user_id,
+            event_type="application.stage_changed",
+            payload=dict(metadata),
+        )
+    )
+    db.add(
+        AuditLog(
+            organization_id=organization_id,
+            actor_user_id=actor_user_id,
+            category="screening",
+            event_type="screening.terminal_routed",
+            outcome="success",
+            resource_type="application",
+            resource_id=application.id,
+            trace_id=trace_id,
+            metadata_json=dict(metadata),
+        )
+    )
+    if outcome.stage == "review":
+        ensure_review_task(
+            db,
+            application=application,
+            job=job,
+            ai_status=ai_status,
+            safe_error_code=safe_error_code,
+        )
+    else:
+        ensure_deferred_membership(
+            db,
+            application=application,
+            candidate=candidate,
+            job=job,
+            run=run,
+            score=score,
+            transferable_capabilities=transferable_capabilities,
+        )
+    db.flush()
+    recalculate_candidate_retention(db, organization_id, candidate.id)
+    return ScreeningRoutingResult(
+        recommendation=outcome.recommendation,
+        stage=outcome.stage,
+        score=score,
+        routed=True,
+    )

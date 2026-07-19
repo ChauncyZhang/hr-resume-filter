@@ -195,6 +195,7 @@ def apply_application_workflow_action_record(
     reason_text=None,
 ):
     from server.app.recruiting.models import Application
+    from server.app.recruiting.tasks import close_review_task
 
     source, target = APPLICATION_WORKFLOW_ACTIONS[action]
     candidate_id = db.scalar(
@@ -222,7 +223,7 @@ def apply_application_workflow_action_record(
         raise InvalidStateTransition
 
     if target in RecruitingService.TERMINAL:
-        return _apply_application_transition(
+        application = _apply_application_transition(
             db,
             application,
             target,
@@ -230,18 +231,24 @@ def apply_application_workflow_action_record(
             trace_id=trace_id,
             reason_text=reason_text,
         )
-
-    target_index = RecruitingService.APPLICATION_PATH.index(target)
-    while application.stage != target:
-        source_index = RecruitingService.APPLICATION_PATH.index(application.stage)
-        if source_index >= target_index:
-            raise InvalidStateTransition
-        application = _apply_application_transition(
+    else:
+        target_index = RecruitingService.APPLICATION_PATH.index(target)
+        while application.stage != target:
+            source_index = RecruitingService.APPLICATION_PATH.index(application.stage)
+            if source_index >= target_index:
+                raise InvalidStateTransition
+            application = _apply_application_transition(
+                db,
+                application,
+                RecruitingService.APPLICATION_PATH[source_index + 1],
+                actor_user_id=actor_user_id,
+                trace_id=trace_id,
+            )
+    if action in {"review_approved", "review_rejected"}:
+        close_review_task(
             db,
-            application,
-            RecruitingService.APPLICATION_PATH[source_index + 1],
-            actor_user_id=actor_user_id,
-            trace_id=trace_id,
+            organization_id=organization_id,
+            application_id=application_id,
         )
     return application
 
