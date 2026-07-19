@@ -42,9 +42,8 @@ class SlowTransport(Transport):
 
 def request(**changes):
     values = {
-        "jd": "Python backend role",
-        "resume": "Built Python services",
-        "rule_facts": ["Python required: hit"],
+        "job_description": "Python backend role",
+        "resume_text": "Built Python services",
     }
     values.update(changes)
     return ScreeningRequest(**values)
@@ -60,7 +59,13 @@ def provider_body(content, usage=None):
 def valid_result(**changes):
     value = {
         "score": 88,
-        "recommendation": "优先沟通",
+        "dimensions": [
+            {"key": "core_capability", "score": 35, "evidence": ["Python"], "gaps": []},
+            {"key": "experience_depth", "score": 25, "evidence": ["Services"], "gaps": []},
+            {"key": "role_seniority", "score": 18, "evidence": [], "gaps": []},
+            {"key": "transferability", "score": 5, "evidence": [], "gaps": []},
+            {"key": "explicit_constraints", "score": 5, "evidence": [], "gaps": []},
+        ],
         "summary": "经验与职位较匹配",
         "strengths": ["Python"],
         "gaps": [],
@@ -95,14 +100,12 @@ Phone: +86 138-0013-8000
 
 
 def test_screening_request_bounds_all_provider_inputs():
-    assert len(request(jd="j" * MAX_JD_CHARS).jd) == MAX_JD_CHARS
-    assert len(request(resume="r" * MAX_RESUME_CHARS).resume) == MAX_RESUME_CHARS
+    assert len(request(job_description="j" * MAX_JD_CHARS).job_description) == MAX_JD_CHARS
+    assert len(request(resume_text="r" * MAX_RESUME_CHARS).resume_text) == MAX_RESUME_CHARS
 
     for changes in (
-        {"jd": "j" * (MAX_JD_CHARS + 1)},
-        {"resume": "r" * (MAX_RESUME_CHARS + 1)},
-        {"rule_facts": ["x"] * 21},
-        {"rule_facts": ["x" * 501]},
+        {"job_description": "j" * (MAX_JD_CHARS + 1)},
+        {"resume_text": "r" * (MAX_RESUME_CHARS + 1)},
     ):
         with pytest.raises(ValidationError):
             request(**changes)
@@ -110,35 +113,39 @@ def test_screening_request_bounds_all_provider_inputs():
 
 def test_redaction_cannot_expand_input_or_output_past_contract_bounds():
     with pytest.raises(ValidationError):
-        request(resume="r"*(MAX_RESUME_CHARS-len(" a@b.co"))+" a@b.co")
+        request(resume_text="r"*(MAX_RESUME_CHARS-len(" a@b.co"))+" a@b.co")
     with pytest.raises(ValidationError):
         ScreeningResult.model_validate(valid_result(summary="x"*(1000-len(" a@b.co"))+" a@b.co"))
 
 
 def test_screening_request_redacts_before_provider_serialization():
     screening_request = request(
-        jd="Contact: hiring@example.test",
-        resume="姓名: 张三\n张三 13800138000\nPython services",
+        job_description="Contact: hiring@example.test",
+        resume_text="姓名: 张三\n张三 13800138000\nPython services",
         candidate_name="张三",
-        rule_facts=["联系邮箱 reviewer@example.test", "张三 required hit"],
     )
 
     rendered = screening_request.provider_content()
 
-    assert all(value not in rendered for value in ("hiring@example.test", "reviewer@example.test", "张三", "13800138000", "candidate_name"))
+    assert all(value not in rendered for value in ("hiring@example.test", "张三", "13800138000", "candidate_name"))
     assert "Python services" in rendered
+    assert set(json.loads(rendered)) == {"job_description", "resume_text"}
 
 
-@pytest.mark.parametrize("recommendation", ["优先沟通", "可沟通", "暂缓", "需人工复核"])
-def test_screening_result_is_strict_and_bounded(recommendation):
-    assert ScreeningResult.model_validate(valid_result(recommendation=recommendation)).recommendation == recommendation
+def test_screening_request_rejects_rule_facts():
+    with pytest.raises(ValidationError):
+        request(rule_facts=["Python required: hit"])
+
+
+def test_screening_result_is_strict_and_bounded():
+    assert ScreeningResult.model_validate(valid_result()).score == 88
 
     invalid = (
         valid_result(score=101),
-        valid_result(recommendation="录用"),
         valid_result(summary="x" * 1001),
         valid_result(strengths=["x"] * 11),
         valid_result(questions=["x" * 501]),
+        {**valid_result(), "recommendation": "优先沟通"},
         {**valid_result(), "reasoning": "private chain of thought"},
     )
     for value in invalid:
@@ -146,10 +153,51 @@ def test_screening_result_is_strict_and_bounded(recommendation):
             ScreeningResult.model_validate(value)
 
 
+def test_screening_result_requires_exactly_one_of_each_dimension():
+    missing = valid_result()
+    missing["dimensions"] = missing["dimensions"][:-1]
+    duplicate = valid_result()
+    duplicate["dimensions"][-1] = {
+        "key": "transferability", "score": 5, "evidence": [], "gaps": []
+    }
+
+    for value in (missing, duplicate):
+        with pytest.raises(ValidationError):
+            ScreeningResult.model_validate(value)
+
+
+def test_screening_result_enforces_dimension_limits():
+    value = valid_result(score=89)
+    value["dimensions"][0]["score"] = 36
+
+    with pytest.raises(ValidationError):
+        ScreeningResult.model_validate(value)
+
+
+def test_dimension_evidence_and_gaps_are_bounded():
+    evidence = valid_result()
+    evidence["dimensions"][0]["evidence"] = ["fact"] * 9
+    gaps = valid_result()
+    gaps["dimensions"][0]["gaps"] = ["gap"] * 9
+
+    for value in (evidence, gaps):
+        with pytest.raises(ValidationError):
+            ScreeningResult.model_validate(value)
+
+
+def test_screening_result_requires_dimension_total_to_equal_score():
+    value = valid_result(score=89)
+
+    with pytest.raises(ValidationError):
+        ScreeningResult.model_validate(value)
+
+
 def test_gateway_evaluate_reuses_pinned_transport_and_returns_bounded_facts():
     transport = Transport(provider_body(valid_result(), {"prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200}))
 
-    evaluation = asyncio.run(gateway(transport).evaluate("provider", "model", "sk-secret", request()))
+    evaluation = asyncio.run(gateway(transport).evaluate(
+        "provider", "model", "sk-secret", request(), system_prompt="persisted prompt v2"
+    ))
 
     assert evaluation.result.score == 88 and evaluation.latency_ms >= 0
     assert evaluation.usage == {"prompt_tokens": 120, "completion_tokens": 80, "total_tokens": 200}
@@ -158,7 +206,9 @@ def test_gateway_evaluate_reuses_pinned_transport_and_returns_bounded_facts():
     assert headers["Authorization"] == "Bearer sk-secret"
     payload = json.loads(body)
     assert payload["response_format"] == {"type": "json_object"}
+    assert payload["messages"][0]["content"] == "persisted prompt v2"
     assert "Python backend role" in payload["messages"][1]["content"]
+    assert set(json.loads(payload["messages"][1]["content"])) == {"job_description", "resume_text"}
     assert payload["max_tokens"] == 800
 
 
@@ -173,7 +223,7 @@ def test_gateway_evaluate_accepts_provider_specific_usage_details():
 
     evaluation = asyncio.run(
         gateway(Transport(provider_body(valid_result(), usage))).evaluate(
-            "provider", "model", "sk-secret", request()
+            "provider", "model", "sk-secret", request(), system_prompt="persisted prompt v2"
         )
     )
 
@@ -191,7 +241,7 @@ def test_gateway_evaluation_has_a_longer_budget_than_the_connection_probe():
         transport,
         total_timeout=0.01,
         evaluation_total_timeout=0.1,
-    ).evaluate("provider", "model", "sk-secret", request()))
+    ).evaluate("provider", "model", "sk-secret", request(), system_prompt="persisted prompt v2"))
 
     assert evaluation.result.score == 88
 
@@ -203,7 +253,9 @@ def test_gateway_disables_default_thinking_for_official_glm_models():
         resolver=resolver,
     )
 
-    asyncio.run(OpenAiCompatibleGateway(policy, transport).evaluate("zai", "glm-5.2", "sk-secret", request()))
+    asyncio.run(OpenAiCompatibleGateway(policy, transport).evaluate(
+        "zai", "glm-5.2", "sk-secret", request(), system_prompt="persisted prompt v2"
+    ))
 
     payload = json.loads(transport.calls[0][4])
     assert payload["thinking"] == {"type": "disabled"}
@@ -211,7 +263,9 @@ def test_gateway_disables_default_thinking_for_official_glm_models():
 
 def test_gateway_evaluate_redacts_identifiers_echoed_by_provider():
     echoed=valid_result(summary="联系 jane@example.test 或 13800138000",questions=["地址: 上海市浦东新区"])
-    evaluation=asyncio.run(gateway(Transport(provider_body(echoed))).evaluate("provider","model","secret",request()))
+    evaluation=asyncio.run(gateway(Transport(provider_body(echoed))).evaluate(
+        "provider","model","secret",request(),system_prompt="persisted prompt v2"
+    ))
     rendered=evaluation.result.model_dump_json()
     assert all(value not in rendered for value in ("jane@example.test","13800138000","上海市浦东新区"))
 
@@ -226,18 +280,24 @@ def test_gateway_evaluate_redacts_identifiers_echoed_by_provider():
 )
 def test_gateway_evaluate_maps_malformed_output_to_safe_error(body, code):
     with pytest.raises(GatewayError) as raised:
-        asyncio.run(gateway(Transport(body)).evaluate("provider", "model", "secret", request()))
+        asyncio.run(gateway(Transport(body)).evaluate(
+            "provider", "model", "secret", request(), system_prompt="persisted prompt v2"
+        ))
     assert raised.value.safe_code == code and str(raised.value) == code
 
 
 def test_gateway_evaluate_maps_oversize_response_to_safe_error():
     with pytest.raises(GatewayError) as raised:
-        asyncio.run(gateway(Transport(b"x" * 101), max_response_bytes=100).evaluate("provider", "model", "secret", request()))
+        asyncio.run(gateway(Transport(b"x" * 101), max_response_bytes=100).evaluate(
+            "provider", "model", "secret", request(), system_prompt="persisted prompt v2"
+        ))
     assert raised.value.safe_code == "provider_response_too_large"
 
 
 @pytest.mark.parametrize("status",[400,422])
 def test_gateway_evaluate_treats_rejected_requests_as_permanent(status):
     with pytest.raises(GatewayError,match="provider_request_rejected") as raised:
-        asyncio.run(gateway(Transport(b"private provider body",status)).evaluate("provider","model","secret",request()))
+        asyncio.run(gateway(Transport(b"private provider body",status)).evaluate(
+            "provider","model","secret",request(),system_prompt="persisted prompt v2"
+        ))
     assert raised.value.safe_code=="provider_request_rejected" and "private provider body" not in str(raised.value)

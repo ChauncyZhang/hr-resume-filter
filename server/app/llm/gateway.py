@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Protocol
 from pydantic import BaseModel,ConfigDict,Field,ValidationError
 from server.app.llm.policy import ProviderAllowlist,ProviderPolicyError,ProviderSpec
-from server.app.llm.screening import SCREENING_SYSTEM_PROMPT,ScreeningEvaluation,ScreeningRequest,ScreeningResult
+from server.app.llm.screening import ScreeningEvaluation,ScreeningRequest,ScreeningResult
 
 FIXED_PROBE_SYSTEM="Return the requested health-check JSON only."
 FIXED_PROBE_USER='Return {"status":"ok"}. This is a configuration test with no recruiting data.'
@@ -70,12 +70,13 @@ class OpenAiCompatibleGateway:
         except (ValueError,KeyError,IndexError,TypeError,json.JSONDecodeError): raise GatewayError("provider_response_invalid") from None
         return max(0,int((time.monotonic()-started)*1000))
 
-    async def evaluate(self,provider_id:str,model:str,api_key:str,request:ScreeningRequest,*,organization_id=None)->ScreeningEvaluation:
+    async def evaluate(self,provider_id:str,model:str,api_key:str,request:ScreeningRequest,*,organization_id=None,system_prompt:str)->ScreeningEvaluation:
         if not isinstance(request,ScreeningRequest): raise GatewayError("screening_request_invalid")
+        if not isinstance(system_prompt,str) or not system_prompt.strip(): raise GatewayError("screening_prompt_invalid")
         started=time.monotonic()
         try:
             spec=self.allowlist.require(provider_id,model,organization_id=organization_id); address=self.allowlist.resolve_public(spec)[0]
-            payload_document={"model":model,"messages":[{"role":"system","content":SCREENING_SYSTEM_PROMPT},{"role":"user","content":request.provider_content()}],"temperature":0,"max_tokens":800,"response_format":{"type":"json_object"}}
+            payload_document={"model":model,"messages":[{"role":"system","content":system_prompt},{"role":"user","content":request.provider_content()}],"temperature":0,"max_tokens":800,"response_format":{"type":"json_object"}}
             if spec.host=="open.bigmodel.cn" and model.casefold().startswith("glm-"): payload_document["thinking"]={"type":"disabled"}
             payload=json.dumps(payload_document,separators=(",",":"),ensure_ascii=False).encode()
             path=(spec.base_path or "")+"/chat/completions"; headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json","Accept":"application/json"}

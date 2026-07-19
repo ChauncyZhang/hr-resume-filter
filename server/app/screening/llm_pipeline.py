@@ -6,7 +6,7 @@ from sqlalchemy import and_, select
 
 from server.app.llm.gateway import GatewayError
 from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
-from server.app.llm.screening import MAX_FACT_CHARS,MAX_JD_CHARS, MAX_RESUME_CHARS, MAX_RULE_FACTS, ScreeningRequest
+from server.app.llm.screening import MAX_JD_CHARS, MAX_RESUME_CHARS, ScreeningRequest
 from server.app.llm.redaction import redact_screening_text
 from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
@@ -17,7 +17,7 @@ from server.app.screening.actions import CandidateTombstoned, lock_candidate_scr
 
 
 _TRANSIENT_ERRORS = {"provider_unavailable", "provider_quota_or_rate_limited", "provider_response_invalid"}
-_REQUEST_FIELDS = ["jd", "resume", "rule_facts"]
+_REQUEST_FIELDS = ["job_description", "resume_text"]
 
 
 def _payload_uuid(payload, name):
@@ -60,7 +60,8 @@ class LlmScreeningPipeline:
             if loaded is None:
                 raise PermanentJobError("screening_item_missing")
             item, run, result, resume, jd, candidate, config, prompt = loaded
-            request = self._request(jd, resume, result, candidate)
+            request = self._request(jd, resume, candidate)
+            system_prompt = self._system_prompt(prompt)
             input_sha256 = hashlib.sha256(request.provider_content().encode()).hexdigest()
             skip_code = self._skip_code(config, run, ids["config_version"])
             try:
@@ -94,7 +95,14 @@ class LlmScreeningPipeline:
             return self._finish_failure(job, ids, queue_job_id, attempt_no, input_sha256, "llm_key_decryption_failed", False)
 
         try:
-            evaluation = await self.gateway.evaluate(provider_id, model, api_key, request, organization_id=ids["organization_id"])
+            evaluation = await self.gateway.evaluate(
+                provider_id,
+                model,
+                api_key,
+                request,
+                organization_id=ids["organization_id"],
+                system_prompt=system_prompt,
+            )
         except GatewayError as error:
             code = error.safe_code
             return self._finish_failure(job, ids, queue_job_id, attempt_no, input_sha256, code, code in _TRANSIENT_ERRORS and attempt_no < max_attempts)
@@ -134,12 +142,13 @@ class LlmScreeningPipeline:
                 invocation_id=invocation.id,
                 prompt_version_id=ids["prompt_version_id"],
                 score=facts.score,
-                recommendation=facts.recommendation,
+                recommendation=self._recommendation(facts.score),
                 summary=facts.summary,
                 strengths=facts.strengths,
                 gaps=facts.gaps,
                 risks=facts.risks,
                 interview_questions=facts.questions,
+                dimensions=[dimension.model_dump() for dimension in facts.dimensions],
             ))
             item.llm_status = "succeeded"
             item.llm_safe_error_code = None
@@ -225,7 +234,7 @@ class LlmScreeningPipeline:
         return db.execute(statement).one_or_none()
 
     @staticmethod
-    def _request(jd, resume, result, candidate):
+    def _request(jd, resume, candidate):
         content = jd.content if isinstance(jd.content, dict) else {}
         jd_text = content.get("description") or content.get("text") or content.get("jd_text") or ""
         if not isinstance(jd_text, str) or not jd_text:
@@ -233,21 +242,25 @@ class LlmScreeningPipeline:
         resume_text = resume.parsed_text or ""
         if not resume_text:
             raise PermanentJobError("llm_input_invalid")
-        facts = []
-        for label, values in (
-            ("required_hit", result.required_hits),
-            ("required_missing", result.required_missing),
-            ("bonus_hit", result.bonus_hits),
-            ("risk", result.risks),
-        ):
-            for value in values or []:
-                if len(facts) >= MAX_RULE_FACTS:
-                    break
-                facts.append(f"{label}: {str(value)[:480]}")
         redacted_jd=redact_screening_text(jd_text)[:MAX_JD_CHARS]
         redacted_resume=redact_screening_text(resume_text,candidate_name=candidate.display_name)[:MAX_RESUME_CHARS]
-        redacted_facts=[redact_screening_text(value,candidate_name=candidate.display_name)[:MAX_FACT_CHARS] for value in facts]
-        return ScreeningRequest(jd=redacted_jd,resume=redacted_resume,rule_facts=redacted_facts)
+        return ScreeningRequest(job_description=redacted_jd,resume_text=redacted_resume)
+
+    @staticmethod
+    def _system_prompt(prompt):
+        content = prompt.content if isinstance(prompt.content, dict) else {}
+        system_prompt = content.get("system")
+        if not isinstance(system_prompt, str) or not system_prompt.strip():
+            raise PermanentJobError("llm_prompt_invalid")
+        return system_prompt
+
+    @staticmethod
+    def _recommendation(score):
+        if score >= 85:
+            return "优先评审"
+        if score >= 60:
+            return "建议评审"
+        return "暂缓"
 
     @staticmethod
     def _skip_code(config, run, expected_version):

@@ -19,8 +19,8 @@ from server.app.llm.screening import SCREENING_SYSTEM_PROMPT
 
 _RETRYABLE={"scanner_unavailable","scanner_error","storage_unavailable"}
 def _uuid(item_id,name): return uuid.uuid5(uuid.UUID(str(item_id)),name)
-_PROMPT_CONTENT={"system":SCREENING_SYSTEM_PROMPT,"schema_version":"screening-evaluation-v1"}
-_PROMPT_VERSION=1
+_PROMPT_CONTENT={"system":SCREENING_SYSTEM_PROMPT,"schema_version":"screening-evaluation-v2"}
+_PROMPT_VERSION=2
 def _ensure_screening_prompt(db,organization_id,created_by,*,content=None,version_number=_PROMPT_VERSION):
     prompt_content=dict(content or _PROMPT_CONTENT); prompt_hash=hashlib.sha256(json.dumps(prompt_content,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     prompt_id=uuid.uuid5(uuid.UUID(str(organization_id)),f"screening-evaluation:{version_number}")

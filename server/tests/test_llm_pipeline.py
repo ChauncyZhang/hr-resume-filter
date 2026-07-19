@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from server.app.llm.gateway import GatewayError
 from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.llm.screening import MAX_RESUME_CHARS,ScreeningEvaluation, ScreeningResult
+from server.app.screening.schemas import LlmEvaluationOut
 from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.identity.models import AuditLog
@@ -28,7 +29,13 @@ class Gateway:
         self.outcome = outcome or ScreeningEvaluation(
             ScreeningResult(
                 score=91,
-                recommendation="优先沟通",
+                dimensions=[
+                    {"key":"core_capability","score":35,"evidence":["Python"],"gaps":[]},
+                    {"key":"experience_depth","score":25,"evidence":["Services"],"gaps":[]},
+                    {"key":"role_seniority","score":20,"evidence":[],"gaps":[]},
+                    {"key":"transferability","score":6,"evidence":[],"gaps":[]},
+                    {"key":"explicit_constraints","score":5,"evidence":[],"gaps":[]},
+                ],
                 summary="Strong Python match",
                 strengths=["Python services"],
                 gaps=[],
@@ -44,7 +51,7 @@ class Gateway:
     async def evaluate(self, provider_id, model, api_key, request, **kwargs):
         if self.inspect:
             self.inspect()
-        self.calls.append((provider_id, model, api_key, request))
+        self.calls.append((provider_id, model, api_key, request, kwargs))
         if isinstance(self.outcome, Exception):
             raise self.outcome
         return self.outcome
@@ -286,8 +293,12 @@ def test_success_commits_running_before_provider_and_is_replay_safe(tmp_path):
         assert db.scalar(select(func.count(LlmScreeningEvaluation.id))) == 1
         assert invocation.status == "succeeded" and invocation.attempt_no == 1
         assert len(invocation.input_sha256) == 64
-        assert invocation.request_field_manifest == ["jd", "resume", "rule_facts"]
+        assert invocation.request_field_manifest == ["job_description", "resume_text"]
         assert evaluation.score == 91 and evaluation.interview_questions == ["Describe a scaling incident"]
+        assert evaluation.dimensions == [dimension.model_dump() for dimension in gateway.outcome.result.dimensions]
+        prompt = db.get(PromptVersion, uuid.UUID(job.payload["prompt_version_id"]))
+        assert prompt.version_number == 2
+        assert gateway.calls[0][4]["system_prompt"] == prompt.content["system"]
         persisted = repr((invocation.usage, invocation.safe_error_code, evaluation.summary, evaluation.strengths))
         assert "sk-private" not in persisted and "Python backend role" not in persisted
         assert db.scalar(select(Application)).stage == "review"
@@ -396,7 +407,7 @@ def db_rule_score(app,item_id):
         return db.scalar(select(RuleResult.rule_score).where(RuleResult.item_id==uuid.UUID(item_id)))
 
 
-def test_request_is_bounded_hashed_after_redaction_and_contains_only_rule_facts(tmp_path):
+def test_request_is_bounded_hashed_after_redaction_and_excludes_rule_facts(tmp_path):
     app, cipher, job = prepared(tmp_path)
     secret_email = "private@example.test"
     with app.state.identity_store.sync_session() as db:
@@ -405,17 +416,16 @@ def test_request_is_bounded_hashed_after_redaction_and_contains_only_rule_facts(
         run = db.get(ScreeningRun, item.run_id)
         db.get(JobJdVersion, run.jd_version_id).content = {"text": "j" * 20_000}
         result = db.get(RuleResult, uuid.UUID(job.payload["screening_result_id"]))
-        result.required_hits = [("a@b.co "*70),*[f"hit-{index}" for index in range(30)]]
-        result.required_missing = ["missing-private@example.test"]
+        result.required_hits = ["SECRET-RULE-FACT"]
         db.commit()
     gateway = Gateway()
 
     asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, gateway, cipher).evaluate_item(job))
 
     request = gateway.calls[0][3]
-    assert len(request.jd) == 12_000 and len(request.resume) <= 30_000 and "private" not in request.resume and "[REDACTED_EMAIL]" in request.resume
-    assert len(request.rule_facts) == 20
-    assert all(len(value)<=500 for value in request.rule_facts) and "[REDACTED_EMAIL]" in request.rule_facts[0]
+    assert len(request.job_description) == 12_000 and len(request.resume_text) <= 30_000 and "private" not in request.resume_text and "[REDACTED_EMAIL]" in request.resume_text
+    assert set(__import__("json").loads(request.provider_content())) == {"job_description", "resume_text"}
+    assert "SECRET-RULE-FACT" not in request.provider_content()
     assert secret_email not in request.provider_content()
     with app.state.identity_store.sync_session() as db:
         invocation = db.scalar(select(LlmInvocation))
@@ -433,7 +443,14 @@ def test_request_uses_the_persisted_jd_description_field(tmp_path):
 
     asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, gateway, cipher).evaluate_item(job))
 
-    assert gateway.calls[0][3].jd == "负责企业级 AI 平台建设"
+    assert gateway.calls[0][3].job_description == "负责企业级 AI 平台建设"
+
+
+def test_llm_api_schema_exposes_dimensions_without_prompt_or_provider_payloads():
+    properties = LlmEvaluationOut.model_json_schema()["properties"]
+
+    assert "dimensions" in properties
+    assert all(name not in properties for name in ("prompt", "system_prompt", "provider_response", "provider_body"))
 
 
 def test_historical_jd_field_failure_is_retryable_when_current_inputs_are_valid(tmp_path):
@@ -469,8 +486,8 @@ def test_screening_items_api_exposes_only_bounded_llm_result(tmp_path):
     assert response.status_code==200
     item=response.json()["data"][0]
     assert item["llm_status"]=="succeeded" and item["llm_error_code"] is None and item["llm_attempts"]==1
-    assert item["llm_evaluation"]=={"score":91,"recommendation":"优先沟通","summary":"Strong Python match","strengths":["Python services"],"gaps":[],"risks":["Confirm availability"],"questions":["Describe a scaling incident"]}
-    assert all(value not in response.text for value in ("input_sha256","prompt_version_id","request_field_manifest","sk-private"))
+    assert item["llm_evaluation"]=={"score":91,"recommendation":"优先评审","summary":"Strong Python match","strengths":["Python services"],"gaps":[],"risks":["Confirm availability"],"questions":["Describe a scaling incident"]}
+    assert all(value not in response.text for value in ("input_sha256","prompt_version_id","request_field_manifest","sk-private","system_prompt","provider_response"))
 
 
 def test_run_api_includes_safe_llm_degradation_summary(tmp_path):

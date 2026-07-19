@@ -98,16 +98,21 @@ def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_
         assert aggregate.status=="llm_scoring" and aggregate.processed_count==0
         assert len(jobs)==1 and jobs[0].payload=={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"screening_result_id":str(db.scalar(select(ScreeningResult.id))),"config_id":str(db.scalar(select(LlmProviderConfig.id))),"config_version":3,"prompt_version_id":str(prompt.id)}
         assert "resume" not in str(jobs[0].payload).lower() and "jd" not in jobs[0].payload
+        assert prompt.version_number==2 and prompt.content["schema_version"]=="screening-evaluation-v2"
+        assert "recommendation" in prompt.content["system"] and "must not" in prompt.content["system"]
+        assert all(value in prompt.content["system"] for value in ("core_capability (0-35)", "experience_depth (0-25)", "role_seniority (0-20)", "transferability (0-10)", "explicit_constraints (0-10)"))
         assert db.scalar(select(Application)).stage=="new"
 
 def test_screening_prompt_versions_can_upgrade_without_identity_conflict(tmp_path):
     app,_,_=app_and_seed(tmp_path)
     with app.state.identity_store.sync_session() as db:
         user=db.scalar(select(__import__("server.app.identity.models",fromlist=["User"]).User)); organization_id=user.organization_id
-        first=_ensure_screening_prompt(db,organization_id,user.id,content=_PROMPT_CONTENT,version_number=1)
-        second=_ensure_screening_prompt(db,organization_id,user.id,content={**_PROMPT_CONTENT,"system":"upgraded"},version_number=2)
+        legacy={"system":"legacy v1 prompt with rule facts","schema_version":"screening-evaluation-v1"}
+        first=_ensure_screening_prompt(db,organization_id,user.id,content=legacy,version_number=1)
+        second=_ensure_screening_prompt(db,organization_id,user.id,content=_PROMPT_CONTENT,version_number=2)
         db.commit()
         assert first.id!=second.id and first.version_number==1 and second.version_number==2
+        assert first.content==legacy and second.content["schema_version"]=="screening-evaluation-v2"
         assert db.scalar(select(func.count(PromptVersion.id)))==2
 
 def test_infected_is_terminal_without_parse_or_identity(tmp_path):

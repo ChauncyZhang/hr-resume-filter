@@ -3,6 +3,7 @@ import pytest
 from server.app.llm.gateway import FIXED_PROBE_MAX_TOKENS,FIXED_PROBE_SYSTEM,FIXED_PROBE_USER,GatewayError,OpenAiCompatibleGateway,TransportResponse
 from server.app.llm.policy import ProviderAllowlist,ProviderPolicyError
 from server.app.llm.security import ApiKeyCipher
+from server.app.llm.screening import ScreeningRequest
 
 KEY=b"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
 def resolver(address): return lambda host,port,type: [(2,1,6,"",(address,port))]
@@ -37,6 +38,20 @@ def test_gateway_pins_public_dns_uses_fixed_probe_and_maps_safe_errors():
     invalid_content=b'{"choices":[{"message":{"content":"all systems nominal"}}]}'
     with pytest.raises(GatewayError,match="provider_response_invalid"):
         asyncio.run(OpenAiCompatibleGateway(policy,Transport(200,invalid_content)).test_connection("provider","model","secret"))
+
+
+def test_evaluation_requires_and_sends_the_persisted_system_prompt():
+    policy=ProviderAllowlist({"provider":{"base_url":"https://provider.example/v1","models":["model"]}},resolver=resolver("8.8.8.8"))
+    body=b'{"choices":[{"message":{"content":"{\\"score\\":0,\\"dimensions\\":[{\\"key\\":\\"core_capability\\",\\"score\\":0,\\"evidence\\":[],\\"gaps\\":[]},{\\"key\\":\\"experience_depth\\",\\"score\\":0,\\"evidence\\":[],\\"gaps\\":[]},{\\"key\\":\\"role_seniority\\",\\"score\\":0,\\"evidence\\":[],\\"gaps\\":[]},{\\"key\\":\\"transferability\\",\\"score\\":0,\\"evidence\\":[],\\"gaps\\":[]},{\\"key\\":\\"explicit_constraints\\",\\"score\\":0,\\"evidence\\":[],\\"gaps\\":[]}],\\"summary\\":\\"none\\",\\"strengths\\":[],\\"gaps\\":[],\\"risks\\":[],\\"questions\\":[]}"}}]}'
+    transport=Transport(body=body)
+
+    asyncio.run(OpenAiCompatibleGateway(policy,transport).evaluate(
+        "provider","model","secret",ScreeningRequest(job_description="JD",resume_text="resume"),
+        system_prompt="prompt loaded from PromptVersion",
+    ))
+
+    document=json.loads(transport.calls[0][4])
+    assert document["messages"][0]=={"role":"system","content":"prompt loaded from PromptVersion"}
 
 def test_allowlist_rejects_arbitrary_url_features_and_models():
     for url in ("http://provider.example/v1","https://user:pass@provider.example/v1","https://provider.example:8443/v1","file:///tmp/model","https://provider.example/v1?target=x","https://xn--bcher-kva.example/v1","https://127.0.0.1/v1","https://169.254.169.254/v1"):
