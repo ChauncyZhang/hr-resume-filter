@@ -162,6 +162,28 @@ def test_gateway_evaluate_reuses_pinned_transport_and_returns_bounded_facts():
     assert payload["max_tokens"] == 800
 
 
+def test_gateway_evaluate_accepts_provider_specific_usage_details():
+    usage = {
+        "prompt_tokens": 120,
+        "completion_tokens": 80,
+        "total_tokens": 200,
+        "prompt_tokens_details": {"cached_tokens": 100},
+        "completion_tokens_details": {"reasoning_tokens": 0},
+    }
+
+    evaluation = asyncio.run(
+        gateway(Transport(provider_body(valid_result(), usage))).evaluate(
+            "provider", "model", "sk-secret", request()
+        )
+    )
+
+    assert evaluation.usage == {
+        "prompt_tokens": 120,
+        "completion_tokens": 80,
+        "total_tokens": 200,
+    }
+
+
 def test_gateway_evaluation_has_a_longer_budget_than_the_connection_probe():
     transport = SlowTransport(provider_body(valid_result()), delay=0.03)
 

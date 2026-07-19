@@ -17,7 +17,9 @@ class GatewayTransport(Protocol):
     def post(self,spec:ProviderSpec,address:str,path:str,headers:dict[str,str],body:bytes,max_response_bytes:int)->TransportResponse: ...
 
 class _Usage(BaseModel):
-    model_config=ConfigDict(extra="forbid",strict=True)
+    # OpenAI-compatible providers may add token-detail objects. Keep the
+    # portable counters strict while ignoring provider-specific metadata.
+    model_config=ConfigDict(extra="ignore",strict=True)
     prompt_tokens:int=Field(default=0,ge=0,le=10_000_000)
     completion_tokens:int=Field(default=0,ge=0,le=10_000_000)
     total_tokens:int=Field(default=0,ge=0,le=10_000_000)
