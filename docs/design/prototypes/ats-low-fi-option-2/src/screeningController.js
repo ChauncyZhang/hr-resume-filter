@@ -222,6 +222,15 @@ export function createScreeningController({
     return resourceData(response);
   }
 
+  async function cancelRun(runId, { signal } = {}) {
+    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/cancel`, {
+      method: "POST",
+      idempotencyKey: createIdempotencyKey(),
+      ...withSignal(signal),
+    });
+    return resourceData(response);
+  }
+
   async function getRun(runId, { signal } = {}) {
     return resourceData(await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}`, withSignal(signal)));
   }
@@ -298,7 +307,7 @@ export function createScreeningController({
     }
   }
 
-  return { listJobs, listRuns, createRun, uploadFiles, startRun, getRun, getItems, retryItem, bulkAction, undoBulkAction, pollRun };
+  return { listJobs, listRuns, createRun, uploadFiles, startRun, cancelRun, getRun, getItems, retryItem, bulkAction, undoBulkAction, pollRun };
 }
 
 export const screeningController = createScreeningController();

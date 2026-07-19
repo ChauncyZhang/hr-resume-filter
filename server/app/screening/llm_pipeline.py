@@ -227,7 +227,7 @@ class LlmScreeningPipeline:
     @staticmethod
     def _request(jd, resume, result, candidate):
         content = jd.content if isinstance(jd.content, dict) else {}
-        jd_text = content.get("text", content.get("jd_text", ""))
+        jd_text = content.get("description") or content.get("text") or content.get("jd_text") or ""
         if not isinstance(jd_text, str) or not jd_text:
             raise PermanentJobError("llm_input_invalid")
         resume_text = resume.parsed_text or ""

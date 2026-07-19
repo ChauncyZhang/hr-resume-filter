@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from fastapi.testclient import TestClient
 
 from server.app.core.settings import Settings
-from server.app.identity.models import Job, JobCollaborator, Organization, User, UserRole
+from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole
 from server.app.identity.security import PasswordService
 from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.main import create_app
@@ -277,3 +277,25 @@ def test_start_run_is_authorized_idempotent_and_enqueues_each_item_atomically(tm
             assert all(set(job.payload)=={"organization_id","screening_item_id","parser_version"} for job in jobs)
         client.post("/api/v1/auth/logout",headers=headers); manager=login(client,"manager@example.test")
         assert client.post(f"/api/v1/screening-runs/{run['id']}/start",headers={**manager,"Idempotency-Key":"manager"}).status_code==404
+
+def test_empty_queued_run_can_be_cancelled_but_started_run_cannot(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        empty=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"empty-run"}).json()["data"]
+        cancelled=client.post(f"/api/v1/screening-runs/{empty['id']}/cancel",headers={**headers,"Idempotency-Key":"cancel-empty"})
+        assert cancelled.status_code==200
+        assert cancelled.json()["data"]["status"]=="cancelled"
+        replay=client.post(f"/api/v1/screening-runs/{empty['id']}/cancel",headers={**headers,"Idempotency-Key":"cancel-empty"})
+        assert replay.status_code==200 and replay.json()==cancelled.json()
+
+        nonempty=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"nonempty-run"}).json()["data"]
+        assert client.post(f"/api/v1/screening-runs/{nonempty['id']}/items",files={"file":("resume.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":"resume"}).status_code==201
+        rejected=client.post(f"/api/v1/screening-runs/{nonempty['id']}/cancel",headers={**headers,"Idempotency-Key":"cancel-nonempty"})
+        assert rejected.status_code==409 and rejected.json()["code"]=="screening_run_not_cancellable"
+
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningRun,uuid.UUID(empty["id"]))
+        audit=db.scalar(select(AuditLog).where(AuditLog.event_type=="screening.run_cancelled"))
+        assert stored.status=="cancelled" and stored.finished_at is not None and stored.version==2
+        assert audit.metadata_json=={"run_id":empty["id"],"reason":"empty_upload_interrupted"}

@@ -171,6 +171,19 @@ test("creates, uploads, and starts with exact contracts and a new key per comman
   assert.equal(new Set(client.calls.map(({ options }) => options.idempotencyKey)).size, 4);
 });
 
+test("cancels an interrupted empty run with an idempotent command", async () => {
+  const client = createClient([{ data: { id: "run-1", status: "cancelled" } }]);
+  const controller = createScreeningController({ client, createIdempotencyKey: () => "cancel-key" });
+
+  const run = await controller.cancelRun("run-1");
+
+  assert.equal(run.status, "cancelled");
+  assert.deepEqual(client.calls[0], {
+    path: "/api/v1/screening-runs/run-1/cancel",
+    options: { method: "POST", idempotencyKey: "cancel-key" },
+  });
+});
+
 test("accepts and preserves a cross-realm-like File object", async () => {
   const client = createClient([{ data: { id: "item-1" } }]);
   const controller = createScreeningController({ client, createIdempotencyKey: () => "upload-key" });

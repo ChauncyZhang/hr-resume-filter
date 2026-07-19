@@ -65,6 +65,18 @@ export function taskLifecycleLabel(task) {
   return "人工审核完成";
 }
 
+export function pollFailureAction(error) {
+  if (error?.code === "RECOVERED_RUN_EMPTY") {
+    return {
+      code: "RECOVERED_RUN_EMPTY",
+      message: "该任务在上传前中断，没有可恢复的简历。可放弃此任务后重新导入。",
+      action: "cancel",
+      label: "放弃任务",
+    };
+  }
+  return { code: error?.code || "POLL_FAILED", message: "暂时无法获取最新进度，已保留上次结果。", action: "retry", label: "重试获取" };
+}
+
 export function humanReviewLabel(file) {
   if (!["success", "partial"].includes(file?.status)) return file?.status === "failed" || file?.status === "cancelled" ? "未进入审核" : "等待处理";
   const stage = file?.application_stage;
@@ -460,7 +472,8 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
   const [filter, setFilter] = useState(restoredViewState.filter);
   const [query, setQuery] = useState(restoredViewState.query);
   const [selected, setSelected] = useState(restoredViewState.selected);
-  const [pollError, setPollError] = useState("");
+  const [pollError, setPollError] = useState(null);
+  const [cancellingTask, setCancellingTask] = useState(false);
   const [bulkError, setBulkError] = useState("");
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
   const [undoItems, setUndoItems] = useState([]);
@@ -494,13 +507,13 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
   useEffect(() => {
     if (!initialTask.serverBacked) return undefined;
     const abortController = new AbortController();
-    setPollError("");
+    setPollError(null);
     pollingRef.current = pollServerTask({
       task: initialTask,
       controller,
       signal: abortController.signal,
       onTaskChange: setTask,
-      onError: (pollFailure) => setPollError(pollFailure?.code === "RECOVERED_RUN_EMPTY" ? "该任务在上传前中断，没有可恢复的简历，请返回后重新导入。" : "暂时无法获取最新进度，已保留上次结果。"),
+      onError: (pollFailure) => setPollError(pollFailureAction(pollFailure)),
     });
     return () => abortController.abort();
   }, [controller, initialTask.id, initialTask.serverBacked, pollAttempt]);
@@ -560,7 +573,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     retryingRef.current.add(id);
     setRetryingIds((current) => [...current, id]);
     if (task.serverBacked) {
-      setPollError("");
+      setPollError(null);
       const accepted = await pollingRef.current?.retry(id);
       if (accepted) {
         onNotify("已提交单文件重试，正在刷新服务端进度");
@@ -579,6 +592,25 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     } finally {
       retryingRef.current.delete(id);
       setRetryingIds((current) => current.filter((itemId) => itemId !== id));
+    }
+  }
+
+  async function handlePollFailureAction() {
+    if (pollError?.action !== "cancel") {
+      setPollAttempt((value) => value + 1);
+      return;
+    }
+    if (cancellingTask) return;
+    setCancellingTask(true);
+    try {
+      await controller.cancelRun(task.id);
+      setTask((current) => ({ ...current, status: "cancelled", stage: "已取消" }));
+      setPollError(null);
+      onNotify("空任务已放弃，可以重新导入简历");
+    } catch {
+      setPollError({ ...pollError, message: "未能放弃该任务，请稍后重试。" });
+    } finally {
+      setCancellingTask(false);
     }
   }
 
@@ -650,7 +682,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
         <div className="progress-stats"><div><strong>{counts.成功}</strong><span>成功</span></div><div><strong>{counts.部分成功}</strong><span>部分成功</span></div><div><strong>{counts.失败}</strong><span>失败</span></div><div><strong>{task.serverBacked ? `${task.completed}/${total}` : `${task.elapsed}s`}</strong><span>{task.serverBacked ? "服务端进度" : "已耗时"}</span></div></div>
       </section>
 
-      {pollError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{pollError}</span><button type="button" onClick={() => setPollAttempt((value) => value + 1)}>重试获取</button></div>}
+      {pollError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{pollError.message}</span><button type="button" disabled={cancellingTask} onClick={handlePollFailureAction}>{cancellingTask ? "处理中" : pollError.label}</button></div>}
       {task.status === "running" && <p className="task-background-tip"><Clock3 size={15} />任务正在后台处理，可以安全离开此页面；稍后从“筛选任务”继续查看。</p>}
       {(counts.失败 > 0 || counts.部分成功 > 0) && task.status !== "running" && <div className="partial-warning"><CircleAlert size={18} /><div><strong>部分文件需要处理</strong><span>单文件失败没有影响其他简历。可在对应行查看原因并单独重试。</span></div></div>}
 

@@ -422,6 +422,43 @@ def test_request_is_bounded_hashed_after_redaction_and_contains_only_rule_facts(
         assert invocation.input_sha256 == __import__("hashlib").sha256(request.provider_content().encode()).hexdigest()
 
 
+def test_request_uses_the_persisted_jd_description_field(tmp_path):
+    app, cipher, job = prepared(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        run = db.get(ScreeningRun, item.run_id)
+        db.get(JobJdVersion, run.jd_version_id).content = {"description": "负责企业级 AI 平台建设"}
+        db.commit()
+    gateway = Gateway()
+
+    asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session, gateway, cipher).evaluate_item(job))
+
+    assert gateway.calls[0][3].jd == "负责企业级 AI 平台建设"
+
+
+def test_historical_jd_field_failure_is_retryable_when_current_inputs_are_valid(tmp_path):
+    app, _cipher, job = prepared(tmp_path)
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        run = db.get(ScreeningRun, item.run_id)
+        db.get(JobJdVersion, run.jd_version_id).content = {"description": "负责企业级 AI 平台建设"}
+        db.commit()
+    item_id, run_id, _application_id = terminal_llm_failure(app, job, "llm_llm_input_invalid")
+
+    with TestClient(app) as client:
+        headers = login(client, "admin@example.test")
+        listing = client.get(f"/api/v1/screening-runs/{run_id}/items", headers=headers)
+        listed = next(value for value in listing.json()["data"] if value["id"] == str(item_id))
+        retried = client.post(
+            f"/api/v1/screening-items/{item_id}/retry",
+            headers={**headers, "Idempotency-Key": "retry-historical-jd-field"},
+        )
+
+    assert listed["llm_retryable"] is True
+    assert retried.status_code == 200
+    assert retried.json()["data"]["item"]["llm_status"] == "queued"
+
+
 def test_screening_items_api_exposes_only_bounded_llm_result(tmp_path):
     app,cipher,job=prepared(tmp_path)
     asyncio.run(LlmScreeningPipeline(app.state.identity_store.sync_session,Gateway(),cipher).evaluate_item(job))

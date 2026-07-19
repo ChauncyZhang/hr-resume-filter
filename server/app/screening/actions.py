@@ -5,7 +5,7 @@ from server.app.identity.models import AuditLog
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
-from server.app.recruiting.models import Application,ApplicationStageEvent,Candidate,FileObject,Resume
+from server.app.recruiting.models import Application,ApplicationStageEvent,Candidate,FileObject,JobJdVersion,Resume
 from server.app.recruiting.service import transition_application_record,undo_bulk_advance_record
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
@@ -47,8 +47,15 @@ def llm_error_code(code):
 def has_recoverable_llm_failure(item):
     return item.status=="scored" and item.llm_status=="failed" and llm_error_code(item.llm_safe_error_code) in LLM_RECOVERABLE_CODES
 
-def is_llm_retryable(item,run,result,config,prompt):
-    if not has_recoverable_llm_failure(item) or run is None or result is None or config is None or prompt is None: return False
+def _has_valid_legacy_llm_inputs(item,jd,resume):
+    if item.status!="scored" or item.llm_status!="failed" or llm_error_code(item.llm_safe_error_code)!="llm_input_invalid": return False
+    content=jd.content if jd is not None and isinstance(jd.content,dict) else {}
+    description=content.get("description")
+    return bool(isinstance(description,str) and description.strip() and resume is not None and isinstance(resume.parsed_text,str) and resume.parsed_text.strip())
+
+def is_llm_retryable(item,run,result,config,prompt,jd=None,resume=None):
+    recoverable=has_recoverable_llm_failure(item) or _has_valid_legacy_llm_inputs(item,jd,resume)
+    if not recoverable or run is None or result is None or config is None or prompt is None: return False
     if result.application_id!=item.application_id or result.resume_id!=item.resume_id: return False
     allowed=not config.allowed_job_ids or str(run.job_id) in config.allowed_job_ids
     return bool(config.enabled and config.encrypted_api_key is not None and allowed)
@@ -70,11 +77,13 @@ def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None)
     if run is None or stored_file is None: raise ScreeningItemNotRetryable
     llm_active=any(job.type=="screening.llm_score_item" for job in active_jobs)
     if item.status=="scored" and (llm_active or item.llm_status in {"queued","running"}): raise ScreeningRetryActive
-    if has_recoverable_llm_failure(item):
+    if item.status=="scored" and item.llm_status=="failed":
         result=db.scalar(select(ScreeningResult).where(ScreeningResult.organization_id==organization_id,ScreeningResult.item_id==item.id,ScreeningResult.application_id==item.application_id,ScreeningResult.resume_id==item.resume_id).order_by(ScreeningResult.created_at.desc(),ScreeningResult.id.desc()).limit(1).with_for_update())
         config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==organization_id).with_for_update())
         prompt=db.scalar(select(PromptVersion).where(PromptVersion.organization_id==organization_id,PromptVersion.name=="screening-evaluation").order_by(PromptVersion.version_number.desc()).limit(1))
-        if not is_llm_retryable(item,run,result,config,prompt): raise ScreeningItemNotRetryable
+        jd=db.scalar(select(JobJdVersion).where(JobJdVersion.organization_id==organization_id,JobJdVersion.id==run.jd_version_id))
+        resume=db.scalar(select(Resume).where(Resume.organization_id==organization_id,Resume.id==item.resume_id)) if item.resume_id else None
+        if not is_llm_retryable(item,run,result,config,prompt,jd,resume): raise ScreeningItemNotRetryable
         job=QueueRepository(db).enqueue(organization_id,"screening.llm_score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"screening_result_id":str(result.id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key=f"llm-retry:{item.id}:{uuid.uuid4()}",trace_id=trace_id,max_attempts=3)
         item.llm_status="queued"; item.llm_safe_error_code=None; item.llm_started_at=None; item.llm_finished_at=None; item.finished_at=None
         run.finished_at=None

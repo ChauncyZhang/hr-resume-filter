@@ -10,7 +10,7 @@ from sqlalchemy import and_,case,exists,func,or_,select
 from server.app.identity.models import AuditLog,Job,User
 from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load_job,_principal,_problem_for
 from server.app.recruiting.authorization import RecruitingAction
-from server.app.recruiting.models import Application,Candidate,FileObject,IdempotencyRecord,JobJdVersion,ScreeningRuleVersion
+from server.app.recruiting.models import Application,Candidate,FileObject,IdempotencyRecord,JobJdVersion,Resume,ScreeningRuleVersion
 from server.app.recruiting.service import IdempotencyConflict,persisted_idempotent
 from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.llm.models import LlmProviderConfig,LlmScreeningEvaluation,PromptVersion
@@ -25,6 +25,7 @@ class RunNotQueued(Exception): pass
 class ScreeningItemLimit(Exception): pass
 class ScreeningRunEmpty(Exception): pass
 class ScreeningRunAlreadyStarted(Exception): pass
+class ScreeningRunNotCancellable(Exception): pass
 def _response(data,status=200):
     response=JSONResponse({"data":data},status_code=status); response.headers["Cache-Control"]="no-store"; return response
 def _problem(request,status,code):
@@ -246,6 +247,29 @@ def start_run(run_id:UUID,request:Request,idempotency_key:str|None=Header(None))
         except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
     response=JSONResponse(body,status_code=status); response.headers["Cache-Control"]="no-store"; return response
 
+@router.post("/screening-runs/{run_id}/cancel",response_model=RunResource)
+def cancel_run(run_id:UUID,request:Request,idempotency_key:str|None=Header(None)):
+    principal=_principal(request); key=_idempotency(request,idempotency_key)
+    if isinstance(principal,JSONResponse): return principal
+    if isinstance(key,JSONResponse): return key
+    with request.app.state.identity_store.sync_session() as db:
+        if _load_run(db,principal,run_id,RecruitingAction.MANAGE_JOB) is None: return _not_found(request)
+        try:
+            def action():
+                run=_load_run(db,principal,run_id,RecruitingAction.MANAGE_JOB,lock=True)
+                if run is None: raise LookupError
+                item_count=db.scalar(select(func.count(ScreeningItem.id)).where(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id)) or 0
+                if run.status!="queued" or run.started_at is not None or run.total_count!=0 or item_count!=0: raise ScreeningRunNotCancellable
+                run.status="cancelled"; run.finished_at=datetime.now(timezone.utc); run.version+=1
+                db.add(AuditLog(organization_id=principal.organization_id,actor_user_id=principal.user_id,event_type="screening.run_cancelled",outcome="success",trace_id=request.state.trace_id,metadata_json={"run_id":str(run.id),"reason":"empty_upload_interrupted"}))
+                db.flush(); return 200,{"data":_run_data(run)}
+            status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,"screening.run.cancel",key,{"run_id":str(run_id)},action); db.commit()
+        except IdempotencyConflict: db.rollback(); return _problem(request,409,"idempotency_conflict")
+        except ScreeningRunNotCancellable: db.rollback(); return _problem(request,409,"screening_run_not_cancellable")
+        except LookupError: db.rollback(); return _not_found(request)
+        except Exception: db.rollback(); return _problem(request,503,"persistence_failed")
+    response=JSONResponse(body,status_code=status); response.headers["Cache-Control"]="no-store"; return response
+
 @router.get("/screening-runs/{run_id}/items",response_model=ItemCollection)
 def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=None,limit:int=Query(50,ge=1,le=100)):
     principal=_principal(request)
@@ -263,7 +287,7 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             except Exception: return _problem(request,422,"validation_failed")
         rows=db.execute(query.order_by(ScreeningItem.created_at,ScreeningItem.id).limit(limit+1)).all(); next_cursor=None
         if len(rows)>limit: next_cursor=request.app.state.recruiting_cursor.encode(str(principal.organization_id),f"screening-items:{run_id}",rows[limit-1][0].created_at.isoformat(),str(rows[limit-1][0].id)); rows=rows[:limit]
-        item_ids=[item.id for item,_ in rows]; applications={}; candidates={}; rule_results={}; evaluations={}; llm_config=None; llm_prompt=None
+        item_ids=[item.id for item,_ in rows]; applications={}; candidates={}; rule_results={}; evaluations={}; resumes={}; llm_config=None; llm_prompt=None; jd_version=None
         if item_ids:
             enrichment_scope=(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.id.in_(item_ids))
             application_rows=db.execute(select(ScreeningItem.id,Application).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(*enrichment_scope)).all()
@@ -274,6 +298,9 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             for item_id,result in result_rows: rule_results.setdefault(item_id,result)
             evaluation_rows=db.execute(select(ScreeningResult.item_id,LlmScreeningEvaluation).join(ScreeningItem,and_(ScreeningItem.organization_id==ScreeningResult.organization_id,ScreeningItem.id==ScreeningResult.item_id)).join(LlmScreeningEvaluation,and_(LlmScreeningEvaluation.organization_id==ScreeningResult.organization_id,LlmScreeningEvaluation.screening_result_id==ScreeningResult.id)).where(*enrichment_scope).order_by(LlmScreeningEvaluation.created_at.desc(),LlmScreeningEvaluation.id.desc())).all()
             for item_id,evaluation in evaluation_rows: evaluations.setdefault(item_id,evaluation)
+            resume_ids={item.resume_id for item,_ in rows if item.resume_id is not None}
+            if resume_ids: resumes={resume.id:resume for resume in db.scalars(select(Resume).where(Resume.organization_id==principal.organization_id,Resume.id.in_(resume_ids)))}
+            jd_version=db.scalar(select(JobJdVersion).where(JobJdVersion.organization_id==principal.organization_id,JobJdVersion.id==run.jd_version_id))
             llm_config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==principal.organization_id))
             llm_prompt=db.scalar(select(PromptVersion).where(PromptVersion.organization_id==principal.organization_id,PromptVersion.name=="screening-evaluation").order_by(PromptVersion.version_number.desc()).limit(1))
-        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.id),evaluations.get(item.id),candidates.get(item.id),rule_results.get(item.id),is_llm_retryable(item,run,rule_results.get(item.id),llm_config,llm_prompt)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
+        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.id),evaluations.get(item.id),candidates.get(item.id),rule_results.get(item.id),is_llm_retryable(item,run,rule_results.get(item.id),llm_config,llm_prompt,jd_version,resumes.get(item.resume_id))) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response

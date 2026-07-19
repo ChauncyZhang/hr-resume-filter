@@ -182,6 +182,16 @@ test("cancelled tasks never describe progress as completed", () => {
   assert.equal(helpers.progressSummary({ status: "complete", completed: 5, total: 5 }), "处理完成：5/5 份简历");
 });
 
+test("an interrupted empty upload offers abandonment instead of an ineffective retry", () => {
+  assert.deepEqual(helpers.pollFailureAction({ code: "RECOVERED_RUN_EMPTY" }), {
+    code: "RECOVERED_RUN_EMPTY",
+    message: "该任务在上传前中断，没有可恢复的简历。可放弃此任务后重新导入。",
+    action: "cancel",
+    label: "放弃任务",
+  });
+  assert.equal(helpers.pollFailureAction(new Error("network")).action, "retry");
+});
+
 test("server retry stays locked while the refreshed row remains failed and retryable", () => {
   assert.deepEqual(helpers.reconcileRetryingIds(["item-1", "missing"], [
     { id: "item-1", status: "failed", retryable: true },
