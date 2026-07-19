@@ -271,10 +271,12 @@ git commit -m "feat: add multidimensional LLM screening contract"
 - Create: `server/app/screening/routing.py`
 - Create: `server/app/recruiting/tasks.py`
 - Create: `server/app/talent/service.py`
+- Modify: `server/app/governance/audit.py`
 - Modify: `server/app/recruiting/service.py`
 - Create: `server/tests/test_screening_routing.py`
 - Create: `server/tests/test_recruiting_tasks.py`
 - Create: `server/tests/test_talent_service.py`
+- Modify: `server/tests/test_governance_audit.py`
 
 **Interfaces:**
 - Produces: `derive_screening_outcome(score)`, `route_llm_screening_terminal(...)`, `ensure_review_task(...)`, `close_review_task(...)`, and `ensure_deferred_membership(...)`.
