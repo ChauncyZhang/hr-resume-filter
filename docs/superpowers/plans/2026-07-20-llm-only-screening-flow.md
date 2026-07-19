@@ -136,10 +136,12 @@ git commit -m "feat: persist LLM screening routes"
 **Files:**
 - Modify: `server/app/llm/screening.py`
 - Modify: `server/app/llm/gateway.py`
+- Modify: `server/app/screening/llm_pipeline.py`
 - Modify: `server/app/screening/pipeline.py`
 - Modify: `server/app/screening/schemas.py`
 - Modify: `server/tests/test_llm_screening_contract.py`
 - Modify: `server/tests/test_llm_gateway.py`
+- Modify: `server/tests/test_llm_pipeline.py`
 - Modify: `server/tests/test_screening_pipeline.py`
 
 **Interfaces:**
@@ -249,7 +251,7 @@ Keep `recommendation` in the API as a server-derived display value added in Task
 Run:
 
 ```powershell
-python -m pytest server/tests/test_llm_screening_contract.py server/tests/test_llm_gateway.py server/tests/test_screening_pipeline.py -q
+python -m pytest server/tests/test_llm_screening_contract.py server/tests/test_llm_gateway.py server/tests/test_llm_pipeline.py server/tests/test_screening_pipeline.py -q
 ```
 
 Expected: all tests pass; request-body assertions show JD and redacted resume only.
@@ -257,7 +259,7 @@ Expected: all tests pass; request-body assertions show JD and redacted resume on
 - [ ] **Step 7: Commit Prompt v2 and the contract**
 
 ```powershell
-git add server/app/llm/screening.py server/app/llm/gateway.py server/app/screening/pipeline.py server/app/screening/schemas.py server/tests/test_llm_screening_contract.py server/tests/test_llm_gateway.py server/tests/test_screening_pipeline.py
+git add server/app/llm/screening.py server/app/llm/gateway.py server/app/screening/llm_pipeline.py server/app/screening/pipeline.py server/app/screening/schemas.py server/tests/test_llm_screening_contract.py server/tests/test_llm_gateway.py server/tests/test_llm_pipeline.py server/tests/test_screening_pipeline.py
 git commit -m "feat: add multidimensional LLM screening contract"
 ```
 
