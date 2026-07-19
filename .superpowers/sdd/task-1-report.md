@@ -200,3 +200,44 @@ line-ending warning.
 - Worker shutdown remains bounded by the 5-second readiness deadline. Documentation explicitly
   states async cancellation does not instantly terminate an OS thread; the underlying MinIO
   network timeout is the finite thread-operation bound.
+
+## Review fixes: shared Nginx route validator
+
+Commit: final amended commit (`fix: enforce shared nginx root routes`); hash is reported in the task response.
+
+### Fix summary
+
+- Restricted upstream validation to the structured `location /` block for each named server.
+- Restricted `proxy_pass` matching to directives directly declared in that root location,
+  excluding nested location or conditional blocks.
+- Added a regression test proving a correct upstream in `/health` cannot satisfy the root route.
+- Added a CLI success-path test asserting exit code `0` and empty stderr.
+
+### RED evidence
+
+```powershell
+python -m pytest deploy/tests/test_shared_nginx_release_validator.py -q -p no:cacheprovider
+```
+
+Observed: `1 failed, 6 passed`; the non-root upstream regression expected
+`wrong_upstream:hr.aurora-tek.cn` but the old implementation returned no errors.
+
+### GREEN evidence
+
+```powershell
+python -m pytest deploy/tests/test_shared_nginx_release_validator.py -q -p no:cacheprovider
+python -m py_compile deploy/shared_nginx_release_validator.py
+```
+
+Observed: `7 passed in 0.24s`; `py_compile` exited `0` with no output.
+
+### Self-review
+
+- The validator now requires a precise root location and direct root-level upstream.
+- Nested brace blocks are preserved during extraction and excluded from direct directive checks.
+- The CLI success contract is explicitly covered and emits no stderr on valid input.
+- `git diff --check` passed before commit.
+
+### Concerns
+
+None identified.
