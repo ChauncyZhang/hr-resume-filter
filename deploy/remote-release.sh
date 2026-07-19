@@ -29,6 +29,26 @@ case "$release" in
     *[!A-Za-z0-9._-]*|'') printf '%s\n' 'invalid release id' >&2; exit 2 ;;
 esac
 
+read_aurora_web_smoke_marker() {
+    python3 - "$env_file" <<'PY'
+import sys
+from pathlib import Path
+
+for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip() != "AURORA_WEB_SMOKE_MARKER":
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    print(value)
+    break
+PY
+}
+
 test -d "$release_dir"
 test -d "$previous_release"
 test -f "$previous_release/deploy/.env"
@@ -37,6 +57,11 @@ test -f "$previous_release/deploy/nginx/production.conf.template"
 test -f "$staging/frontend-image.tar"
 cp "$previous_release/deploy/.env" "$env_file"
 chmod 600 "$env_file"
+aurora_web_smoke_marker=$(read_aurora_web_smoke_marker)
+if [ -z "$aurora_web_smoke_marker" ]; then
+    printf '%s\n' 'AURORA_WEB_SMOKE_MARKER is required' >&2
+    exit 1
+fi
 cp "$previous_release/deploy/compose.server-https.yaml" "$overlay"
 cp "$previous_release/deploy/nginx/production.conf.template" "$nginx_template"
 python3 "$release_dir/deploy/shared_nginx_release_validator.py" \
@@ -78,26 +103,6 @@ verify_shared_networks() {
     docker inspect --format '{{json .NetworkSettings.Networks}}' beyondcandidate-proxy-1 | grep -q 'beyondcandidate_edge'
 }
 
-read_aurora_web_smoke_marker() {
-    python3 - "$env_file" <<'PY'
-import sys
-from pathlib import Path
-
-for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    line = raw_line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    if key.strip() != "AURORA_WEB_SMOKE_MARKER":
-        continue
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1]
-    print(value)
-    break
-PY
-}
-
 verify_release_runtime() {
     runtime_release=$1
     wait_for_health beyondcandidate-proxy-1 \
@@ -135,7 +140,6 @@ fi
 compose_at "$release_dir" config --quiet
 aurora_web_before=$(docker inspect --format '{{.Id}}' aurora-web)
 test -n "$aurora_web_before"
-aurora_web_smoke_marker=$(read_aurora_web_smoke_marker)
 smoke_tool="$release_dir/deploy/shared-nginx-smoke.sh"
 test -f "$smoke_tool"
 

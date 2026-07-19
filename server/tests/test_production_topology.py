@@ -837,6 +837,18 @@ def test_preflight_accepts_installed_compose_and_validates_merged_model(
 def test_remote_release_protection_is_part_of_repository_gate() -> None:
     script = (ROOT / "deploy" / "deploy-remote.ps1").read_text(encoding="utf-8")
 
+    gate_index = script.index("Invoke-SharedNginxReleaseGate $repositoryRoot")
+    validate_only_index = script.index("if ($ValidateOnly)")
+    validate_only_return = script.index("return", validate_only_index)
+    side_effect_indices = [
+        script.index("Invoke-Native docker build"),
+        script.index("New-Item -ItemType Directory -Force -Path $localStaging"),
+        script.index("Invoke-Native tar -czf $sourceArchive"),
+        script.index("Invoke-Native ssh"),
+        script.index("Copy-RemoteArtifact $sourceArchive"),
+    ]
+
     assert "test_shared_nginx_release_validator.py" in script
     assert "test_remote_deploy_scripts.py" in script
     assert "shared-nginx-smoke.sh" in script
+    assert gate_index < validate_only_index < validate_only_return < min(side_effect_indices)

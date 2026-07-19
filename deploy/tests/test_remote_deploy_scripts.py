@@ -77,6 +77,75 @@ def test_release_revalidates_previous_services_after_automatic_rollback() -> Non
     assert "rollback verification failed; previous release is not healthy" in REMOTE_SHELL
 
 
+def test_release_rejects_missing_marker_before_remote_service_side_effects(tmp_path) -> None:
+    def bash_path(path: Path) -> str:
+        value = path.as_posix()
+        return f"/{value[0].lower()}{value[2:]}"
+
+    app_root = tmp_path / "app"
+    previous = app_root / "releases" / "previous"
+    candidate = app_root / "releases" / "candidate"
+    staging = tmp_path / "staging"
+    for release in (previous, candidate):
+        (release / "deploy" / "nginx").mkdir(parents=True)
+        (release / "deploy" / ".env").write_text("OTHER_SETTING=value\n", encoding="utf-8")
+        (release / "deploy" / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
+        (release / "deploy" / "compose.server-https.yaml").write_text(
+            "services:\n  proxy:\n    image: beyondcandidate-frontend:old\n",
+            encoding="utf-8",
+        )
+        (release / "deploy" / "nginx" / "production.conf.template").write_text(
+            "server {}\n", encoding="utf-8"
+        )
+    (candidate / "deploy" / "remote-release.sh").write_text(REMOTE_SHELL, encoding="utf-8")
+    (candidate / "deploy" / "shared_nginx_release_validator.py").write_text(
+        (ROOT / "deploy" / "shared_nginx_release_validator.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (staging / "frontend-image.tar").parent.mkdir()
+    (staging / "frontend-image.tar").write_bytes(b"image")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    (bin_dir / "docker").write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$DOCKER_LOG\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "readlink").write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{bash_path(previous)}'\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "python3").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    for command in bin_dir.iterdir():
+        command.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            BASH,
+            "-c",
+            'export PATH="$1:$PATH" DOCKER_LOG="$2"; shift 2; exec "$@"',
+            "bash",
+            bash_path(bin_dir),
+            bash_path(docker_log),
+            bash_path(candidate / "deploy" / "remote-release.sh"),
+            "candidate",
+            "frontend",
+            "hr.aurora-tek.cn",
+            bash_path(app_root),
+            bash_path(staging),
+            "commit",
+            "sha256",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "AURORA_WEB_SMOKE_MARKER is required" in result.stderr
+    assert not docker_log.exists()
+
+
 def test_release_marker_failure_rolls_back_without_composing_aurora_web(tmp_path) -> None:
     def bash_path(path: Path) -> str:
         value = path.as_posix()
