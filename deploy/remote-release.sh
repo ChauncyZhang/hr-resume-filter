@@ -54,9 +54,9 @@ compose_at() {
 
 rollback_services() {
     if [ "$scope" = all ]; then
-        compose_at "$previous_release" up -d --no-build api worker proxy || true
+        compose_at "$previous_release" up -d --no-build api worker proxy
     else
-        compose_at "$previous_release" up -d --no-deps --force-recreate proxy || true
+        compose_at "$previous_release" up -d --no-deps --force-recreate proxy
     fi
 }
 
@@ -78,6 +78,46 @@ verify_shared_networks() {
     docker inspect --format '{{json .NetworkSettings.Networks}}' beyondcandidate-proxy-1 | grep -q 'beyondcandidate_edge'
 }
 
+read_aurora_web_smoke_marker() {
+    python3 - "$env_file" <<'PY'
+import sys
+from pathlib import Path
+
+for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip() != "AURORA_WEB_SMOKE_MARKER":
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    print(value)
+    break
+PY
+}
+
+verify_release_runtime() {
+    runtime_release=$1
+    wait_for_health beyondcandidate-proxy-1 \
+        && compose_at "$runtime_release" exec -T proxy nginx -t \
+        && verify_shared_networks \
+        && AURORA_WEB_SMOKE_MARKER="$aurora_web_smoke_marker" \
+            sh "$smoke_tool" "$aurora_web_before"
+}
+
+restore_previous_and_verify() {
+    if ! rollback_services; then
+        printf '%s\n' 'rollback service restoration failed' >&2
+        return 1
+    fi
+    if ! verify_release_runtime "$previous_release"; then
+        printf '%s\n' 'rollback verification failed; previous release is not healthy' >&2
+        return 1
+    fi
+}
+
 docker load -i "$staging/frontend-image.tar"
 docker image inspect "$frontend_image" >/dev/null
 sed -i -E "0,/image: beyondcandidate-frontend:[^[:space:]]+/s//image: beyondcandidate-frontend:$release/" "$overlay"
@@ -95,6 +135,9 @@ fi
 compose_at "$release_dir" config --quiet
 aurora_web_before=$(docker inspect --format '{{.Id}}' aurora-web)
 test -n "$aurora_web_before"
+aurora_web_smoke_marker=$(read_aurora_web_smoke_marker)
+smoke_tool="$release_dir/deploy/shared-nginx-smoke.sh"
+test -f "$smoke_tool"
 
 if [ "$scope" = all ]; then
     compose_at "$release_dir" up -d postgres minio clamav
@@ -133,47 +176,24 @@ PY
     compose_at "$release_dir" exec -T postgres \
         sh /docker-entrypoint-initdb.d/10-provision-app-role.sh
     if ! compose_at "$release_dir" up -d --no-build api worker proxy; then
-        rollback_services
+        restore_previous_and_verify || exit 1
         exit 1
     fi
     if ! wait_for_health beyondcandidate-api-1 || ! wait_for_health beyondcandidate-worker-1; then
         printf '%s\n' 'application health verification failed; rolling back services' >&2
-        rollback_services
+        restore_previous_and_verify || exit 1
         exit 1
     fi
 else
     if ! compose_at "$release_dir" up -d --no-deps --force-recreate proxy; then
-        rollback_services
+        restore_previous_and_verify || exit 1
         exit 1
     fi
 fi
 
-aurora_web_smoke_marker=$(python3 - "$env_file" <<'PY'
-import sys
-from pathlib import Path
-
-for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
-    line = raw_line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, value = line.split("=", 1)
-    if key.strip() != "AURORA_WEB_SMOKE_MARKER":
-        continue
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        value = value[1:-1]
-    print(value)
-    break
-PY
-)
-
-if ! wait_for_health beyondcandidate-proxy-1 \
-    || ! compose_at "$release_dir" exec -T proxy nginx -t \
-    || ! verify_shared_networks \
-    || ! AURORA_WEB_SMOKE_MARKER="$aurora_web_smoke_marker" \
-        sh "$release_dir/deploy/shared-nginx-smoke.sh" "$aurora_web_before"; then
+if ! verify_release_runtime "$release_dir"; then
     printf '%s\n' 'shared routing verification failed; rolling back services' >&2
-    rollback_services
+    restore_previous_and_verify || exit 1
     exit 1
 fi
 

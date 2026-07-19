@@ -12,12 +12,14 @@ expected_release=$3
 current_release=$(readlink -f "$app_root/current")
 expected_path="$app_root/releases/$expected_release"
 info_file="$current_release/deploy/release-info.txt"
+smoke_tool="$current_release/deploy/shared-nginx-smoke.sh"
 
 if [ "$current_release" != "$expected_path" ]; then
     printf 'refusing rollback: current release is not %s\n' "$expected_release" >&2
     exit 1
 fi
 test -f "$info_file"
+test -f "$smoke_tool"
 scope=$(sed -n 's/^scope=//p' "$info_file")
 previous_release=$(sed -n 's/^previous_release=//p' "$info_file")
 case "$scope" in
@@ -94,7 +96,7 @@ aurora_web_smoke_marker=$(shared_nginx_smoke_marker)
 compose_previous exec -T proxy nginx -t
 verify_shared_networks
 AURORA_WEB_SMOKE_MARKER="$aurora_web_smoke_marker" \
-    sh "$previous_release/deploy/shared-nginx-smoke.sh" "$aurora_web_before"
+    sh "$smoke_tool" "$aurora_web_before"
 ln -sfn "$previous_release" "$app_root/current.new"
 mv -Tf "$app_root/current.new" "$app_root/current"
 printf 'rolled_back_from=%s\n' "$expected_release"

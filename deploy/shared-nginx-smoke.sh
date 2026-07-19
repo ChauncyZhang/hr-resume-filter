@@ -18,7 +18,7 @@ curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
     https://hr.aurora-tek.cn/health/ready >/dev/null
 curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
     https://hr.aurora-tek.cn/ >/dev/null
-curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+curl --fail --silent --show-error --location --max-redirs 3 --connect-timeout 5 --max-time 15 \
     https://aurora-tek.cn/ | grep -Fq "$AURORA_WEB_SMOKE_MARKER"
-curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+curl --fail --silent --show-error --location --max-redirs 3 --connect-timeout 5 --max-time 15 \
     https://www.aurora-tek.cn/ | grep -Fq "$AURORA_WEB_SMOKE_MARKER"
