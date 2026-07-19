@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import pytest
 from pydantic import ValidationError
@@ -27,6 +28,16 @@ class Transport:
     def post(self, spec, address, path, headers, body, max_response_bytes):
         self.calls.append((spec, address, path, headers, body, max_response_bytes))
         return TransportResponse(self.status, self.body)
+
+
+class SlowTransport(Transport):
+    def __init__(self, body, delay):
+        super().__init__(body)
+        self.delay = delay
+
+    def post(self, *args, **kwargs):
+        time.sleep(self.delay)
+        return super().post(*args, **kwargs)
 
 
 def request(**changes):
@@ -149,6 +160,18 @@ def test_gateway_evaluate_reuses_pinned_transport_and_returns_bounded_facts():
     assert payload["response_format"] == {"type": "json_object"}
     assert "Python backend role" in payload["messages"][1]["content"]
     assert payload["max_tokens"] == 800
+
+
+def test_gateway_evaluation_has_a_longer_budget_than_the_connection_probe():
+    transport = SlowTransport(provider_body(valid_result()), delay=0.03)
+
+    evaluation = asyncio.run(gateway(
+        transport,
+        total_timeout=0.01,
+        evaluation_total_timeout=0.1,
+    ).evaluate("provider", "model", "sk-secret", request()))
+
+    assert evaluation.result.score == 88
 
 
 def test_gateway_evaluate_redacts_identifiers_echoed_by_provider():

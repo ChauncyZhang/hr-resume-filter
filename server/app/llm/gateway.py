@@ -23,7 +23,7 @@ class _Usage(BaseModel):
     total_tokens:int=Field(default=0,ge=0,le=10_000_000)
 
 class PinnedHttpsTransport:
-    def __init__(self,*,connect_timeout:float=3,read_timeout:float=10): self.connect_timeout=connect_timeout; self.read_timeout=read_timeout
+    def __init__(self,*,connect_timeout:float=3,read_timeout:float=60): self.connect_timeout=connect_timeout; self.read_timeout=read_timeout
     def post(self,spec,address,path,headers,body,max_response_bytes):
         raw=socket.create_connection((address,spec.port),timeout=self.connect_timeout); connection=raw
         try:
@@ -37,9 +37,10 @@ class PinnedHttpsTransport:
             connection.close()
 
 class OpenAiCompatibleGateway:
-    def __init__(self,allowlist:ProviderAllowlist,transport:GatewayTransport|None=None,*,total_timeout:float=15,max_response_bytes:int=64*1024,max_concurrency:int=4):
+    def __init__(self,allowlist:ProviderAllowlist,transport:GatewayTransport|None=None,*,total_timeout:float=15,evaluation_total_timeout:float=75,max_response_bytes:int=64*1024,max_concurrency:int=4):
         if max_concurrency<1: raise ValueError("max_concurrency must be positive")
-        self.allowlist=allowlist; self.transport=transport or PinnedHttpsTransport(); self.total_timeout=total_timeout; self.max_response_bytes=max_response_bytes; self._semaphore=asyncio.Semaphore(max_concurrency)
+        if total_timeout<=0 or evaluation_total_timeout<=0: raise ValueError("timeouts must be positive")
+        self.allowlist=allowlist; self.transport=transport or PinnedHttpsTransport(); self.total_timeout=total_timeout; self.evaluation_total_timeout=evaluation_total_timeout; self.max_response_bytes=max_response_bytes; self._semaphore=asyncio.Semaphore(max_concurrency)
     async def test_connection(self,provider_id:str,model:str,api_key:str,*,organization_id=None)->int:
         started=time.monotonic()
         try:
@@ -77,7 +78,7 @@ class OpenAiCompatibleGateway:
             async def send():
                 async with self._semaphore:
                     return await asyncio.to_thread(self.transport.post,spec,address,path,headers,payload,self.max_response_bytes)
-            response=await asyncio.wait_for(send(),self.total_timeout)
+            response=await asyncio.wait_for(send(),self.evaluation_total_timeout)
         except GatewayError: raise
         except ProviderPolicyError as error: raise GatewayError(str(error)) from None
         except (TimeoutError,OSError,ssl.SSLError): raise GatewayError("provider_unavailable") from None
