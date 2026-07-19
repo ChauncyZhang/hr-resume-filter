@@ -17,6 +17,7 @@ release_dir="$app_root/releases/$release"
 previous_release=$(readlink -f "$app_root/current")
 overlay="$release_dir/deploy/compose.server-https.yaml"
 env_file="$release_dir/deploy/.env"
+nginx_template="$release_dir/deploy/nginx/production.conf.template"
 frontend_image="beyondcandidate-frontend:$release"
 app_image="beyondcandidate-server:$release"
 
@@ -32,10 +33,14 @@ test -d "$release_dir"
 test -d "$previous_release"
 test -f "$previous_release/deploy/.env"
 test -f "$previous_release/deploy/compose.server-https.yaml"
+test -f "$previous_release/deploy/nginx/production.conf.template"
 test -f "$staging/frontend-image.tar"
 cp "$previous_release/deploy/.env" "$env_file"
 chmod 600 "$env_file"
 cp "$previous_release/deploy/compose.server-https.yaml" "$overlay"
+cp "$previous_release/deploy/nginx/production.conf.template" "$nginx_template"
+python3 "$release_dir/deploy/shared_nginx_release_validator.py" \
+    --nginx-template "$nginx_template"
 
 compose_at() {
     compose_root=$1
@@ -68,6 +73,11 @@ wait_for_health() {
     return 1
 }
 
+verify_shared_networks() {
+    docker inspect --format '{{json .NetworkSettings.Networks}}' aurora-web | grep -q 'beyondcandidate_edge'
+    docker inspect --format '{{json .NetworkSettings.Networks}}' beyondcandidate-proxy-1 | grep -q 'beyondcandidate_edge'
+}
+
 docker load -i "$staging/frontend-image.tar"
 docker image inspect "$frontend_image" >/dev/null
 sed -i -E "0,/image: beyondcandidate-frontend:[^[:space:]]+/s//image: beyondcandidate-frontend:$release/" "$overlay"
@@ -83,6 +93,8 @@ if [ "$scope" = all ]; then
 fi
 
 compose_at "$release_dir" config --quiet
+aurora_web_before=$(docker inspect --format '{{.Id}}' aurora-web)
+test -n "$aurora_web_before"
 
 if [ "$scope" = all ]; then
     compose_at "$release_dir" up -d postgres minio clamav
@@ -136,9 +148,31 @@ else
     fi
 fi
 
+aurora_web_smoke_marker=$(python3 - "$env_file" <<'PY'
+import sys
+from pathlib import Path
+
+for raw_line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    if key.strip() != "AURORA_WEB_SMOKE_MARKER":
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    print(value)
+    break
+PY
+)
+
 if ! wait_for_health beyondcandidate-proxy-1 \
-    || ! curl --fail --silent --show-error --max-time 15 "https://$domain/health/ready" >/dev/null; then
-    printf '%s\n' 'HTTPS health verification failed; rolling back services' >&2
+    || ! compose_at "$release_dir" exec -T proxy nginx -t \
+    || ! verify_shared_networks \
+    || ! AURORA_WEB_SMOKE_MARKER="$aurora_web_smoke_marker" \
+        sh "$release_dir/deploy/shared-nginx-smoke.sh" "$aurora_web_before"; then
+    printf '%s\n' 'shared routing verification failed; rolling back services' >&2
     rollback_services
     exit 1
 fi
