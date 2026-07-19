@@ -832,3 +832,11 @@ def test_preflight_accepts_installed_compose_and_validates_merged_model(
     result = _run_preflight(_preflight_environment(cert_path, key_path))
 
     assert result.returncode == 0, result.stderr
+
+
+def test_remote_release_protection_is_part_of_repository_gate() -> None:
+    script = (ROOT / "deploy" / "deploy-remote.ps1").read_text(encoding="utf-8")
+
+    assert "test_shared_nginx_release_validator.py" in script
+    assert "test_remote_deploy_scripts.py" in script
+    assert "shared-nginx-smoke.sh" in script

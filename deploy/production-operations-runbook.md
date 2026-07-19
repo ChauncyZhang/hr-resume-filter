@@ -39,7 +39,22 @@ PowerShell -ExecutionPolicy Bypass -File deploy\deploy-remote.ps1 -Scope fronten
 The command rejects a dirty worktree by default. `-AllowDirty` is reserved for an explicitly
 approved emergency release and marks the release ID as dirty. `-SkipTests` is also an emergency
 override, not the normal path. `-ValidateOnly` checks local prerequisites and release identity
-without building or changing the server.
+without building or changing the server. It runs the shared Nginx release gate: the release
+validator tests, remote deployment-script tests, and Git Bash syntax check for
+`deploy/shared-nginx-smoke.sh`. This gate runs before any archive creation or SSH upload and
+cannot be skipped by `-SkipTests`.
+
+Before release, configure the required server-only setting
+`AURORA_WEB_SMOKE_MARKER=<stable text from the website homepage>` in the protected deployment
+environment. Do not put its production value in this repository. The release inherits the
+server-owned `deploy/.env`, `deploy/compose.server-https.yaml`, and
+`deploy/nginx/production.conf.template`. A missing previous shared template is a release
+blocker, not permission to fall back to the repository template.
+
+Retain post-release evidence for the three domain statuses, website marker match, unchanged
+`aurora-web` container ID, `nginx -t`, and the current release symlink. A failed shared-route
+smoke keeps the candidate from becoming current and uses the existing rollback path; inspect the
+same evidence again before further traffic decisions.
 
 This single-host archive transfer is the current operational path for the trial deployment. It
 does not replace the immutable registry/digest and progressive rollout process required below

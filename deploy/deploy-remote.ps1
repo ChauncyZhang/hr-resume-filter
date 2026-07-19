@@ -55,6 +55,24 @@ function Remove-SafeStagingDirectory([string]$Path) {
     Remove-Item -LiteralPath $resolvedPath -Recurse -Force
 }
 
+function Invoke-SharedNginxReleaseGate([string]$RepositoryRoot) {
+    $gitBash = "C:\Program Files\Git\bin\bash.exe"
+    if (-not (Test-Path -LiteralPath $gitBash -PathType Leaf)) {
+        throw "Git Bash is required for the shared Nginx release gate"
+    }
+
+    Push-Location $RepositoryRoot
+    try {
+        Invoke-Native python -m pytest `
+            deploy/tests/test_shared_nginx_release_validator.py `
+            deploy/tests/test_remote_deploy_scripts.py `
+            -q -p no:cacheprovider
+        Invoke-Native $gitBash -n deploy/shared-nginx-smoke.sh
+    } finally {
+        Pop-Location
+    }
+}
+
 if ($RemoteHost -notmatch '^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$') {
     throw "RemoteHost must use the form user@host"
 }
@@ -79,9 +97,6 @@ $shortCommit = $commit.Substring(0, 8)
 $dirtyLines = @(& git -C $repositoryRoot status --porcelain --untracked-files=normal)
 if ($LASTEXITCODE -ne 0) { throw "Unable to inspect repository status" }
 $isDirty = $dirtyLines.Count -gt 0
-if ($isDirty -and -not $AllowDirty) {
-    throw "Refusing to deploy a dirty worktree. Commit the release or use -AllowDirty for an explicit emergency deployment."
-}
 
 $dirtySuffix = if ($isDirty) { "-dirty" } else { "" }
 $releaseId = "{0}-{1}{2}" -f [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss"), $shortCommit, $dirtySuffix
@@ -95,9 +110,13 @@ $appArchive = Join-Path $localStaging "app-image.tar"
 
 Write-Host "[deploy] release=$releaseId scope=$Scope host=$RemoteHost"
 Write-Host "[deploy] commit=$commit dirty=$isDirty"
+Invoke-SharedNginxReleaseGate $repositoryRoot
 if ($ValidateOnly) {
-    Write-Host "[deploy] validation complete; no build or remote change performed"
+    Write-Host "[deploy] shared Nginx release gate passed; no build or remote change performed"
     return
+}
+if ($isDirty -and -not $AllowDirty) {
+    throw "Refusing to deploy a dirty worktree. Commit the release or use -AllowDirty for an explicit emergency deployment."
 }
 
 try {
