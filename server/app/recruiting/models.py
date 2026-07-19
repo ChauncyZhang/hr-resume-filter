@@ -96,7 +96,45 @@ class Application(Record, Base):
     human_conclusion: Mapped[str | None] = mapped_column(Text)
     version: Mapped[int] = mapped_column(Integer, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
-    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "id", "candidate_id", name="uq_applications_tenant_id_candidate"), UniqueConstraint("organization_id", "id", "candidate_id", "job_id"), CheckConstraint("stage in ('new','review','contact','interview_pending','interviewing','decision','passed','hired','rejected','withdrawn')", name="ck_applications_stage"), Index("uq_applications_active", "organization_id", "candidate_id", "job_id", unique=True, postgresql_where=text("stage not in ('hired','rejected','withdrawn')"), sqlite_where=text("stage not in ('hired','rejected','withdrawn')")), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "job_id"], ["jobs.organization_id", "jobs.id"]), ForeignKeyConstraint(["organization_id", "resume_id", "candidate_id"], ["resumes.organization_id", "resumes.id", "resumes.candidate_id"]), ForeignKeyConstraint(["organization_id", "source_application_id", "candidate_id"], ["applications.organization_id", "applications.id", "applications.candidate_id"]), ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]))
+    __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "id", "candidate_id", name="uq_applications_tenant_id_candidate"), UniqueConstraint("organization_id", "id", "candidate_id", "job_id"), CheckConstraint("stage in ('new','review','deferred','contact','interview_pending','interviewing','decision','passed','hired','rejected','withdrawn')", name="ck_applications_stage"), Index("uq_applications_active", "organization_id", "candidate_id", "job_id", unique=True, postgresql_where=text("stage not in ('hired','rejected','withdrawn')"), sqlite_where=text("stage not in ('hired','rejected','withdrawn')")), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "job_id"], ["jobs.organization_id", "jobs.id"]), ForeignKeyConstraint(["organization_id", "resume_id", "candidate_id"], ["resumes.organization_id", "resumes.id", "resumes.candidate_id"]), ForeignKeyConstraint(["organization_id", "source_application_id", "candidate_id"], ["applications.organization_id", "applications.id", "applications.candidate_id"]), ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]))
+
+
+class ApplicationReviewTask(Record, Base):
+    __tablename__ = "application_review_tasks"
+    application_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    assignee_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    ai_status: Mapped[str] = mapped_column(String(16))
+    safe_error_code: Mapped[str | None] = mapped_column(String(64))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id"),
+        ForeignKeyConstraint(
+            ["organization_id", "application_id"],
+            ["applications.organization_id", "applications.id"],
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "assignee_id"],
+            ["users.organization_id", "users.id"],
+        ),
+        CheckConstraint(
+            "status in ('open','closed','cancelled')",
+            name="ck_application_review_tasks_status",
+        ),
+        CheckConstraint(
+            "ai_status in ('succeeded','failed')",
+            name="ck_application_review_tasks_ai_status",
+        ),
+        Index(
+            "uq_application_review_tasks_open_application",
+            "organization_id",
+            "application_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
+    )
 
 
 class EventRecord(Record):

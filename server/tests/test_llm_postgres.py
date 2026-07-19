@@ -33,7 +33,7 @@ def test_llm_screening_evaluations_are_tenant_safe_idempotent_and_immutable():
         connection.execute(text("INSERT INTO prompt_versions(id,organization_id,name,version_number,content,content_hash,created_by,created_at) VALUES(:prompt,:o1,'screen',1,'{}',repeat('0',64),:u1,now())"),ids)
         connection.execute(text("INSERT INTO background_jobs(id,organization_id,type,payload,status,priority,attempts,max_attempts,run_after,created_at,updated_at) VALUES(:queue,:o1,'screening.llm_score_item','{}','succeeded',0,1,3,now(),now(),now())"),ids)
         connection.execute(text("INSERT INTO llm_invocations(id,organization_id,config_id,prompt_version_id,screening_result_id,queue_job_id,attempt_no,config_version,input_sha256,provider_id,model,request_field_manifest,status,usage,created_at) VALUES(:invocation,:o1,:config,:prompt,:result,:queue,1,2,repeat('a',64),'approved','model','[]','succeeded','{}',now())"),ids)
-        connection.execute(text("INSERT INTO llm_screening_evaluations(id,organization_id,screening_result_id,invocation_id,prompt_version_id,score,recommendation,summary,strengths,gaps,risks,interview_questions,created_at) VALUES(:evaluation,:o1,:result,:invocation,:prompt,91,'优先沟通','Strong match','[]','[]','[]','[]',now())"),ids)
+        connection.execute(text("INSERT INTO llm_screening_evaluations(id,organization_id,screening_result_id,invocation_id,prompt_version_id,score,recommendation,summary,strengths,gaps,risks,interview_questions,dimensions,created_at) VALUES(:evaluation,:o1,:result,:invocation,:prompt,91,'优先沟通','Strong match','[]','[]','[]','[]','[{\"name\": \"experience\", \"score\": 91}]',now())"),ids)
     statements=(
         "INSERT INTO llm_screening_evaluations(id,organization_id,screening_result_id,invocation_id,prompt_version_id,score,recommendation,summary,strengths,gaps,risks,interview_questions,created_at) VALUES(gen_random_uuid(),:o2,:result,:invocation,:prompt,50,'可沟通','x','[]','[]','[]','[]',now())",
         "INSERT INTO llm_invocations(id,organization_id,config_id,prompt_version_id,screening_result_id,queue_job_id,attempt_no,config_version,input_sha256,provider_id,model,request_field_manifest,status,usage,created_at) VALUES(gen_random_uuid(),:o1,:config,:prompt,:result,:queue,1,2,repeat('b',64),'approved','model','[]','failed','{}',now())",
@@ -47,4 +47,6 @@ def test_llm_screening_evaluations_are_tenant_safe_idempotent_and_immutable():
             transaction.rollback()
     checks={item["name"] for item in inspect(engine).get_check_constraints("llm_screening_evaluations")}
     assert {"ck_llm_screening_evaluations_score","ck_llm_screening_evaluations_recommendation"} <= checks
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT dimensions FROM llm_screening_evaluations WHERE id = :evaluation"), ids) == [{"name": "experience", "score": 91}]
     engine.dispose()

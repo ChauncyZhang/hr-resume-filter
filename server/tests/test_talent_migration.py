@@ -4,6 +4,7 @@ import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 from server.tests.test_interview_persistence_postgres import _seed_application
 
@@ -105,4 +106,48 @@ def test_0014_downgrade_preserves_cross_job_source_in_a_history_event() -> None:
         ).one()
     assert application == (None, "talent_pool_reactivation")
     assert history[0] == str(identifiers["application"])
+    engine.dispose()
+
+
+def test_0021_enforces_one_system_pool_key_per_organization() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    env = {**os.environ, "DATABASE_URL": url}
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    subprocess.run(
+        ["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "head"],
+        check=True,
+        env=env,
+    )
+    with engine.begin() as connection:
+        connection.execute(text("TRUNCATE organizations CASCADE"))
+        identifiers = _seed_application(connection)
+        connection.execute(
+            text(
+                """
+                INSERT INTO talent_pools(
+                  id, organization_id, name, purpose, owner_id, suitable_roles,
+                  retention_days, version, system_key, created_at, updated_at
+                ) VALUES (
+                  :pool, :organization, 'Deferred', 'AI review', :owner, '[]',
+                  730, 1, 'ai_screening_deferred', now(), now()
+                )
+                """
+            ),
+            {**identifiers, "pool": uuid.uuid4()},
+        )
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO talent_pools(
+                      id, organization_id, name, purpose, owner_id, suitable_roles,
+                      retention_days, version, system_key, created_at, updated_at
+                    ) VALUES (
+                      :pool, :organization, 'Deferred duplicate', 'AI review', :owner, '[]',
+                      730, 1, 'ai_screening_deferred', now(), now()
+                    )
+                    """
+                ),
+                {**identifiers, "pool": uuid.uuid4()},
+            )
     engine.dispose()

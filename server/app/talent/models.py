@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid
+from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, Index, Integer, JSON, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -23,6 +23,7 @@ class TalentPool(Base):
     purpose: Mapped[str] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(String(32), default="recruiting_team")
     owner_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    system_key: Mapped[str | None] = mapped_column(String(64))
     suitable_roles: Mapped[list] = mapped_column(JSON_DOCUMENT, default=list)
     retention_days: Mapped[int] = mapped_column(Integer, default=730)
     version: Mapped[int] = mapped_column(Integer, default=1)
@@ -36,6 +37,7 @@ class TalentPool(Base):
         CheckConstraint("version >= 1", name="ck_talent_pools_version"),
         ForeignKeyConstraint(["organization_id", "owner_id"], ["users.organization_id", "users.id"]),
         Index("ix_talent_pools_tenant_updated", "organization_id", "updated_at", "id"),
+        Index("uq_talent_pools_system_key", "organization_id", "system_key", unique=True, postgresql_where=text("system_key IS NOT NULL"), sqlite_where=text("system_key IS NOT NULL")),
     )
 
 

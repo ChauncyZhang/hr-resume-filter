@@ -12,6 +12,8 @@ from server.app.screening import models as screening_models  # noqa: F401
 from server.app.llm import models as llm_models  # noqa: F401
 from server.app.interviews import models as interview_models  # noqa: F401
 from server.app.integrations.feishu import models as feishu_models  # noqa: F401
+from server.app.recruiting import models as recruiting_models  # noqa: F401
+from server.app.talent import models as talent_models  # noqa: F401
 
 
 config = context.config

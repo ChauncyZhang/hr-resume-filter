@@ -4,12 +4,21 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect,text
+from sqlalchemy.exc import IntegrityError
 
 from server.tests.test_interview_persistence_postgres import _seed_application
 
 
-TABLES = {"organizations", "departments", "users", "user_roles", "user_sessions", "jobs", "job_collaborators", "audit_logs", "candidates", "candidate_contacts", "file_objects", "resumes", "job_jd_versions", "screening_rule_versions", "applications", "application_stage_events", "candidate_notes", "candidate_events", "download_tickets", "idempotency_records", "background_jobs", "job_attempts", "outbox_events", "queue_claim_cursors", "screening_runs", "screening_items", "screening_results", "candidate_duplicate_hints", "llm_provider_configs", "prompt_versions", "llm_invocations", "llm_screening_evaluations", "interviews", "interview_participants", "interview_events", "interview_feedbacks", "interview_feedback_revisions", "talent_pools", "talent_pool_grants", "talent_pool_memberships"}
+TABLES = {"organizations", "departments", "users", "user_roles", "user_sessions", "jobs", "job_collaborators", "audit_logs", "candidates", "candidate_contacts", "file_objects", "resumes", "job_jd_versions", "screening_rule_versions", "applications", "application_stage_events", "application_review_tasks", "candidate_notes", "candidate_events", "download_tickets", "idempotency_records", "background_jobs", "job_attempts", "outbox_events", "queue_claim_cursors", "screening_runs", "screening_items", "screening_results", "candidate_duplicate_hints", "llm_provider_configs", "prompt_versions", "llm_invocations", "llm_screening_evaluations", "interviews", "interview_participants", "interview_events", "interview_feedbacks", "interview_feedback_revisions", "talent_pools", "talent_pool_grants", "talent_pool_memberships"}
+
+
+def test_llm_only_routing_migration_is_latest_revision() -> None:
+    script_directory = ScriptDirectory.from_config(Config("server/alembic.ini"))
+
+    assert script_directory.get_current_head() == "0021_llm_only_auto_routing"
 
 
 @pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
@@ -22,6 +31,46 @@ def test_migration_upgrades_and_downgrades_empty_baseline() -> None:
     assert TABLES <= set(inspect(engine).get_table_names())
     subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "downgrade", "base"], check=True, env=env)
     assert not (TABLES & set(inspect(engine).get_table_names()))
+
+
+@pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
+def test_0021_persists_deferred_stage_and_one_open_review_task() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    env = {**os.environ, "DATABASE_URL": url}
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "head"], check=True, env=env)
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    with engine.begin() as connection:
+        connection.execute(text("TRUNCATE organizations CASCADE"))
+        identifiers = _seed_application(connection)
+        connection.execute(text("UPDATE applications SET stage = 'deferred' WHERE id = :application"), identifiers)
+        connection.execute(
+            text(
+                """
+                INSERT INTO application_review_tasks(
+                  id, organization_id, application_id, assignee_id, status, ai_status,
+                  created_at
+                ) VALUES (
+                  :task, :organization, :application, :owner, 'open', 'succeeded', now()
+                )
+                """
+            ),
+            {**identifiers, "task": uuid.uuid4()},
+        )
+        with pytest.raises(IntegrityError):
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO application_review_tasks(
+                      id, organization_id, application_id, assignee_id, status, ai_status,
+                      created_at
+                    ) VALUES (
+                      :task, :organization, :application, :owner, 'open', 'failed', now()
+                    )
+                    """
+                ),
+                {**identifiers, "task": uuid.uuid4()},
+            )
+    engine.dispose()
 
 
 @pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
