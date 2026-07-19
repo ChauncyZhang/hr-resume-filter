@@ -15,6 +15,7 @@ commit=$6
 source_sha=$7
 release_dir="$app_root/releases/$release"
 previous_release=$(readlink -f "$app_root/current")
+previous_env_file="$previous_release/deploy/.env"
 overlay="$release_dir/deploy/compose.server-https.yaml"
 env_file="$release_dir/deploy/.env"
 nginx_template="$release_dir/deploy/nginx/production.conf.template"
@@ -30,7 +31,8 @@ case "$release" in
 esac
 
 read_aurora_web_smoke_marker() {
-    python3 - "$env_file" <<'PY'
+    marker_file=$1
+    python3 - "$marker_file" <<'PY'
 import sys
 from pathlib import Path
 
@@ -51,17 +53,17 @@ PY
 
 test -d "$release_dir"
 test -d "$previous_release"
-test -f "$previous_release/deploy/.env"
+test -f "$previous_env_file"
 test -f "$previous_release/deploy/compose.server-https.yaml"
 test -f "$previous_release/deploy/nginx/production.conf.template"
 test -f "$staging/frontend-image.tar"
-cp "$previous_release/deploy/.env" "$env_file"
-chmod 600 "$env_file"
-aurora_web_smoke_marker=$(read_aurora_web_smoke_marker)
+aurora_web_smoke_marker=$(read_aurora_web_smoke_marker "$previous_env_file")
 if [ -z "$aurora_web_smoke_marker" ]; then
     printf '%s\n' 'AURORA_WEB_SMOKE_MARKER is required' >&2
     exit 1
 fi
+cp "$previous_env_file" "$env_file"
+chmod 600 "$env_file"
 cp "$previous_release/deploy/compose.server-https.yaml" "$overlay"
 cp "$previous_release/deploy/nginx/production.conf.template" "$nginx_template"
 python3 "$release_dir/deploy/shared_nginx_release_validator.py" \

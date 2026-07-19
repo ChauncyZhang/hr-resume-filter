@@ -86,17 +86,25 @@ def test_release_rejects_missing_marker_before_remote_service_side_effects(tmp_p
     previous = app_root / "releases" / "previous"
     candidate = app_root / "releases" / "candidate"
     staging = tmp_path / "staging"
-    for release in (previous, candidate):
-        (release / "deploy" / "nginx").mkdir(parents=True)
-        (release / "deploy" / ".env").write_text("OTHER_SETTING=value\n", encoding="utf-8")
-        (release / "deploy" / "compose.yaml").write_text("services: {}\n", encoding="utf-8")
-        (release / "deploy" / "compose.server-https.yaml").write_text(
-            "services:\n  proxy:\n    image: beyondcandidate-frontend:old\n",
-            encoding="utf-8",
-        )
-        (release / "deploy" / "nginx" / "production.conf.template").write_text(
-            "server {}\n", encoding="utf-8"
-        )
+    (previous / "deploy" / "nginx").mkdir(parents=True)
+    (previous / "deploy" / ".env").write_text("OTHER_SETTING=previous\n", encoding="utf-8")
+    (previous / "deploy" / "compose.server-https.yaml").write_text(
+        "previous overlay\n", encoding="utf-8"
+    )
+    (previous / "deploy" / "nginx" / "production.conf.template").write_text(
+        "previous template\n", encoding="utf-8"
+    )
+    (candidate / "deploy" / "nginx").mkdir(parents=True)
+    candidate_env = "CANDIDATE_ENV=unchanged\n"
+    candidate_overlay = "candidate overlay unchanged\n"
+    candidate_template = "candidate template unchanged\n"
+    (candidate / "deploy" / ".env").write_text(candidate_env, encoding="utf-8")
+    (candidate / "deploy" / "compose.server-https.yaml").write_text(
+        candidate_overlay, encoding="utf-8"
+    )
+    (candidate / "deploy" / "nginx" / "production.conf.template").write_text(
+        candidate_template, encoding="utf-8"
+    )
     (candidate / "deploy" / "remote-release.sh").write_text(REMOTE_SHELL, encoding="utf-8")
     (candidate / "deploy" / "shared_nginx_release_validator.py").write_text(
         (ROOT / "deploy" / "shared_nginx_release_validator.py").read_text(encoding="utf-8"),
@@ -143,7 +151,16 @@ def test_release_rejects_missing_marker_before_remote_service_side_effects(tmp_p
 
     assert result.returncode != 0
     assert "AURORA_WEB_SMOKE_MARKER is required" in result.stderr
+    assert "OTHER_SETTING=previous" not in result.stderr
+    assert candidate_env.strip() not in result.stderr
     assert not docker_log.exists()
+    assert (candidate / "deploy" / ".env").read_text(encoding="utf-8") == candidate_env
+    assert (
+        candidate / "deploy" / "compose.server-https.yaml"
+    ).read_text(encoding="utf-8") == candidate_overlay
+    assert (
+        candidate / "deploy" / "nginx" / "production.conf.template"
+    ).read_text(encoding="utf-8") == candidate_template
 
 
 def test_release_marker_failure_rolls_back_without_composing_aurora_web(tmp_path) -> None:
