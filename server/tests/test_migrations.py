@@ -74,6 +74,47 @@ def test_0021_persists_deferred_stage_and_one_open_review_task() -> None:
 
 
 @pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
+def test_0021_round_trip_preserves_historical_evaluation_without_rewrite() -> None:
+    url = os.environ["POSTGRES_SMOKE_URL"]
+    env = {**os.environ, "DATABASE_URL": url}
+    engine = create_engine(url.replace("+asyncpg", "+psycopg"))
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "downgrade", "base"], check=True, env=env)
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "0020_llm_provider_catalog"], check=True, env=env)
+    ids = {name: uuid.uuid4() for name in ("org", "user", "job", "jd", "rule", "file", "run", "item", "result", "config", "prompt", "queue", "invocation", "evaluation")}
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO organizations(id,slug,name,status,created_at,updated_at) VALUES(:org,'llm-0021-history','LLM history','active',now(),now())"), ids)
+        connection.execute(text("INSERT INTO users(id,organization_id,email,normalized_email,display_name,password_hash,status,authorization_version,created_at,updated_at) VALUES(:user,:org,'llm-0021-history@test','llm-0021-history@test','History','x','active',1,now(),now())"), ids)
+        connection.execute(text("INSERT INTO jobs(id,organization_id,title,status,owner_id,headcount,priority,version,created_at,updated_at) VALUES(:job,:org,'Job','draft',:user,1,'normal',1,now(),now())"), ids)
+        for table, key in (("job_jd_versions", "jd"), ("screening_rule_versions", "rule")):
+            connection.execute(text(f"INSERT INTO {table}(id,organization_id,job_id,version_number,content,created_by,created_at) VALUES(:{key},:org,:job,1,'{{}}',:user,now())"), ids)
+        connection.execute(text("INSERT INTO file_objects(id,organization_id,storage_key,original_filename,mime_type,size_bytes,sha256,uploaded_by,created_at) VALUES(:file,:org,'llm-history/x','x.txt','text/plain',1,repeat('0',64),:user,now())"), ids)
+        connection.execute(text("INSERT INTO screening_runs(id,organization_id,job_id,jd_version_id,rule_version_id,source,status,total_count,processed_count,succeeded_count,failed_count,created_by,version,created_at,updated_at) VALUES(:run,:org,:job,:jd,:rule,'upload','completed',1,1,1,0,:user,1,now(),now())"), ids)
+        connection.execute(text("INSERT INTO screening_items(id,organization_id,run_id,file_object_id,status,attempts,llm_status,llm_attempts,created_at,updated_at) VALUES(:item,:org,:run,:file,'scored',1,'succeeded',1,now(),now())"), ids)
+        connection.execute(text("INSERT INTO screening_results(id,organization_id,item_id,rule_engine_version,rule_score,recommendation,required_hits,required_missing,bonus_hits,estimated_years,risks,questions,created_at,updated_at) VALUES(:result,:org,:item,'rule-v1',88,'优先沟通','[]','[]','[]',3,'[]','[]',now(),now())"), ids)
+        connection.execute(text("INSERT INTO llm_provider_configs(id,organization_id,provider_id,model,encrypted_api_key,enabled,allowed_job_ids,version,created_by,updated_by,created_at,updated_at) VALUES(:config,:org,'approved','model',decode('00','hex'),false,'[]',1,:user,:user,now(),now())"), ids)
+        connection.execute(text("INSERT INTO prompt_versions(id,organization_id,name,version_number,content,content_hash,created_by,created_at) VALUES(:prompt,:org,'screen',1,'{\"version\": 1}',repeat('0',64),:user,now())"), ids)
+        connection.execute(text("INSERT INTO background_jobs(id,organization_id,type,payload,status,priority,attempts,max_attempts,run_after,created_at,updated_at) VALUES(:queue,:org,'screening.llm_score_item','{}','succeeded',0,1,3,now(),now(),now())"), ids)
+        connection.execute(text("INSERT INTO llm_invocations(id,organization_id,config_id,prompt_version_id,screening_result_id,queue_job_id,attempt_no,config_version,input_sha256,provider_id,model,request_field_manifest,status,usage,created_at) VALUES(:invocation,:org,:config,:prompt,:result,:queue,1,1,repeat('a',64),'approved','model','[]','succeeded','{}',now())"), ids)
+        connection.execute(text("INSERT INTO llm_screening_evaluations(id,organization_id,screening_result_id,invocation_id,prompt_version_id,score,recommendation,summary,strengths,gaps,risks,interview_questions,created_at) VALUES(:evaluation,:org,:result,:invocation,:prompt,88,'优先沟通','Historical evaluation','[\"strength\"]','[\"gap\"]','[\"risk\"]','[\"question\"]',now())"), ids)
+
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "0021_llm_only_auto_routing"], check=True, env=env)
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT score,recommendation,summary,strengths,gaps,risks,interview_questions,dimensions FROM llm_screening_evaluations WHERE id=:evaluation"), ids).one() == (88, "优先沟通", "Historical evaluation", ["strength"], ["gap"], ["risk"], ["question"], [])
+        assert "ck_applications_stage" in {item["name"] for item in inspect(engine).get_check_constraints("applications")}
+
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "downgrade", "0020_llm_provider_catalog"], check=True, env=env)
+    with engine.connect() as connection:
+        assert "applications_stage_check" in {item["name"] for item in inspect(engine).get_check_constraints("applications")}
+        assert connection.execute(text("SELECT score,recommendation,summary,strengths,gaps,risks,interview_questions FROM llm_screening_evaluations WHERE id=:evaluation"), ids).one() == (88, "优先沟通", "Historical evaluation", ["strength"], ["gap"], ["risk"], ["question"])
+
+    subprocess.run(["python", "-m", "alembic", "-c", "server/alembic.ini", "upgrade", "0021_llm_only_auto_routing"], check=True, env=env)
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT dimensions FROM llm_screening_evaluations WHERE id=:evaluation"), ids) == []
+        assert "ck_applications_stage" in {item["name"] for item in inspect(engine).get_check_constraints("applications")}
+    engine.dispose()
+
+
+@pytest.mark.skipif(not os.getenv("POSTGRES_SMOKE_URL"), reason="PostgreSQL smoke URL not configured")
 def test_0010_backfills_and_downgrades_data_bearing_0009() -> None:
     url=os.environ["POSTGRES_SMOKE_URL"]; env={**os.environ,"DATABASE_URL":url}; sync_url=url.replace("+asyncpg","+psycopg"); engine=create_engine(sync_url)
     subprocess.run(["python","-m","alembic","-c","server/alembic.ini","upgrade","0009_llm_gateway_foundation"],check=True,env=env)
