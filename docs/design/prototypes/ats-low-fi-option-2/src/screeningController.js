@@ -102,9 +102,10 @@ function normalizeLlmEvaluation(value) {
 }
 
 function normalizeFile(item) {
-  const routeResult = safeString(item?.route_result);
+  const technicalFailure = item?.status === "failed" && Boolean(safeString(item?.error_code));
+  const routeResult = technicalFailure ? null : safeString(item?.route_result);
   const llmFailed = item?.llm_status === "failed";
-  const llmEvaluation = llmFailed ? null : normalizeLlmEvaluation(item?.llm_evaluation);
+  const llmEvaluation = technicalFailure || llmFailed ? null : normalizeLlmEvaluation(item?.llm_evaluation);
   let status = item?.status === "queued" ? "queued" : "running";
 
   if (item?.status === "failed") {
@@ -124,9 +125,9 @@ function normalizeFile(item) {
     candidate: safeString(item?.candidate_name),
     status,
     routeResult,
-    routeLabel: routeLabel(routeResult),
-    score: llmFailed ? null : safeScore(item?.ai_score),
-    recommendation: llmFailed ? "AI评分不可用" : safeString(item?.ai_recommendation),
+    routeLabel: technicalFailure ? "未流转" : routeLabel(routeResult),
+    score: technicalFailure || llmFailed ? null : safeScore(item?.ai_score),
+    recommendation: technicalFailure ? "未进入AI评分" : llmFailed ? "AI评分不可用" : safeString(item?.ai_recommendation),
     llmStatus: safeString(item?.llm_status),
     error: safeString(item?.error_code),
     llmErrorCode: safeString(item?.llm_error_code),

@@ -172,12 +172,54 @@ test("screening file errors take priority over simultaneous LLM failure metadata
     },
   ]);
 
-  assert.equal(task.files[0].recommendation, "AI评分不可用");
+  assert.equal(task.files[0].recommendation, "未进入AI评分");
   assert.equal(task.files[0].llmErrorCode, "provider_unavailable");
   assert.match(helpers.serverIssueMessage(task.files[0]), /文件解析失败/);
   assert.doesNotMatch(helpers.serverIssueMessage(task.files[0]), /AI评分不可用/);
   assert.match(helpers.serverIssueMessage(task.files[1]), /恶意文件/);
   assert.doesNotMatch(helpers.serverIssueMessage(task.files[1]), /AI评分不可用/);
+});
+
+test("technical screening failures render no contradictory route, LLM conclusion, or AI evidence", () => {
+  const task = controllerHelpers.normalizeScreeningTask({
+    id: "run-technical-failure",
+    job_title: "AI 工程师",
+    status: "failed",
+    processed_count: 1,
+    total_count: 1,
+    failed_count: 1,
+  }, [{
+    id: "parse-error",
+    filename: "损坏简历.pdf",
+    status: "failed",
+    error_code: "parse_failed",
+    route_result: "review",
+    ai_score: 91,
+    ai_recommendation: "强烈推荐",
+    llm_status: "failed",
+    llm_error_code: "provider_unavailable",
+    llm_evaluation: {
+      dimensions: [{ key: "core_capability", score: 91, evidence: ["矛盾维度证据"] }],
+      strengths: ["矛盾优势"],
+      risks: ["矛盾风险"],
+    },
+    retryable: true,
+  }]);
+  const html = renderToStaticMarkup(createElement(helpers.ScreeningTaskView, {
+    task,
+    onTaskChange() {},
+    onBack() {},
+    onOpenCandidate() {},
+    onNotify() {},
+  }));
+  const [row] = html.match(/<div class="screening-row"[\s\S]*?<\/div>/) || [];
+
+  assert.ok(row);
+  assert.match(row, /aria-label="流转结果：未流转"[^>]*>未流转<\/span>/);
+  assert.match(row, /aria-label="LLM结论：未进入AI评分"[^>]*>未进入AI评分<\/span>/);
+  assert.match(row, /aria-label="最终分：—"/);
+  assert.doesNotMatch(row, /已转交用人经理|AI评分不可用|强烈推荐|矛盾维度证据|矛盾优势|矛盾风险/);
+  assert.match(row, /文件解析失败/);
 });
 
 test("screening result grid exposes table semantics and understandable mobile field labels", () => {

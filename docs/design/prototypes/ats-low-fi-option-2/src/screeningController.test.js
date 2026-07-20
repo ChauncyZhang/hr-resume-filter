@@ -251,6 +251,41 @@ test("preserves parser file errors separately from LLM errors", () => {
   assert.equal(file.retryable, true);
 });
 
+test("technical file failures suppress contradictory routing and LLM outcomes", () => {
+  const [file] = normalizeScreeningTask(run({ status: "failed", processed_count: 1, total_count: 1 }), [item({
+    status: "failed",
+    error_code: "parse_failed",
+    route_result: "review",
+    ai_score: 91,
+    ai_recommendation: "强烈推荐",
+    llm_status: "failed",
+    llm_error_code: "provider_unavailable",
+    llm_evaluation: {
+      dimensions: [{ key: "core_capability", score: 91, evidence: ["矛盾维度证据"], gaps: ["矛盾维度缺口"] }],
+      evidence: ["矛盾综合证据"],
+      gaps: ["矛盾综合缺口"],
+      strengths: ["矛盾优势"],
+      risks: ["矛盾风险"],
+    },
+    retryable: true,
+  })]).files;
+
+  assert.equal(file.status, "failed");
+  assert.equal(file.routeResult, null);
+  assert.equal(file.routeLabel, "未流转");
+  assert.equal(file.score, null);
+  assert.equal(file.recommendation, "未进入AI评分");
+  assert.equal(file.llmEvaluation, null);
+  assert.deepEqual(file.dimensions, []);
+  assert.deepEqual(file.evidence, []);
+  assert.deepEqual(file.gaps, []);
+  assert.deepEqual(file.strengths, []);
+  assert.deepEqual(file.risks, []);
+  assert.equal(file.error, "parse_failed");
+  assert.equal(file.llmErrorCode, "provider_unavailable");
+  assert.equal(file.retryable, true);
+});
+
 test("polling fetches ordered snapshots immediately, waits between rounds, and stops terminally without overlap", async () => {
   const calls = [];
   const waits = [];
