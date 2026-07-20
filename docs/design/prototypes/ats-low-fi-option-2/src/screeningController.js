@@ -2,6 +2,13 @@ import { apiClient as defaultApiClient } from "./apiClient.js";
 
 const TERMINAL_RUN_STATUSES = new Set(["complete", "partial", "failed", "cancelled"]);
 const SUCCESSFUL_LLM_STATUSES = new Set(["succeeded", "skipped", "not_requested"]);
+const DIMENSION_LABELS = {
+  core_capability: "核心能力",
+  experience_depth: "经验深度",
+  role_seniority: "职级匹配",
+  transferability: "能力迁移",
+  explicit_constraints: "明确约束",
+};
 
 function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -71,8 +78,10 @@ function routeLabel(routeResult) {
 
 function normalizeDimension(dimension) {
   if (!isRecord(dimension)) return null;
+  const key = safeString(dimension.key);
   return {
-    label: safeString(dimension.label),
+    key,
+    label: DIMENSION_LABELS[key] ?? "",
     score: safeScore(dimension.score),
     evidence: safeStrings(dimension.evidence),
     gaps: safeStrings(dimension.gaps),
@@ -119,7 +128,8 @@ function normalizeFile(item) {
     score: llmFailed ? null : safeScore(item?.ai_score),
     recommendation: llmFailed ? "AI评分不可用" : safeString(item?.ai_recommendation),
     llmStatus: safeString(item?.llm_status),
-    error: safeString(item?.llm_error_code),
+    error: safeString(item?.error_code),
+    llmErrorCode: safeString(item?.llm_error_code),
     llmEvaluation,
     dimensions: llmEvaluation?.dimensions ?? [],
     evidence: llmEvaluation?.evidence ?? [],

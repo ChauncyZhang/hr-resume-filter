@@ -232,7 +232,23 @@ test("keeps cancelled file items distinct from failures", () => {
 
   assert.equal(task.status, "cancelled");
   assert.equal(task.files[0].status, "cancelled");
-  assert.equal(task.files[0].error, "");
+  assert.equal(task.files[0].error, "cancelled");
+  assert.equal(task.files[0].llmErrorCode, "");
+});
+
+test("preserves parser file errors separately from LLM errors", () => {
+  const [file] = normalizeScreeningTask(run({ status: "failed", processed_count: 1, total_count: 1 }), [item({
+    status: "failed",
+    error_code: "parse_failed",
+    llm_status: "failed",
+    llm_error_code: "provider_unavailable",
+    retryable: true,
+  })]).files;
+
+  assert.equal(file.status, "failed");
+  assert.equal(file.error, "parse_failed");
+  assert.equal(file.llmErrorCode, "provider_unavailable");
+  assert.equal(file.retryable, true);
 });
 
 test("polling fetches ordered snapshots immediately, waits between rounds, and stops terminally without overlap", async () => {
@@ -400,11 +416,21 @@ test("normalizes the four automatic outcome counters directly from the run", () 
 });
 
 test("normalizes only Task 5 automatic outcome fields and all five LLM dimensions", () => {
-  const dimensions = Array.from({ length: 5 }, (_, index) => ({
-    label: `dimension-${index + 1}`,
+  const dimensions = [
+    ["core_capability", "核心能力"],
+    ["experience_depth", "经验深度"],
+    ["role_seniority", "职级匹配"],
+    ["transferability", "能力迁移"],
+    ["explicit_constraints", "明确约束"],
+  ].map(([key], index) => ({
+    key,
     score: 60 + index,
     evidence: [`evidence-${index + 1}`],
     gaps: [`gap-${index + 1}`],
+  }));
+  const expectedDimensions = dimensions.map((dimension, index) => ({
+    ...dimension,
+    label: ["核心能力", "经验深度", "职级匹配", "能力迁移", "明确约束"][index],
   }));
   const [result] = normalizeScreeningTask(run(), [item({
     status: "scored",
@@ -427,7 +453,7 @@ test("normalizes only Task 5 automatic outcome fields and all five LLM dimension
   assert.equal(result.routeLabel, "已转交用人经理");
   assert.equal(result.score, 72);
   assert.equal(result.recommendation, "建议评审");
-  assert.deepEqual(result.dimensions, dimensions);
+  assert.deepEqual(result.dimensions, expectedDimensions);
   assert.deepEqual(result.evidence, ["多年平台经验"]);
   assert.deepEqual(result.gaps, ["行业经验待确认"]);
   assert.deepEqual(result.strengths, ["系统设计"]);
@@ -455,12 +481,12 @@ test("safely degrades malformed LLM evaluation values", () => {
     llm_error_code: { unsafe: true },
     llm_evaluation: {
       dimensions: [
-        { label: "valid", score: 80, evidence: ["proof", 7], gaps: "none" },
+        { key: "core_capability", score: 80, evidence: ["proof", 7], gaps: "none" },
         null,
         "bad",
-        { label: { unsafe: true }, score: "90", evidence: null, gaps: [{ unsafe: true }] },
-        { label: "fifth", score: Number.NaN, evidence: [], gaps: [] },
-        { label: "ignored-sixth", score: 100 },
+        { key: { unsafe: true }, score: "90", evidence: null, gaps: [{ unsafe: true }] },
+        { key: "explicit_constraints", score: Number.NaN, evidence: [], gaps: [] },
+        { key: "transferability", score: 100 },
       ],
       evidence: "bad",
       gaps: [null],
@@ -472,10 +498,11 @@ test("safely degrades malformed LLM evaluation values", () => {
   assert.equal(result.score, null);
   assert.equal(result.recommendation, "");
   assert.equal(result.error, "");
+  assert.equal(result.llmErrorCode, "");
   assert.deepEqual(result.dimensions, [
-    { label: "valid", score: 80, evidence: ["proof"], gaps: [] },
-    { label: "", score: null, evidence: [], gaps: [] },
-    { label: "fifth", score: null, evidence: [], gaps: [] },
+    { key: "core_capability", label: "核心能力", score: 80, evidence: ["proof"], gaps: [] },
+    { key: "", label: "", score: null, evidence: [], gaps: [] },
+    { key: "explicit_constraints", label: "明确约束", score: null, evidence: [], gaps: [] },
   ]);
   assert.deepEqual(result.evidence, []);
   assert.deepEqual(result.gaps, []);
@@ -491,7 +518,7 @@ test("final LLM failure has no score or fabricated evaluation and keeps manager 
     ai_recommendation: "推荐",
     llm_status: "failed",
     llm_error_code: "provider_unavailable",
-    llm_evaluation: { dimensions: [{ label: "legacy", score: 91 }], strengths: ["legacy"] },
+    llm_evaluation: { dimensions: [{ key: "core_capability", score: 91 }], strengths: ["legacy"] },
   })]).files;
 
   assert.equal(result.score, null);
@@ -500,7 +527,8 @@ test("final LLM failure has no score or fabricated evaluation and keeps manager 
   assert.equal(result.llmEvaluation, null);
   assert.deepEqual(result.dimensions, []);
   assert.deepEqual(result.strengths, []);
-  assert.equal(result.error, "provider_unavailable");
+  assert.equal(result.error, "");
+  assert.equal(result.llmErrorCode, "provider_unavailable");
 });
 
 test("controller exposes retryItem but no bulk or undo API", () => {
