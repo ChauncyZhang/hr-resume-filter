@@ -1,79 +1,54 @@
 {
-  "generatedAt": "2026-07-12T03:36:04.433Z",
-  "baseUrl": "http://127.0.0.1:4174/",
+  "baseUrl": "http://127.0.0.1:4174",
+  "fixture": "llm-only-controller-contract",
   "results": [
     {
-      "id": "F-01-default-workbench",
+      "id": "desktop-screening-auto-routing",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "F-01-create-and-publish-position",
+      "id": "desktop-manager-review-deep-link",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "F-02-partial-screening-recovery",
+      "id": "desktop-deferred-pool-referral",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "F-03-screening-undo-and-promote",
+      "id": "desktop-reports-hide-rule-metrics",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "F-05-feedback-draft-and-retry",
+      "id": "desktop-runtime-integrity",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "F-04-schedule-interview",
+      "id": "mobile-screening-layout",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "F-06-talent-reactivation",
+      "id": "mobile-manager-review-layout",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "ADMIN-settings-governance",
+      "id": "mobile-deferred-pool-layout",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "ROLE-interviewer-boundary",
+      "id": "mobile-report-layout",
       "status": "passed",
       "detail": ""
     },
     {
-      "id": "EMPTY-empty-state",
-      "status": "passed",
-      "detail": ""
-    },
-    {
-      "id": "A11Y-keyboard-focus",
-      "status": "passed",
-      "detail": ""
-    },
-    {
-      "id": "MOBILE-default",
-      "status": "passed",
-      "detail": ""
-    },
-    {
-      "id": "MOBILE-partial-screening",
-      "status": "passed",
-      "detail": ""
-    },
-    {
-      "id": "MOBILE-feedback",
-      "status": "passed",
-      "detail": ""
-    },
-    {
-      "id": "MOBILE-restricted",
+      "id": "mobile-runtime-integrity",
       "status": "passed",
       "detail": ""
     }
