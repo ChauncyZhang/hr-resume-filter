@@ -7,6 +7,7 @@ import { createServer } from "vite";
 
 let helpers;
 let candidateHelpers;
+let controllerHelpers;
 let vite;
 
 before(async () => {
@@ -18,6 +19,7 @@ before(async () => {
   });
   helpers = await vite.ssrLoadModule("/src/ScreeningViews.jsx");
   candidateHelpers = await vite.ssrLoadModule("/src/CandidateViews.jsx");
+  controllerHelpers = await vite.ssrLoadModule("/src/screeningController.js");
 });
 
 after(async () => {
@@ -129,48 +131,86 @@ test("screening dimensions render five valid scores and malformed optional data 
 });
 
 test("screening summary uses the four server counters without recomputing rows", () => {
-  assert.deepEqual(helpers.screeningSummaryCounts({
-    serverCounts: { managerReviewCount: 8, deferredCount: 3, aiUnavailableCount: 2, fileFailedCount: 1 },
-    files: [{ routeResult: "deferred", status: "failed" }],
-  }), [
+  const task = controllerHelpers.normalizeScreeningTask({
+    id: "run-summary",
+    manager_review_count: 8,
+    deferred_count: 3,
+    ai_unavailable_count: 2,
+    file_failed_count: 1,
+  }, [{ id: "item-1", status: "failed", route_result: "deferred" }]);
+
+  assert.deepEqual(helpers.screeningSummaryCounts(task), [
     { label: "已转交用人经理", value: 8 },
     { label: "已暂缓", value: 3 },
     { label: "AI评分不可用", value: 2 },
     { label: "文件处理失败", value: 1 },
   ]);
-  assert.deepEqual(helpers.screeningSummaryCounts({
-    managerReviewCount: 99,
-    files: Array.from({ length: 4 }, () => ({ routeResult: "review" })),
-  }).map((item) => item.value), [0, 0, 0, 0]);
+  assert.equal(task.managerReviewCount, 8);
+  assert.equal("serverCounts" in task, false);
+});
+
+test("screening file errors take priority over simultaneous LLM failure metadata", () => {
+  const task = controllerHelpers.normalizeScreeningTask({ id: "run-errors" }, [
+    {
+      id: "parse-error",
+      filename: "损坏简历.pdf",
+      status: "failed",
+      route_result: "review",
+      error_code: "parse_failed",
+      llm_status: "failed",
+      llm_error_code: "provider_unavailable",
+      retryable: true,
+    },
+    {
+      id: "malware-error",
+      filename: "危险简历.pdf",
+      status: "failed",
+      route_result: "review",
+      error_code: "malware_detected",
+      llm_status: "failed",
+      llm_error_code: "provider_unavailable",
+    },
+  ]);
+
+  assert.equal(task.files[0].recommendation, "AI评分不可用");
+  assert.equal(task.files[0].llmErrorCode, "provider_unavailable");
+  assert.match(helpers.serverIssueMessage(task.files[0]), /文件解析失败/);
+  assert.doesNotMatch(helpers.serverIssueMessage(task.files[0]), /AI评分不可用/);
+  assert.match(helpers.serverIssueMessage(task.files[1]), /恶意文件/);
+  assert.doesNotMatch(helpers.serverIssueMessage(task.files[1]), /AI评分不可用/);
 });
 
 test("screening result grid exposes table semantics and understandable mobile field labels", () => {
   const task = {
-    id: "run-1",
-    position: "AI 工程师",
-    status: "complete",
-    completed: 1,
-    total: 1,
-    source: "BOSS 直聘",
-    creator: "张小北",
-    createdAt: "刚刚",
-    note: "语义测试",
-    serverBacked: true,
-    serverCounts: { managerReviewCount: 1, deferredCount: 0, aiUnavailableCount: 0, fileFailedCount: 0 },
-    files: [{
+    ...controllerHelpers.normalizeScreeningTask({
+      id: "run-1",
+      job_title: "AI 工程师",
+      status: "completed",
+      processed_count: 1,
+      total_count: 1,
+      source: "boss",
+      created_by_name: "张小北",
+      manager_review_count: 1,
+      deferred_count: 0,
+      ai_unavailable_count: 0,
+      file_failed_count: 0,
+    }, [{
       id: "item-1",
-      name: "候选人.pdf",
-      candidate: "张三",
-      candidateId: "candidate-1",
+      filename: "候选人.pdf",
+      candidate_name: "张三",
+      candidate_id: "candidate-1",
       status: "success",
-      routeResult: "review",
-      routeLabel: "已转交用人经理",
-      recommendation: "建议评审",
-      score: 72,
-      dimensions: [{ label: "岗位匹配", score: 80, evidence: [], gaps: [] }],
-      strengths: ["经验匹配"],
-      risks: ["到岗时间待确认"],
-    }],
+      route_result: "review",
+      ai_recommendation: "建议评审",
+      ai_score: 72,
+      llm_status: "succeeded",
+      llm_evaluation: {
+        dimensions: [{ key: "core_capability", score: 80, evidence: [], gaps: [] }],
+        strengths: ["经验匹配"],
+        risks: ["到岗时间待确认"],
+      },
+    }]),
+    note: "语义测试",
   };
   const html = renderToStaticMarkup(createElement(helpers.ScreeningTaskView, {
     task,
@@ -198,6 +238,16 @@ test("screening source has the eight automatic columns and no removed manual pat
   for (const heading of ["流转结果", "候选人/文件", "处理状态", "LLM结论", "最终分", "维度评分", "主要优势与风险", "查看候选人"]) assert.match(source, new RegExp(heading));
   const removed = ["待" + "HR审核", "HR初筛" + "进度", "待提交" + "用人经理", "advance" + "_to_review"];
   for (const text of removed) assert.equal(source.includes(text), false);
+});
+
+test("screening import and demo flow contains only LLM automatic scoring and routing copy", () => {
+  const source = readFileSync(new URL("./ScreeningViews.jsx", import.meta.url), "utf8");
+  const removed = ["规则" + "评分", "保留规则" + "结果", "规则评分" + "中"];
+
+  for (const text of removed) assert.equal(source.includes(text), false);
+  assert.match(source, /LLM 自动评分/);
+  assert.match(source, /自动路由/);
+  assert.match(source, /不淘汰候选人/);
 });
 
 test("cancelled tasks never describe progress as completed", () => {

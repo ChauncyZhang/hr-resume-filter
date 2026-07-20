@@ -119,10 +119,11 @@ export function candidateReviewContext(file, task) {
 }
 
 export function serverIssueMessage(file) {
+  if (file.status === "failed" && file.error === "malware_detected") return "检测到恶意文件，已拒绝并从隔离区删除。";
+  if (file.error === "parse_failed") return file.retryable ? "文件解析失败，可使用下方“重新解析”操作。" : "文件解析失败，当前没有可用的重试操作。";
+  if (file.error || file.status === "failed") return file.retryable ? "文件处理失败，可使用下方“重新解析”操作。" : "文件处理失败，当前没有可用的重试操作。";
   if (file.recommendation === "AI评分不可用") return "AI评分不可用；已转交用人经理。";
   if (file.status === "partial") return file.llmRetryable ? "AI 评分暂不可用，可单独重试 LLM。" : "AI 评分暂不可用。";
-  if (file.status === "failed" && file.error === "malware_detected") return "检测到恶意文件，已拒绝并从隔离区删除。";
-  if (file.status === "failed") return file.retryable ? "文件处理失败，可使用下方“重新解析”操作。" : "文件处理失败，当前没有可用的重试操作。";
   return "—";
 }
 
@@ -182,7 +183,7 @@ function serverCount(value) {
 }
 
 export function screeningSummaryCounts(task) {
-  const source = task?.serverCounts || {};
+  const source = task || {};
   return [
     { label: "已转交用人经理", value: serverCount(source.managerReviewCount) },
     { label: "已暂缓", value: serverCount(source.deferredCount) },
@@ -364,8 +365,8 @@ export function ImportWizard({ activeJob, recentTask, onClose, onCreateTask, onR
               <dl><div><dt>目标职位</dt><dd>{serverJobs.find((job) => job.id === position)?.title || "—"}</dd></div><div><dt>简历来源</dt><dd>{source}</dd></div><div><dt>批次说明</dt><dd>{note || "未填写"}</dd></div><div><dt>有效文件</dt><dd>{validFiles.length} 份</dd></div></dl>
             </div>
             <div className="screening-options">
-              <label><span><FileText size={18} /><span><strong>规则评分</strong><small>根据职位必须条件、加分项和风险规则评分</small></span></span><input type="checkbox" checked readOnly /></label>
-              <label><span><Bot size={18} /><span><strong>LLM 语义评估</strong><small>是否启用由系统设置决定；LLM 部分失败时仍保留规则结果</small></span></span><span>由系统设置决定</span></label>
+              <label><span><Bot size={18} /><span><strong>LLM 自动评分</strong><small>根据职位要求生成结论、最终分与五项维度评分</small></span></span><input type="checkbox" checked readOnly /></label>
+              <label><span><CircleCheck size={18} /><span><strong>自动路由</strong><small>按 LLM 结论自动转交或暂缓；AI评分不可用时不淘汰候选人，自动转交用人经理</small></span></span><span>始终启用</span></label>
             </div>
             <p className="background-task-note"><Clock3 size={16} />创建后可离开页面，任务会在后台继续；可随时从“筛选任务”重新进入。</p>
           </div>}
@@ -478,12 +479,12 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
         const files = current.files.map((file, fileIndex) => {
           if (fileIndex !== index) return file;
           if (file.expectedParseStatus === "failed" || (!file.expectedParseStatus && index === 3)) return { ...file, status: "failed", recommendation: "待重试", traceId: "TR-PARSE-4081", error: "PDF 文本层损坏，未能提取有效内容" };
-          if ((file.expectedLlmStatus === "failed" || (!file.expectedLlmStatus && index === 4)) && current.llmEnabled) return { ...file, status: "partial", traceId: "TR-LLM-4297", error: "LLM 请求额度暂时不可用，已保留规则评分" };
+          if (file.expectedLlmStatus === "failed" || (!file.expectedLlmStatus && index === 4)) return { ...file, status: "partial", score: null, recommendation: "AI评分不可用", routeResult: "review", routeLabel: "已转交用人经理", llmStatus: "failed", llmErrorCode: "demo_llm_unavailable", llmRetryable: true, traceId: "TR-LLM-4297", error: null };
           return { ...file, status: "success" };
         });
         const completed = index + 1;
         const finished = completed === files.length;
-        return { ...current, files, completed, elapsed: current.elapsed + 7, stage: finished ? "已完成" : completed < 2 ? "规则评分中" : "LLM 评分中", status: finished ? (files.some((file) => file.status === "failed" || file.status === "partial") ? "partial" : "complete") : "running" };
+        return { ...current, files, completed, elapsed: current.elapsed + 7, stage: finished ? "已完成" : completed < 2 ? "简历解析中" : "LLM 自动评分与路由中", status: finished ? (files.some((file) => file.status === "failed" || file.status === "partial") ? "partial" : "complete") : "running" };
       });
     }, 650);
     return () => window.clearTimeout(timer);
