@@ -58,8 +58,8 @@ def _requested_outcome(score, ai_status, safe_error_code):
     return derive_screening_outcome(score)
 
 
-def _previous_result(db, application):
-    audit = db.scalar(
+def _latest_route_audit(db, application):
+    return db.scalar(
         select(AuditLog)
         .where(
             AuditLog.organization_id == application.organization_id,
@@ -70,6 +70,9 @@ def _previous_result(db, application):
         .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
         .limit(1)
     )
+
+
+def _previous_result(application, audit):
     metadata = audit.metadata_json if audit is not None else {}
     recommendation = metadata.get("recommendation")
     if not isinstance(recommendation, str):
@@ -82,6 +85,17 @@ def _previous_result(db, application):
         stage=application.stage,
         score=persisted_score,
         routed=False,
+    )
+
+
+def _is_fail_open_success_retry(audit, item, ai_status):
+    if audit is None or ai_status != "succeeded":
+        return False
+    metadata = audit.metadata_json
+    return (
+        metadata.get("item_id") == str(item.id)
+        and metadata.get("ai_status") == "failed"
+        and metadata.get("to_stage") == "review"
     )
 
 
@@ -148,8 +162,12 @@ def route_llm_screening_terminal(
     )
     if application is None:
         raise ScreeningRoutingConflict("application_unavailable")
-    if application.stage != "new":
-        return _previous_result(db, application)
+    previous_audit = _latest_route_audit(db, application)
+    is_fail_open_retry = application.stage != "new" and _is_fail_open_success_retry(
+        previous_audit, item, ai_status
+    )
+    if application.stage != "new" and not is_fail_open_retry:
+        return _previous_result(application, previous_audit)
 
     outcome = _requested_outcome(score, ai_status, safe_error_code)
     if ai_status == "failed":
@@ -176,14 +194,16 @@ def route_llm_screening_terminal(
     if actor is None or run is None or job is None:
         raise ScreeningRoutingConflict("routing_context_unavailable")
 
-    application.stage = outcome.stage
-    application.version += 1
-    application.updated_at = datetime.now(timezone.utc)
+    if not is_fail_open_retry:
+        application.stage = outcome.stage
+        application.version += 1
+        application.updated_at = datetime.now(timezone.utc)
+    routed_stage = "review" if is_fail_open_retry else outcome.stage
     metadata = {
         "application_id": str(application.id),
         "item_id": str(item.id),
         "from_stage": "new",
-        "to_stage": outcome.stage,
+        "to_stage": routed_stage,
         "ai_status": ai_status,
         "recommendation": outcome.recommendation,
     }
@@ -191,15 +211,16 @@ def route_llm_screening_terminal(
         metadata["score"] = score
     if safe_error_code is not None:
         metadata["safe_error_code"] = safe_error_code
-    db.add(
-        ApplicationStageEvent(
-            organization_id=organization_id,
-            application_id=application.id,
-            actor_user_id=actor_user_id,
-            event_type="application.stage_changed",
-            payload=dict(metadata),
+    if not is_fail_open_retry:
+        db.add(
+            ApplicationStageEvent(
+                organization_id=organization_id,
+                application_id=application.id,
+                actor_user_id=actor_user_id,
+                event_type="application.stage_changed",
+                payload=dict(metadata),
+            )
         )
-    )
     append_audit(
         db,
         actor=actor,
@@ -211,13 +232,14 @@ def route_llm_screening_terminal(
         trace_id=trace_id,
         metadata=metadata,
     )
-    if outcome.stage == "review":
+    if routed_stage == "review":
         ensure_review_task(
             db,
             application=application,
             job=job,
             ai_status=ai_status,
             safe_error_code=safe_error_code,
+            create_if_missing=not is_fail_open_retry,
         )
     else:
         ensure_deferred_membership(
@@ -230,10 +252,11 @@ def route_llm_screening_terminal(
             transferable_capabilities=transferable_capabilities,
         )
     db.flush()
-    recalculate_candidate_retention(db, organization_id, candidate.id)
+    if not is_fail_open_retry:
+        recalculate_candidate_retention(db, organization_id, candidate.id)
     return ScreeningRoutingResult(
         recommendation=outcome.recommendation,
-        stage=outcome.stage,
+        stage=application.stage,
         score=score,
         routed=True,
     )

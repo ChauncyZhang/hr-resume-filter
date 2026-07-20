@@ -53,6 +53,7 @@ def ensure_review_task(
     job,
     ai_status: str,
     safe_error_code: str | None = None,
+    create_if_missing: bool = True,
 ):
     if (
         job.organization_id != application.organization_id
@@ -76,7 +77,12 @@ def ensure_review_task(
         .with_for_update()
     )
     if existing is not None:
+        if ai_status == "succeeded":
+            existing.ai_status = ai_status
+            existing.safe_error_code = None
         return existing
+    if not create_if_missing:
+        return None
 
     task = ApplicationReviewTask(
         organization_id=application.organization_id,

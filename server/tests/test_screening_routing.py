@@ -21,6 +21,7 @@ from server.app.screening.models import ScreeningItem, ScreeningRun
 from server.app.screening.routing import (
     ScreeningOutcome,
     ScreeningRoutingConflict,
+    ScreeningRoutingResult,
     derive_screening_outcome,
     route_llm_screening_terminal,
 )
@@ -270,6 +271,81 @@ def test_repeated_and_stale_routing_does_not_duplicate_side_effects(tmp_path):
                 AuditLog.event_type == "screening.terminal_routed"
             )
         ) == 1
+
+
+def test_successful_retry_refreshes_fail_open_route_without_regressing_progress(tmp_path):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="fail-open-retry")
+
+    with app.state.identity_store.sync_session() as db:
+        route_llm_screening_terminal(
+            db,
+            organization_id=case.organization_id,
+            item_id=case.item_id,
+            actor_user_id=case.creator_id,
+            score=None,
+            ai_status="failed",
+            safe_error_code="provider_unavailable",
+            trace_id="trace-failed",
+        )
+        application = db.get(Application, case.application_id)
+        application.stage = "contact"
+        application.version += 1
+        db.flush()
+
+        retry = route_llm_screening_terminal(
+            db,
+            organization_id=case.organization_id,
+            item_id=case.item_id,
+            actor_user_id=case.creator_id,
+            score=59,
+            ai_status="succeeded",
+            safe_error_code=None,
+            trace_id="trace-retry",
+        )
+        replay = route_llm_screening_terminal(
+            db,
+            organization_id=case.organization_id,
+            item_id=case.item_id,
+            actor_user_id=case.creator_id,
+            score=59,
+            ai_status="succeeded",
+            safe_error_code=None,
+            trace_id="trace-retry",
+        )
+
+        audits = db.scalars(
+            select(AuditLog)
+            .where(AuditLog.event_type == "screening.terminal_routed")
+            .order_by(AuditLog.created_at, AuditLog.id)
+        ).all()
+        task = db.scalar(select(ApplicationReviewTask))
+        assert retry == ScreeningRoutingResult(
+            recommendation="暂缓",
+            stage="contact",
+            score=59,
+            routed=True,
+        )
+        assert replay == ScreeningRoutingResult(
+            recommendation="暂缓",
+            stage="contact",
+            score=59,
+            routed=False,
+        )
+        assert application.stage == "contact" and application.version == 3
+        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 1
+        assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 1
+        assert task.ai_status == "succeeded" and task.safe_error_code is None
+        assert len(audits) == 2
+        assert audits[-1].metadata_json == {
+            "application_id": str(case.application_id),
+            "item_id": str(case.item_id),
+            "from_stage": "new",
+            "to_stage": "review",
+            "ai_status": "succeeded",
+            "recommendation": "暂缓",
+            "score": 59,
+        }
 
 
 def test_invalid_stale_callback_is_noop_after_locked_application_left_new(tmp_path):

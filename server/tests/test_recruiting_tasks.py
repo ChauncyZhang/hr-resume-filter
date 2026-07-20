@@ -35,8 +35,44 @@ def test_review_task_creation_is_idempotent_and_uses_hiring_owner(tmp_path):
         )
         assert first.id == second.id
         assert first.assignee_id == case.manager_id
-        assert first.ai_status == "failed"
-        assert first.safe_error_code == "provider_unavailable"
+        assert first.ai_status == "succeeded"
+        assert first.safe_error_code is None
+        assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 1
+
+
+def test_review_task_refreshes_failed_ai_state_after_successful_retry(tmp_path):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="task-refresh")
+    with app.state.identity_store.sync_session() as db:
+        application = db.get(Application, case.application_id)
+        job = db.get(Job, case.job_id)
+        failed = ensure_review_task(
+            db,
+            application=application,
+            job=job,
+            ai_status="failed",
+            safe_error_code="provider_unavailable",
+        )
+        db.flush()
+
+        succeeded = ensure_review_task(
+            db,
+            application=application,
+            job=job,
+            ai_status="succeeded",
+        )
+        stale_failure = ensure_review_task(
+            db,
+            application=application,
+            job=job,
+            ai_status="failed",
+            safe_error_code="provider_unavailable",
+        )
+
+        assert succeeded.id == failed.id
+        assert stale_failure.id == succeeded.id
+        assert stale_failure.ai_status == "succeeded"
+        assert stale_failure.safe_error_code is None
         assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 1
 
 
