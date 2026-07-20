@@ -78,7 +78,7 @@ verify_shared_networks() {
     docker inspect --format '{{json .NetworkSettings.Networks}}' beyondcandidate-proxy-1 | grep -q 'beyondcandidate_edge'
 }
 
-python3 "$previous_release/deploy/shared_nginx_release_validator.py" \
+python3 "$current_release/deploy/shared_nginx_release_validator.py" \
     --nginx-template "$previous_release/deploy/nginx/production.conf.template"
 compose_previous config --quiet
 aurora_web_before=$(docker inspect --format '{{.Id}}' aurora-web)

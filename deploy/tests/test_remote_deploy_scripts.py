@@ -16,6 +16,9 @@ PRODUCTION_SMOKE = (
     / "scripts"
     / "production-browser-smoke.cjs"
 ).read_text(encoding="utf-8")
+SHARED_TEMPLATE = (
+    ROOT / "deploy" / "tests" / "fixtures" / "shared-production.conf.template"
+).read_text(encoding="utf-8")
 
 
 def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
@@ -70,6 +73,8 @@ def test_release_and_rollback_use_three_domain_smoke_without_orphan_cleanup() ->
 def test_rollback_uses_current_release_smoke_for_legacy_target() -> None:
     assert 'smoke_tool="$current_release/deploy/shared-nginx-smoke.sh"' in REMOTE_ROLLBACK
     assert '"$previous_release/deploy/shared-nginx-smoke.sh"' not in REMOTE_ROLLBACK
+    assert '"$current_release/deploy/shared_nginx_release_validator.py"' in REMOTE_ROLLBACK
+    assert '"$previous_release/deploy/shared_nginx_release_validator.py"' not in REMOTE_ROLLBACK
 
 
 def test_release_revalidates_previous_services_after_automatic_rollback() -> None:
@@ -184,11 +189,7 @@ def test_release_marker_failure_rolls_back_without_composing_aurora_web(tmp_path
             encoding="utf-8",
         )
         (release / "deploy" / "nginx" / "production.conf.template").write_text(
-            """
-server { server_name hr.aurora-tek.cn; location / { proxy_pass http://api:8000; } }
-server { server_name aurora-tek.cn www.aurora-tek.cn; location / { proxy_pass http://aurora-web:3000; } }
-""",
-            encoding="utf-8",
+            SHARED_TEMPLATE, encoding="utf-8"
         )
     (candidate / "deploy" / "remote-release.sh").write_text(REMOTE_SHELL, encoding="utf-8")
     (candidate / "deploy" / "shared_nginx_release_validator.py").write_text(
@@ -288,10 +289,7 @@ def test_rollback_uses_current_smoke_when_legacy_target_has_none(tmp_path) -> No
     app_root = tmp_path / "app"
     current = app_root / "releases" / "current"
     legacy = app_root / "releases" / "f6be6dc"
-    template = (
-        "server { server_name hr.aurora-tek.cn; location / { proxy_pass http://api:8000; } }\n"
-        "server { server_name aurora-tek.cn www.aurora-tek.cn; location / { proxy_pass http://aurora-web:3000; } }\n"
-    )
+    template = SHARED_TEMPLATE
     for release in (current, legacy):
         (release / "deploy" / "nginx").mkdir(parents=True)
         (release / "deploy" / ".env").write_text("AURORA_WEB_SMOKE_MARKER=marker\n", encoding="utf-8")
@@ -303,7 +301,7 @@ def test_rollback_uses_current_smoke_when_legacy_target_has_none(tmp_path) -> No
     )
     for name in ("remote-rollback.sh", "shared-nginx-smoke.sh"):
         (current / "deploy" / name).write_text((ROOT / "deploy" / name).read_text(encoding="utf-8"), encoding="utf-8")
-    (legacy / "deploy" / "shared_nginx_release_validator.py").write_text(
+    (current / "deploy" / "shared_nginx_release_validator.py").write_text(
         (ROOT / "deploy" / "shared_nginx_release_validator.py").read_text(encoding="utf-8"), encoding="utf-8"
     )
 

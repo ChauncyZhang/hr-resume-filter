@@ -1,0 +1,49 @@
+limit_req_zone $binary_remote_addr zone=login_per_ip:10m rate=1r/m;
+limit_req_zone $binary_remote_addr zone=api_per_ip:10m rate=10r/s;
+
+server {
+    listen 443 ssl;
+    server_name hr.aurora-tek.cn;
+    root /usr/share/nginx/html;
+
+    ssl_certificate /etc/nginx/tls/tls.crt;
+    ssl_certificate_key /etc/nginx/tls/tls.key;
+
+    location = /api/v1/auth/login {
+        limit_req zone=login_per_ip burst=20 nodelay;
+        proxy_pass http://api:8000;
+        proxy_set_header Host $host;
+    }
+
+    location ^~ /api/ {
+        limit_req zone=api_per_ip burst=20 nodelay;
+        proxy_pass http://api:8000;
+        proxy_set_header Host $host;
+    }
+
+    location /health/ {
+        proxy_pass http://api:8000/health/;
+    }
+
+    location = /index.html {
+        add_header Cache-Control "no-store" always;
+        try_files /index.html =404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name aurora-tek.cn www.aurora-tek.cn;
+
+    ssl_certificate /etc/nginx/tls/tls.crt;
+    ssl_certificate_key /etc/nginx/tls/tls.key;
+
+    location / {
+        proxy_pass http://aurora-web:3000;
+        proxy_set_header Host $host;
+    }
+}
