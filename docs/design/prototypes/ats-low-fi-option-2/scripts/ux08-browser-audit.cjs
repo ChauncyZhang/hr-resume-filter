@@ -9,7 +9,7 @@ const results = [];
 
 const ids = Object.freeze({
   run: "run-llm-only-audit",
-  job: "job-llm-platform",
+  job: "00000000-0000-4000-8000-000000000208",
   reviewCandidate: "candidate-score-60",
   reviewApplication: "application-score-60",
   failedCandidate: "candidate-ai-unavailable",
@@ -417,7 +417,10 @@ async function installApiFixture(page, state) {
       return fulfillJson(route, { data: [], meta: { next_cursor: null, owners: [] } });
     }
     if (method === "GET" && pathname === "/api/v1/jobs") {
-      return fulfillJson(route, { data: [], meta: { next_cursor: null } });
+      return fulfillJson(route, {
+        data: [{ id: ids.job, title: "LLM 平台工程师" }],
+        meta: { next_cursor: null },
+      });
     }
     if (method === "GET" && pathname === "/api/v1/candidates") {
       return fulfillJson(route, { data: [], meta: { next_cursor: null, owners: [] } });
@@ -630,6 +633,24 @@ async function auditReports(page, viewportName) {
   await assertTextAbsent(page.locator("main"), /规则通过率|规则筛选通过率|97\.3%/, "当前报表不得展示旧规则指标");
   await assertNoBodyOverflow(page, `${viewportName} 报表`);
   await screenshot(page, `task8-llm-report-${viewportName}.png`);
+
+  await page.getByRole("combobox", { name: "报表职位" }).selectOption(ids.job);
+  await assertVisible(page.locator(".report-funnel button").filter({ hasText: "AI 初筛暂缓" }), "暂缓阶段漏斗");
+  const deferredRequest = page.waitForRequest((request) => {
+    const requestUrl = new URL(request.url());
+    return request.method() === "GET"
+      && requestUrl.pathname === "/api/v1/candidates"
+      && requestUrl.searchParams.get("job_id") === ids.job
+      && requestUrl.searchParams.get("stage") === "deferred";
+  });
+  await page.locator(".report-funnel button").filter({ hasText: "AI 初筛暂缓" }).click();
+  await deferredRequest;
+  await assertVisible(page.getByRole("heading", { name: "全部候选人", exact: true }), "暂缓候选人列表");
+  const candidateUrl = new URL(page.url());
+  assert.equal(candidateUrl.pathname, "/candidates");
+  assert.equal(candidateUrl.searchParams.get("job"), ids.job);
+  assert.equal(candidateUrl.searchParams.get("stage"), "AI 初筛暂缓");
+  assert.equal(await page.getByRole("combobox", { name: "阶段筛选" }).inputValue(), "AI 初筛暂缓");
 }
 
 async function runViewport(browser, viewportName, viewport, audits) {

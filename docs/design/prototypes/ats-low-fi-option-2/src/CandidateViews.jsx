@@ -100,7 +100,7 @@ export function canScheduleCandidateInterview(stage, role, scheduleAvailable) {
 }
 
 export function candidateStageFilterOptions() {
-  return ["新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"];
+  return ["新简历", "待复核", "AI 初筛暂缓", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"];
 }
 
 export function candidateDetailTabs(serverBacked) {

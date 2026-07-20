@@ -493,7 +493,7 @@ test("server candidate detail exposes the connected interview path and reports c
   assert.doesNotMatch(candidateHelpers.candidateMutationError(new Error("database internal.example")), /database|internal/);
   assert.equal(candidateHelpers.resumeDisplayName({ original_filename: "真实简历.pdf" }), "真实简历.pdf");
   assert.equal(candidateHelpers.resumeDisplayName(null), "暂无可用简历");
-  assert.deepEqual(candidateHelpers.candidateStageFilterOptions(), ["新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"]);
+  assert.deepEqual(candidateHelpers.candidateStageFilterOptions(), ["新简历", "待复核", "AI 初筛暂缓", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"]);
   assert.deepEqual(candidateHelpers.candidateWorkflowActions("待决策", "用人经理").map((item) => item.id), ["hiring_approved", "hiring_rejected"]);
   assert.deepEqual(candidateHelpers.candidateWorkflowActions("待安排", "HR 招聘专员"), []);
   assert.equal(candidateHelpers.candidateNextStep("面试中"), "等待面试官提交反馈");
