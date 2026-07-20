@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from uuid import uuid5
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +12,11 @@ from server.app.talent.models import TalentPool, TalentPoolMembership
 
 DEFERRED_POOL_SYSTEM_KEY = "ai_screening_deferred"
 DEFERRED_POOL_DISPLAY_NAME = "AI 初筛暂缓"
+DEFERRED_POOL_CREATE_MAX_ATTEMPTS = 5
+
+
+class DeferredPoolUnavailableError(RuntimeError):
+    pass
 
 
 def _aware(value: datetime) -> datetime:
@@ -39,13 +45,14 @@ def _pool_owner_id(db, organization_id, fallback_id):
     ) or fallback_id
 
 
-def _system_pool_names():
+def _system_pool_names(organization_id):
     yield DEFERRED_POOL_DISPLAY_NAME
-    index = 1
-    while True:
-        suffix = "" if index == 1 else f"-{index}"
-        yield f"{DEFERRED_POOL_DISPLAY_NAME} [{DEFERRED_POOL_SYSTEM_KEY}{suffix}]"
-        index += 1
+    for attempt in range(1, DEFERRED_POOL_CREATE_MAX_ATTEMPTS):
+        suffix = uuid5(
+            organization_id,
+            f"{DEFERRED_POOL_SYSTEM_KEY}:{attempt}",
+        ).hex[:16]
+        yield f"{DEFERRED_POOL_DISPLAY_NAME} [{suffix}]"
 
 
 def _refresh_pool_retention(pool, retention_days):
@@ -69,7 +76,7 @@ def _ensure_system_pool(db, organization_id, fallback_owner_id):
         return _refresh_pool_retention(pool, retention_days)
 
     owner_id = _pool_owner_id(db, organization_id, fallback_owner_id)
-    for name in _system_pool_names():
+    for name in _system_pool_names(organization_id):
         pool = TalentPool(
             organization_id=organization_id,
             name=name,
@@ -97,6 +104,7 @@ def _ensure_system_pool(db, organization_id, fallback_owner_id):
             )
             if name_taken is None:
                 raise
+    raise DeferredPoolUnavailableError("deferred_pool_name_exhausted")
 
 
 def ensure_deferred_membership(

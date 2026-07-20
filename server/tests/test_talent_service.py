@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from uuid import uuid4
+from unittest.mock import patch
+from uuid import uuid4, uuid5
 
 import pytest
 
@@ -10,10 +11,44 @@ from server.app.governance.models import RetentionPolicy
 from server.app.identity.models import Job
 from server.app.recruiting.models import Application, Candidate
 from server.app.screening.models import ScreeningRun
+from server.app.talent import service as talent_service
 from server.app.talent.models import TalentPool, TalentPoolMembership
-from server.app.talent.service import DEFERRED_POOL_SYSTEM_KEY, ensure_deferred_membership
+from server.app.talent.service import (
+    DEFERRED_POOL_SYSTEM_KEY,
+    DeferredPoolUnavailableError,
+    ensure_deferred_membership,
+)
 from server.tests.test_recruiting_api import make_app
 from server.tests.test_screening_routing import seed_routing_case
+
+
+EXPECTED_POOL_CREATE_MAX_ATTEMPTS = 5
+
+
+def expected_system_pool_names(organization_id):
+    names = ["AI 初筛暂缓"]
+    for attempt in range(1, EXPECTED_POOL_CREATE_MAX_ATTEMPTS):
+        suffix = uuid5(
+            organization_id,
+            f"{DEFERRED_POOL_SYSTEM_KEY}:{attempt}",
+        ).hex[:16]
+        names.append(f"AI 初筛暂缓 [{suffix}]")
+    return names
+
+
+def add_ordinary_pool(db, case, name, purpose):
+    pool = TalentPool(
+        organization_id=case.organization_id,
+        name=name,
+        purpose=purpose,
+        visibility="private",
+        owner_id=case.creator_id,
+        system_key=None,
+        suitable_roles=[],
+        retention_days=730,
+    )
+    db.add(pool)
+    return pool
 
 
 def test_deferred_membership_uses_system_pool_admin_and_retention_policy(tmp_path):
@@ -125,24 +160,20 @@ def test_deferred_membership_upsert_does_not_duplicate_pool_or_membership(tmp_pa
         assert db.scalar(select(func.count(TalentPoolMembership.id))) == 1
 
 
-def test_system_deferred_pool_uses_backup_name_when_normal_pool_owns_display_name(
-    tmp_path,
-):
+def test_system_deferred_pool_uses_bounded_backup_after_multiple_name_conflicts(tmp_path):
     app = make_app(tmp_path)
     case = seed_routing_case(app, suffix="pool-name-conflict")
     with app.state.identity_store.sync_session() as db:
-        ordinary = TalentPool(
-            organization_id=case.organization_id,
-            name="AI 初筛暂缓",
-            purpose="Ordinary recruiter-managed pool",
-            visibility="private",
-            owner_id=case.creator_id,
-            system_key=None,
-            suitable_roles=[],
-            retention_days=730,
-        )
-        db.add(ordinary)
+        candidate_names = expected_system_pool_names(case.organization_id)
+        ordinary_pools = [
+            add_ordinary_pool(db, case, name, f"Ordinary pool {index}")
+            for index, name in enumerate(candidate_names[:3])
+        ]
         db.flush()
+        ordinary_snapshot = [
+            (pool.id, pool.name, pool.purpose, pool.visibility, pool.system_key)
+            for pool in ordinary_pools
+        ]
         membership = ensure_deferred_membership(
             db,
             application=db.get(Application, case.application_id),
@@ -154,14 +185,67 @@ def test_system_deferred_pool_uses_backup_name_when_normal_pool_owns_display_nam
         db.flush()
 
         system_pool = db.get(TalentPool, membership.pool_id)
-        assert system_pool.id != ordinary.id
+        assert system_pool.id not in {pool.id for pool in ordinary_pools}
         assert system_pool.system_key == DEFERRED_POOL_SYSTEM_KEY
-        assert system_pool.name != ordinary.name
-        assert system_pool.name.startswith("AI 初筛暂缓")
-        assert ordinary.system_key is None
-        assert ordinary.purpose == "Ordinary recruiter-managed pool"
-        assert ordinary.visibility == "private"
-        assert db.scalar(select(func.count(TalentPool.id))) == 2
+        assert system_pool.name == candidate_names[3]
+        assert [
+            (pool.id, pool.name, pool.purpose, pool.visibility, pool.system_key)
+            for pool in ordinary_pools
+        ] == ordinary_snapshot
+        assert db.scalar(select(func.count(TalentPool.id))) == 4
+
+
+def test_system_deferred_pool_exhaustion_is_bounded_and_preserves_outer_transaction(
+    tmp_path,
+):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="pool-name-exhausted")
+    with app.state.identity_store.sync_session() as db:
+        candidate_names = expected_system_pool_names(case.organization_id)
+        ordinary_pools = [
+            add_ordinary_pool(db, case, name, f"Occupied {index}")
+            for index, name in enumerate(candidate_names)
+        ]
+        sentinel = add_ordinary_pool(db, case, "Outer transaction sentinel", "keep-me")
+        db.flush()
+        ordinary_snapshot = [
+            (pool.id, pool.name, pool.purpose, pool.visibility, pool.system_key)
+            for pool in ordinary_pools
+        ]
+        real_begin_nested = db.begin_nested
+        attempts = 0
+
+        def counted_begin_nested():
+            nonlocal attempts
+            attempts += 1
+            return real_begin_nested()
+
+        with patch.object(db, "begin_nested", side_effect=counted_begin_nested):
+            with pytest.raises(
+                DeferredPoolUnavailableError,
+                match="deferred_pool_name_exhausted",
+            ):
+                ensure_deferred_membership(
+                    db,
+                    application=db.get(Application, case.application_id),
+                    candidate=db.get(Candidate, case.candidate_id),
+                    job=db.get(Job, case.job_id),
+                    run=db.get(ScreeningRun, case.run_id),
+                    score=59,
+                )
+
+        assert (
+            talent_service.DEFERRED_POOL_CREATE_MAX_ATTEMPTS
+            == EXPECTED_POOL_CREATE_MAX_ATTEMPTS
+        )
+        assert attempts == EXPECTED_POOL_CREATE_MAX_ATTEMPTS
+        assert db.in_transaction()
+        assert db.get(TalentPool, sentinel.id).purpose == "keep-me"
+        assert [
+            (pool.id, pool.name, pool.purpose, pool.visibility, pool.system_key)
+            for pool in ordinary_pools
+        ] == ordinary_snapshot
+        assert db.scalar(select(func.count(TalentPool.id))) == len(ordinary_pools) + 1
 
 
 def test_deferred_membership_rejects_cross_tenant_run_context(tmp_path):
