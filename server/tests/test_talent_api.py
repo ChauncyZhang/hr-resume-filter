@@ -339,6 +339,57 @@ def test_deferred_membership_does_not_bind_old_audit_to_later_same_score_evaluat
     }
 
 
+def test_deferred_membership_rejects_evaluation_created_after_its_terminal_audit(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    routed_at = datetime(2026, 7, 18, 4, 55, tzinfo=timezone.utc)
+    evaluated_at = datetime(2026, 7, 18, 5, 5, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "deferred"
+        resume = database.get(Resume, source.resume_id)
+        item, results = seed_screening_results(
+            database,
+            source,
+            resume.file_object_id,
+            seed["admin_id"],
+            [("future-evidence", 48, "暂缓", evaluated_at)],
+        )
+        evaluation = seed_llm_evaluation(
+            database,
+            source,
+            seed["admin_id"],
+            results[0],
+            48,
+            "暂缓",
+            evaluated_at,
+        )
+        evaluation.gaps = ["future evidence must not project"]
+        audit = seed_terminal_route_audit(
+            database,
+            source,
+            item,
+            seed["admin_id"],
+            route="deferred",
+            score=48,
+            created_at=routed_at,
+        )
+        bind_terminal_audit_to_evaluation(audit, evaluation)
+        database.commit()
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        members = client.get(f"/api/v1/talent-pools/{pool_id}/memberships", headers=headers)
+
+    assert members.json()["data"][0]["deferred_screening"] == {
+        "final_score": None,
+        "deferred_at": None,
+        "main_gaps": [],
+    }
+
+
 def test_deferred_membership_without_llm_evaluation_does_not_fall_back_to_rule_score_or_tags(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
