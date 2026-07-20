@@ -6,7 +6,7 @@ from server.app.identity.models import AuditLog,Job,Organization,User,UserRole
 from server.app.identity.security import PasswordService
 from server.app.llm.models import LlmProviderConfig,LlmScreeningEvaluation,PromptVersion
 from server.app.main import create_app
-from server.app.queue.models import BackgroundJob
+from server.app.queue.models import BackgroundJob,JobAttempt
 from server.app.queue.repository import QueueRepository
 from server.app.queue.runtime import DatabaseQueueGateway
 from server.app.recruiting.models import Application,ApplicationReviewTask,ApplicationStageEvent,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
@@ -55,7 +55,7 @@ def test_llm_worker_dead_letter_routes_only_complete_relational_context_once():
         config=LlmProviderConfig(organization_id=org.id,provider_id="approved",model="model",encrypted_api_key=b"encrypted",enabled=True,allowed_job_ids=[],version=3,created_by=user.id,updated_by=user.id); db.add(config)
         prompt=PromptVersion(organization_id=org.id,name="screening-evaluation",version_number=2,content={"system":"safe"},content_hash="a"*64,created_by=user.id); db.add(prompt); db.flush()
         queue_job=QueueRepository(db).enqueue(org.id,"screening.llm_score_item",{"organization_id":str(org.id),"screening_item_id":str(item.id),"screening_result_id":str(result.id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key="llm-dead",max_attempts=1)
-        db.commit(); ids=(queue_job.id,item.id,run.id,application.id)
+        db.commit(); ids=(queue_job.id,item.id,run.id,application.id,org.id)
     async def explode(_): raise RuntimeError("private resume provider body")
     finalizer=LlmTerminalFinalizer(app.state.identity_store.sync_session)
     worker=Worker(Probe(),Probe(),interval_seconds=0,queue=DatabaseQueueGateway(url,terminal_callbacks=screening_terminal_callbacks()),handlers={"screening.llm_score_item":explode,"screening.llm_finalize_terminal":finalizer},outbox_handlers={},worker_id="llm-dead-worker",lease_seconds=30,heartbeat_seconds=10)
@@ -70,17 +70,41 @@ def test_llm_worker_dead_letter_routes_only_complete_relational_context_once():
         assert db.scalar(select(func.count(ApplicationReviewTask.id)))==0
         assert db.scalar(select(func.count(ApplicationStageEvent.id)))==0
         assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="screening.terminal_routed"))==0
+        finalizer_id=finalizer_job.id
+    for expected_attempt in range(1,4):
+        with app.state.identity_store.sync_session() as db:
+            repo=QueueRepository(db,terminal_callbacks=screening_terminal_callbacks())
+            pending=db.get(BackgroundJob,finalizer_id); pending.run_after=repo.database_now(); db.flush()
+            claimed=repo.claim(ids[4],"failing-finalizer",lease_seconds=30,recover_expired=False)
+            assert claimed.id==finalizer_id and claimed.attempts==expected_attempt
+            repo.fail(ids[4],finalizer_id,"failing-finalizer",safe_code="queue_unavailable",retryable=True)
+            db.commit()
+    with app.state.identity_store.sync_session() as db:
+        repo=QueueRepository(db,terminal_callbacks=screening_terminal_callbacks())
+        finalizer_job=db.get(BackgroundJob,finalizer_id); item=db.get(ScreeningItem,ids[1]); application=db.get(Application,ids[3])
+        assert finalizer_job.status=="queued" and finalizer_job.attempts==3 and finalizer_job.max_attempts==6
+        assert finalizer_job.run_after>finalizer_job.updated_at
+        assert item.llm_status=="queued" and application.stage=="new"
+        assert db.scalar(select(func.count(ApplicationReviewTask.id)))==0
+        assert db.scalar(select(func.count(ApplicationStageEvent.id)))==0
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="screening.terminal_routed"))==0
+        before=(finalizer_job.attempts,finalizer_job.max_attempts,finalizer_job.run_after)
+        screening_terminal_callbacks()["screening.llm_finalize_terminal"](db,finalizer_job,"queue_unavailable",repo.database_now())
+        assert (finalizer_job.attempts,finalizer_job.max_attempts,finalizer_job.run_after)==before
+        finalizer_job.run_after=repo.database_now(); db.commit()
     asyncio.run(worker._poll_once())
     with app.state.identity_store.sync_session() as db:
         queue_job=db.get(BackgroundJob,ids[0]); item=db.get(ScreeningItem,ids[1]); run=db.get(ScreeningRun,ids[2]); application=db.get(Application,ids[3])
         finalizer_job=db.scalar(select(BackgroundJob).where(BackgroundJob.type=="screening.llm_finalize_terminal"))
-        assert finalizer_job.status=="succeeded"
+        assert finalizer_job.status=="succeeded" and finalizer_job.attempts==4 and finalizer_job.max_attempts==6
         assert item.llm_status=="failed" and item.llm_safe_error_code=="llm_handler_failed"
         assert run.status=="partial" and application.stage=="review"
         assert db.scalar(select(func.count(ApplicationReviewTask.id)))==1
         assert db.scalar(select(func.count(ApplicationStageEvent.id)))==1
         assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="screening.terminal_routed"))==1
         assert db.scalar(select(func.count(LlmScreeningEvaluation.id)))==0
+        attempts=list(db.scalars(select(JobAttempt.attempt_no).where(JobAttempt.job_id==finalizer_job.id).order_by(JobAttempt.attempt_no)))
+        assert attempts==[1,2,3,4]
         finalize_llm_dead_letter(db,queue_job,"private resume provider body",queue_job.updated_at); db.commit()
         assert db.scalar(select(func.count(ApplicationReviewTask.id)))==1
         assert db.scalar(select(func.count(ApplicationStageEvent.id)))==1

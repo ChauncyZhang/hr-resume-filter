@@ -9,7 +9,7 @@ from sqlalchemy.exc import DisconnectionError, OperationalError, TimeoutError as
 from server.app.llm.models import LlmProviderConfig, PromptVersion
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
-from server.app.queue.service import RetryableJobError, normalize_safe_code
+from server.app.queue.service import RetryableJobError, normalize_safe_code, retry_delay
 from server.app.recruiting.models import Application, Candidate, JobJdVersion, Resume
 from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
@@ -33,6 +33,9 @@ _LLM_WORKER_EXHAUSTION_CODES = {
     "lease_expired": "llm_handler_failed",
     "llm_handler_failed": "llm_handler_failed",
 }
+_LLM_FINALIZER_RECOVERY_CODES = frozenset({"queue_unavailable", "lease_expired"})
+_LLM_FINALIZER_ATTEMPT_BATCH = 3
+_MAX_JOB_ATTEMPTS = 2_147_483_647
 
 
 @dataclass(frozen=True)
@@ -367,9 +370,29 @@ def finalize_llm_dead_letter(session, job, safe_code, now):
     _enqueue_llm_terminal_finalizer(session, job, safe_code)
 
 
+def recover_llm_finalizer_exhaustion(session, job, safe_code, now):
+    normalized = normalize_safe_code(safe_code)
+    if (
+        getattr(job, "type", None) != "screening.llm_finalize_terminal"
+        or getattr(job, "status", None) != "dead_letter"
+        or normalized not in _LLM_FINALIZER_RECOVERY_CODES
+        or normalize_safe_code(getattr(job, "last_error_code", None)) != normalized
+        or job.attempts < job.max_attempts
+        or job.max_attempts > _MAX_JOB_ATTEMPTS - _LLM_FINALIZER_ATTEMPT_BATCH
+    ):
+        return
+    job.max_attempts += _LLM_FINALIZER_ATTEMPT_BATCH
+    job.status = "queued"
+    job.last_error_code = normalized
+    job.run_after = now + retry_delay(
+        min(job.attempts, 7), maximum_seconds=300, jitter=lambda _: 0
+    )
+
+
 def screening_terminal_callbacks():
     return {
         "screening.parse_item": finalize_screening_dead_letter,
         "screening.score_item": finalize_screening_dead_letter,
         "screening.llm_score_item": finalize_llm_dead_letter,
+        "screening.llm_finalize_terminal": recover_llm_finalizer_exhaustion,
     }

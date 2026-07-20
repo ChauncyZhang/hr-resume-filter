@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ from server.app.core.settings import Settings
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, UnsafePayload
 from server.app.queue.service import RetryableJobError
 from server.app.screening.terminal import LlmTerminalFinalizer
+from server.app.screening.terminal import screening_terminal_callbacks
 from server.app.worker.main import build_screening_handlers
 
 def test_production_screening_registry_is_allowlisted_and_scanner_settings_are_bounded():
@@ -89,3 +91,43 @@ def test_llm_terminal_finalizer_retries_database_unavailability():
         asyncio.run(LlmTerminalFinalizer(BrokenSessions())(SimpleNamespace()))
 
     assert failed.value.safe_code == "queue_unavailable"
+
+
+def test_llm_finalizer_exhaustion_callback_reschedules_only_infrastructure_failure():
+    callbacks = screening_terminal_callbacks()
+    callback = callbacks["screening.llm_finalize_terminal"]
+    now = datetime.now(timezone.utc)
+    job = SimpleNamespace(
+        type="screening.llm_finalize_terminal",
+        status="dead_letter",
+        attempts=3,
+        max_attempts=3,
+        run_after=now,
+        last_error_code="queue_unavailable",
+    )
+
+    class NoDomainSession:
+        def __getattribute__(self, name):
+            if name in {"execute", "scalar", "get"}:
+                raise AssertionError("terminal recovery must not access domain tables")
+            return super().__getattribute__(name)
+
+    callback(NoDomainSession(), job, "queue_unavailable", now)
+
+    assert job.status == "queued"
+    assert job.attempts == 3
+    assert job.max_attempts == 6
+    assert job.run_after > now
+    callback(NoDomainSession(), job, "queue_unavailable", now)
+    assert job.attempts == 3 and job.max_attempts == 6
+
+    technical = SimpleNamespace(
+        type="screening.llm_finalize_terminal",
+        status="dead_letter",
+        attempts=3,
+        max_attempts=3,
+        run_after=now,
+        last_error_code="internal_error",
+    )
+    callback(NoDomainSession(), technical, "internal_error", now)
+    assert technical.status == "dead_letter" and technical.max_attempts == 3
