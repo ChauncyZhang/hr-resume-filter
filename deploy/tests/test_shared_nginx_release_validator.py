@@ -6,14 +6,18 @@ from deploy.shared_nginx_release_validator import validate_nginx_template
 
 def test_accepts_shared_hr_and_website_routes():
     text = """
-    server { server_name hr.aurora-tek.cn; location / { proxy_pass http://api:8000; } }
+    server {
+        server_name hr.aurora-tek.cn;
+        location / { try_files $uri $uri/ /index.html; }
+        location /api/ { proxy_pass http://api:8000; }
+    }
     server { server_name aurora-tek.cn www.aurora-tek.cn; location / { proxy_pass http://aurora-web:3000; } }
     """
     assert validate_nginx_template(text) == []
 
 
 def test_rejects_template_that_drops_website_route():
-    text = "server { server_name hr.aurora-tek.cn; location / { proxy_pass http://api:8000; } }"
+    text = "server { server_name hr.aurora-tek.cn; location /api/ { proxy_pass http://api:8000; } }"
     assert validate_nginx_template(text) == [
         "missing_server_name:aurora-tek.cn",
         "missing_server_name:www.aurora-tek.cn",
@@ -24,7 +28,7 @@ def test_keeps_nested_location_inside_server_block():
     text = """
     server {
         server_name hr.aurora-tek.cn;
-        location / {
+        location /api/ {
             if ($request_method = OPTIONS) { return 204; }
             proxy_pass http://api:8000;
         }
@@ -36,17 +40,17 @@ def test_keeps_nested_location_inside_server_block():
 
 def test_reports_wrong_upstream_for_named_route():
     text = """
-    server { server_name hr.aurora-tek.cn; location / { proxy_pass http://wrong:8000; } }
+    server { server_name hr.aurora-tek.cn; location /api/ { proxy_pass http://wrong:8000; } }
     server { server_name aurora-tek.cn www.aurora-tek.cn; location / { proxy_pass http://aurora-web:3000; } }
     """
     assert validate_nginx_template(text) == ["wrong_upstream:hr.aurora-tek.cn"]
 
 
-def test_rejects_correct_upstream_in_non_root_location():
+def test_rejects_correct_upstream_in_non_api_location():
     text = """
     server {
         server_name hr.aurora-tek.cn;
-        location / { proxy_pass http://aurora-web:3000; }
+        location / { try_files $uri $uri/ /index.html; }
         location /health { proxy_pass http://api:8000; }
     }
     server { server_name aurora-tek.cn www.aurora-tek.cn; location / { proxy_pass http://aurora-web:3000; } }
@@ -57,7 +61,7 @@ def test_rejects_correct_upstream_in_non_root_location():
 def test_cli_reports_only_error_codes_without_template_contents(tmp_path):
     template = tmp_path / "nginx.conf"
     template.write_text(
-        "server { server_name hr.aurora-tek.cn; location / { proxy_pass http://api:8000; } }",
+        "server { server_name hr.aurora-tek.cn; location /api/ { proxy_pass http://api:8000; } }",
         encoding="utf-8",
     )
     result = subprocess.run(
@@ -84,7 +88,11 @@ def test_cli_accepts_valid_template_without_stderr(tmp_path):
     template = tmp_path / "nginx.conf"
     template.write_text(
         """
-        server { server_name hr.aurora-tek.cn; location / { proxy_pass http://api:8000; } }
+        server {
+            server_name hr.aurora-tek.cn;
+            location / { try_files $uri $uri/ /index.html; }
+            location /api/ { proxy_pass http://api:8000; }
+        }
         server { server_name aurora-tek.cn www.aurora-tek.cn; location / { proxy_pass http://aurora-web:3000; } }
         """,
         encoding="utf-8",

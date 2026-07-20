@@ -117,12 +117,12 @@ def _direct_proxy_passes(location_body: str) -> list[str]:
 def validate_nginx_template(text: str) -> list[str]:
     blocks = extract_server_blocks(text)
     routes = [
-        ("hr.aurora-tek.cn", "http://api:8000"),
-        ("aurora-tek.cn", "http://aurora-web:3000"),
-        ("www.aurora-tek.cn", "http://aurora-web:3000"),
+        ("hr.aurora-tek.cn", "/api/", "http://api:8000"),
+        ("aurora-tek.cn", "/", "http://aurora-web:3000"),
+        ("www.aurora-tek.cn", "/", "http://aurora-web:3000"),
     ]
     errors: list[str] = []
-    for name, upstream in routes:
+    for name, route_path, upstream in routes:
         named = [block for block in blocks if name in server_names(block)]
         if not named:
             errors.append(f"missing_server_name:{name}")
@@ -130,7 +130,7 @@ def validate_nginx_template(text: str) -> list[str]:
             upstream in _direct_proxy_passes(body)
             for block in named
             for path, body in extract_location_blocks(block)
-            if path == "/"
+            if path == route_path
         ):
             errors.append(f"wrong_upstream:{name}")
     return errors
