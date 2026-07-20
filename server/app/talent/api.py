@@ -15,7 +15,7 @@ from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
-from server.app.llm.models import LlmScreeningEvaluation
+from server.app.llm.models import LlmInvocation, LlmScreeningEvaluation
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, Resume
 from server.app.recruiting.tasks import ensure_review_task
@@ -305,55 +305,24 @@ def _authorized_resume(db, principal: Principal, resume_id: UUID, candidate_id: 
     )
 
 
-def _latest_valid_deferred_route(db, source: Application):
-    item_ids = set(
-        db.scalars(
-            select(ScreeningItem.id).where(
-                ScreeningItem.organization_id == source.organization_id,
-                ScreeningItem.application_id == source.id,
-            )
-        ).all()
-    )
-    if not item_ids:
-        return None
-    audits = db.scalars(
-        select(AuditLog)
-        .where(
-            AuditLog.organization_id == source.organization_id,
-            AuditLog.category == "recruiting",
-            AuditLog.event_type == "screening.terminal_routed",
-            AuditLog.outcome == "success",
-            AuditLog.resource_type == "application",
-            AuditLog.resource_id == source.id,
+def _empty_deferred_screening() -> dict:
+    return {"final_score": None, "deferred_at": None, "main_gaps": []}
+
+
+def _deferred_screening_projections(db, organization_id: UUID, application_ids: set[UUID]) -> dict[UUID, dict]:
+    if not application_ids:
+        return {}
+    rows = db.execute(
+        select(
+            ScreeningItem.application_id,
+            ScreeningItem.id.label("item_id"),
+            LlmScreeningEvaluation.id.label("evaluation_id"),
+            LlmScreeningEvaluation.score,
+            LlmScreeningEvaluation.recommendation,
+            LlmScreeningEvaluation.gaps,
+            LlmScreeningEvaluation.created_at,
         )
-        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
-    ).all()
-    for audit in audits:
-        try:
-            metadata = _validate_metadata("screening.terminal_routed", audit.metadata_json)
-            item_id = UUID(metadata["item_id"])
-        except (AuditValidationError, KeyError, TypeError, ValueError):
-            continue
-        score = metadata.get("score")
-        if (
-            metadata.get("application_id") != str(source.id)
-            or metadata.get("from_stage") != "new"
-            or metadata.get("to_stage") != "deferred"
-            or metadata.get("ai_status") != "succeeded"
-            or item_id not in item_ids
-            or not isinstance(score, int)
-            or isinstance(score, bool)
-            or not 0 <= score <= 100
-            or metadata.get("safe_error_code") is not None
-        ):
-            continue
-        return audit
-    return None
-
-
-def _deferred_screening_data(db, source: Application) -> dict:
-    evaluation = db.scalar(
-        select(LlmScreeningEvaluation)
+        .select_from(LlmScreeningEvaluation)
         .join(
             ScreeningResult,
             and_(
@@ -361,80 +330,209 @@ def _deferred_screening_data(db, source: Application) -> dict:
                 ScreeningResult.id == LlmScreeningEvaluation.screening_result_id,
             ),
         )
-        .where(
-            LlmScreeningEvaluation.organization_id == source.organization_id,
-            ScreeningResult.application_id == source.id,
+        .join(
+            ScreeningItem,
+            and_(
+                ScreeningItem.organization_id == ScreeningResult.organization_id,
+                ScreeningItem.id == ScreeningResult.item_id,
+                ScreeningItem.application_id == ScreeningResult.application_id,
+            ),
         )
-        .order_by(LlmScreeningEvaluation.created_at.desc(), LlmScreeningEvaluation.id.desc())
-        .limit(1)
-    )
-    route = _latest_valid_deferred_route(db, source)
-    return {
-        "final_score": evaluation.score if evaluation else None,
-        "deferred_at": _aware(route.created_at).isoformat() if route else None,
-        "main_gaps": list(evaluation.gaps or []) if evaluation else [],
+        .join(
+            LlmInvocation,
+            and_(
+                LlmInvocation.organization_id == LlmScreeningEvaluation.organization_id,
+                LlmInvocation.id == LlmScreeningEvaluation.invocation_id,
+                LlmInvocation.screening_result_id == LlmScreeningEvaluation.screening_result_id,
+                LlmInvocation.prompt_version_id == LlmScreeningEvaluation.prompt_version_id,
+            ),
+        )
+        .where(
+            LlmScreeningEvaluation.organization_id == organization_id,
+            ScreeningItem.application_id.in_(application_ids),
+            ScreeningItem.llm_status == "succeeded",
+            LlmInvocation.status == "succeeded",
+        )
+        .order_by(
+            ScreeningItem.application_id,
+            LlmScreeningEvaluation.created_at.desc(),
+            LlmScreeningEvaluation.id.desc(),
+        )
+    ).all()
+    evaluations = {}
+    for row in rows:
+        evaluations.setdefault(row.application_id, row)
+
+    audits = db.scalars(
+        select(AuditLog)
+        .where(
+            AuditLog.organization_id == organization_id,
+            AuditLog.category == "recruiting",
+            AuditLog.event_type == "screening.terminal_routed",
+            AuditLog.outcome == "success",
+            AuditLog.resource_type == "application",
+            AuditLog.resource_id.in_(application_ids),
+        )
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+    ).all()
+    projections = {}
+    for audit in audits:
+        application_id = audit.resource_id
+        if application_id in projections:
+            continue
+        evaluation = evaluations.get(application_id)
+        if evaluation is None or not 0 <= evaluation.score < 60 or evaluation.recommendation != "暂缓":
+            continue
+        try:
+            metadata = _validate_metadata("screening.terminal_routed", audit.metadata_json)
+            item_id = UUID(metadata["item_id"])
+        except (AuditValidationError, KeyError, TypeError, ValueError):
+            continue
+        if (
+            metadata.get("application_id") != str(application_id)
+            or metadata.get("from_stage") != "new"
+            or metadata.get("to_stage") != "deferred"
+            or metadata.get("ai_status") != "succeeded"
+            or metadata.get("score") != evaluation.score
+            or metadata.get("recommendation") != evaluation.recommendation
+            or metadata.get("safe_error_code") is not None
+            or item_id != evaluation.item_id
+        ):
+            continue
+        projections[application_id] = {
+            "final_score": evaluation.score,
+            "deferred_at": _aware(audit.created_at).isoformat(),
+            "main_gaps": list(evaluation.gaps or []),
+        }
+    return projections
+
+
+def _membership_data_batch(
+    db,
+    principal: Principal,
+    memberships: list[TalentPoolMembership],
+    *,
+    pools: dict[UUID, TalentPool] | None = None,
+) -> list[dict]:
+    if not memberships:
+        return []
+    organization_id = principal.organization_id
+    candidate_ids = {membership.candidate_id for membership in memberships}
+    owner_ids = {membership.owner_id for membership in memberships}
+    source_ids = {membership.source_application_id for membership in memberships if membership.source_application_id}
+    pool_ids = {membership.pool_id for membership in memberships}
+
+    candidates = {
+        candidate.id: candidate
+        for candidate in db.scalars(
+            select(Candidate).where(
+                Candidate.organization_id == organization_id,
+                Candidate.id.in_(candidate_ids),
+                Candidate.deleted_at.is_(None),
+            )
+        ).all()
     }
+    owners = {
+        owner.id: owner
+        for owner in db.scalars(
+            select(User).where(User.organization_id == organization_id, User.id.in_(owner_ids))
+        ).all()
+    }
+    loaded_pools = dict(pools or {})
+    missing_pool_ids = pool_ids - loaded_pools.keys()
+    if missing_pool_ids:
+        loaded_pools.update(
+            {
+                pool.id: pool
+                for pool in db.scalars(
+                    select(TalentPool).where(
+                        TalentPool.organization_id == organization_id,
+                        TalentPool.id.in_(missing_pool_ids),
+                    )
+                ).all()
+            }
+        )
+
+    visible_sources = {}
+    if source_ids:
+        source_rows = db.execute(
+            select(Application, Job)
+            .join(
+                Job,
+                and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id),
+            )
+            .where(
+                Application.organization_id == organization_id,
+                Application.id.in_(source_ids),
+                AUTH.job_predicate(principal, RecruitingAction.READ, Job),
+            )
+        ).all()
+        visible_sources = {source.id: (source, job) for source, job in source_rows}
+
+    deferred_source_ids = {
+        membership.source_application_id
+        for membership in memberships
+        if membership.source_application_id in visible_sources
+        and loaded_pools.get(membership.pool_id) is not None
+        and loaded_pools[membership.pool_id].system_key == DEFERRED_POOL_SYSTEM_KEY
+        and visible_sources[membership.source_application_id][0].candidate_id == membership.candidate_id
+    }
+    deferred_projections = _deferred_screening_projections(db, organization_id, deferred_source_ids)
+
+    data = []
+    for membership in memberships:
+        candidate = candidates.get(membership.candidate_id)
+        owner = owners.get(membership.owner_id)
+        visible_source = visible_sources.get(membership.source_application_id)
+        if visible_source is not None and visible_source[0].candidate_id != membership.candidate_id:
+            visible_source = None
+        if membership.source_application_id is None:
+            source_data = None
+        elif visible_source is None:
+            source_data = {"id": str(membership.source_application_id), "redacted": True}
+        else:
+            source, source_job = visible_source
+            source_data = {
+                "id": str(source.id),
+                "job_id": str(source.job_id),
+                "job_title": source_job.title,
+                "stage": source.stage,
+                "human_conclusion": source.human_conclusion,
+            }
+        pool = loaded_pools.get(membership.pool_id)
+        deferred_screening = None
+        if pool is not None and pool.system_key == DEFERRED_POOL_SYSTEM_KEY and visible_source is not None:
+            deferred_screening = deferred_projections.get(
+                membership.source_application_id,
+                _empty_deferred_screening(),
+            )
+        data.append({
+            "id": str(membership.id),
+            "pool_id": str(membership.pool_id),
+            "candidate": {
+                "id": str(membership.candidate_id),
+                "display_name": candidate.display_name if candidate else "Unavailable",
+                "current_title": candidate.current_title if candidate else None,
+                "location": candidate.location if candidate else None,
+            },
+            "source_application": source_data,
+            "deferred_screening": deferred_screening,
+            "owner": {"id": str(membership.owner_id), "display_name": owner.display_name if owner else "Unavailable"},
+            "suitable_roles": list(membership.suitable_roles or []),
+            "tags": list(membership.tags or []),
+            "reason": membership.reason,
+            "next_contact_at": _aware(membership.next_contact_at).isoformat() if membership.next_contact_at else None,
+            "retention_until": _aware(membership.retention_until).isoformat(),
+            "status": membership.status,
+            "version": membership.version,
+            "created_at": _aware(membership.created_at).isoformat(),
+            "updated_at": _aware(membership.updated_at).isoformat(),
+        })
+    return data
 
 
 def _membership_data(db, principal: Principal, membership: TalentPoolMembership) -> dict:
-    candidate = db.get(Candidate, membership.candidate_id)
-    owner = db.get(User, membership.owner_id)
-    source = (
-        _authorized_application(
-            db,
-            principal,
-            membership.source_application_id,
-            membership.candidate_id,
-        )
-        if membership.source_application_id
-        else None
-    )
-    source_job = db.get(Job, source.job_id) if source else None
-    if membership.source_application_id is None:
-        source_data = None
-    elif source is None:
-        source_data = {"id": str(membership.source_application_id), "redacted": True}
-    else:
-        source_data = {
-            "id": str(source.id),
-            "job_id": str(source.job_id),
-            "job_title": source_job.title if source_job else "Unavailable",
-            "stage": source.stage,
-            "human_conclusion": source.human_conclusion,
-        }
-    pool = db.scalar(
-        select(TalentPool).where(
-            TalentPool.organization_id == membership.organization_id,
-            TalentPool.id == membership.pool_id,
-        )
-    )
-    deferred_screening = (
-        _deferred_screening_data(db, source)
-        if pool is not None and pool.system_key == DEFERRED_POOL_SYSTEM_KEY and source is not None
-        else None
-    )
-    return {
-        "id": str(membership.id),
-        "pool_id": str(membership.pool_id),
-        "candidate": {
-            "id": str(membership.candidate_id),
-            "display_name": candidate.display_name if candidate else "Unavailable",
-            "current_title": candidate.current_title if candidate else None,
-            "location": candidate.location if candidate else None,
-        },
-        "source_application": source_data,
-        "deferred_screening": deferred_screening,
-        "owner": {"id": str(membership.owner_id), "display_name": owner.display_name if owner else "Unavailable"},
-        "suitable_roles": list(membership.suitable_roles or []),
-        "tags": list(membership.tags or []),
-        "reason": membership.reason,
-        "next_contact_at": _aware(membership.next_contact_at).isoformat() if membership.next_contact_at else None,
-        "retention_until": _aware(membership.retention_until).isoformat(),
-        "status": membership.status,
-        "version": membership.version,
-        "created_at": _aware(membership.created_at).isoformat(),
-        "updated_at": _aware(membership.updated_at).isoformat(),
-    }
+    return _membership_data_batch(db, principal, [membership])[0]
 
 
 def _application_data(application: Application) -> dict:
@@ -673,7 +771,10 @@ def list_talent_pool_memberships(
             last = rows[limit - 1]
             next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), cursor_sort, _aware(last.updated_at).isoformat(), str(last.id))
             rows = rows[:limit]
-        response = JSONResponse({"data": [_membership_data(db, principal, row) for row in rows], "meta": {"limit": limit, "next_cursor": next_cursor}})
+        response = JSONResponse({
+            "data": _membership_data_batch(db, principal, rows, pools={pool.id: pool}),
+            "meta": {"limit": limit, "next_cursor": next_cursor},
+        })
         response.headers["Cache-Control"] = "no-store"
         return response
 

@@ -1,18 +1,21 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
+import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
 
 from server.app.core.settings import Settings
 from server.app.identity.models import AuditLog, Job, JobCollaborator, Organization, User, UserRole
 from server.app.identity.security import PasswordService
+from server.app.llm.models import LlmInvocation
 from server.app.main import create_app
 from server.app.recruiting.models import (
     Application,
     ApplicationReviewTask,
     ApplicationStageEvent,
+    Candidate,
     CandidateContact,
     CandidateEvent,
     FileObject,
@@ -248,9 +251,226 @@ def test_deferred_membership_without_llm_evaluation_does_not_fall_back_to_rule_s
 
     assert members.json()["data"][0]["deferred_screening"] == {
         "final_score": None,
-        "deferred_at": malformed_at.isoformat(),
+        "deferred_at": None,
         "main_gaps": [],
     }
+
+
+def test_deferred_membership_rejects_evaluation_and_audit_from_different_screening_items(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    routed_at = datetime(2026, 7, 18, 6, 0, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "deferred"
+        source_resume = database.get(Resume, source.resume_id)
+        source_item, _ = seed_screening_results(
+            database,
+            source,
+            source_resume.file_object_id,
+            seed["admin_id"],
+            [("source-rule", 50, "暂缓", routed_at)],
+        )
+
+        foreign_candidate = Candidate(
+            organization_id=source.organization_id,
+            display_name="Foreign candidate",
+            owner_id=seed["admin_id"],
+        )
+        foreign_file = FileObject(
+            organization_id=source.organization_id,
+            storage_key="talent/foreign.pdf",
+            original_filename="foreign.pdf",
+            mime_type="application/pdf",
+            size_bytes=10,
+            sha256="c" * 64,
+            uploaded_by=seed["admin_id"],
+        )
+        database.add_all([foreign_candidate, foreign_file])
+        database.flush()
+        foreign_resume = Resume(
+            organization_id=source.organization_id,
+            candidate_id=foreign_candidate.id,
+            file_object_id=foreign_file.id,
+            version_number=1,
+        )
+        database.add(foreign_resume)
+        database.flush()
+        foreign_application = Application(
+            organization_id=source.organization_id,
+            candidate_id=foreign_candidate.id,
+            job_id=source.job_id,
+            resume_id=foreign_resume.id,
+            owner_id=seed["admin_id"],
+            stage="rejected",
+        )
+        database.add(foreign_application)
+        database.flush()
+        _, foreign_results = seed_screening_results(
+            database,
+            foreign_application,
+            foreign_file.id,
+            seed["admin_id"],
+            [("foreign-rule", 48, "暂缓", routed_at)],
+        )
+        forged_result = foreign_results[0]
+        forged_result.application_id = source.id
+        forged_evaluation = seed_llm_evaluation(
+            database,
+            source,
+            seed["admin_id"],
+            forged_result,
+            48,
+            "暂缓",
+            routed_at,
+        )
+        forged_evaluation.gaps = ["forged gap"]
+        seed_terminal_route_audit(
+            database,
+            source,
+            source_item,
+            seed["admin_id"],
+            route="deferred",
+            score=48,
+            created_at=routed_at,
+        )
+        database.commit()
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        members = client.get(f"/api/v1/talent-pools/{pool_id}/memberships", headers=headers)
+
+    assert members.json()["data"][0]["deferred_screening"] == {
+        "final_score": None,
+        "deferred_at": None,
+        "main_gaps": [],
+    }
+
+
+@pytest.mark.parametrize(
+    ("item_status", "invocation_status", "score", "evaluation_recommendation", "audit_score"),
+    [
+        ("failed", "succeeded", 48, "暂缓", 48),
+        ("succeeded", "failed", 48, "暂缓", 48),
+        ("succeeded", "succeeded", 95, "暂缓", 95),
+        ("succeeded", "succeeded", 48, "建议评审", 48),
+        ("succeeded", "succeeded", 48, "暂缓", 47),
+    ],
+)
+def test_deferred_membership_rejects_invalid_terminal_state(
+    tmp_path,
+    item_status,
+    invocation_status,
+    score,
+    evaluation_recommendation,
+    audit_score,
+) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    routed_at = datetime(2026, 7, 18, 7, 0, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "deferred"
+        resume = database.get(Resume, source.resume_id)
+        item, results = seed_screening_results(
+            database,
+            source,
+            resume.file_object_id,
+            seed["admin_id"],
+            [("strict-route", 99, "优先沟通", routed_at)],
+        )
+        evaluation = seed_llm_evaluation(
+            database,
+            source,
+            seed["admin_id"],
+            results[0],
+            score,
+            evaluation_recommendation,
+            routed_at,
+        )
+        evaluation.gaps = ["must not project"]
+        item.llm_status = item_status
+        database.get(LlmInvocation, evaluation.invocation_id).status = invocation_status
+        seed_terminal_route_audit(
+            database,
+            source,
+            item,
+            seed["admin_id"],
+            route="deferred",
+            score=audit_score,
+            created_at=routed_at,
+        )
+        database.commit()
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        members = client.get(f"/api/v1/talent-pools/{pool_id}/memberships", headers=headers)
+
+    assert members.json()["data"][0]["deferred_screening"] == {
+        "final_score": None,
+        "deferred_at": None,
+        "main_gaps": [],
+    }
+
+
+def test_membership_list_query_count_is_bounded_as_pool_grows(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+
+    def select_count(client, path):
+        statements = []
+
+        def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(app.state.identity_store.engine, "before_cursor_execute", record_statement)
+        try:
+            response = client.get(path, headers=headers)
+        finally:
+            event.remove(app.state.identity_store.engine, "before_cursor_execute", record_statement)
+        assert response.status_code == 200
+        return len(statements)
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        path = f"/api/v1/talent-pools/{pool_id}/memberships?limit=100"
+        one_member_selects = select_count(client, path)
+
+        with app.state.identity_store.sync_session() as database:
+            source = database.get(Application, seed["application_id"])
+            for index in range(12):
+                candidate = Candidate(
+                    organization_id=source.organization_id,
+                    display_name=f"Query count candidate {index}",
+                    owner_id=seed["admin_id"],
+                )
+                database.add(candidate)
+                database.flush()
+                database.add(
+                    TalentPoolMembership(
+                        organization_id=source.organization_id,
+                        pool_id=UUID(pool_id),
+                        candidate_id=candidate.id,
+                        source_application_id=None,
+                        owner_id=seed["admin_id"],
+                        suitable_roles=["Engineer"],
+                        tags=[],
+                        reason="Query count fixture",
+                        retention_until=datetime(2028, 7, 20, tzinfo=timezone.utc),
+                    )
+                )
+            database.commit()
+
+        many_member_selects = select_count(client, path)
+
+    assert many_member_selects <= one_member_selects + 1
 
 
 def test_deferred_membership_referral_reuses_application_and_is_idempotent(tmp_path) -> None:
