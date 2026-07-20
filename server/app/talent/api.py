@@ -9,11 +9,13 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy import String, and_, cast, delete, exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
+from server.app.governance.audit import AuditValidationError, _validate_metadata
 from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Job, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
+from server.app.llm.models import LlmScreeningEvaluation
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, Resume
 from server.app.recruiting.tasks import ensure_review_task
@@ -24,7 +26,9 @@ from server.app.recruiting.service import (
     lock_active_candidate,
     persisted_idempotent,
 )
+from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.app.talent.models import TalentPool, TalentPoolGrant, TalentPoolMembership
+from server.app.talent.service import DEFERRED_POOL_SYSTEM_KEY
 from server.app.talent.schemas import (
     DataCollection,
     DataResource,
@@ -148,6 +152,42 @@ def _load_membership(db, principal: Principal, membership_id: UUID, *, manage: b
     return db.scalar(statement)
 
 
+def _load_review_referral_membership(db, principal: Principal, membership_id: UUID, *, for_update: bool = False):
+    referral_scope = or_(
+        _pool_scope(principal, manage=True),
+        and_(
+            TalentPool.system_key == DEFERRED_POOL_SYSTEM_KEY,
+            _pool_scope(principal),
+        ),
+    )
+    statement = (
+        select(TalentPoolMembership)
+        .join(
+            TalentPool,
+            and_(
+                TalentPool.organization_id == TalentPoolMembership.organization_id,
+                TalentPool.id == TalentPoolMembership.pool_id,
+            ),
+        )
+        .join(
+            Candidate,
+            and_(
+                Candidate.organization_id == TalentPoolMembership.organization_id,
+                Candidate.id == TalentPoolMembership.candidate_id,
+            ),
+        )
+        .where(
+            TalentPoolMembership.organization_id == principal.organization_id,
+            TalentPoolMembership.id == membership_id,
+            Candidate.deleted_at.is_(None),
+            referral_scope,
+        )
+    )
+    if for_update:
+        statement = statement.with_for_update()
+    return db.scalar(statement)
+
+
 def _active_user(db, organization_id: UUID, user_id: UUID):
     return db.scalar(
         select(User).where(
@@ -193,6 +233,7 @@ def _pool_data(db, pool: TalentPool, *, include_grants: bool = False) -> dict:
     body = {
         "id": str(pool.id),
         "name": pool.name,
+        "system_key": pool.system_key,
         "purpose": pool.purpose,
         "visibility": pool.visibility,
         "owner": {"id": str(pool.owner_id), "display_name": owner.display_name if owner else "Unavailable"},
@@ -264,6 +305,77 @@ def _authorized_resume(db, principal: Principal, resume_id: UUID, candidate_id: 
     )
 
 
+def _latest_valid_deferred_route(db, source: Application):
+    item_ids = set(
+        db.scalars(
+            select(ScreeningItem.id).where(
+                ScreeningItem.organization_id == source.organization_id,
+                ScreeningItem.application_id == source.id,
+            )
+        ).all()
+    )
+    if not item_ids:
+        return None
+    audits = db.scalars(
+        select(AuditLog)
+        .where(
+            AuditLog.organization_id == source.organization_id,
+            AuditLog.category == "recruiting",
+            AuditLog.event_type == "screening.terminal_routed",
+            AuditLog.outcome == "success",
+            AuditLog.resource_type == "application",
+            AuditLog.resource_id == source.id,
+        )
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+    ).all()
+    for audit in audits:
+        try:
+            metadata = _validate_metadata("screening.terminal_routed", audit.metadata_json)
+            item_id = UUID(metadata["item_id"])
+        except (AuditValidationError, KeyError, TypeError, ValueError):
+            continue
+        score = metadata.get("score")
+        if (
+            metadata.get("application_id") != str(source.id)
+            or metadata.get("from_stage") != "new"
+            or metadata.get("to_stage") != "deferred"
+            or metadata.get("ai_status") != "succeeded"
+            or item_id not in item_ids
+            or not isinstance(score, int)
+            or isinstance(score, bool)
+            or not 0 <= score <= 100
+            or metadata.get("safe_error_code") is not None
+        ):
+            continue
+        return audit
+    return None
+
+
+def _deferred_screening_data(db, source: Application) -> dict:
+    evaluation = db.scalar(
+        select(LlmScreeningEvaluation)
+        .join(
+            ScreeningResult,
+            and_(
+                ScreeningResult.organization_id == LlmScreeningEvaluation.organization_id,
+                ScreeningResult.id == LlmScreeningEvaluation.screening_result_id,
+            ),
+        )
+        .where(
+            LlmScreeningEvaluation.organization_id == source.organization_id,
+            ScreeningResult.application_id == source.id,
+        )
+        .order_by(LlmScreeningEvaluation.created_at.desc(), LlmScreeningEvaluation.id.desc())
+        .limit(1)
+    )
+    route = _latest_valid_deferred_route(db, source)
+    return {
+        "final_score": evaluation.score if evaluation else None,
+        "deferred_at": _aware(route.created_at).isoformat() if route else None,
+        "main_gaps": list(evaluation.gaps or []) if evaluation else [],
+    }
+
+
 def _membership_data(db, principal: Principal, membership: TalentPoolMembership) -> dict:
     candidate = db.get(Candidate, membership.candidate_id)
     owner = db.get(User, membership.owner_id)
@@ -290,6 +402,17 @@ def _membership_data(db, principal: Principal, membership: TalentPoolMembership)
             "stage": source.stage,
             "human_conclusion": source.human_conclusion,
         }
+    pool = db.scalar(
+        select(TalentPool).where(
+            TalentPool.organization_id == membership.organization_id,
+            TalentPool.id == membership.pool_id,
+        )
+    )
+    deferred_screening = (
+        _deferred_screening_data(db, source)
+        if pool is not None and pool.system_key == DEFERRED_POOL_SYSTEM_KEY and source is not None
+        else None
+    )
     return {
         "id": str(membership.id),
         "pool_id": str(membership.pool_id),
@@ -300,6 +423,7 @@ def _membership_data(db, principal: Principal, membership: TalentPoolMembership)
             "location": candidate.location if candidate else None,
         },
         "source_application": source_data,
+        "deferred_screening": deferred_screening,
         "owner": {"id": str(membership.owner_id), "display_name": owner.display_name if owner else "Unavailable"},
         "suitable_roles": list(membership.suitable_roles or []),
         "tags": list(membership.tags or []),
@@ -792,13 +916,13 @@ def refer_deferred_membership_to_review(
     fingerprint={"membership_id":membership_id,"expected_version":expected,**payload.model_dump()}
     with request.app.state.identity_store.sync_session() as db:
         def action():
-            visible=_load_membership(db,principal,membership_id,manage=True)
+            visible=_load_review_referral_membership(db,principal,membership_id)
             if visible is None: raise ReviewReferralUnavailable
             try:
                 candidate=lock_active_candidate(db,principal.organization_id,visible.candidate_id)
             except CandidateUnavailable as error:
                 raise ReviewReferralUnavailable from error
-            membership=_load_membership(db,principal,membership_id,manage=True,for_update=True)
+            membership=_load_review_referral_membership(db,principal,membership_id,for_update=True)
             if membership is None or membership.candidate_id!=candidate.id or membership.status!="active" or membership.source_application_id is None:
                 raise ReviewReferralUnavailable
             if membership.version!=expected: raise ReviewReferralVersionConflict
