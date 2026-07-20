@@ -13,6 +13,10 @@ function MetricCard({ label, value, unit, note, icon: Icon }) {
   return <section className="report-metric"><div><span>{label}</span><Icon size={18} /></div><strong>{value ?? "—"}<small>{value == null ? "" : unit}</small></strong><p>{note}</p></section>;
 }
 
+export function ScreeningQualityPanel({ quality }) {
+  return <section className="report-panel quality-panel"><header><div><h3>筛选质量</h3><p>当前筛选质量基于简历解析与 LLM 自动评分；历史规则字段即使由 API 返回，也不在当前面板展示。</p></div></header><div className="quality-rates">{[["解析成功率", quality.parseSuccessRate], ["LLM 成功率", quality.llmSuccessRate]].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}%</strong><div><i style={{ width: `${value}%` }} /></div></div>)}</div></section>;
+}
+
 function rangeForPeriod(period, now = new Date()) {
   const to = new Date(now);
   const from = new Date(now);
@@ -138,7 +142,7 @@ export function ReportWorkspace({ positions = [], currentRole, onDrillDown, onNo
       <div className="report-grid">
         <div className="report-column">
           <section className="report-panel funnel-panel"><header><div><h3>招聘漏斗</h3><p>当前阶段人数，点击后查看候选人</p></div><span>{filters.period}</span></header><div className="report-funnel">{data.stages.map((item) => <button type="button" key={item.apiStage} onClick={() => onDrillDown({ position: selectedPosition?.name || "全部职位", stage: item.stage })} style={{ "--funnel-fill": `${Math.max(0, item.currentCount / maxStageCount * 100)}%` }}><span>{item.stage}</span><strong>{item.currentCount}</strong><small>{data.totalApplications ? `${Math.round(item.currentCount / data.totalApplications * 100)}%` : "0%"}</small><ArrowRight size={15} /></button>)}</div></section>
-          <section className="report-panel quality-panel"><header><div><h3>筛选质量</h3><p>解析、规则和 LLM 独立统计</p></div></header><div className="quality-rates">{[["解析成功率", data.quality.parseSuccessRate], ["规则通过率", data.quality.rulePassRate], ["LLM 成功率", data.quality.llmSuccessRate]].map(([label, value]) => <div key={label}><span>{label}</span><strong>{value}%</strong><div><i style={{ width: `${value}%` }} /></div></div>)}</div></section>
+          <ScreeningQualityPanel quality={data.quality} />
         </div>
         <div className="report-column">
           <section className="report-panel duration-panel"><header><div><h3>阶段平均停留</h3><p>基于申请阶段事件计算</p></div></header><div className="duration-bars">{data.stages.map((item) => <div key={item.apiStage}><span>{item.stage}</span><div><i style={{ width: `${Math.min(100, item.averageDays / Math.max(1, ...data.stages.map((row) => row.averageDays)) * 100)}%` }} /></div><strong>{item.averageDays} 天</strong><small>当前 {item.currentCount} 人</small></div>)}</div></section>
