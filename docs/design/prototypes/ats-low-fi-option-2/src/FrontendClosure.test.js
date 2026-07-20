@@ -188,7 +188,7 @@ test("new jobs default to the standard process and manage departments navigates 
     assert.equal(await process.evaluate((element) => element.tagName), "SELECT");
     assert.equal(await process.inputValue(), "标准社招流程");
     assert.match(await page.getByText("阶段摘要", { exact: true }).locator("..").textContent(), /新简历.*待复核.*面试.*待决策/s);
-    assert.match(await page.getByText("AI 简历评估", { exact: true }).locator("..").textContent(), /规则评分后补充匹配分、结论和理由/);
+    assert.match(await page.getByText("AI 简历评估", { exact: true }).locator("..").textContent(), /LLM 直接生成最终分、结论、理由和路由结果/);
     await page.getByLabel("职位名称", { exact: true }).fill("平台工程师");
     await page.getByRole("button", { name: /管理部门/ }).click();
     await page.getByRole("heading", { name: "组织与权限", exact: true }).waitFor();
