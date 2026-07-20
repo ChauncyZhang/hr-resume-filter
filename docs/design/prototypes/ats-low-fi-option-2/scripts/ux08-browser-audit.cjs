@@ -1,22 +1,53 @@
+const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { chromium } = require("playwright");
 
-const baseUrl = process.env.UX08_URL || "http://127.0.0.1:4174/";
-const evidenceDir = path.resolve(__dirname, "../ux-08-evidence");
+const baseUrl = new URL(process.env.UX08_URL || "http://127.0.0.1:4174/");
+const evidenceDir = path.resolve(process.env.UX08_EVIDENCE_DIR || path.join(__dirname, "../ux-08-evidence"));
 const results = [];
+
+const ids = Object.freeze({
+  run: "run-llm-only-audit",
+  job: "job-llm-platform",
+  reviewCandidate: "candidate-score-60",
+  reviewApplication: "application-score-60",
+  failedCandidate: "candidate-ai-unavailable",
+  failedApplication: "application-ai-unavailable",
+  deferredCandidate: "candidate-score-59",
+  deferredApplication: "application-score-59",
+  deferredPool: "pool-ai-screening-deferred",
+  deferredMembership: "membership-score-59",
+});
 
 function record(id, status, detail = "") {
   results.push({ id, status, detail });
   process.stdout.write(`${status === "passed" ? "PASS" : "FAIL"} ${id}${detail ? `: ${detail}` : ""}\n`);
 }
 
+async function runCase(page, id, fn) {
+  try {
+    await fn();
+    record(id, "passed");
+  } catch (error) {
+    const filename = `task8-failure-${id.replace(/[^a-z0-9-]+/gi, "-")}.png`;
+    await page.screenshot({ path: path.join(evidenceDir, filename), fullPage: true }).catch(() => {});
+    record(id, "failed", `${error.message}; screenshot=${filename}`);
+    throw error;
+  }
+}
+
 async function assertVisible(locator, description) {
   try {
-    await locator.first().waitFor({ state: "visible", timeout: 5000 });
+    await locator.first().waitFor({ state: "visible", timeout: 8_000 });
   } catch {
-    throw new Error(`${description} 不可见`);
+    throw new Error(`${description}不可见`);
   }
+}
+
+async function assertTextAbsent(locator, pattern, description) {
+  const text = await locator.innerText();
+  assert.doesNotMatch(text, pattern, description);
 }
 
 async function assertNoBodyOverflow(page, label) {
@@ -25,238 +56,627 @@ async function assertNoBodyOverflow(page, label) {
     document: document.documentElement.scrollWidth,
     body: document.body.scrollWidth,
   }));
-  if (dimensions.document > dimensions.viewport + 1 || dimensions.body > dimensions.viewport + 1) {
-    throw new Error(`${label} 横向溢出 ${JSON.stringify(dimensions)}`);
-  }
+  assert.ok(
+    dimensions.document <= dimensions.viewport + 1 && dimensions.body <= dimensions.viewport + 1,
+    `${label}横向溢出 ${JSON.stringify(dimensions)}`,
+  );
 }
 
-async function switchScenario(page, value) {
-  const trigger = page.getByRole("button", { name: "验收场景" });
-  if (!(await page.getByLabel("当前场景").count())) await trigger.click();
-  await page.getByLabel("当前场景").selectOption(value);
-  const dialog = page.getByRole("dialog", { name: "切换验收场景" });
-  await assertVisible(dialog, "场景切换确认框");
-  await dialog.getByRole("button", { name: "确认切换" }).click();
-  await page.waitForTimeout(100);
+async function assertRendered(page, label) {
+  await assertVisible(page.locator("main"), `${label}主内容`);
+  const state = await page.locator("main").evaluate((element) => ({
+    textLength: element.innerText.trim().length,
+    width: element.getBoundingClientRect().width,
+    height: element.getBoundingClientRect().height,
+  }));
+  assert.ok(state.textLength > 20 && state.width > 0 && state.height > 0, `${label}疑似白屏 ${JSON.stringify(state)}`);
 }
 
 async function screenshot(page, filename) {
   await page.screenshot({ path: path.join(evidenceDir, filename), fullPage: true });
 }
 
-async function runCase(id, fn) {
+function dimensionsFor(score) {
+  const limits = [
+    ["core_capability", 35, "核心能力证据"],
+    ["experience_depth", 25, "经验深度证据"],
+    ["role_seniority", 20, "职级证据"],
+    ["transferability", 10, "迁移能力证据"],
+    ["explicit_constraints", 10, "明确约束证据"],
+  ];
+  let remaining = score;
+  return limits.map(([key, limit, evidence]) => {
+    const value = Math.min(remaining, limit);
+    remaining -= value;
+    return {
+      key,
+      score: value,
+      evidence: value ? [evidence] : [],
+      gaps: value === limit ? [] : [`${key}仍需核验`],
+    };
+  });
+}
+
+function screeningEvaluation(score, recommendation) {
+  return {
+    score,
+    recommendation,
+    summary: score >= 60 ? "达到用人经理评审边界。" : "当前匹配度不足，进入暂缓人才池。",
+    dimensions: dimensionsFor(score),
+    evidence: ["合成简历中的可验证项目经历"],
+    gaps: score >= 60 ? ["到岗时间待确认"] : ["系统设计深度不足", "缺少带队经验"],
+    strengths: ["具备可迁移的平台研发经验"],
+    risks: score >= 60 ? ["项目规模待确认"] : ["岗位级别匹配不足"],
+    questions: ["请说明最近项目中的职责边界"],
+  };
+}
+
+function screeningRun() {
+  return {
+    id: ids.run,
+    job_id: ids.job,
+    job_title: "LLM 平台工程师",
+    created_by_name: "合成验收账号",
+    source: "upload",
+    status: "partial",
+    processed_count: 4,
+    total_count: 4,
+    succeeded_count: 3,
+    failed_count: 1,
+    manager_review_count: 2,
+    deferred_count: 1,
+    ai_unavailable_count: 1,
+    file_failed_count: 1,
+    created_at: "2026-07-20T06:00:00Z",
+  };
+}
+
+function screeningItems() {
+  return [
+    {
+      id: "item-score-60",
+      filename: "score-60-review.pdf",
+      candidate_id: ids.reviewCandidate,
+      candidate_name: "林界（60分）",
+      status: "scored",
+      route_result: "review",
+      llm_status: "succeeded",
+      ai_score: 60,
+      ai_recommendation: "建议评审",
+      llm_evaluation: screeningEvaluation(60, "建议评审"),
+      rule_score: 99,
+      rule_recommendation: "规则强制通过（旧数据，不得展示）",
+    },
+    {
+      id: "item-score-59",
+      filename: "score-59-deferred.pdf",
+      candidate_id: ids.deferredCandidate,
+      candidate_name: "韩松（59分）",
+      status: "scored",
+      route_result: "deferred",
+      llm_status: "succeeded",
+      ai_score: 59,
+      ai_recommendation: "暂缓",
+      llm_evaluation: screeningEvaluation(59, "暂缓"),
+      rule_score: 100,
+      rule_recommendation: "规则强制通过（旧数据，不得展示）",
+    },
+    {
+      id: "item-ai-unavailable",
+      filename: "provider-final-failure.pdf",
+      candidate_id: ids.failedCandidate,
+      candidate_name: "周旻（AI不可用）",
+      status: "scored",
+      route_result: "review",
+      llm_status: "failed",
+      llm_error_code: "provider_unavailable",
+      ai_score: null,
+      ai_recommendation: null,
+      llm_evaluation: {
+        score: 92,
+        recommendation: "陈旧模型结论（不得展示）",
+        dimensions: dimensionsFor(92),
+        strengths: ["陈旧优势（不得展示）"],
+        risks: [],
+      },
+      rule_score: 97,
+      rule_recommendation: "陈旧规则建议（不得展示）",
+    },
+    {
+      id: "item-parse-failed",
+      filename: "broken-resume.pdf",
+      candidate_id: null,
+      candidate_name: "",
+      status: "failed",
+      error_code: "parse_failed",
+      retryable: false,
+      route_result: "review",
+      llm_status: "failed",
+      ai_score: 88,
+      ai_recommendation: "陈旧技术失败结论（不得展示）",
+    },
+  ];
+}
+
+function workbenchCandidate({ candidateId, applicationId, name }) {
+  return {
+    application_id: applicationId,
+    candidate_id: candidateId,
+    job_id: ids.job,
+    display_name: name,
+    current_title: "平台工程师",
+    location: "上海",
+    source: "upload",
+    stage: "review",
+    updated_at: "2026-07-20T06:05:00Z",
+  };
+}
+
+function reviewTask(candidate, { taskId, aiStatus }) {
+  return {
+    ...candidate,
+    task_id: taskId,
+    ai_status: aiStatus,
+    config_warning: false,
+    candidate_link: `/candidates/${candidate.candidate_id}?tab=evidence&application=${candidate.application_id}&job=${candidate.job_id}`,
+  };
+}
+
+function workbenchEnvelope() {
+  const scored = workbenchCandidate({
+    candidateId: ids.reviewCandidate,
+    applicationId: ids.reviewApplication,
+    name: "林界（60分）",
+  });
+  const unavailable = workbenchCandidate({
+    candidateId: ids.failedCandidate,
+    applicationId: ids.failedApplication,
+    name: "周旻（AI不可用）",
+  });
+  const empty = () => ({ count: 0, items: [] });
+  return {
+    data: {
+      generated_at: "2026-07-20T06:10:00Z",
+      jobs: [{
+        id: ids.job,
+        title: "LLM 平台工程师",
+        department_name: "研发中心",
+        status: "open",
+        updated_at: "2026-07-20T06:10:00Z",
+        active_count: 2,
+        stages: {
+          new: empty(),
+          review: { count: 2, items: [scored, unavailable] },
+          contact: empty(),
+          interview_pending: empty(),
+          interviewing: empty(),
+          decision: empty(),
+          passed: empty(),
+        },
+      }],
+      tasks: {
+        review: {
+          count: 2,
+          items: [
+            reviewTask(scored, { taskId: "review-task-score-60", aiStatus: "succeeded" }),
+            reviewTask(unavailable, { taskId: "review-task-ai-unavailable", aiStatus: "failed" }),
+          ],
+        },
+        interview_pending: empty(),
+        decision: empty(),
+        passed: empty(),
+      },
+      interviews: { available: false, upcoming: [], pending_feedback: [] },
+    },
+  };
+}
+
+function candidateRecord(candidateId) {
+  const unavailable = candidateId === ids.failedCandidate;
+  return {
+    id: candidateId,
+    display_name: unavailable ? "周旻（AI不可用）" : "林界（60分）",
+    current_title: "平台工程师",
+    location: "上海",
+    owner_id: "fixture-user",
+    version: 2,
+    updated_at: "2026-07-20T06:05:00Z",
+    contacts: [
+      { kind: "phone", value: "138****0000" },
+      { kind: "email", value: "synthetic***@example.test" },
+    ],
+  };
+}
+
+function candidateApplication(candidateId) {
+  const unavailable = candidateId === ids.failedCandidate;
+  return {
+    id: unavailable ? ids.failedApplication : ids.reviewApplication,
+    candidate_id: candidateId,
+    job_id: ids.job,
+    job_title: "LLM 平台工程师",
+    resume_id: unavailable ? "resume-ai-unavailable" : "resume-score-60",
+    owner_id: "fixture-user",
+    stage: "review",
+    source: "upload",
+    human_conclusion: null,
+    version: 2,
+    updated_at: "2026-07-20T06:05:00Z",
+    rule_score: 98,
+    recommendation: "陈旧规则建议",
+    ai_score: unavailable ? null : 60,
+    ai_recommendation: unavailable ? "AI评分不可用" : "建议评审",
+    llm_status: unavailable ? "failed" : "succeeded",
+    llm_evaluation: unavailable
+      ? { score: 92, recommendation: "陈旧模型结论", dimensions: dimensionsFor(92) }
+      : screeningEvaluation(60, "建议评审"),
+  };
+}
+
+function candidateResume(candidateId) {
+  return {
+    id: candidateId === ids.failedCandidate ? "resume-ai-unavailable" : "resume-score-60",
+    candidate_id: candidateId,
+    version_number: 1,
+    created_at: "2026-07-20T05:55:00Z",
+    profile: {
+      summary: "仅用于 Task 8 浏览器验收的合成候选人。",
+      skills: ["平台工程", "Python"],
+      experience: "合成项目经验",
+      education: "合成教育经历",
+      status: "ready",
+    },
+  };
+}
+
+function deferredPool() {
+  return {
+    id: ids.deferredPool,
+    name: "AI 初筛暂缓",
+    purpose: "承接 LLM 最终分低于 60 的候选人",
+    visibility: "recruiting_team",
+    system_key: "ai_screening_deferred",
+    owner: { id: "fixture-user", display_name: "招聘负责人" },
+    suitable_roles: ["平台工程师"],
+    retention_days: 730,
+    member_count: 1,
+    version: 2,
+    updated_at: "2026-07-20T06:00:00Z",
+  };
+}
+
+function deferredMembership(referred = false) {
+  return {
+    id: ids.deferredMembership,
+    pool_id: ids.deferredPool,
+    candidate: {
+      id: ids.deferredCandidate,
+      display_name: "韩松（59分）",
+      current_title: "后端工程师",
+      location: "杭州",
+    },
+    source_application: {
+      id: ids.deferredApplication,
+      job_id: ids.job,
+      job_title: "LLM 平台工程师",
+      stage: referred ? "review" : "deferred",
+      human_conclusion: null,
+    },
+    deferred_screening: {
+      final_score: 59,
+      deferred_at: "2026-07-20T06:00:00Z",
+      main_gaps: ["系统设计深度不足", "缺少带队经验"],
+    },
+    owner: { id: "fixture-user", display_name: "招聘负责人" },
+    suitable_roles: ["平台工程师"],
+    tags: ["LLM 59分"],
+    reason: "LLM 初筛分低于 60",
+    status: "active",
+    version: referred ? 4 : 3,
+    retention_until: "2028-07-20T00:00:00Z",
+    created_at: "2026-07-20T06:00:00Z",
+    updated_at: referred ? "2026-07-20T06:20:00Z" : "2026-07-20T06:00:00Z",
+  };
+}
+
+function fixtureState() {
+  return { referred: false, referralRequests: 0, unknownRequests: [] };
+}
+
+async function fulfillJson(route, payload, status = 200, extraHeaders = {}) {
+  await route.fulfill({
+    status,
+    contentType: "application/json; charset=utf-8",
+    headers: extraHeaders,
+    body: JSON.stringify(payload),
+  });
+}
+
+async function installApiFixture(page, state) {
+  await page.route("**/api/v1/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const { pathname } = url;
+    const method = request.method();
+
+    if (method === "GET" && pathname === "/api/v1/me") {
+      return fulfillJson(route, {
+        data: {
+          id: "fixture-user",
+          display_name: "Task 8 验收账号",
+          roles: ["recruiting_admin"],
+        },
+      }, 200, { "X-CSRF-Token": "synthetic-csrf-token" });
+    }
+    if (method === "GET" && pathname === "/api/v1/workbench") return fulfillJson(route, workbenchEnvelope());
+    if (method === "GET" && pathname === `/api/v1/screening-runs/${ids.run}`) return fulfillJson(route, { data: screeningRun() });
+    if (method === "GET" && pathname === `/api/v1/screening-runs/${ids.run}/items`) return fulfillJson(route, { data: screeningItems(), meta: { next_cursor: null } });
+    if (method === "GET" && pathname === "/api/v1/interviews") return fulfillJson(route, { data: [], meta: { count: 0, next_cursor: null } });
+    if (method === "GET" && pathname === "/api/v1/me/tasks") return fulfillJson(route, { data: [] });
+    if (method === "GET" && pathname === "/api/v1/candidates" && url.searchParams.get("stage") === "interview_pending") {
+      return fulfillJson(route, { data: [], meta: { next_cursor: null, owners: [] } });
+    }
+    if (method === "GET" && pathname === "/api/v1/jobs") {
+      return fulfillJson(route, { data: [], meta: { next_cursor: null } });
+    }
+    if (method === "GET" && pathname === "/api/v1/candidates") {
+      return fulfillJson(route, { data: [], meta: { next_cursor: null, owners: [] } });
+    }
+    if (method === "GET" && pathname === "/api/v1/talent-pools") {
+      return fulfillJson(route, { data: [deferredPool()], meta: { next_cursor: null } });
+    }
+    if (method === "GET" && pathname === `/api/v1/talent-pools/${ids.deferredPool}/memberships`) {
+      return fulfillJson(route, { data: [deferredMembership(state.referred)], meta: { next_cursor: null } });
+    }
+    if (method === "POST" && pathname === `/api/v1/talent-pool-memberships/${ids.deferredMembership}/review-referrals`) {
+      assert.equal(request.headers()["if-match"], '"3"', "转交评审必须携带当前人才关系版本");
+      assert.deepEqual(request.postDataJSON(), {}, "转交评审不应携带手工 stage");
+      state.referred = true;
+      state.referralRequests += 1;
+      return fulfillJson(route, {
+        data: {
+          application: { id: ids.deferredApplication, stage: "review", version: 4 },
+          membership: deferredMembership(true),
+        },
+      });
+    }
+    if (method === "GET" && pathname === "/api/v1/reports/recruiting-funnel") {
+      return fulfillJson(route, {
+        data: {
+          can_export: false,
+          total_applications: 4,
+          stages: [
+            { stage: "review", current_count: 2, average_time_in_stage_seconds: 3_600 },
+            { stage: "deferred", current_count: 1, average_time_in_stage_seconds: 7_200 },
+            { stage: "new", current_count: 1, average_time_in_stage_seconds: 1_800 },
+          ],
+          interviews: {
+            count: 0,
+            required_feedback_completed: 0,
+            required_feedback_total: 0,
+            required_feedback_completion_rate: 0,
+            average_feedback_turnaround_seconds: 0,
+          },
+        },
+      });
+    }
+    if (method === "GET" && pathname === "/api/v1/reports/screening-quality") {
+      return fulfillJson(route, {
+        data: {
+          resume_parsing: { succeeded: 3, total: 4, success_rate: 0.75 },
+          llm: { succeeded: 2, total: 3, success_rate: 2 / 3 },
+          rule_screening: { passed: 973, total: 1_000, pass_rate: 0.973 },
+        },
+      });
+    }
+
+    const candidateMatch = pathname.match(/^\/api\/v1\/candidates\/([^/]+)(?:\/(applications|resumes|timeline|notes|governance-status))?$/);
+    if (method === "GET" && candidateMatch) {
+      const candidateId = decodeURIComponent(candidateMatch[1]);
+      const resource = candidateMatch[2] || "candidate";
+      if (![ids.failedCandidate, ids.reviewCandidate].includes(candidateId)) {
+        state.unknownRequests.push(`${method} ${pathname}${url.search}`);
+        return fulfillJson(route, { code: "fixture_candidate_missing", title: "Fixture candidate missing" }, 404);
+      }
+      if (resource === "candidate") return fulfillJson(route, { data: candidateRecord(candidateId) });
+      if (resource === "applications") return fulfillJson(route, { data: [candidateApplication(candidateId)] });
+      if (resource === "resumes") return fulfillJson(route, { data: [candidateResume(candidateId)] });
+      if (resource === "timeline" || resource === "notes") return fulfillJson(route, { data: [] });
+      if (resource === "governance-status") {
+        return fulfillJson(route, { data: { deletion_status: null, deletion_request_id: null, legal_hold_active: false } });
+      }
+    }
+
+    state.unknownRequests.push(`${method} ${pathname}${url.search}`);
+    return fulfillJson(route, { code: "fixture_route_missing", title: "Fixture route missing" }, 404);
+  });
+}
+
+function observeRuntime(page) {
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+  });
+  page.on("requestfailed", (request) => {
+    const reason = request.failure()?.errorText || "unknown";
+    if (!reason.includes("ERR_ABORTED")) errors.push(`requestfailed: ${request.method()} ${new URL(request.url()).pathname} ${reason}`);
+  });
+  return errors;
+}
+
+async function gotoApp(page, pathname, heading) {
+  const response = await page.goto(new URL(pathname, baseUrl).href, { waitUntil: "domcontentloaded" });
+  assert.equal(response?.status(), 200, `${pathname} 应返回前端入口`);
+  await assertVisible(page.getByRole("heading", { name: heading, exact: true }), `${pathname} 标题`);
+  await assertRendered(page, pathname);
+}
+
+function screeningRow(page, text) {
+  return page.getByRole("row").filter({ hasText: text }).first();
+}
+
+async function auditScreening(page, viewportName) {
+  await gotoApp(page, `/screening/tasks/${ids.run}`, "筛选任务");
+  await assertVisible(page.getByRole("heading", { name: "逐文件结果", exact: true }), "逐文件结果");
+  const headers = ["流转结果", "候选人/文件", "处理状态", "LLM结论", "最终分", "维度评分", "主要优势与风险", "查看候选人"];
+  for (const header of headers) {
+    const columnHeader = page.getByRole("columnheader", { name: header, exact: true, includeHidden: true });
+    assert.equal(await columnHeader.count(), 1, `${header}列语义缺失`);
+    if (viewportName === "desktop") await assertVisible(columnHeader, `${header}列`);
+  }
+
+  const score60 = screeningRow(page, "score-60-review.pdf");
+  await assertVisible(score60, "60 分候选人行");
+  assert.match(await score60.innerText(), /已转交用人经理/);
+  assert.match(await score60.innerText(), /建议评审/);
+  assert.equal((await score60.locator(".final-score").innerText()).trim(), "60");
+  if (viewportName === "mobile") {
+    const labels = await score60.locator("[role=cell]").evaluateAll((cells) => cells.map((cell) => cell.getAttribute("data-label")));
+    assert.deepEqual(labels, headers, "移动端每个结果值必须保留字段标签");
+  }
+
+  const score59 = screeningRow(page, "score-59-deferred.pdf");
+  await assertVisible(score59, "59 分候选人行");
+  assert.match(await score59.innerText(), /已暂缓/);
+  assert.match(await score59.innerText(), /暂缓/);
+  assert.equal((await score59.locator(".final-score").innerText()).trim(), "59");
+
+  const unavailable = screeningRow(page, "provider-final-failure.pdf");
+  await assertVisible(unavailable, "最终 LLM 失败候选人行");
+  assert.match(await unavailable.innerText(), /已转交用人经理/);
+  assert.match(await unavailable.innerText(), /AI评分不可用/);
+  assert.equal((await unavailable.locator(".final-score").innerText()).trim(), "—");
+  await assertTextAbsent(unavailable, /陈旧模型结论|陈旧规则建议|陈旧优势/, "最终失败不得回退到陈旧决策");
+
+  const technicalFailure = screeningRow(page, "broken-resume.pdf");
+  await assertVisible(technicalFailure, "技术失败文件行");
+  assert.match(await technicalFailure.innerText(), /未流转/);
+  assert.match(await technicalFailure.innerText(), /未进入AI评分/);
+  await assertTextAbsent(technicalFailure, /已转交用人经理|AI评分不可用|陈旧技术失败结论/, "技术失败不得伪装成 AI 路由结果");
+
+  const summary = page.locator(".progress-stats");
+  await assertVisible(summary, "自动路由汇总");
+  for (const text of ["2已转交用人经理", "1已暂缓", "1AI评分不可用", "1文件处理失败"]) {
+    assert.match((await summary.innerText()).replace(/\s/g, ""), new RegExp(text));
+  }
+  await assertTextAbsent(page.locator("main"), /规则通过率|规则分|规则强制通过|待HR审核|HR已审核|需人工复核|待提交用人经理/, "当前筛选决策不得展示规则或 HR 手工阶段");
+  assert.equal(await page.locator('.screening-table input[type="checkbox"]').count(), 0, "LLM-only 结果表不得保留批量全选");
+  assert.equal(await page.getByRole("button", { name: /推进到待复核|撤销/ }).count(), 0, "不得保留手工推进或撤销操作");
+  await assertNoBodyOverflow(page, `${viewportName} 筛选任务`);
+  await screenshot(page, `task8-llm-screening-${viewportName}.png`);
+}
+
+async function auditWorkbenchDeepLink(page, viewportName) {
+  await gotoApp(page, "/workbench", "工作台");
+  await assertVisible(page.getByText("待用人经理评审（2）", { exact: false }), "用人经理待办分组");
+  const task = page.locator(".dashboard-tasks .rail-item").filter({ hasText: "周旻（AI不可用）" });
+  await assertVisible(task, "AI 不可用经理评审待办");
+  await screenshot(page, `task8-manager-workbench-${viewportName}.png`);
+
+  await task.click();
+  await page.waitForURL((url) => url.pathname === `/candidates/${ids.failedCandidate}` && url.searchParams.get("tab") === "evidence" && url.searchParams.get("return") === "/workbench");
+  await assertVisible(page.getByRole("heading", { name: "候选人详情", exact: true }), "候选人详情");
+  await assertVisible(page.getByRole("button", { name: "筛选证据", exact: true }), "筛选证据页签");
+  const evidence = page.locator(".llm-evidence");
+  await assertVisible(evidence, "持久化筛选证据");
+  assert.match(await evidence.innerText(), /AI评分不可用/);
+  await assertTextAbsent(evidence, /陈旧模型结论|陈旧规则建议/, "AI 不可用提示不得回退到旧决策");
+  const back = page.getByRole("button", { name: "返回工作台", exact: true });
+  await assertVisible(back, "返回工作台操作");
+  await assertNoBodyOverflow(page, `${viewportName} 筛选证据`);
+  await screenshot(page, `task8-ai-unavailable-evidence-${viewportName}.png`);
+
+  await back.click();
+  await page.waitForURL((url) => url.pathname === "/workbench");
+  await assertVisible(page.getByRole("heading", { name: "工作台", exact: true }), "返回后的工作台");
+}
+
+async function auditDeferredPool(page, state, viewportName) {
+  await gotoApp(page, `/talent/${ids.deferredPool}`, "人才库详情");
+  await assertVisible(page.getByRole("heading", { name: "AI 初筛暂缓", exact: true }), "系统暂缓人才池");
+  const table = page.locator(".talent-table");
+  await assertVisible(table, "暂缓人才列表");
+  for (const label of ["原岗位", "最终分", "暂缓时间", "主要缺口", "跟进负责人", "状态", "操作"]) {
+    assert.match(await table.locator(".talent-table-head").innerText(), new RegExp(label));
+  }
+  const row = table.locator(".talent-table-row").filter({ hasText: "韩松（59分）" });
+  await assertVisible(row, "59 分暂缓人才");
+  for (const value of ["LLM 平台工程师", "59", "2026-07-20", "系统设计深度不足", "缺少带队经验", "招聘负责人", "AI 初筛暂缓"]) {
+    assert.match(await row.innerText(), new RegExp(value));
+  }
+  await screenshot(page, `task8-deferred-pool-before-referral-${viewportName}.png`);
+
+  const routeBefore = new URL(page.url());
+  const referralResponse = page.waitForResponse((response) => response.request().method() === "POST" && new URL(response.url()).pathname.endsWith(`/talent-pool-memberships/${ids.deferredMembership}/review-referrals`));
+  await row.getByRole("button", { name: "转交用人经理：韩松（59分）", exact: true }).click();
+  assert.equal((await referralResponse).status(), 200);
+  await assertVisible(row.getByRole("button", { name: "转交用人经理：韩松（59分）", exact: true }).filter({ hasText: "已转交用人经理" }), "转交完成状态");
+  assert.equal(state.referralRequests, 1, "转交评审应只提交一次");
+  assert.equal(new URL(page.url()).pathname, routeBefore.pathname, "转交后必须留在同一人才池路由");
+  assert.equal(await table.locator(".talent-table-row").count(), 1, "转交后必须保留列表行");
+  assert.match(await row.innerText(), /用人经理复核/);
+  await assertNoBodyOverflow(page, `${viewportName} AI 初筛暂缓人才池`);
+  await screenshot(page, `task8-deferred-pool-referred-${viewportName}.png`);
+}
+
+async function auditReports(page, viewportName) {
+  await gotoApp(page, "/reports", "报表");
+  await assertVisible(page.getByRole("heading", { name: "基础招聘报表", exact: true }), "基础招聘报表");
+  const quality = page.getByRole("heading", { name: "筛选质量", exact: true }).locator("xpath=ancestor::section[1]");
+  await assertVisible(quality, "筛选质量面板");
+  assert.match(await quality.innerText(), /解析成功率/);
+  assert.match(await quality.innerText(), /LLM 成功率/);
+  await assertTextAbsent(page.locator("main"), /规则通过率|规则筛选通过率|97\.3%/, "当前报表不得展示旧规则指标");
+  await assertNoBodyOverflow(page, `${viewportName} 报表`);
+  await screenshot(page, `task8-llm-report-${viewportName}.png`);
+}
+
+async function runViewport(browser, viewportName, viewport, audits) {
+  const context = await browser.newContext({ viewport, locale: "zh-CN", isMobile: viewportName === "mobile" });
+  const page = await context.newPage();
+  const state = fixtureState();
+  const runtimeErrors = observeRuntime(page);
+  await installApiFixture(page, state);
   try {
-    await fn();
-    record(id, "passed");
-  } catch (error) {
-    record(id, "failed", error.message);
-    throw error;
+    for (const [id, audit] of audits) await runCase(page, `${viewportName}-${id}`, () => audit(page, state, viewportName));
+    await runCase(page, `${viewportName}-runtime-integrity`, async () => {
+      assert.deepEqual(state.unknownRequests, [], `fixture 缺少 API：${state.unknownRequests.join(" | ")}`);
+      assert.deepEqual(runtimeErrors, [], `浏览器运行时错误：${runtimeErrors.join(" | ")}`);
+    });
+  } finally {
+    await context.close();
   }
 }
 
-async function desktopAudit(browser) {
-  const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, locale: "zh-CN" });
-  const page = await context.newPage();
-  const runtimeErrors = [];
-  page.on("pageerror", (error) => runtimeErrors.push(`pageerror: ${error.message}`));
-  page.on("console", (message) => { if (message.type() === "error") runtimeErrors.push(`console: ${message.text()}`); });
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
-
-  await runCase("F-01-default-workbench", async () => {
-    await assertVisible(page.getByRole("heading", { name: "工作台" }), "工作台标题");
-    await assertVisible(page.getByRole("button", { name: /导入简历/ }), "导入简历主操作");
-    await assertNoBodyOverflow(page, "桌面工作台");
-    await screenshot(page, "ux08-default-workbench-1280x720.png");
-  });
-
-  await runCase("F-01-create-and-publish-position", async () => {
-    await page.getByRole("button", { name: /新建职位/ }).click();
-    await page.getByLabel("职位名称").fill("UX-08 AI 平台工程师");
-    await page.getByLabel("公开 JD").fill("负责企业级 RAG、Agent 与大模型应用平台建设，要求熟悉 Python、机器学习、深度学习和 LLM 工程化。");
-    await page.getByRole("button", { name: /AI 提取筛选条件/ }).click();
-    await assertVisible(page.getByText("已提取，可人工修改", { exact: true }), "JD 条件提取结果");
-    await page.getByRole("button", { name: "发布职位", exact: true }).click();
-    await assertVisible(page.getByRole("heading", { name: "职位详情" }), "发布后的职位详情");
-    await assertVisible(page.getByText("UX-08 AI 平台工程师", { exact: true }).first(), "新发布职位名称");
-    await screenshot(page, "ux08-position-published-1280x720.png");
-  });
-
-  await runCase("F-02-partial-screening-recovery", async () => {
-    await switchScenario(page, "partial-screening");
-    await assertVisible(page.getByText("8/8", { exact: true }), "筛选完成进度");
-    const parseRetry = page.getByRole("button", { name: /重新解析/ });
-    const llmRetry = page.getByRole("button", { name: /重试 LLM/ });
-    if (await parseRetry.count()) await parseRetry.first().click();
-    if (await llmRetry.count()) await llmRetry.first().click();
-    await assertVisible(page.getByText("8", { exact: true }).first(), "筛选成功数量");
-    await screenshot(page, "ux08-screening-recovered-1280x720.png");
-  });
-
-  await runCase("F-03-screening-undo-and-promote", async () => {
-    const selectAll = page.locator(".screening-table-head input[type=checkbox]");
-    await selectAll.check();
-    await page.getByRole("button", { name: /推进到待复核/ }).click();
-    await assertVisible(page.getByText(/已完成“推进到待复核”/), "批量操作撤销提示");
-    await assertVisible(page.getByText(/影响 7 人/), "重复简历去重后的影响人数");
-    await page.getByRole("button", { name: "撤销" }).click();
-    await selectAll.check();
-    await page.getByRole("button", { name: /推进到待复核/ }).click();
-    await page.locator(".screening-identity").filter({ hasText: "林启舟" }).first().click();
-    await assertVisible(page.getByRole("heading", { name: "候选人详情" }), "候选人详情");
-    await page.getByRole("button", { name: "职位申请" }).click();
-    const aiApplications = page.locator(".applications-table").getByText("AI 工程师", { exact: true });
-    if (await aiApplications.count() !== 1) throw new Error(`重复候选人产生 ${await aiApplications.count()} 条 AI 工程师申请`);
-    await screenshot(page, "ux08-candidate-single-application-1280x720.png");
-  });
-
-  await runCase("F-05-feedback-draft-and-retry", async () => {
-    await switchScenario(page, "pending-feedback");
-    const strengths = page.getByLabel(/候选人优点/);
-    await strengths.fill("结构化表达清晰，能说明关键产品决策。");
-    await page.getByRole("button", { name: /返回面试列表/ }).click();
-    await page.getByRole("button", { name: /填写反馈/ }).first().click();
-    if ((await page.getByLabel(/候选人优点/).inputValue()) !== "结构化表达清晰，能说明关键产品决策。") throw new Error("离开后反馈草稿未恢复");
-    for (const row of await page.locator(".rating-row").all()) await row.getByRole("button", { name: "良好" }).click();
-    await page.getByLabel(/风险与待确认项/).fill("商业化指标需要进一步确认。");
-    await page.getByRole("button", { name: "推荐", exact: true }).click();
-    await page.getByRole("button", { name: /提交反馈/ }).click();
-    await assertVisible(page.getByText("反馈提交失败", { exact: true }), "首次提交失败提示");
-    await page.getByRole("button", { name: /重试提交/ }).click();
-    await assertVisible(page.getByText("已提交", { exact: true }).first(), "反馈提交完成状态");
-    await screenshot(page, "ux08-feedback-submitted-1280x720.png");
-  });
-
-  await runCase("F-04-schedule-interview", async () => {
-    await switchScenario(page, "default");
-    await page.locator(".sidebar nav").getByRole("button", { name: "候选人", exact: true }).click();
-    await page.locator(".candidate-table-row").filter({ hasText: "陈浩" }).click();
-    await page.getByRole("button", { name: "面试与反馈", exact: true }).click();
-    await page.getByRole("button", { name: /安排面试/ }).first().click();
-    await page.getByRole("button", { name: /下一步：面试协同/ }).click();
-    await page.locator(".schedule-full-field input").fill("https://meeting.example.com/ux08-final");
-    await page.getByRole("button", { name: /检查时间并继续/ }).click();
-    await page.getByRole("button", { name: /确认并保存/ }).click();
-    await assertVisible(page.locator(".interview-table-row").filter({ hasText: "陈浩" }), "已保存的面试记录");
-    await screenshot(page, "ux08-interview-scheduled-1280x720.png");
-  });
-
-  await runCase("F-06-talent-reactivation", async () => {
-    await switchScenario(page, "talent-reactivation");
-    await page.locator(".talent-table-row .button.primary.small").first().click();
-    await page.locator(".talent-member-drawer > footer .button.primary").click();
-    const targetPosition = page.locator(".reactivate-drawer select").first();
-    await targetPosition.selectOption("JOB-JAVA-002");
-    await page.locator(".reactivate-drawer > footer .button.primary").click();
-    await assertVisible(page.getByText("已创建新的职位申请", { exact: true }), "人才重新激活结果");
-    await assertVisible(page.getByText(/历史申请和人才库关系均已保留/), "历史关系保留说明");
-    await screenshot(page, "ux08-talent-reactivated-1280x720.png");
-    await page.locator(".reactivation-success .button.secondary").click();
-    await page.locator(".talent-member-drawer .icon-button").click();
-  });
-
-  await runCase("ADMIN-settings-governance", async () => {
-    await switchScenario(page, "default");
-    await page.locator(".sidebar nav").getByRole("button", { name: "设置", exact: true }).click();
-    await page.locator(".settings-table-row").filter({ hasText: "陈雨" }).click();
-    await page.getByLabel("AI 工程师", { exact: true }).check();
-    await page.getByRole("button", { name: "保存权限", exact: true }).click();
-    await page.getByRole("dialog", { name: "确认扩大职位权限" }).getByRole("button", { name: "确认扩大权限" }).click();
-    await page.locator(".settings-subnav").getByRole("button", { name: "AI 设置", exact: true }).click();
-    await page.getByLabel("Base URL").fill("https://invalid.example.com/v1");
-    await page.getByRole("button", { name: "测试连接", exact: true }).click();
-    await assertVisible(page.getByText("连接失败", { exact: true }), "AI 连接失败状态");
-    await page.getByLabel("Base URL").fill("https://open.example.com/v1");
-    await page.getByRole("button", { name: "测试连接", exact: true }).click();
-    await assertVisible(page.getByText("连接成功", { exact: true }), "AI 连接恢复状态");
-    await page.locator(".settings-subnav").getByRole("button", { name: "审计与数据治理", exact: true }).click();
-    const dirtyDialog = page.getByRole("dialog", { name: "AI 设置尚未保存" });
-    if (await dirtyDialog.count()) await dirtyDialog.getByRole("button", { name: "保存草稿并离开" }).click();
-    await page.locator(".retention-policy select").selectOption("365");
-    await page.getByRole("button", { name: "保存保留策略", exact: true }).click();
-    await page.getByRole("dialog", { name: "确认缩短候选人保留期限" }).getByRole("button", { name: "确认缩短期限" }).click();
-    await screenshot(page, "ux08-admin-governance-1280x720.png");
-  });
-
-  await runCase("ROLE-interviewer-boundary", async () => {
-    await switchScenario(page, "restricted");
-    await assertVisible(page.getByText("暂无报表查看权限", { exact: true }), "报表无权限状态");
-    const navText = await page.locator(".sidebar nav").innerText();
-    if (navText.includes("职位") || navText.includes("候选人") || navText.includes("人才库") || navText.includes("设置")) throw new Error(`面试官导航越权：${navText}`);
-    if (await page.locator(".role-switch").count()) throw new Error("无权限页面仍可切换为管理员");
-    await screenshot(page, "ux08-interviewer-restricted-1280x720.png");
-  });
-
-  await runCase("EMPTY-empty-state", async () => {
-    await switchScenario(page, "empty");
-    await assertVisible(page.getByText("没有符合条件的候选人", { exact: true }), "候选人空态");
-    await assertNoBodyOverflow(page, "桌面空态");
-  });
-
-  await runCase("A11Y-keyboard-focus", async () => {
-    await switchScenario(page, "default");
-    await page.keyboard.press("Tab");
-    const focused = await page.evaluate(() => ({ tag: document.activeElement?.tagName, text: document.activeElement?.textContent?.trim(), outline: getComputedStyle(document.activeElement).outlineStyle }));
-    if (!focused.tag || focused.tag === "BODY") throw new Error("Tab 未进入可交互控件");
-  });
-
-  if (runtimeErrors.length) throw new Error(`桌面运行时错误：${runtimeErrors.join(" | ")}`);
-  await context.close();
-}
-
-async function mobileAudit(browser) {
-  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, locale: "zh-CN", isMobile: true });
-  const page = await context.newPage();
-  const runtimeErrors = [];
-  page.on("pageerror", (error) => runtimeErrors.push(error.message));
-  page.on("console", (message) => { if (message.type() === "error") runtimeErrors.push(message.text()); });
-  await page.goto(baseUrl, { waitUntil: "networkidle" });
-
-  await runCase("MOBILE-default", async () => {
-    await assertNoBodyOverflow(page, "移动工作台");
-    await page.getByRole("button", { name: "打开菜单" }).click();
-    await assertVisible(page.locator(".sidebar.sidebar-open"), "移动导航");
-    await screenshot(page, "ux08-default-workbench-390x844.png");
-  });
-
-  await runCase("MOBILE-partial-screening", async () => {
-    await page.getByRole("button", { name: "关闭菜单" }).click();
-    await switchScenario(page, "partial-screening");
-    await assertNoBodyOverflow(page, "移动筛选页");
-    await screenshot(page, "ux08-partial-screening-390x844.png");
-  });
-
-  await runCase("MOBILE-feedback", async () => {
-    await switchScenario(page, "pending-feedback");
-    await assertNoBodyOverflow(page, "移动反馈页");
-    await screenshot(page, "ux08-feedback-390x844.png");
-  });
-
-  await runCase("MOBILE-restricted", async () => {
-    await switchScenario(page, "restricted");
-    await assertNoBodyOverflow(page, "移动权限页");
-    await assertVisible(page.getByText("暂无报表查看权限", { exact: true }), "移动权限状态");
-    await screenshot(page, "ux08-interviewer-restricted-390x844.png");
-  });
-
-  if (runtimeErrors.length) throw new Error(`移动运行时错误：${runtimeErrors.join(" | ")}`);
-  await context.close();
-}
-
-(async () => {
+async function main() {
   fs.mkdirSync(evidenceDir, { recursive: true });
   const browser = await chromium.launch({ headless: true });
   try {
-    await desktopAudit(browser);
-    await mobileAudit(browser);
+    await runViewport(browser, "desktop", { width: 1280, height: 720 }, [
+      ["screening-auto-routing", (page, _state, viewportName) => auditScreening(page, viewportName)],
+      ["manager-review-deep-link", (page, _state, viewportName) => auditWorkbenchDeepLink(page, viewportName)],
+      ["deferred-pool-referral", auditDeferredPool],
+      ["reports-hide-rule-metrics", (page, _state, viewportName) => auditReports(page, viewportName)],
+    ]);
+    await runViewport(browser, "mobile", { width: 390, height: 844 }, [
+      ["screening-layout", (page, _state, viewportName) => auditScreening(page, viewportName)],
+      ["manager-review-layout", (page, _state, viewportName) => auditWorkbenchDeepLink(page, viewportName)],
+      ["deferred-pool-layout", auditDeferredPool],
+      ["report-layout", (page, _state, viewportName) => auditReports(page, viewportName)],
+    ]);
   } finally {
     await browser.close();
+    fs.writeFileSync(
+      path.join(evidenceDir, "ux08-browser-audit-results.json"),
+      `${JSON.stringify({ baseUrl: baseUrl.origin, fixture: "llm-only-controller-contract", results }, null, 2)}\n`,
+      "utf8",
+    );
   }
-  const failed = results.filter((item) => item.status === "failed");
-  fs.writeFileSync(path.join(evidenceDir, "ux08-browser-audit-results.json"), `${JSON.stringify({ generatedAt: new Date().toISOString(), baseUrl, results }, null, 2)}\n`, "utf8");
-  if (failed.length) process.exitCode = 1;
-})().catch((error) => {
-  record("AUDIT-runtime", "failed", error.stack || error.message);
-  fs.mkdirSync(evidenceDir, { recursive: true });
-  fs.writeFileSync(path.join(evidenceDir, "ux08-browser-audit-results.json"), `${JSON.stringify({ generatedAt: new Date().toISOString(), baseUrl, results }, null, 2)}\n`, "utf8");
+  process.stdout.write(`Browser audit passed (${results.length}/${results.length}); evidence: ${evidenceDir}\n`);
+}
+
+main().catch((error) => {
+  process.stderr.write(`${error.stack || error.message}\n`);
   process.exitCode = 1;
 });
