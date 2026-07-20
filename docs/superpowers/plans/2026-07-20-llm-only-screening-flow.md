@@ -594,6 +594,8 @@ The immutable automatic route is the latest `screening.terminal_routed` audit fo
 
 When a fail-open LLM outcome is explicitly retried and later succeeds, preserve the already granted manager-review route, append a refreshed terminal-routing audit carrying the latest AI status/score/recommendation, and refresh any still-open review task from `failed` to `succeeded`. Do not move a progressed application backwards or create duplicate stage events, tasks, or audits for replayed callbacks.
 
+Candidate `min_score` filtering must use the same effective AI projection returned by the API. A latest valid failed terminal audit suppresses any older evaluation score for both display and filtering. Workbench review-task counts must cover every visible open task assigned to the principal and must not be constrained by the separate latest-20-jobs dashboard window; only the returned task item list may be independently capped.
+
 - [ ] **Step 5: Add deferred-to-review referral without creating a new application**
 
 Create `ReviewReferralInput` with no client-controlled stage or assignee. The endpoint must lock membership/source application, require `source.stage == "deferred"`, require an open job and valid hiring owner/fallback owner, transition the same application to `review`, create its stage event/audit/open review task, and preserve the membership as source history. Repeated idempotency key returns the same application.
