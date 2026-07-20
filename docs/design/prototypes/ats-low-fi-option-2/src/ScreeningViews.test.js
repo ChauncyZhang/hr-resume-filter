@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { after, before, test } from "node:test";
 import { createServer } from "vite";
 
@@ -57,16 +58,9 @@ test("server candidate labels never present a derived name as verified", () => {
   assert.equal(helpers.candidateDisplayName({ candidate: "张三" }, false), "张三");
 });
 
-test("server LLM partial failure preserves rule-result wording without promising retry", () => {
-  const message = helpers.serverIssueMessage({ status: "partial", error: "LLM_PROVIDER_UNAVAILABLE" });
-
-  assert.match(message, /规则结果已保留/);
-  assert.match(message, /当前没有可用的 LLM 重试操作/);
-  assert.doesNotMatch(message, /请重试|稍后重试/);
-});
-
-test("server LLM retry is offered only when the backend marks it retryable", () => {
-  assert.match(helpers.serverIssueMessage({ status: "partial", llmRetryable: true }), /可使用下方“重试 LLM”/);
+test("screening keeps a single-file LLM retry only when the server marks it retryable", () => {
+  assert.deepEqual(helpers.screeningRetryAction({ status: "partial", llmRetryable: true }), { kind: "llm", label: "重试 LLM" });
+  assert.equal(helpers.screeningRetryAction({ status: "partial", llmRetryable: false }), null);
   assert.deepEqual(helpers.reconcileRetryingIds(["item-1"], [
     { id: "item-1", status: "partial", llmRetryable: true },
   ]), ["item-1"]);
@@ -75,18 +69,10 @@ test("server LLM retry is offered only when the backend marks it retryable", () 
   ]), []);
 });
 
-test("server rules-only success explains the deterministic LLM degradation", () => {
-  const message = helpers.serverIssueMessage({ status: "success", llmStatus: "skipped" });
-
-  assert.match(message, /LLM 未启用/);
-  assert.match(message, /规则评分已保留/);
-});
-
-test("server malware rejection is explicit and never offers retry", () => {
-  const message = helpers.serverIssueMessage({ status: "failed", error: "malware_detected", retryable: false });
-
-  assert.match(message, /恶意文件/);
-  assert.match(message, /已拒绝/);
+test("screening keeps a single-file parser retry only for retryable file failures", () => {
+  assert.deepEqual(helpers.screeningRetryAction({ status: "failed", retryable: true }), { kind: "parse", label: "重新解析" });
+  assert.equal(helpers.screeningRetryAction({ status: "failed", retryable: false }), null);
+  assert.equal(helpers.screeningRetryAction({ status: "success", retryable: true }), null);
 });
 
 test("server task metadata uses persisted source and creator context", () => {
@@ -96,84 +82,67 @@ test("server task metadata uses persisted source and creator context", () => {
   assert.match(line, /发起人 张小北/);
 });
 
-test("task status follows human review progress after file processing completes", () => {
+test("screening task status ends with automatic processing instead of a review phase", () => {
   assert.equal(helpers.taskLifecycleLabel({ status: "running", reviewTotal: 5, reviewed: 0 }), "处理中");
-  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 0 }), "待人工审核");
-  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 2 }), "审核中 2/5");
-  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 5 }), "人工审核完成");
+  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 0 }), "已完成");
+  assert.equal(helpers.taskLifecycleLabel({ status: "complete", reviewTotal: 5, reviewed: 2 }), "已完成");
 });
 
-test("screening rows describe the actual review state instead of a fixed submitted label", () => {
-  assert.equal(helpers.humanReviewLabel({ status: "running" }), "等待处理");
-  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "new", humanReviewed: false }), "待HR审核");
-  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "new", humanReviewed: true }), "HR已审核");
-  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "review", humanReviewed: true }), "待用人经理评审");
-  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "interview_pending", humanReviewed: true }), "评审通过");
-  assert.equal(helpers.humanReviewLabel({ status: "success", application_stage: "rejected", humanReviewed: true }), "已淘汰");
+test("screening renders the controller automatic outcome instead of the historical rule score", () => {
+  assert.deepEqual(helpers.screeningDisplayOutcome({
+    ruleScore: 12,
+    score: 72,
+    recommendation: "建议评审",
+    routeResult: "review",
+    routeLabel: "已转交用人经理",
+  }), { score: 72, recommendation: "建议评审", routeLabel: "已转交用人经理" });
+  assert.equal(helpers.screeningRouteLabel({ routeResult: "review" }), "已转交用人经理");
+  assert.equal(helpers.screeningRouteLabel({ routeResult: "deferred" }), "已暂缓");
 });
 
-test("review breakdown separates HR completion from manager submission and decision", () => {
-  assert.deepEqual(helpers.reviewBreakdown({ files: [
-    { status: "success", application_stage: "new", humanReviewed: true },
-    { status: "success", application_stage: "review", humanReviewed: true },
-    { status: "success", application_stage: "interview_pending", humanReviewed: true },
-    { status: "success", application_stage: "contact", humanReviewed: true },
-    { status: "success", application_stage: "rejected", humanReviewed: true },
-    { status: "failed", application_stage: null, humanReviewed: false },
-  ] }), {
-    pendingHr: 0,
-    readyToSubmit: 1,
-    waitingManager: 1,
-    approved: 2,
-    rejected: 1,
-  });
+test("screening final AI failure stays neutral and retains manager handoff", () => {
+  assert.deepEqual(helpers.screeningDisplayOutcome({
+    status: "partial",
+    score: null,
+    recommendation: "AI评分不可用",
+    routeResult: "review",
+    routeLabel: "已转交用人经理",
+  }), { score: null, recommendation: "AI评分不可用", routeLabel: "已转交用人经理" });
+  assert.doesNotMatch(JSON.stringify(helpers.screeningDisplayOutcome({ status: "failed", score: null })), /候选人失败/);
 });
 
-test("only completed server rows with a new positive-version application can advance", () => {
-  const eligible = { status: "success", application_stage: "new", application_version: 2 };
+test("screening dimensions render five valid scores and malformed optional data degrades safely", () => {
+  const dimensions = ["岗位匹配", "技能经验", "项目深度", "成长潜力", "稳定性"].map((label, index) => ({
+    label,
+    score: 80 - index,
+    evidence: [`证据 ${index + 1}`],
+    gaps: index === 0 ? [] : [`缺口 ${index}`],
+  }));
 
-  assert.equal(helpers.isAdvanceSelectable(eligible, true), true);
-  assert.equal(helpers.isAdvanceSelectable({ ...eligible, status: "partial" }, true), true);
-  assert.equal(helpers.isAdvanceSelectable({ ...eligible, status: "failed" }, true), false);
-  assert.equal(helpers.isAdvanceSelectable({ ...eligible, application_stage: "review" }, true), false);
-  assert.equal(helpers.isAdvanceSelectable({ ...eligible, application_version: 0 }, true), false);
-  assert.equal(helpers.isAdvanceSelectable({ ...eligible, application_version: 1.5 }, true), false);
-  assert.equal(helpers.isAdvanceSelectable(eligible, false), false);
-});
-
-test("advance payload and success notice use only selected server data", () => {
-  const files = [
-    { id: "item-1", status: "success", application_stage: "new", application_version: 3 },
-    { id: "item-2", status: "partial", application_stage: "new", application_version: 4 },
-    { id: "item-3", status: "success", application_stage: "review", application_version: 5 },
-  ];
-
-  assert.deepEqual(helpers.advanceItems(files, ["item-1", "item-2", "item-3"]), [
-    { item_id: "item-1", expected_application_version: 3 },
-    { item_id: "item-2", expected_application_version: 4 },
+  assert.deepEqual(helpers.normalizeScreeningDimensions(dimensions).map(({ label, score }) => ({ label, score })), dimensions.map(({ label, score }) => ({ label, score })));
+  assert.deepEqual(helpers.normalizeScreeningDimensions([null, { label: "技能经验", score: "bad", evidence: "错误", gaps: 7 }]), [
+    { label: "技能经验", score: null, evidence: [], gaps: [] },
   ]);
-  assert.equal(helpers.advanceSuccessMessage({ applied: 2, already_applied: 1 }), "已推进 3 位候选人到待复核（新推进 2 位，已在待复核 1 位）");
+  assert.deepEqual(helpers.normalizeScreeningDimensions("bad"), []);
 });
 
-test("bulk failures expose safe messages without echoing server details", () => {
-  const conflict = Object.assign(new Error("candidate alice@example.com version 8"), { status: 409 });
-  const failure = new Error("database host internal.example failed");
-
-  assert.equal(helpers.advanceErrorMessage(conflict), "推进未完成，候选人状态可能已变化；正在刷新服务端结果，请重新选择。");
-  assert.equal(helpers.advanceErrorMessage(failure), "推进失败，请稍后重试。");
-  assert.doesNotMatch(helpers.advanceErrorMessage(conflict), /alice|version|8/);
-  assert.doesNotMatch(helpers.advanceErrorMessage(failure), /database|internal/);
+test("screening summary uses the four server counters without recomputing rows", () => {
+  assert.deepEqual(helpers.screeningSummaryCounts({
+    serverCounts: { managerHandoff: 8, deferred: 3, aiUnavailable: 2, fileFailed: 1 },
+    files: [{ routeResult: "deferred", status: "failed" }],
+  }), [
+    { label: "已转交用人经理", value: 8 },
+    { label: "已暂缓", value: 3 },
+    { label: "AI评分不可用", value: 2 },
+    { label: "文件处理失败", value: 1 },
+  ]);
 });
 
-test("bulk undo action is explicit and conflict messages never echo server details", () => {
-  assert.deepEqual(helpers.bulkUndoActionState([], false), { visible: false, disabled: false, label: "撤销批量推进" });
-  assert.deepEqual(helpers.bulkUndoActionState([{ item_id: "item-1", expected_application_version: 4 }], false), { visible: true, disabled: false, label: "撤销批量推进" });
-  assert.deepEqual(helpers.bulkUndoActionState([{ item_id: "item-1", expected_application_version: 4 }], true), { visible: true, disabled: true, label: "撤销中" });
-  assert.equal(helpers.undoSuccessMessage({ applied: 2 }), "已撤销 2 位候选人的本次批量推进，服务端结果已刷新。");
-  const conflict = Object.assign(new Error("alice@example.com changed at version 9"), { status: 409 });
-  assert.equal(helpers.undoErrorMessage(conflict), "无法撤销：候选人状态已变化，已刷新服务端结果。");
-  assert.doesNotMatch(helpers.undoErrorMessage(conflict), /alice|version|9/);
-  assert.equal(helpers.undoErrorMessage(new Error("database internal.example")), "撤销失败，请稍后重试。");
+test("screening source has the eight automatic columns and no removed manual path", () => {
+  const source = readFileSync(new URL("./ScreeningViews.jsx", import.meta.url), "utf8");
+  for (const heading of ["流转结果", "候选人/文件", "处理状态", "LLM结论", "最终分", "维度评分", "主要优势与风险", "查看候选人"]) assert.match(source, new RegExp(heading));
+  const removed = ["待" + "HR审核", "HR初筛" + "进度", "待提交" + "用人经理", "advance" + "_to_review"];
+  for (const text of removed) assert.equal(source.includes(text), false);
 });
 
 test("cancelled tasks never describe progress as completed", () => {
@@ -213,29 +182,37 @@ test("server result opens review only from a completed row with a candidate id",
   assert.equal(helpers.canOpenCandidateReview({ status: "success" }, false), true);
 });
 
-test("server review context keeps candidate identity separate from display fields", () => {
+test("server candidate context keeps identity separate from automatic screening fields", () => {
   const context = helpers.candidateReviewContext({
     candidateId: "candidate-1", candidate: "未核验姓名", email: "derived@example.com",
-    ruleScore: 81, llmScore: 78, recommendation: "可沟通", matched: "Python", missing: "Kubernetes", risk: "待确认", llmReason: "匹配",
+    score: 78, recommendation: "建议评审", routeResult: "review", routeLabel: "已转交用人经理",
+    dimensions: [{ label: "技能经验", score: 82, evidence: ["Python"], gaps: ["Kubernetes"] }], strengths: ["经验匹配"], risks: ["规模待确认"],
   }, { jobId: "job-1", position: "AI 工程师" });
 
   assert.deepEqual(context, {
     candidateId: "candidate-1",
     jobId: "job-1",
     position: "AI 工程师",
-    evidence: { ruleScore: 81, llmScore: 78, recommendation: "可沟通", matched: "Python", missing: "Kubernetes", risk: "待确认", llmReason: "匹配" },
+    evidence: {
+      score: 78,
+      recommendation: "建议评审",
+      routeResult: "review",
+      routeLabel: "已转交用人经理",
+      dimensions: [{ label: "技能经验", score: 82, evidence: ["Python"], gaps: ["Kubernetes"] }],
+      strengths: ["经验匹配"],
+      risks: ["规模待确认"],
+    },
   });
   assert.equal("email" in context, false);
   assert.equal("candidate" in context, false);
 });
 
-test("screening view context restores filters and only still-selectable rows", () => {
+test("screening view context restores filters without row selection state", () => {
   assert.equal(typeof helpers.restoreScreeningViewState, "function");
   assert.deepEqual(helpers.restoreScreeningViewState({
     taskId: "task-1",
     query: "zhang",
     filter: "成功",
-    selected: ["candidate-1", "candidate-2", "missing"],
   }, {
     id: "task-1",
     serverBacked: true,
@@ -246,7 +223,6 @@ test("screening view context restores filters and only still-selectable rows", (
   }), {
     query: "zhang",
     filter: "成功",
-    selected: ["candidate-1"],
   });
 });
 

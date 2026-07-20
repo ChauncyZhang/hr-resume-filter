@@ -19,7 +19,6 @@ import {
   RotateCcw,
   Search,
   Trash2,
-  UserRoundCheck,
   X,
 } from "lucide-react";
 import { screeningController as defaultScreeningController } from "./screeningController.js";
@@ -35,14 +34,6 @@ const demoFiles = [
   { id: "f6", name: "候选人作品集.zip", size: "8.6 MB", type: "ZIP", valid: false, error: "不支持 ZIP 文件，请仅上传 PDF、DOCX 或 TXT" },
 ].map((file) => ({ ...file, example: true }));
 
-const resultProfiles = [
-  { candidate: "李嘉明", recommendation: "可沟通", ruleScore: 81, llmScore: 78, matched: "Python、LLM、RAG", missing: "Kubernetes", risk: "项目规模待确认" },
-  { candidate: "王晨", recommendation: "人工复核", ruleScore: 74, llmScore: 72, matched: "Python、机器学习", missing: "Agent", risk: "大模型经验偏少" },
-  { candidate: "赵宁", recommendation: "优先沟通", ruleScore: 88, llmScore: 84, matched: "LLM、RAG、Agent", missing: "无明显缺失", risk: "到岗时间待确认" },
-  { candidate: "陈浩", recommendation: "待重试", ruleScore: null, llmScore: null, matched: "—", missing: "—", risk: "文件解析失败" },
-  { candidate: "孙悦", recommendation: "人工复核", ruleScore: 66, llmScore: null, matched: "Python、深度学习", missing: "项目经验", risk: "LLM 评分失败" },
-];
-
 export function statusLabel(status) {
   return {
     queued: "排队中",
@@ -56,13 +47,7 @@ export function statusLabel(status) {
 }
 
 export function taskLifecycleLabel(task) {
-  if (task?.status === "running" || task?.status === "cancelled" || task?.status === "failed") return statusLabel(task.status);
-  const total = Number.isInteger(task?.reviewTotal) ? task.reviewTotal : 0;
-  const reviewed = Number.isInteger(task?.reviewed) ? task.reviewed : 0;
-  if (total <= 0) return statusLabel(task?.status);
-  if (reviewed <= 0) return "待人工审核";
-  if (reviewed < total) return `审核中 ${reviewed}/${total}`;
-  return "人工审核完成";
+  return statusLabel(task?.status);
 }
 
 export function pollFailureAction(error) {
@@ -77,34 +62,10 @@ export function pollFailureAction(error) {
   return { code: error?.code || "POLL_FAILED", message: "暂时无法获取最新进度，已保留上次结果。", action: "retry", label: "重试获取" };
 }
 
-export function humanReviewLabel(file) {
-  if (!["success", "partial"].includes(file?.status)) return file?.status === "failed" || file?.status === "cancelled" ? "未进入审核" : "等待处理";
-  const stage = file?.application_stage;
-  if (stage === "rejected" || stage === "withdrawn") return "已淘汰";
-  if (["contact", "interview_pending", "interviewing", "decision", "passed", "hired"].includes(stage)) return "评审通过";
-  if (stage === "review" && file?.humanReviewed) return "待用人经理评审";
-  if (file?.humanReviewed) return "HR已审核";
-  return "待HR审核";
-}
-
-export function reviewBreakdown(task) {
-  return (task?.files || [])
-    .filter((file) => ["success", "partial"].includes(file?.status))
-    .reduce((counts, file) => {
-      const stage = file?.application_stage;
-      if (!file?.humanReviewed) counts.pendingHr += 1;
-      else if (stage === "new") counts.readyToSubmit += 1;
-      else if (stage === "review") counts.waitingManager += 1;
-      else if (["rejected", "withdrawn"].includes(stage)) counts.rejected += 1;
-      else if (["contact", "interview_pending", "interviewing", "decision", "passed", "hired"].includes(stage)) counts.approved += 1;
-      return counts;
-    }, { pendingHr: 0, readyToSubmit: 0, waitingManager: 0, approved: 0, rejected: 0 });
-}
-
 function lifecycleStatusClass(task) {
   if (task?.status === "running") return "running";
   if (task?.status === "failed" || task?.status === "cancelled") return fileStatusClass(task.status);
-  return task?.reviewTotal > 0 && task?.reviewed < task.reviewTotal ? "partial" : "success";
+  return task?.status === "partial" ? "partial" : "success";
 }
 
 function fileStatusClass(status) {
@@ -146,23 +107,23 @@ export function candidateReviewContext(file, task) {
     jobId: task.jobId,
     position: task.position,
     evidence: {
-      ruleScore: file.ruleScore,
-      llmScore: file.llmScore,
+      score: file.score,
       recommendation: file.recommendation,
-      matched: file.matched,
-      missing: file.missing,
-      risk: file.risk,
-      llmReason: file.llmReason,
+      routeResult: file.routeResult,
+      routeLabel: screeningRouteLabel(file),
+      dimensions: normalizeScreeningDimensions(file.dimensions),
+      strengths: normalizeTextList(file.strengths),
+      risks: normalizeTextList(file.risks),
     },
   };
 }
 
 export function serverIssueMessage(file) {
-  if (file.status === "partial") return file.llmRetryable ? "LLM 评估未完成，规则结果已保留；可使用下方“重试 LLM”操作。" : "LLM 评估未完成，规则结果已保留；当前没有可用的 LLM 重试操作。";
+  if (file.recommendation === "AI评分不可用") return "AI评分不可用；已转交用人经理。";
+  if (file.status === "partial") return file.llmRetryable ? "AI 评分暂不可用，可单独重试 LLM。" : "AI 评分暂不可用。";
   if (file.status === "failed" && file.error === "malware_detected") return "检测到恶意文件，已拒绝并从隔离区删除。";
   if (file.status === "failed") return file.retryable ? "文件处理失败，可使用下方“重新解析”操作。" : "文件处理失败，当前没有可用的重试操作。";
-  if (file.llmStatus === "skipped" || file.llmStatus === "not_requested") return "LLM 未启用，规则评分已保留；请由招聘团队完成人工复核。";
-  return file.risk || "—";
+  return "—";
 }
 
 export function taskMetadataLine(task) {
@@ -170,67 +131,71 @@ export function taskMetadataLine(task) {
   return `${task.id} · 来源 ${task.source} · 发起人 ${task.creator} · ${taskCreatedAt(task.createdAt)}`;
 }
 
-export function isAdvanceSelectable(file, serverBacked) {
-  return serverBacked === true
-    && (file?.status === "success" || file?.status === "partial")
-    && file?.application_stage === "new"
-    && Number.isInteger(file?.application_version)
-    && file.application_version > 0;
-}
-
 export function restoreScreeningViewState(viewState, task) {
-  if (viewState?.taskId !== task?.id) return { query: "", filter: "全部", selected: [] };
+  if (viewState?.taskId !== task?.id) return { query: "", filter: "全部" };
   const validFilters = ["全部", "处理中", "成功", "部分成功", "失败"];
-  const selected = Array.isArray(viewState.selected) ? viewState.selected : [];
   return {
     query: typeof viewState.query === "string" ? viewState.query : "",
     filter: validFilters.includes(viewState.filter) ? viewState.filter : "全部",
-    selected: selected.filter((id) => task.files.some((file) => file.id === id && isAdvanceSelectable(file, task.serverBacked))),
   };
 }
 
-export function advanceItems(files, selectedIds) {
-  const selected = new Set(selectedIds);
-  return files
-    .filter((file) => selected.has(file.id) && isAdvanceSelectable(file, true))
-    .map((file) => ({
-      item_id: file.id,
-      expected_application_version: file.application_version,
-    }));
+function normalizeTextList(value) {
+  if (Array.isArray(value)) return value.filter((item) => typeof item === "string" && item.trim()).map((item) => item.trim());
+  return typeof value === "string" && value.trim() ? [value.trim()] : [];
 }
 
-function safeActionCount(value) {
-  return Number.isInteger(value) && value >= 0 ? value : 0;
+function normalizeDimensionDetails(value) {
+  return Array.isArray(value) ? normalizeTextList(value) : [];
 }
 
-export function advanceSuccessMessage(result) {
-  const applied = safeActionCount(result?.applied);
-  const alreadyApplied = safeActionCount(result?.already_applied);
-  return `已推进 ${applied + alreadyApplied} 位候选人到待复核（新推进 ${applied} 位，已在待复核 ${alreadyApplied} 位）`;
+export function normalizeScreeningDimensions(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((dimension) => {
+    if (!dimension || typeof dimension.label !== "string" || !dimension.label.trim()) return [];
+    const score = typeof dimension.score === "number" && Number.isFinite(dimension.score) ? dimension.score : null;
+    return [{
+      label: dimension.label.trim(),
+      score,
+      evidence: normalizeDimensionDetails(dimension.evidence),
+      gaps: normalizeDimensionDetails(dimension.gaps),
+    }];
+  });
 }
 
-export function advanceErrorMessage(error) {
-  return error?.status === 409
-    ? "推进未完成，候选人状态可能已变化；正在刷新服务端结果，请重新选择。"
-    : "推进失败，请稍后重试。";
+export function screeningRouteLabel(file) {
+  if (typeof file?.routeLabel === "string" && file.routeLabel.trim()) return file.routeLabel;
+  return { review: "已转交用人经理", deferred: "已暂缓" }[file?.routeResult] || "—";
 }
 
-export function bulkUndoActionState(items, submitting) {
+export function screeningDisplayOutcome(file) {
+  const waiting = file?.status === "queued" || file?.status === "running";
   return {
-    visible: Array.isArray(items) && items.length > 0,
-    disabled: submitting === true,
-    label: submitting ? "撤销中" : "撤销批量推进",
+    score: waiting || typeof file?.score !== "number" || !Number.isFinite(file.score) ? null : file.score,
+    recommendation: waiting ? "等待处理" : (typeof file?.recommendation === "string" && file.recommendation.trim() ? file.recommendation : "—"),
+    routeLabel: waiting ? "等待处理" : screeningRouteLabel(file),
   };
 }
 
-export function undoSuccessMessage(result) {
-  return `已撤销 ${safeActionCount(result?.applied)} 位候选人的本次批量推进，服务端结果已刷新。`;
+function serverCount(source, keys) {
+  const value = keys.map((key) => source?.[key]).find((item) => Number.isInteger(item) && item >= 0);
+  return value ?? 0;
 }
 
-export function undoErrorMessage(error) {
-  return error?.status === 409
-    ? "无法撤销：候选人状态已变化，已刷新服务端结果。"
-    : "撤销失败，请稍后重试。";
+export function screeningSummaryCounts(task) {
+  const source = task?.serverCounts || task?.outcomeCounts || task?.summary || task || {};
+  return [
+    { label: "已转交用人经理", value: serverCount(source, ["managerHandoff", "managerHandoffCount", "routedToManager", "routedToManagerCount", "routed_to_manager_count"]) },
+    { label: "已暂缓", value: serverCount(source, ["deferred", "deferredCount", "deferred_count"]) },
+    { label: "AI评分不可用", value: serverCount(source, ["aiUnavailable", "aiUnavailableCount", "ai_unavailable_count"]) },
+    { label: "文件处理失败", value: serverCount(source, ["fileFailed", "fileFailedCount", "file_failed_count"]) },
+  ];
+}
+
+export function screeningRetryAction(file) {
+  if (file?.status === "failed" && file.retryable === true) return { kind: "parse", label: "重新解析" };
+  if (file?.status === "partial" && file.llmRetryable === true) return { kind: "llm", label: "重试 LLM" };
+  return null;
 }
 
 export function progressSummary(task, currentFile = "") {
@@ -442,7 +407,7 @@ export function ScreeningTaskCenter({ controller = defaultScreeningController, o
     <div className="screening-center-page">
       <PagePrimaryAction host={pageActionHost}><button className="button primary" type="button" onClick={onImport}><Import size={17} />导入并筛选简历</button></PagePrimaryAction>
       <section className="screening-center-intro">
-        <div><h2>简历筛选任务</h2><p>集中查看批量简历的处理进度、逐份结果和失败重试，并从结果进入候选人人工复核。</p></div>
+        <div><h2>简历筛选任务</h2><p>集中查看批量简历的处理进度、自动筛选结果和单文件失败重试。</p></div>
       </section>
 
       <section className="screening-task-list" aria-busy={state.status === "loading"}>
@@ -471,34 +436,21 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
   const [task, setTask] = useState(initialTask);
   const [filter, setFilter] = useState(restoredViewState.filter);
   const [query, setQuery] = useState(restoredViewState.query);
-  const [selected, setSelected] = useState(restoredViewState.selected);
   const [pollError, setPollError] = useState(null);
   const [cancellingTask, setCancellingTask] = useState(false);
-  const [bulkError, setBulkError] = useState("");
-  const [bulkSubmitting, setBulkSubmitting] = useState(false);
-  const [undoItems, setUndoItems] = useState([]);
   const [pollAttempt, setPollAttempt] = useState(0);
   const [retryingIds, setRetryingIds] = useState([]);
   const pollingRef = useRef(null);
   const retryingRef = useRef(new Set());
-  const bulkAbortRef = useRef(null);
 
   useEffect(() => {
     const nextViewState = restoreScreeningViewState(initialViewState, initialTask);
     setTask(initialTask);
     setFilter(nextViewState.filter);
     setQuery(nextViewState.query);
-    setSelected(nextViewState.selected);
-    setBulkError("");
-    setBulkSubmitting(false);
-    setUndoItems([]);
-    bulkAbortRef.current?.abort();
-    bulkAbortRef.current = null;
     retryingRef.current.clear();
     setRetryingIds([]);
   }, [initialTask.id]);
-
-  useEffect(() => () => bulkAbortRef.current?.abort(), []);
 
   useEffect(() => {
     onTaskChange(task);
@@ -545,7 +497,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     部分成功: task.files.filter((file) => file.status === "partial").length,
     失败: task.files.filter((file) => file.status === "failed").length,
   }), [task.files]);
-  const review = useMemo(() => reviewBreakdown(task), [task]);
+  const serverSummary = useMemo(() => screeningSummaryCounts(task), [task]);
 
   const filtered = useMemo(() => task.files.filter((file) => {
     const matchQuery = !query || `${file.name}${file.candidate}`.toLowerCase().includes(query.toLowerCase());
@@ -555,12 +507,8 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
 
   const total = task.serverBacked ? task.total : task.files.length;
   const currentFile = task.files[task.completed]?.name || (task.serverBacked && total === 0 ? "正在获取服务端任务" : "全部文件已处理");
-  const selectableIds = filtered.filter((file) => isAdvanceSelectable(file, task.serverBacked)).map((file) => file.id);
-  const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.includes(id));
-  const undoAction = bulkUndoActionState(undoItems, bulkSubmitting);
 
   useEffect(() => {
-    setSelected((current) => current.filter((id) => task.files.some((file) => file.id === id && isAdvanceSelectable(file, task.serverBacked))));
     setRetryingIds((current) => {
       const next = reconcileRetryingIds(current, task.files);
       retryingRef.current = new Set(next);
@@ -585,7 +533,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     }
     try {
       setTask((current) => {
-        const files = current.files.map((file) => file.id === id ? { ...file, status: "success", traceId: null, error: null, ruleScore: file.ruleScore ?? 71, llmScore: kind === "llm" ? 69 : (file.llmScore ?? 68), recommendation: "人工复核" } : file);
+        const files = current.files.map((file) => file.id === id ? { ...file, status: "success", traceId: null, error: null, score: kind === "llm" ? 69 : (file.score ?? 68), recommendation: "建议评审", routeResult: "review", routeLabel: "已转交用人经理" } : file);
         return { ...current, files, status: files.some((file) => file.status === "failed" || file.status === "partial") ? "partial" : "complete" };
       });
       onNotify(kind === "llm" ? "LLM 评分重试成功" : "文件重新解析成功");
@@ -614,61 +562,6 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
     }
   }
 
-  async function advanceToReview() {
-    const items = advanceItems(task.files, selected);
-    if (bulkSubmitting || items.length === 0) return;
-    const abortController = new AbortController();
-    bulkAbortRef.current?.abort();
-    bulkAbortRef.current = abortController;
-    setBulkSubmitting(true);
-    setBulkError("");
-    try {
-      const result = await controller.bulkAction(task.id, items, { signal: abortController.signal });
-      if (abortController.signal.aborted) return;
-      setSelected([]);
-      setUndoItems(result.undo_items);
-      onNotify(advanceSuccessMessage(result));
-      setPollAttempt((value) => value + 1);
-    } catch (error) {
-      if (abortController.signal.aborted || error?.name === "AbortError") return;
-      setBulkError(advanceErrorMessage(error));
-      if (error?.status === 409) setPollAttempt((value) => value + 1);
-    } finally {
-      if (bulkAbortRef.current === abortController) {
-        bulkAbortRef.current = null;
-        setBulkSubmitting(false);
-      }
-    }
-  }
-
-  async function undoBulkAdvance() {
-    if (bulkSubmitting || undoItems.length === 0) return;
-    const abortController = new AbortController();
-    bulkAbortRef.current?.abort();
-    bulkAbortRef.current = abortController;
-    setBulkSubmitting(true);
-    setBulkError("");
-    try {
-      const result = await controller.undoBulkAction(task.id, undoItems, { signal: abortController.signal });
-      if (abortController.signal.aborted) return;
-      setUndoItems([]);
-      setPollAttempt((value) => value + 1);
-      onNotify(undoSuccessMessage(result));
-    } catch (error) {
-      if (abortController.signal.aborted || error?.name === "AbortError") return;
-      setBulkError(undoErrorMessage(error));
-      if (error?.status === 409) {
-        setUndoItems([]);
-        setPollAttempt((value) => value + 1);
-      }
-    } finally {
-      if (bulkAbortRef.current === abortController) {
-        bulkAbortRef.current = null;
-        setBulkSubmitting(false);
-      }
-    }
-  }
-
   return (
     <div className="screening-task-page">
       <button className="back-link" type="button" onClick={onBack}><ArrowLeft size={17} />返回筛选任务</button>
@@ -679,7 +572,7 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
 
       <section className="task-progress-panel">
         <div className="progress-primary"><div><span>处理进度</span><strong>{task.completed}/{total}</strong></div><div className="task-progress-track"><span style={{ width: `${total > 0 ? (task.completed / total) * 100 : 0}%` }} /></div><p>{progressSummary({ ...task, total }, currentFile)}<span>当前阶段：{task.stage || (task.status === "running" ? "服务端处理中" : task.status === "cancelled" ? "已取消" : "服务端已结束")}</span></p></div>
-        <div className="progress-stats"><div><strong>{counts.成功}</strong><span>成功</span></div><div><strong>{counts.部分成功}</strong><span>部分成功</span></div><div><strong>{counts.失败}</strong><span>失败</span></div><div><strong>{task.serverBacked ? `${task.completed}/${total}` : `${task.elapsed}s`}</strong><span>{task.serverBacked ? "服务端进度" : "已耗时"}</span></div></div>
+        <div className="progress-stats">{serverSummary.map((item) => <div key={item.label}><strong>{item.value}</strong><span>{item.label}</span></div>)}</div>
       </section>
 
       {pollError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{pollError.message}</span><button type="button" disabled={cancellingTask} onClick={handlePollFailureAction}>{cancellingTask ? "处理中" : pollError.label}</button></div>}
@@ -690,21 +583,26 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
         <header className="results-header"><div><h3>逐文件结果</h3><span>{task.serverBacked ? `本机批次备注：${task.note}` : task.note}</span></div><div className="result-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索候选人或文件名" /></div></header>
         <div className="result-status-tabs">{["全部", "处理中", "成功", "部分成功", "失败"].map((item) => <button key={item} type="button" className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item}<span>{counts[item]}</span></button>)}</div>
 
-        {task.serverBacked && <div className="screening-auto-review-note"><UserRoundCheck size={17} /><div><strong>{review.pendingHr === 0 && task.reviewTotal > 0 ? `HR初筛已完成 ${task.reviewed}/${task.reviewTotal}` : `HR初筛进度 ${task.reviewed}/${task.reviewTotal}`}</strong><span>待HR审核 {review.pendingHr} 份 · 待提交用人经理 {review.readyToSubmit} 份 · 待用人经理评审 {review.waitingManager} 份 · 评审通过 {review.approved} 份 · 已淘汰 {review.rejected} 份</span></div></div>}
-        {bulkError && <div className="task-poll-error" role="alert"><CircleAlert size={17} /><span>{bulkError}</span></div>}
-
         <div className="screening-table">
-          <div className="screening-table-head"><span>审核状态</span><span>候选人 / 文件</span><span>处理状态</span><span>AI初筛建议</span><span>规则分</span><span>LLM 分</span><span>命中 / 缺失</span><span>风险与操作</span></div>
-          {filtered.map((file) => <div className="screening-row" key={file.id}>
-            <span className={`screening-auto-state ${file.humanReviewed ? "reviewed" : "pending"}`}>{file.humanReviewed && <Check size={14} />}{humanReviewLabel(file)}</span>
-            <button className="screening-identity" type="button" disabled={!canOpenCandidateReview(file, task.serverBacked)} title={!canOpenCandidateReview(file, task.serverBacked) ? (task.serverBacked && !file.candidateId ? "服务端尚未生成候选人记录" : "处理成功后可查看候选人") : undefined} onClick={() => onOpenCandidate(task.serverBacked ? { serverBacked: true, ...candidateReviewContext(file, task) } : { name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ruleScore: file.ruleScore, llmScore: file.llmScore, recommendation: file.recommendation, matched: file.matched, missing: file.missing, risk: file.risk }, { taskId: task.id, query, filter, selected })}><strong>{candidateDisplayName(file, task.serverBacked)}</strong><small>{file.name}</small></button>
-            <span><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{(file.status === "failed" || file.status === "cancelled") && <X size={13} />}{statusLabel(file.status)}</span></span>
-            <span className="recommendation-cell" title="这是系统筛选时生成的原始建议，不代表当前人工审核状态">{file.status === "queued" ? "等待处理" : file.status === "cancelled" ? "未处理" : file.recommendation}</span>
-            <span className="score-source"><strong>{file.status === "queued" ? "—" : (file.ruleScore ?? "—")}</strong><small>规则</small></span>
-            <span className="score-source llm"><strong>{file.status === "queued" ? "—" : (file.llmScore ?? "—")}</strong><small>LLM</small></span>
-            <span className="evidence-cell"><strong>{file.status === "queued" ? "等待处理" : (file.matched || "—")}</strong><small>缺失：{file.status === "queued" ? "—" : (file.missing || "—")}</small></span>
-            <span className="risk-cell"><strong>{file.status === "queued" ? "等待处理" : task.serverBacked ? serverIssueMessage(file) : (file.error || file.risk || "—")}</strong>{!task.serverBacked && file.traceId && <small>追踪 ID：{file.traceId}</small>}{file.status === "failed" && (!task.serverBacked || file.retryable) && <button type="button" disabled={retryingIds.includes(file.id)} onClick={() => retry(file.id, "parse")}><RotateCcw size={14} />{retryingIds.includes(file.id) ? "重试中" : "重新解析"}</button>}{file.status === "partial" && (!task.serverBacked || file.llmRetryable) && <button type="button" disabled={retryingIds.includes(file.id)} onClick={() => retry(file.id, "llm")}><Redo2 size={14} />{retryingIds.includes(file.id) ? "重试中" : "重试 LLM"}</button>}</span>
-          </div>)}
+          <div className="screening-table-head"><span>流转结果</span><span>候选人/文件</span><span>处理状态</span><span>LLM结论</span><span>最终分</span><span>维度评分</span><span>主要优势与风险</span><span>查看候选人</span></div>
+          {filtered.map((file) => {
+            const outcome = screeningDisplayOutcome(file);
+            const dimensions = normalizeScreeningDimensions(file.dimensions);
+            const strengths = normalizeTextList(file.strengths);
+            const risks = normalizeTextList(file.risks);
+            const retryAction = screeningRetryAction(file);
+            const canOpen = canOpenCandidateReview(file, task.serverBacked);
+            return <div className="screening-row" key={file.id}>
+              <span className={`screening-route ${file.routeResult || "pending"}`}>{outcome.routeLabel}</span>
+              <span className="screening-candidate-file"><strong>{candidateDisplayName(file, task.serverBacked)}</strong><small>{file.name}</small></span>
+              <span><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{(file.status === "failed" || file.status === "cancelled") && <X size={13} />}{statusLabel(file.status)}</span></span>
+              <span className="recommendation-cell">{outcome.recommendation}</span>
+              <span className="final-score"><strong>{outcome.score ?? "—"}</strong></span>
+              <span className="dimension-cell">{dimensions.length > 0 ? dimensions.map((dimension) => <span key={dimension.label} title={[...dimension.evidence, ...dimension.gaps].join("；") || undefined}><b>{dimension.label}</b><strong>{dimension.score ?? "—"}</strong></span>) : <span className="empty-value">—</span>}</span>
+              <span className="strength-risk-cell"><strong>{strengths.length > 0 ? `优势：${strengths.join("；")}` : "优势：—"}</strong><small>{risks.length > 0 ? `风险：${risks.join("；")}` : `风险：${serverIssueMessage(file)}`}</small>{!task.serverBacked && file.traceId && <small>追踪 ID：{file.traceId}</small>}{retryAction && <button type="button" disabled={retryingIds.includes(file.id)} onClick={() => retry(file.id, retryAction.kind)}>{retryAction.kind === "llm" ? <Redo2 size={14} /> : <RotateCcw size={14} />}{retryingIds.includes(file.id) ? "重试中" : retryAction.label}</button>}</span>
+              <button className="screening-candidate-link" type="button" disabled={!canOpen} title={!canOpen ? (task.serverBacked && !file.candidateId ? "服务端尚未生成候选人记录" : "处理成功后可查看候选人") : undefined} onClick={() => onOpenCandidate(task.serverBacked ? { serverBacked: true, ...candidateReviewContext(file, task) } : { name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ...candidateReviewContext(file, task).evidence }, { taskId: task.id, query, filter })}><span>查看</span><ChevronRight size={15} /></button>
+            </div>;
+          })}
         </div>
       </section>
 

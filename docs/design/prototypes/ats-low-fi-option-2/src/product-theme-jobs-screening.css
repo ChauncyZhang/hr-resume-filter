@@ -170,7 +170,7 @@ body .screening-row:hover {
 body .job-table-row:focus-visible,
 body .detail-candidate-table > button:focus-visible,
 body .screening-task-list-row:focus-visible,
-body .screening-identity:focus-visible {
+body .screening-candidate-link:focus-visible {
   position: relative;
   z-index: 1;
   outline: 3px solid rgba(0, 102, 230, .22);
@@ -228,8 +228,7 @@ body .task-poll-error,
 body .task-background-tip,
 body .partial-warning,
 body .privacy-note,
-body .wizard-error,
-body .screening-auto-review-note {
+body .wizard-error {
   border-radius: 7px;
   font-size: 14px;
 }
@@ -806,8 +805,7 @@ body .progress-stats strong {
   font-size: 19px;
 }
 
-body .task-background-tip,
-body .screening-auto-review-note {
+body .task-background-tip {
   color: var(--blue-dark);
   background: var(--blue-soft);
 }
@@ -841,27 +839,11 @@ body .result-status-tabs {
   gap: 24px;
 }
 
-body .screening-auto-review-note {
-  min-height: 58px;
-  padding: 10px 14px;
-  border-color: #cfe2fa;
-}
-
-body .screening-auto-review-note strong {
-  color: var(--ink);
-  font-size: 14px;
-}
-
-body .screening-auto-review-note span {
-  color: var(--ink-secondary);
-  font-size: 13px;
-}
-
 body .screening-table-head,
 body .screening-row {
-  min-width: 1080px;
-  grid-template-columns: 96px minmax(190px, 1.25fr) 92px 94px 64px 64px minmax(170px, 1fr) minmax(200px, 1.2fr);
-  gap: 10px;
+  min-width: 1240px;
+  grid-template-columns: 116px minmax(170px, 1.05fr) 92px 110px 64px minmax(250px, 1.45fr) minmax(230px, 1.25fr) 96px;
+  gap: 12px;
 }
 
 body .screening-table-head {
@@ -878,68 +860,109 @@ body .screening-row {
   border-color: var(--line);
 }
 
-body .screening-auto-state,
-body .screening-identity strong,
+body .screening-route,
+body .screening-candidate-file strong,
 body .recommendation-cell {
   font-size: 13px;
 }
 
-body .screening-auto-state {
+body .screening-route {
   color: var(--green);
-}
-
-body .screening-auto-state.pending {
-  color: var(--amber);
-}
-
-body .screening-auto-state.reviewed {
-  color: var(--green);
-}
-
-body .screening-identity {
-  min-width: 0;
-  color: var(--ink);
-}
-
-body .screening-identity:disabled {
-  color: var(--muted);
-  cursor: not-allowed;
-}
-
-body .screening-identity strong,
-body .screening-identity small,
-body .evidence-cell strong,
-body .evidence-cell small,
-body .risk-cell strong,
-body .risk-cell small {
+  font-weight: 600;
+  line-height: 1.4;
   overflow-wrap: anywhere;
 }
 
-body .screening-identity strong {
+body .screening-route.pending,
+body .screening-route.deferred {
+  color: var(--amber);
+}
+
+body .screening-candidate-file,
+body .dimension-cell,
+body .strength-risk-cell {
+  min-width: 0;
+}
+
+body .screening-candidate-file {
+  color: var(--ink);
+}
+
+body .screening-candidate-file strong,
+body .screening-candidate-file small,
+body .strength-risk-cell strong,
+body .strength-risk-cell small {
+  overflow-wrap: anywhere;
+}
+
+body .screening-candidate-file strong {
   color: inherit;
   font-weight: 600;
 }
 
-body .screening-identity small,
-body .evidence-cell small,
-body .risk-cell small {
+body .screening-candidate-file small,
+body .strength-risk-cell small {
+  display: block;
+  margin-top: 3px;
   color: var(--muted);
   font-size: 12px;
+  line-height: 1.45;
 }
 
-body .score-source strong,
-body .score-source.llm strong {
+body .final-score strong {
   color: var(--ink);
   font-size: 16px;
 }
 
-body .score-source small {
-  color: var(--muted);
+body .dimension-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
 }
 
-body .risk-cell button {
+body .dimension-cell > span:not(.empty-value) {
+  min-width: 74px;
+  padding: 4px 6px;
+  display: inline-flex;
+  justify-content: space-between;
+  gap: 6px;
+  border-radius: 6px;
+  color: var(--ink-secondary);
+  background: #f2f2f5;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+body .dimension-cell b {
+  font-weight: 500;
+}
+
+body .dimension-cell strong {
+  color: var(--ink);
+}
+
+body .strength-risk-cell button,
+body .screening-candidate-link {
   color: var(--blue);
   font-weight: 600;
+}
+
+body .strength-risk-cell button {
+  margin-top: 5px;
+}
+
+body .screening-candidate-link {
+  min-height: 36px;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  white-space: nowrap;
+}
+
+body .screening-candidate-link:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
 }
 
 @media (max-width: 1100px) {
@@ -1419,30 +1442,33 @@ body .risk-cell button {
 
   body .screening-row {
     min-width: 0;
-    min-height: 220px;
+    min-height: 0;
     padding: 12px;
     border: 1px solid var(--line);
     border-radius: var(--radius);
-    grid-template-columns: minmax(88px, auto) minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
-      "flow identity status"
-      "recommend recommend recommend"
-      "rule llm risk"
-      "evidence evidence evidence";
+      "route status"
+      "identity identity"
+      "recommend score"
+      "dimensions dimensions"
+      "evidence evidence"
+      "navigation navigation";
     align-items: start;
     gap: 11px;
   }
 
-  body .screening-auto-state { grid-area: flow; }
-  body .screening-identity { grid-area: identity; }
+  body .screening-route { grid-area: route; }
+  body .screening-candidate-file { grid-area: identity; }
   body .screening-row > span:nth-child(3) { grid-area: status; }
   body .recommendation-cell { grid-area: recommend; }
-  body .score-source { grid-area: rule; }
-  body .score-source.llm { grid-area: llm; }
-  body .evidence-cell { grid-area: evidence; }
-  body .risk-cell { grid-area: risk; }
+  body .final-score { grid-area: score; text-align: right; }
+  body .dimension-cell { grid-area: dimensions; }
+  body .strength-risk-cell { grid-area: evidence; }
+  body .screening-candidate-link { grid-area: navigation; justify-self: end; }
 
-  body .risk-cell {
+  body .strength-risk-cell,
+  body .dimension-cell {
     min-width: 0;
   }
 }
