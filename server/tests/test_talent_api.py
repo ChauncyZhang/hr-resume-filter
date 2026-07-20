@@ -114,6 +114,14 @@ def mark_deferred_system_pool(app, pool_id):
         database.commit()
 
 
+def bind_terminal_audit_to_evaluation(audit, evaluation):
+    audit.metadata_json = {
+        **audit.metadata_json,
+        "evaluation_id": str(evaluation.id),
+        "invocation_id": str(evaluation.invocation_id),
+    }
+
+
 def test_talent_openapi_registers_phase_5_pool_contract(tmp_path) -> None:
     app = make_app(tmp_path)
     with TestClient(app) as client:
@@ -179,7 +187,7 @@ def test_deferred_membership_projects_latest_llm_evaluation_and_latest_valid_rou
         old_evaluation.gaps = ["旧缺口"]
         latest_evaluation = seed_llm_evaluation(database, source, seed["admin_id"], results[1], 52, "暂缓", latest_time)
         latest_evaluation.gaps = ["缺少生产级 RAG 经验", "系统设计深度不足"]
-        seed_terminal_route_audit(
+        valid_audit = seed_terminal_route_audit(
             database,
             source,
             item,
@@ -188,6 +196,7 @@ def test_deferred_membership_projects_latest_llm_evaluation_and_latest_valid_rou
             score=52,
             created_at=routed_at,
         )
+        bind_terminal_audit_to_evaluation(valid_audit, latest_evaluation)
         malformed = seed_terminal_route_audit(
             database,
             source,
@@ -197,6 +206,7 @@ def test_deferred_membership_projects_latest_llm_evaluation_and_latest_valid_rou
             score=52,
             created_at=malformed_at,
         )
+        bind_terminal_audit_to_evaluation(malformed, latest_evaluation)
         malformed.metadata_json = {**malformed.metadata_json, "ai_status": "pending"}
         database.commit()
 
@@ -215,6 +225,118 @@ def test_deferred_membership_projects_latest_llm_evaluation_and_latest_valid_rou
     assert member["owner"]["id"] == str(seed["admin_id"])
     assert member["source_application"]["job_id"] == str(seed["job_id"])
     assert member["source_application"]["stage"] == "deferred"
+
+
+def test_deferred_membership_rejects_historical_terminal_audit_without_evidence_ids(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    evaluated_at = datetime(2026, 7, 18, 4, 10, tzinfo=timezone.utc)
+    routed_at = datetime(2026, 7, 18, 4, 20, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "deferred"
+        resume = database.get(Resume, source.resume_id)
+        item, results = seed_screening_results(
+            database,
+            source,
+            resume.file_object_id,
+            seed["admin_id"],
+            [("historical-route", 48, "暂缓", evaluated_at)],
+        )
+        evaluation = seed_llm_evaluation(
+            database,
+            source,
+            seed["admin_id"],
+            results[0],
+            48,
+            "暂缓",
+            evaluated_at,
+        )
+        evaluation.gaps = ["historical gap"]
+        seed_terminal_route_audit(
+            database,
+            source,
+            item,
+            seed["admin_id"],
+            route="deferred",
+            score=48,
+            created_at=routed_at,
+        )
+        database.commit()
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        members = client.get(f"/api/v1/talent-pools/{pool_id}/memberships", headers=headers)
+
+    assert members.json()["data"][0]["deferred_screening"] == {
+        "final_score": None,
+        "deferred_at": None,
+        "main_gaps": [],
+    }
+
+
+def test_deferred_membership_does_not_bind_old_audit_to_later_same_score_evaluation(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    first_at = datetime(2026, 7, 18, 4, 30, tzinfo=timezone.utc)
+    routed_at = datetime(2026, 7, 18, 4, 40, tzinfo=timezone.utc)
+    later_at = datetime(2026, 7, 18, 4, 50, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as database:
+        source = database.get(Application, seed["application_id"])
+        source.stage = "deferred"
+        resume = database.get(Resume, source.resume_id)
+        item, results = seed_screening_results(
+            database,
+            source,
+            resume.file_object_id,
+            seed["admin_id"],
+            [("first-evidence", 48, "暂缓", first_at), ("later-evidence", 48, "暂缓", later_at)],
+        )
+        first_evaluation = seed_llm_evaluation(
+            database,
+            source,
+            seed["admin_id"],
+            results[0],
+            48,
+            "暂缓",
+            first_at,
+        )
+        first_evaluation.gaps = ["first gap"]
+        audit = seed_terminal_route_audit(
+            database,
+            source,
+            item,
+            seed["admin_id"],
+            route="deferred",
+            score=48,
+            created_at=routed_at,
+        )
+        bind_terminal_audit_to_evaluation(audit, first_evaluation)
+        later_evaluation = seed_llm_evaluation(
+            database,
+            source,
+            seed["admin_id"],
+            results[1],
+            48,
+            "暂缓",
+            later_at,
+        )
+        later_evaluation.gaps = ["later gap must not project"]
+        database.commit()
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        members = client.get(f"/api/v1/talent-pools/{pool_id}/memberships", headers=headers)
+
+    assert members.json()["data"][0]["deferred_screening"] == {
+        "final_score": 48,
+        "deferred_at": routed_at.isoformat(),
+        "main_gaps": ["first gap"],
+    }
 
 
 def test_deferred_membership_without_llm_evaluation_does_not_fall_back_to_rule_score_or_tags(tmp_path) -> None:
@@ -325,7 +447,7 @@ def test_deferred_membership_rejects_evaluation_and_audit_from_different_screeni
             routed_at,
         )
         forged_evaluation.gaps = ["forged gap"]
-        seed_terminal_route_audit(
+        forged_audit = seed_terminal_route_audit(
             database,
             source,
             source_item,
@@ -334,6 +456,7 @@ def test_deferred_membership_rejects_evaluation_and_audit_from_different_screeni
             score=48,
             created_at=routed_at,
         )
+        bind_terminal_audit_to_evaluation(forged_audit, forged_evaluation)
         database.commit()
 
     with TestClient(app) as client:
@@ -393,7 +516,7 @@ def test_deferred_membership_rejects_invalid_terminal_state(
         evaluation.gaps = ["must not project"]
         item.llm_status = item_status
         database.get(LlmInvocation, evaluation.invocation_id).status = invocation_status
-        seed_terminal_route_audit(
+        audit = seed_terminal_route_audit(
             database,
             source,
             item,
@@ -402,6 +525,7 @@ def test_deferred_membership_rejects_invalid_terminal_state(
             score=audit_score,
             created_at=routed_at,
         )
+        bind_terminal_audit_to_evaluation(audit, evaluation)
         database.commit()
 
     with TestClient(app) as client:
@@ -473,6 +597,135 @@ def test_membership_list_query_count_is_bounded_as_pool_grows(tmp_path) -> None:
     assert many_member_selects <= one_member_selects + 1
 
 
+def test_deferred_membership_list_batches_real_screening_projections(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+
+    def add_projection(database, application, file_id, index):
+        evaluated_at = datetime(2026, 7, 19, index, 0, tzinfo=timezone.utc)
+        routed_at = datetime(2026, 7, 19, index, 1, tzinfo=timezone.utc)
+        score = 40 + index
+        item, results = seed_screening_results(
+            database,
+            application,
+            file_id,
+            seed["admin_id"],
+            [(f"bulk-deferred-{index}", 99, "优先沟通", evaluated_at)],
+        )
+        evaluation = seed_llm_evaluation(
+            database,
+            application,
+            seed["admin_id"],
+            results[0],
+            score,
+            "暂缓",
+            evaluated_at,
+        )
+        evaluation.gaps = [f"gap-{index}"]
+        audit = seed_terminal_route_audit(
+            database,
+            application,
+            item,
+            seed["admin_id"],
+            route="deferred",
+            score=score,
+            created_at=routed_at,
+        )
+        bind_terminal_audit_to_evaluation(audit, evaluation)
+        return score
+
+    def get_with_select_count(client, path, headers):
+        statements = []
+
+        def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+            if statement.lstrip().upper().startswith("SELECT"):
+                statements.append(statement)
+
+        event.listen(app.state.identity_store.engine, "before_cursor_execute", record_statement)
+        try:
+            response = client.get(path, headers=headers)
+        finally:
+            event.remove(app.state.identity_store.engine, "before_cursor_execute", record_statement)
+        assert response.status_code == 200
+        return response, len(statements)
+
+    with TestClient(app) as client:
+        headers, pool, _ = create_pool_and_membership(client, seed)
+        pool_id = pool.json()["data"]["id"]
+        mark_deferred_system_pool(app, pool_id)
+        with app.state.identity_store.sync_session() as database:
+            source = database.get(Application, seed["application_id"])
+            source.stage = "deferred"
+            source_resume = database.get(Resume, source.resume_id)
+            expected_scores = {add_projection(database, source, source_resume.file_object_id, 1)}
+            database.commit()
+
+        path = f"/api/v1/talent-pools/{pool_id}/memberships?limit=100"
+        one_response, one_member_selects = get_with_select_count(client, path, headers)
+        assert len(one_response.json()["data"]) == 1
+
+        with app.state.identity_store.sync_session() as database:
+            source = database.get(Application, seed["application_id"])
+            for index in range(2, 8):
+                candidate = Candidate(
+                    organization_id=source.organization_id,
+                    display_name=f"Deferred bulk candidate {index}",
+                    owner_id=seed["admin_id"],
+                )
+                file_object = FileObject(
+                    organization_id=source.organization_id,
+                    storage_key=f"talent/deferred-bulk-{index}.pdf",
+                    original_filename=f"deferred-bulk-{index}.pdf",
+                    mime_type="application/pdf",
+                    size_bytes=10,
+                    sha256=(f"{index:x}" * 64)[:64],
+                    uploaded_by=seed["admin_id"],
+                )
+                database.add_all([candidate, file_object])
+                database.flush()
+                resume = Resume(
+                    organization_id=source.organization_id,
+                    candidate_id=candidate.id,
+                    file_object_id=file_object.id,
+                    version_number=1,
+                )
+                database.add(resume)
+                database.flush()
+                application = Application(
+                    organization_id=source.organization_id,
+                    candidate_id=candidate.id,
+                    job_id=source.job_id,
+                    resume_id=resume.id,
+                    owner_id=seed["admin_id"],
+                    stage="deferred",
+                )
+                database.add(application)
+                database.flush()
+                expected_scores.add(add_projection(database, application, file_object.id, index))
+                database.add(
+                    TalentPoolMembership(
+                        organization_id=source.organization_id,
+                        pool_id=UUID(pool_id),
+                        candidate_id=candidate.id,
+                        source_application_id=application.id,
+                        owner_id=seed["admin_id"],
+                        suitable_roles=["Engineer"],
+                        tags=[],
+                        reason="Deferred projection fixture",
+                        retention_until=datetime(2028, 7, 20, tzinfo=timezone.utc),
+                    )
+                )
+            database.commit()
+
+        many_response, many_member_selects = get_with_select_count(client, path, headers)
+
+    rows = many_response.json()["data"]
+    assert len(rows) == 7
+    assert {row["deferred_screening"]["final_score"] for row in rows} == expected_scores
+    assert all(row["deferred_screening"]["main_gaps"] for row in rows)
+    assert many_member_selects <= one_member_selects + 1
+
+
 def test_deferred_membership_referral_reuses_application_and_is_idempotent(tmp_path) -> None:
     app=make_app(tmp_path); seed=seed_application(app)
     with app.state.identity_store.sync_session() as db:
@@ -532,7 +785,7 @@ def test_deferred_membership_referral_allows_visible_hr_with_source_job_transiti
             routed_at,
         )
         evaluation.gaps = ["分布式系统经验不足"]
-        seed_terminal_route_audit(
+        audit = seed_terminal_route_audit(
             database,
             source,
             item,
@@ -541,6 +794,7 @@ def test_deferred_membership_referral_allows_visible_hr_with_source_job_transiti
             score=48,
             created_at=routed_at,
         )
+        bind_terminal_audit_to_evaluation(audit, evaluation)
         database.add(
             JobCollaborator(
                 organization_id=source.organization_id,

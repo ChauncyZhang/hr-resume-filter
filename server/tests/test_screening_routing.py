@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import func, select
@@ -135,6 +136,10 @@ def seed_routing_case(app, *, suffix="route", with_admin=True):
         )
 
 
+def evidence_ids():
+    return {"evaluation_id": uuid4(), "invocation_id": uuid4()}
+
+
 @pytest.mark.parametrize(
     ("score", "recommendation", "stage"),
     [
@@ -152,6 +157,31 @@ def test_derive_screening_outcome(score, recommendation, stage):
 def test_derive_screening_outcome_rejects_out_of_range_scores(score):
     with pytest.raises(ValueError, match="score_out_of_range"):
         derive_screening_outcome(score)
+
+
+def test_successful_terminal_route_persists_explicit_evidence_ids(tmp_path):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="evidence-ids")
+    evaluation_id = uuid4()
+    invocation_id = uuid4()
+
+    with app.state.identity_store.sync_session() as db:
+        route_llm_screening_terminal(
+            db,
+            organization_id=case.organization_id,
+            item_id=case.item_id,
+            actor_user_id=case.creator_id,
+            score=48,
+            ai_status="succeeded",
+            safe_error_code=None,
+            trace_id="trace-evidence-ids",
+            evaluation_id=evaluation_id,
+            invocation_id=invocation_id,
+        )
+        audit = db.scalar(select(AuditLog).where(AuditLog.event_type == "screening.terminal_routed"))
+
+    assert audit.metadata_json["evaluation_id"] == str(evaluation_id)
+    assert audit.metadata_json["invocation_id"] == str(invocation_id)
 
 
 def test_final_llm_failure_fails_open_without_fake_score_or_internal_commit(tmp_path):
@@ -233,6 +263,7 @@ def test_router_uses_central_audit_metadata_validation(tmp_path, monkeypatch):
                 ai_status="succeeded",
                 safe_error_code=None,
                 trace_id="trace-audit-boundary",
+                **evidence_ids(),
             )
 
 
@@ -250,6 +281,7 @@ def test_repeated_and_stale_routing_does_not_duplicate_side_effects(tmp_path):
             ai_status="succeeded",
             safe_error_code=None,
             trace_id="trace-first",
+            **evidence_ids(),
         )
         second = route_llm_screening_terminal(
             db,
@@ -293,6 +325,7 @@ def test_successful_retry_refreshes_fail_open_route_without_regressing_progress(
         application.version += 1
         db.flush()
 
+        retry_evidence = evidence_ids()
         retry = route_llm_screening_terminal(
             db,
             organization_id=case.organization_id,
@@ -302,6 +335,7 @@ def test_successful_retry_refreshes_fail_open_route_without_regressing_progress(
             ai_status="succeeded",
             safe_error_code=None,
             trace_id="trace-retry",
+            **retry_evidence,
         )
         replay = route_llm_screening_terminal(
             db,
@@ -312,6 +346,7 @@ def test_successful_retry_refreshes_fail_open_route_without_regressing_progress(
             ai_status="succeeded",
             safe_error_code=None,
             trace_id="trace-retry",
+            **retry_evidence,
         )
 
         audits = db.scalars(
@@ -345,6 +380,8 @@ def test_successful_retry_refreshes_fail_open_route_without_regressing_progress(
             "ai_status": "succeeded",
             "recommendation": "暂缓",
             "score": 59,
+            "evaluation_id": str(retry_evidence["evaluation_id"]),
+            "invocation_id": str(retry_evidence["invocation_id"]),
         }
 
 
@@ -361,6 +398,7 @@ def test_invalid_stale_callback_is_noop_after_locked_application_left_new(tmp_pa
             ai_status="succeeded",
             safe_error_code=None,
             trace_id="trace-first",
+            **evidence_ids(),
         )
         stale = route_llm_screening_terminal(
             db,

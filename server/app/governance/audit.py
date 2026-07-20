@@ -46,6 +46,8 @@ EVENT_METADATA_ALLOWLIST: dict[str, dict[str, MetadataField]] = {
     "screening.terminal_routed": {
         "application_id": _CODE,
         "item_id": _CODE,
+        "evaluation_id": _CODE,
+        "invocation_id": _CODE,
         "from_stage": _SHORT,
         "to_stage": _SHORT,
         "ai_status": _SHORT,

@@ -119,6 +119,39 @@ def test_append_audit_accepts_screening_terminal_routed_safe_metadata() -> None:
         assert log.metadata_json["safe_error_code"] == "provider_unavailable"
 
 
+def test_append_audit_accepts_terminal_screening_evidence_ids() -> None:
+    actor = SimpleNamespace(user_id=uuid4(), organization_id=uuid4())
+    application_id = uuid4()
+    item_id = uuid4()
+    evaluation_id = uuid4()
+    invocation_id = uuid4()
+    with Session(create_engine("sqlite://")) as db:
+        log = append_audit(
+            db,
+            actor=actor,
+            category="recruiting",
+            event_type="screening.terminal_routed",
+            outcome="success",
+            trace_id="trace-screening-evidence",
+            resource_type="application",
+            resource_id=application_id,
+            metadata={
+                "application_id": str(application_id),
+                "item_id": str(item_id),
+                "evaluation_id": str(evaluation_id),
+                "invocation_id": str(invocation_id),
+                "from_stage": "new",
+                "to_stage": "deferred",
+                "ai_status": "succeeded",
+                "recommendation": "暂缓",
+                "score": 48,
+            },
+        )
+
+    assert log.metadata_json["evaluation_id"] == str(evaluation_id)
+    assert log.metadata_json["invocation_id"] == str(invocation_id)
+
+
 def test_append_audit_rejects_unknown_screening_route_metadata_key() -> None:
     actor = SimpleNamespace(user_id=uuid4(), organization_id=uuid4())
     with pytest.raises(AuditValidationError, match="metadata key 'provider_body'"):

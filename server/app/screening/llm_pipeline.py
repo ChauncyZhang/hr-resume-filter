@@ -147,7 +147,7 @@ class LlmScreeningPipeline:
                 trace_id=getattr(job, "trace_id", None),
             )
             facts = evaluation.result
-            db.add(LlmScreeningEvaluation(
+            screening_evaluation = LlmScreeningEvaluation(
                 id=uuid.uuid5(invocation.id, "screening-evaluation"),
                 organization_id=ids["organization_id"],
                 screening_result_id=ids["screening_result_id"],
@@ -161,7 +161,8 @@ class LlmScreeningPipeline:
                 risks=facts.risks,
                 interview_questions=facts.questions,
                 dimensions=[dimension.model_dump() for dimension in facts.dimensions],
-            ))
+            )
+            db.add(screening_evaluation)
             item.llm_status = "succeeded"
             item.llm_safe_error_code = None
             finished_at=datetime.now(timezone.utc); item.llm_finished_at = item.llm_finished_at or finished_at; item.finished_at=item.finished_at or finished_at
@@ -175,6 +176,8 @@ class LlmScreeningPipeline:
                 ai_status="succeeded",
                 safe_error_code=None,
                 trace_id=getattr(job, "trace_id", None) or f"llm:{queue_job_id}",
+                evaluation_id=screening_evaluation.id,
+                invocation_id=invocation.id,
             )
             aggregate_run(db, run)
             db.commit()

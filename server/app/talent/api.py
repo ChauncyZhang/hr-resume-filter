@@ -317,10 +317,11 @@ def _deferred_screening_projections(db, organization_id: UUID, application_ids: 
             ScreeningItem.application_id,
             ScreeningItem.id.label("item_id"),
             LlmScreeningEvaluation.id.label("evaluation_id"),
+            LlmInvocation.id.label("invocation_id"),
             LlmScreeningEvaluation.score,
             LlmScreeningEvaluation.recommendation,
             LlmScreeningEvaluation.gaps,
-            LlmScreeningEvaluation.created_at,
+            LlmScreeningEvaluation.created_at.label("evaluation_created_at"),
         )
         .select_from(LlmScreeningEvaluation)
         .join(
@@ -359,9 +360,10 @@ def _deferred_screening_projections(db, organization_id: UUID, application_ids: 
             LlmScreeningEvaluation.id.desc(),
         )
     ).all()
-    evaluations = {}
-    for row in rows:
-        evaluations.setdefault(row.application_id, row)
+    evaluations = {
+        (row.application_id, row.evaluation_id, row.invocation_id): row
+        for row in rows
+    }
 
     audits = db.scalars(
         select(AuditLog)
@@ -380,13 +382,15 @@ def _deferred_screening_projections(db, organization_id: UUID, application_ids: 
         application_id = audit.resource_id
         if application_id in projections:
             continue
-        evaluation = evaluations.get(application_id)
-        if evaluation is None or not 0 <= evaluation.score < 60 or evaluation.recommendation != "暂缓":
-            continue
         try:
             metadata = _validate_metadata("screening.terminal_routed", audit.metadata_json)
             item_id = UUID(metadata["item_id"])
+            evaluation_id = UUID(metadata["evaluation_id"])
+            invocation_id = UUID(metadata["invocation_id"])
         except (AuditValidationError, KeyError, TypeError, ValueError):
+            continue
+        evaluation = evaluations.get((application_id, evaluation_id, invocation_id))
+        if evaluation is None or not 0 <= evaluation.score < 60 or evaluation.recommendation != "暂缓":
             continue
         if (
             metadata.get("application_id") != str(application_id)
@@ -397,6 +401,7 @@ def _deferred_screening_projections(db, organization_id: UUID, application_ids: 
             or metadata.get("recommendation") != evaluation.recommendation
             or metadata.get("safe_error_code") is not None
             or item_id != evaluation.item_id
+            or _aware(evaluation.evaluation_created_at) > _aware(audit.created_at)
         ):
             continue
         projections[application_id] = {

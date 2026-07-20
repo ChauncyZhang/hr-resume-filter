@@ -109,6 +109,8 @@ def route_llm_screening_terminal(
     ai_status: str,
     safe_error_code: str | None,
     trace_id: str,
+    evaluation_id=None,
+    invocation_id=None,
     transferable_capabilities=(),
 ):
     item_identity = db.execute(
@@ -170,6 +172,8 @@ def route_llm_screening_terminal(
         return _previous_result(application, previous_audit)
 
     outcome = _requested_outcome(score, ai_status, safe_error_code)
+    if ai_status == "succeeded" and (evaluation_id is None or invocation_id is None):
+        raise ValueError("screening_evidence_ids_required")
     if ai_status == "failed":
         safe_error_code = normalize_llm_terminal_safe_error_code(safe_error_code)
 
@@ -209,6 +213,10 @@ def route_llm_screening_terminal(
     }
     if score is not None:
         metadata["score"] = score
+    if evaluation_id is not None:
+        metadata["evaluation_id"] = str(evaluation_id)
+    if invocation_id is not None:
+        metadata["invocation_id"] = str(invocation_id)
     if safe_error_code is not None:
         metadata["safe_error_code"] = safe_error_code
     if not is_fail_open_retry:

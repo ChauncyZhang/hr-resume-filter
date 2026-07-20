@@ -372,6 +372,9 @@ def test_success_commits_running_before_provider_and_is_replay_safe(tmp_path):
         assert "sk-private" not in persisted and "Python backend role" not in persisted
         assert db.scalar(select(Application)).stage == "review"
         assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 1
+        audit = db.scalar(select(AuditLog).where(AuditLog.event_type == "screening.terminal_routed"))
+        assert audit.metadata_json["evaluation_id"] == str(evaluation.id)
+        assert audit.metadata_json["invocation_id"] == str(invocation.id)
 
 
 @pytest.mark.parametrize(
