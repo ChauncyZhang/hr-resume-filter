@@ -11,6 +11,7 @@ from server.app.identity.models import AuditLog,Job,User
 from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load_job,_principal,_problem_for
 from server.app.recruiting.authorization import RecruitingAction
 from server.app.recruiting.models import Application,Candidate,FileObject,IdempotencyRecord,JobJdVersion,Resume,ScreeningRuleVersion
+from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
 from server.app.recruiting.service import IdempotencyConflict,persisted_idempotent
 from server.app.screening.models import CandidateDuplicateHint,ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.llm.models import LlmProviderConfig,LlmScreeningEvaluation,PromptVersion
@@ -35,6 +36,19 @@ def _not_found(request): return _problem(request,404,"resource_not_found")
 _REVIEW_APPROVED_STAGES=("contact","interview_pending","interviewing","decision","passed","hired")
 _REVIEW_REJECTED_STAGES=("rejected","withdrawn")
 def _empty_review_progress(): return {"review_total_count":0,"reviewed_count":0,"review_pending_count":0,"review_approved_count":0,"review_rejected_count":0,"review_status":"not_applicable"}
+def _empty_route_summary(): return {"manager_review_count":0,"deferred_count":0,"ai_unavailable_count":0,"file_failed_count":0}
+def _route_summaries(db,organization_id,run_ids):
+    run_ids=list(run_ids)
+    if not run_ids: return {}
+    rows=db.execute(select(ScreeningItem.run_id,ScreeningItem.status,ScreeningItem.llm_status,ScreeningItem.llm_safe_error_code,Application.id,Application.stage).outerjoin(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id.in_(run_ids))).all()
+    summaries={run_id:_empty_route_summary() for run_id in run_ids}
+    for run_id,item_status,llm_status,llm_error_code,application_id,application_stage in rows:
+        summary=summaries[run_id]
+        if application_stage=="review": summary["manager_review_count"]+=1
+        if application_stage=="deferred": summary["deferred_count"]+=1
+        if application_id is not None and application_stage!="new" and llm_status in ("failed","skipped") and llm_error_code: summary["ai_unavailable_count"]+=1
+        if item_status=="failed": summary["file_failed_count"]+=1
+    return summaries
 def _review_progress(db,organization_id,run_ids):
     run_ids=list(run_ids)
     if not run_ids: return {}
@@ -46,17 +60,21 @@ def _review_progress(db,organization_id,run_ids):
         status="completed" if total and done>=total else "in_progress" if done else "pending" if total else "not_applicable"
         result[run_id]={"review_total_count":total,"reviewed_count":done,"review_pending_count":max(0,total-done),"review_approved_count":approved,"review_rejected_count":rejected,"review_status":status}
     return result
-def _run_data(run,error_summary=None,job_title=None,created_by_name=None,review_progress=None):
+def _run_data(run,error_summary=None,job_title=None,created_by_name=None,review_progress=None,route_summary=None):
     data={"id":str(run.id),"job_id":str(run.job_id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"source":run.source,"status":run.status,"total_count":run.total_count,"processed_count":run.processed_count,"succeeded_count":run.succeeded_count,"failed_count":run.failed_count,"version":run.version,"created_at":run.created_at.isoformat(),"error_summary":error_summary or {}}
     if job_title is not None: data["job_title"]=job_title
     if created_by_name is not None: data["created_by_name"]=created_by_name
     data.update(review_progress or _empty_review_progress())
+    data.update(route_summary or _empty_route_summary())
     return data
 def _item_data(item,file,application=None,evaluation=None,candidate=None,rule_result=None,llm_retryable=False):
-    llm_evaluation=None if evaluation is None else {"score":evaluation.score,"recommendation":evaluation.recommendation,"summary":evaluation.summary,"strengths":evaluation.strengths,"gaps":evaluation.gaps,"risks":evaluation.risks,"questions":evaluation.interview_questions}
+    llm_evaluation=None if evaluation is None else {"score":evaluation.score,"recommendation":evaluation.recommendation,"dimensions":list(evaluation.dimensions or []),"summary":evaluation.summary,"strengths":evaluation.strengths,"gaps":evaluation.gaps,"risks":evaluation.risks,"questions":evaluation.interview_questions}
     rule_data=None if rule_result is None or item.status!="scored" else {"score":rule_result.rule_score,"recommendation":rule_result.recommendation,"required_hits":rule_result.required_hits,"required_missing":rule_result.required_missing,"bonus_hits":rule_result.bonus_hits,"risks":rule_result.risks}
     human_reviewed=application is not None and (application.human_conclusion is not None or application.stage not in ("new","review"))
-    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"llm_retryable":llm_retryable,"candidate_id":str(candidate.id) if candidate else None,"candidate_name":candidate.display_name if candidate else None,"rule_result":rule_data,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"human_reviewed":human_reviewed,"llm_status":item.llm_status,"llm_error_code":item.llm_safe_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
+    route_result=application.stage if application is not None and application.stage in ("review","deferred") else None
+    ai_unavailable=evaluation is None and route_result=="review" and item.llm_status in ("failed","skipped") and item.llm_safe_error_code is not None
+    llm_error_code=normalize_llm_terminal_safe_error_code(item.llm_safe_error_code) if ai_unavailable else None
+    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"llm_retryable":llm_retryable,"candidate_id":str(candidate.id) if candidate else None,"candidate_name":candidate.display_name if candidate else None,"rule_result":rule_data,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"human_reviewed":human_reviewed,"route_result":route_result,"ai_score":evaluation.score if evaluation is not None else None,"ai_recommendation":evaluation.recommendation if evaluation is not None else "AI评分不可用" if ai_unavailable else None,"llm_status":item.llm_status,"llm_error_code":llm_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
 def _load_run(db,principal,run_id,action=RecruitingAction.READ,lock=False):
     query=select(ScreeningRun).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningRun.organization_id==principal.organization_id,ScreeningRun.id==run_id,_job_scope(principal,action))
     return db.scalar(query.with_for_update() if lock else query)
@@ -111,8 +129,8 @@ def list_runs(request:Request,cursor:str|None=None,limit:int=Query(50,ge=1,le=10
         rows=db.execute(query.order_by(ScreeningRun.created_at.desc(),ScreeningRun.id.desc()).limit(limit+1)).all(); next_cursor=None
         if len(rows)>limit:
             last=rows[limit-1][0]; next_cursor=request.app.state.recruiting_cursor.encode(str(principal.organization_id),cursor_sort,last.created_at.isoformat(),str(last.id)); rows=rows[:limit]
-        progress=_review_progress(db,principal.organization_id,(run.id for run,_,_ in rows))
-        response=JSONResponse({"data":[_run_data(run,job_title=job_title,created_by_name=creator_name,review_progress=progress.get(run.id)) for run,job_title,creator_name in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
+        run_ids=[run.id for run,_,_ in rows]; progress=_review_progress(db,principal.organization_id,run_ids); route_summaries=_route_summaries(db,principal.organization_id,run_ids)
+        response=JSONResponse({"data":[_run_data(run,job_title=job_title,created_by_name=creator_name,review_progress=progress.get(run.id),route_summary=route_summaries.get(run.id)) for run,job_title,creator_name in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
 
 @router.post("/screening-runs/{run_id}/items",response_model=ItemResource,status_code=201)
 def upload_item(run_id:UUID,request:Request,file:UploadFile=File(...),idempotency_key:str|None=Header(None)):
@@ -184,7 +202,8 @@ def get_run(run_id:UUID,request:Request):
         summary=dict(sorted(errors.items(),key=lambda item:(-item[1],item[0]))[:20])
         context=db.execute(select(Job.title,User.display_name).join(User,and_(User.organization_id==run.organization_id,User.id==run.created_by)).where(Job.organization_id==run.organization_id,Job.id==run.job_id)).one()
         progress=_review_progress(db,principal.organization_id,[run.id]).get(run.id)
-        return _response(_run_data(run,summary,context[0],context[1],progress))
+        route_summary=_route_summaries(db,principal.organization_id,[run.id]).get(run.id)
+        return _response(_run_data(run,summary,context[0],context[1],progress,route_summary))
 
 @router.post("/screening-items/{item_id}/retry",response_model=RetryResource)
 def retry_item(item_id:UUID,request:Request,idempotency_key:str|None=Header(None)):

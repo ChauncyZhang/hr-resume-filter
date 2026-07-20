@@ -20,10 +20,12 @@ from server.app.identity.service import InvalidSession
 from server.app.recruiting.cursor import CursorCodec, InvalidCursor
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import (
-    Application, ApplicationStageEvent, Candidate, CandidateContact, CandidateEvent, CandidateNote,
+    Application, ApplicationReviewTask, ApplicationStageEvent, Candidate, CandidateContact, CandidateEvent, CandidateNote,
     DownloadTicket, JobJdVersion, Resume, ScreeningRuleVersion,
 )
-from server.app.screening.models import ScreeningResult
+from server.app.screening.models import ScreeningItem, ScreeningResult
+from server.app.llm.models import LlmScreeningEvaluation
+from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
 from server.app.screening.rules import RuleSnapshotError,normalize_rule_content
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.http import content_disposition
@@ -310,6 +312,8 @@ def _candidate_data(db, candidate: Candidate, principal: Principal) -> dict[str,
 def _latest_screening_results(organization_id: UUID):
     return select(
         ScreeningResult.organization_id,
+        ScreeningResult.id.label("screening_result_id"),
+        ScreeningResult.item_id,
         ScreeningResult.application_id,
         ScreeningResult.rule_score,
         ScreeningResult.recommendation,
@@ -321,6 +325,44 @@ def _latest_screening_results(organization_id: UUID):
         ScreeningResult.organization_id == organization_id,
         ScreeningResult.application_id.is_not(None),
     ).subquery()
+
+
+def _latest_llm_evaluations(organization_id: UUID):
+    return select(
+        LlmScreeningEvaluation.organization_id,
+        LlmScreeningEvaluation.id.label("evaluation_id"),
+        LlmScreeningEvaluation.screening_result_id,
+        LlmScreeningEvaluation.score,
+        LlmScreeningEvaluation.recommendation,
+        LlmScreeningEvaluation.dimensions,
+        LlmScreeningEvaluation.summary,
+        LlmScreeningEvaluation.strengths,
+        LlmScreeningEvaluation.gaps,
+        LlmScreeningEvaluation.risks,
+        LlmScreeningEvaluation.interview_questions,
+        func.row_number().over(
+            partition_by=(LlmScreeningEvaluation.organization_id,LlmScreeningEvaluation.screening_result_id),
+            order_by=(LlmScreeningEvaluation.created_at.desc(),LlmScreeningEvaluation.id.desc()),
+        ).label("evaluation_rank"),
+    ).where(LlmScreeningEvaluation.organization_id==organization_id).subquery()
+
+
+def _screening_projections_for_applications(db,organization_id:UUID,application_ids:list[UUID]):
+    if not application_ids: return {}
+    latest_result=_latest_screening_results(organization_id); latest_evaluation=_latest_llm_evaluations(organization_id)
+    rows=db.execute(select(
+        Application.id,Application.stage,ScreeningItem.llm_status,ScreeningItem.llm_safe_error_code,
+        latest_evaluation.c.evaluation_id,latest_evaluation.c.score,latest_evaluation.c.recommendation,
+        latest_evaluation.c.dimensions,latest_evaluation.c.summary,latest_evaluation.c.strengths,
+        latest_evaluation.c.gaps,latest_evaluation.c.risks,latest_evaluation.c.interview_questions,
+    ).join(latest_result,and_(latest_result.c.organization_id==Application.organization_id,latest_result.c.application_id==Application.id,latest_result.c.result_rank==1)).join(ScreeningItem,and_(ScreeningItem.organization_id==Application.organization_id,ScreeningItem.id==latest_result.c.item_id)).outerjoin(latest_evaluation,and_(latest_evaluation.c.organization_id==Application.organization_id,latest_evaluation.c.screening_result_id==latest_result.c.screening_result_id,latest_evaluation.c.evaluation_rank==1)).where(Application.organization_id==organization_id,Application.id.in_(application_ids))).all()
+    projections={}
+    for row in rows:
+        route_result=row.stage if row.stage in ("review","deferred") else None
+        evaluation=None if row.evaluation_id is None else {"score":row.score,"recommendation":row.recommendation,"dimensions":list(row.dimensions or []),"summary":row.summary,"strengths":list(row.strengths or []),"gaps":list(row.gaps or []),"risks":list(row.risks or []),"questions":list(row.interview_questions or [])}
+        unavailable=evaluation is None and route_result=="review" and row.llm_status in ("failed","skipped") and row.llm_safe_error_code is not None
+        projections[row.id]={"route_result":route_result,"ai_score":row.score if evaluation is not None else None,"ai_recommendation":row.recommendation if evaluation is not None else "AI评分不可用" if unavailable else None,"llm_status":row.llm_status,"llm_error_code":normalize_llm_terminal_safe_error_code(row.llm_safe_error_code) if unavailable else None,"llm_evaluation":evaluation}
+    return projections
 
 
 def _candidate_application_summaries(db, organization_id: UUID, application_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
@@ -348,6 +390,7 @@ def _candidate_application_summaries(db, organization_id: UUID, application_ids:
         Application.organization_id == organization_id,
         Application.id.in_(application_ids),
     )).all()
+    projections=_screening_projections_for_applications(db,organization_id,application_ids)
     return {
         application.id: {
             "id": str(application.id),
@@ -363,6 +406,7 @@ def _candidate_application_summaries(db, organization_id: UUID, application_ids:
             "updated_at": application.updated_at.isoformat(),
             "rule_score": rule_score,
             "recommendation": recommendation,
+            **projections.get(application.id,{"route_result":None,"ai_score":None,"ai_recommendation":None,"llm_status":None,"llm_error_code":None,"llm_evaluation":None}),
         }
         for application, job_title, owner_name, rule_score, recommendation in rows
     }
@@ -605,10 +649,40 @@ def get_workbench(request: Request, response: Response):
                     else False
                 )
                 if row.stage in tasks and can_handle_task:
+                    if row.stage == "review":
+                        continue
                     task = tasks[row.stage]
                     task["count"] += 1
                     if len(task["items"]) < 5:
                         task["items"].append(item)
+
+            review_rows=db.execute(select(
+                ApplicationReviewTask.id.label("task_id"),
+                ApplicationReviewTask.ai_status,
+                Application.id.label("application_id"),Application.candidate_id,Application.job_id,
+                Application.source,literal("review").label("stage"),Application.updated_at,Candidate.display_name,Candidate.current_title,Candidate.location,
+                Job.hiring_owner_id,
+            ).join(Application,and_(Application.organization_id==ApplicationReviewTask.organization_id,Application.id==ApplicationReviewTask.application_id)).join(Candidate,and_(Candidate.organization_id==Application.organization_id,Candidate.id==Application.candidate_id)).join(Job,and_(Job.organization_id==Application.organization_id,Job.id==Application.job_id)).where(
+                ApplicationReviewTask.organization_id==principal.organization_id,
+                ApplicationReviewTask.assignee_id==principal.user_id,
+                ApplicationReviewTask.status=="open",
+                Application.stage=="review",
+                Application.job_id.in_(jobs_by_id),
+                Candidate.deleted_at.is_(None),
+                AUTH.job_predicate(principal,RecruitingAction.READ,Job),
+            ).order_by(Application.updated_at.desc(),ApplicationReviewTask.id.desc())).all()
+            review_task=tasks["review"]
+            review_task["count"]=len(review_rows)
+            for row in review_rows[:5]:
+                item=_workbench_candidate_data(row)
+                item.update({
+                    "stage":"review",
+                    "task_id":str(row.task_id),
+                    "ai_status":row.ai_status,
+                    "config_warning":row.hiring_owner_id is None,
+                    "candidate_link":f"/candidates/{row.candidate_id}?tab=evidence&application={row.application_id}&job={row.job_id}",
+                })
+                review_task["items"].append(item)
 
         return {
             "data": {
@@ -878,6 +952,7 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
         selected_application = aliased(Application)
         selected_job = aliased(Job)
         latest_result = _latest_screening_results(principal.organization_id)
+        latest_evaluation = _latest_llm_evaluations(principal.organization_id)
 
         def application_conditions(application, job, include_owner: bool):
             conditions = [
@@ -888,7 +963,7 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
             if stage: conditions.append(application.stage == stage)
             if include_owner and owner_id: conditions.append(application.owner_id == owner_id)
             if source: conditions.append(application.source == source)
-            if min_score is not None: conditions.append(latest_result.c.rule_score >= min_score)
+            if min_score is not None: conditions.append(latest_evaluation.c.score >= min_score)
             return conditions
 
         ranked_applications = select(
@@ -909,6 +984,13 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
                 latest_result.c.organization_id == selected_application.organization_id,
                 latest_result.c.application_id == selected_application.id,
                 latest_result.c.result_rank == 1,
+            ),
+        ).outerjoin(
+            latest_evaluation,
+            and_(
+                latest_evaluation.c.organization_id == selected_application.organization_id,
+                latest_evaluation.c.screening_result_id == latest_result.c.screening_result_id,
+                latest_evaluation.c.evaluation_rank == 1,
             ),
         ).where(*application_conditions(selected_application, selected_job, True)).subquery()
         sort_updated_at = func.coalesce(ranked_applications.c.application_updated_at, Candidate.updated_at)
@@ -962,6 +1044,13 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
                 latest_result.c.organization_id == facet_application.organization_id,
                 latest_result.c.application_id == facet_application.id,
                 latest_result.c.result_rank == 1,
+            ),
+        ).outerjoin(
+            latest_evaluation,
+            and_(
+                latest_evaluation.c.organization_id == facet_application.organization_id,
+                latest_evaluation.c.screening_result_id == latest_result.c.screening_result_id,
+                latest_evaluation.c.evaluation_rank == 1,
             ),
         ).where(
             *application_conditions(facet_application, facet_job, False),
@@ -1256,7 +1345,9 @@ def applications(candidate_id: UUID, request: Request):
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate(db, principal, candidate_id) is None: return _denied(request)
         rows = db.execute(select(Application, Job.title).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.candidate_id == candidate_id, _job_scope(principal)).order_by(Application.created_at.desc())).all()
-        return {"data": [{**_application_data(application), "job_title": job_title} for application, job_title in rows], "meta": {"count": len(rows)}}
+        projections=_screening_projections_for_applications(db,principal.organization_id,[application.id for application,_ in rows])
+        empty={"route_result":None,"ai_score":None,"ai_recommendation":None,"llm_status":None,"llm_error_code":None,"llm_evaluation":None}
+        return {"data": [{**_application_data(application), "job_title": job_title,**projections.get(application.id,empty)} for application, job_title in rows], "meta": {"count": len(rows)}}
 
 
 @router.post("/jobs/{job_id}/applications", status_code=201, response_model=ApplicationResource)

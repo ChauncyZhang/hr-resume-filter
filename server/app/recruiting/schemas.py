@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from server.app.screening.rules import MAX_JD_TEXT_CHARS,MAX_RULE_TERM_CHARS,MAX_RULE_TERMS
+from server.app.screening.schemas import LlmEvaluationOut
 
 
 class ApiModel(BaseModel):
@@ -156,6 +157,12 @@ class CandidateApplicationSummaryOut(ApiModel):
     updated_at: str
     rule_score: int | None
     recommendation: str | None
+    route_result: Literal["review", "deferred"] | None
+    ai_score: int | None
+    ai_recommendation: str | None
+    llm_status: str | None
+    llm_error_code: str | None
+    llm_evaluation: LlmEvaluationOut | None
 
 
 class CandidateListOut(CandidateOut):
@@ -178,6 +185,12 @@ class ApplicationOut(ApiModel):
 
 class ApplicationHistoryOut(ApplicationOut):
     job_title: str
+    route_result: Literal["review", "deferred"] | None
+    ai_score: int | None
+    ai_recommendation: str | None
+    llm_status: str | None
+    llm_error_code: str | None
+    llm_evaluation: LlmEvaluationOut | None
 
 
 class VersionOut(ApiModel):
@@ -254,6 +267,18 @@ class WorkbenchStageOut(ApiModel):
     items: list[WorkbenchCandidateOut] = Field(max_length=5)
 
 
+class WorkbenchReviewTaskOut(WorkbenchCandidateOut):
+    task_id: str
+    ai_status: Literal["succeeded", "failed"]
+    config_warning: bool
+    candidate_link: str
+
+
+class WorkbenchReviewStageOut(ApiModel):
+    count: int = Field(ge=0)
+    items: list[WorkbenchReviewTaskOut] = Field(max_length=5)
+
+
 class WorkbenchStagesOut(ApiModel):
     new: WorkbenchStageOut
     review: WorkbenchStageOut
@@ -275,7 +300,7 @@ class WorkbenchJobOut(ApiModel):
 
 
 class WorkbenchTasksOut(ApiModel):
-    review: WorkbenchStageOut
+    review: WorkbenchReviewStageOut
     interview_pending: WorkbenchStageOut
     decision: WorkbenchStageOut
     passed: WorkbenchStageOut

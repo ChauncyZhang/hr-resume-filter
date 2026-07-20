@@ -11,11 +11,12 @@ from sqlalchemy.exc import IntegrityError
 
 from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
-from server.app.identity.models import AuditLog, Job, User, UserStatus
+from server.app.identity.models import AuditLog, Job, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, Resume
+from server.app.recruiting.tasks import ensure_review_task
 from server.app.recruiting.service import (
     ActiveApplicationExists,
     CandidateUnavailable,
@@ -33,6 +34,7 @@ from server.app.talent.schemas import (
     PoolCreate,
     PoolPatch,
     ReactivationInput,
+    ReviewReferralInput,
 )
 
 
@@ -41,6 +43,14 @@ AUTH = RecruitingAuthorizationService()
 ETAG = re.compile(r'^"(0|[1-9][0-9]*)"$')
 TERMINAL_APPLICATION_STAGES = frozenset({"hired", "rejected", "withdrawn"})
 TALENT_ROLES = frozenset({"recruiting_admin", "recruiter"})
+
+
+class ReviewReferralUnavailable(Exception):
+    pass
+
+
+class ReviewReferralVersionConflict(Exception):
+    pass
 
 
 def _principal(request: Request) -> Principal | JSONResponse:
@@ -764,3 +774,55 @@ def reactivate_talent_pool_membership(membership_id: UUID, payload: Reactivation
         response.headers["ETag"] = f'"{body["data"]["version"]}"'
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+@router.post("/talent-pool-memberships/{membership_id}/review-referrals", response_model=DataResource)
+def refer_deferred_membership_to_review(
+    membership_id: UUID,
+    payload: ReviewReferralInput,
+    request: Request,
+    if_match: str | None = Header(None, alias="If-Match"),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
+):
+    principal=_principal(request); expected=_expected_version(request,if_match); key=_idempotency(request,idempotency_key)
+    if isinstance(principal,JSONResponse): return principal
+    if isinstance(expected,JSONResponse): return expected
+    if isinstance(key,JSONResponse): return key
+    operation="talent_pool.review_referral"
+    fingerprint={"membership_id":membership_id,"expected_version":expected,**payload.model_dump()}
+    with request.app.state.identity_store.sync_session() as db:
+        def action():
+            visible=_load_membership(db,principal,membership_id,manage=True)
+            if visible is None: raise ReviewReferralUnavailable
+            try:
+                candidate=lock_active_candidate(db,principal.organization_id,visible.candidate_id)
+            except CandidateUnavailable as error:
+                raise ReviewReferralUnavailable from error
+            membership=_load_membership(db,principal,membership_id,manage=True,for_update=True)
+            if membership is None or membership.candidate_id!=candidate.id or membership.status!="active" or membership.source_application_id is None:
+                raise ReviewReferralUnavailable
+            if membership.version!=expected: raise ReviewReferralVersionConflict
+            source=db.scalar(select(Application).where(Application.organization_id==principal.organization_id,Application.id==membership.source_application_id,Application.candidate_id==candidate.id).with_for_update())
+            if source is None or source.stage!="deferred": raise ReviewReferralUnavailable
+            job=db.scalar(select(Job).where(Job.organization_id==principal.organization_id,Job.id==source.job_id,Job.status=="open",AUTH.job_predicate(principal,RecruitingAction.TRANSITION,Job)).with_for_update())
+            if job is None: raise ReviewReferralUnavailable
+            assignee_id=job.hiring_owner_id or job.owner_id
+            if _active_user(db,principal.organization_id,assignee_id) is None: raise ReviewReferralUnavailable
+            if job.hiring_owner_id is not None and not db.scalar(select(exists().where(UserRole.user_id==assignee_id,UserRole.role=="hiring_manager"))): raise ReviewReferralUnavailable
+            source.stage="review"; source.version+=1; source.updated_at=datetime.now(timezone.utc)
+            event_payload={"membership_id":str(membership.id),"pool_id":str(membership.pool_id),"from_stage":"deferred","to_stage":"review"}
+            db.add(ApplicationStageEvent(organization_id=principal.organization_id,application_id=source.id,actor_user_id=principal.user_id,event_type="application.stage_changed",payload=event_payload))
+            db.add(AuditLog(organization_id=principal.organization_id,actor_user_id=principal.user_id,event_type="talent_pool.review_referred",outcome="success",trace_id=request.state.trace_id,metadata_json={"membership_id":str(membership.id),"application_id":str(source.id)}))
+            ensure_review_task(db,application=source,job=job,ai_status="succeeded")
+            db.flush(); recalculate_candidate_retention(db,principal.organization_id,candidate.id)
+            return 200,{"data":{"application":_application_data(source),"membership":_membership_data(db,principal,membership)}}
+        try:
+            status,body=persisted_idempotent(db,principal.organization_id,principal.user_id,operation,key,fingerprint,action)
+            db.commit()
+        except ReviewReferralVersionConflict:
+            db.rollback(); return problem(request,409,"version_conflict","The resource version changed.")
+        except ReviewReferralUnavailable:
+            db.rollback(); return _denied(request)
+        except IdempotencyConflict:
+            db.rollback(); return problem(request,409,"idempotency_conflict","The idempotency key was already used.")
+        response=JSONResponse(body,status_code=status); response.headers["ETag"]=f'"{body["data"]["membership"]["version"]}"'; response.headers["Cache-Control"]="no-store"; return response

@@ -135,6 +135,10 @@ class ReactivationInput(StrictModel):
     resume_id: UUID | None = None
 
 
+class ReviewReferralInput(StrictModel):
+    pass
+
+
 class DataResource(BaseModel):
     data: dict[str, Any]
 

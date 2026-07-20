@@ -10,6 +10,7 @@ from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting.models import (
     Application,
+    ApplicationReviewTask,
     ApplicationStageEvent,
     CandidateContact,
     CandidateEvent,
@@ -107,8 +108,66 @@ def test_talent_openapi_registers_phase_5_pool_contract(tmp_path) -> None:
         "/api/v1/talent-pools/{pool_id}/memberships": {"get", "post"},
         "/api/v1/talent-pool-memberships/{membership_id}": {"patch", "delete"},
         "/api/v1/talent-pool-memberships/{membership_id}/reactivations": {"post"},
+        "/api/v1/talent-pool-memberships/{membership_id}/review-referrals": {"post"},
     }
     assert {path: set(paths.get(path, {})) for path in expected} == expected
+
+
+def test_deferred_membership_referral_reuses_application_and_is_idempotent(tmp_path) -> None:
+    app=make_app(tmp_path); seed=seed_application(app)
+    with app.state.identity_store.sync_session() as db:
+        source=db.get(Application,seed["application_id"]); source.stage="deferred"; source.version=1
+        job=db.get(Job,source.job_id); job.status="open"; job.hiring_owner_id=None
+        db.commit()
+    with TestClient(app) as client:
+        headers,_,membership=create_pool_and_membership(client,seed); membership_id=membership.json()["data"]["id"]
+        request_headers={**headers,"Idempotency-Key":"referral-1","If-Match":'"1"'}
+        first=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers=request_headers)
+        replay=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers=request_headers)
+        changed_precondition=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers={**headers,"Idempotency-Key":"referral-1","If-Match":'"2"'})
+
+    assert first.status_code==replay.status_code==200
+    assert first.json()==replay.json()
+    assert changed_precondition.status_code==409 and changed_precondition.json()["code"]=="idempotency_conflict"
+    assert first.json()["data"]["application"]["id"]==str(seed["application_id"])
+    assert first.json()["data"]["application"]["stage"]=="review"
+    assert first.json()["data"]["membership"]["id"]==membership_id
+    with app.state.identity_store.sync_session() as db:
+        source=db.get(Application,seed["application_id"])
+        membership_row=db.get(TalentPoolMembership,UUID(membership_id))
+        task=db.scalar(select(ApplicationReviewTask).where(ApplicationReviewTask.application_id==source.id,ApplicationReviewTask.status=="open"))
+        assert source.stage=="review" and source.version==2
+        assert membership_row is not None and membership_row.status=="active"
+        assert task is not None and task.assignee_id==seed["admin_id"]
+        assert db.query(ApplicationStageEvent).filter_by(application_id=source.id,event_type="application.stage_changed").count()==1
+        assert db.query(AuditLog).filter_by(event_type="talent_pool.review_referred").count()==1
+        assert db.query(IdempotencyRecord).filter_by(operation="talent_pool.review_referral").count()==1
+
+
+def test_deferred_membership_referral_requires_version_deferred_stage_and_open_job(tmp_path) -> None:
+    app=make_app(tmp_path); seed=seed_application(app)
+    with app.state.identity_store.sync_session() as db:
+        source=db.get(Application,seed["application_id"]); source.stage="deferred"
+        job=db.get(Job,source.job_id); job.status="open"; db.commit()
+    with app.state.identity_store.sync_session() as db:
+        other=Organization(slug="other",name="Other",status="active")
+        other_admin=User(organization=other,email="other-admin@example.test",normalized_email="other-admin@example.test",display_name="Other Admin",password_hash=PasswordService().hash("correct horse")); other_admin.roles.append(UserRole(role="recruiting_admin")); db.add(other_admin); db.commit()
+    with TestClient(app) as client:
+        headers,_,membership=create_pool_and_membership(client,seed); membership_id=membership.json()["data"]["id"]
+        missing=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers={**headers,"Idempotency-Key":"missing-version"})
+        stale=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers={**headers,"Idempotency-Key":"stale-version","If-Match":'"2"'})
+        with app.state.identity_store.sync_session() as db:
+            db.get(Job,seed["job_id"]).status="closed"; db.commit()
+        closed=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers={**headers,"Idempotency-Key":"closed-job","If-Match":'"1"'})
+        client.post("/api/v1/auth/logout",headers=headers)
+        authenticated=client.post("/api/v1/auth/login",json={"organization_slug":"other","email":"other-admin@example.test","password":"correct horse"},headers={"Origin":"https://hr.example.test"})
+        other_headers={"Origin":"https://hr.example.test","X-CSRF-Token":authenticated.headers["X-CSRF-Token"],"Idempotency-Key":"cross-tenant","If-Match":'"1"'}
+        cross_tenant=client.post(f"/api/v1/talent-pool-memberships/{membership_id}/review-referrals",json={},headers=other_headers)
+    assert missing.status_code==428 and missing.json()["code"]=="precondition_required"
+    assert stale.status_code==409 and stale.json()["code"]=="version_conflict"
+    assert closed.status_code==404 and closed.json()["code"]=="resource_not_found"
+    assert cross_tenant.status_code==404 and cross_tenant.json()["code"]=="resource_not_found"
+    assert str(seed["application_id"]) not in cross_tenant.text
 
 
 def test_only_named_active_application_constraint_is_translated() -> None:

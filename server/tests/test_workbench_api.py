@@ -19,7 +19,7 @@ from server.app.identity.policy import Principal
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
 from server.app.recruiting import api as recruiting_api
-from server.app.recruiting.models import Application, Candidate, FileObject, Resume
+from server.app.recruiting.models import Application, ApplicationReviewTask, Candidate, FileObject, Resume
 
 
 class Probe:
@@ -226,7 +226,7 @@ def test_workbench_contract_filters_terminal_rows_and_caps_newest_items(tmp_path
         "pending_feedback": [],
     }
     assert list(body["data"]["tasks"]) == ["review", "interview_pending", "decision", "passed"]
-    assert body["data"]["tasks"]["review"]["count"] == 1
+    assert body["data"]["tasks"]["review"]["count"] == 0
     assert body["data"]["tasks"]["interview_pending"]["count"] == 1
     assert body["data"]["tasks"]["decision"]["count"] == 1
     assert body["data"]["tasks"]["passed"]["count"] == 1
@@ -258,6 +258,45 @@ def test_workbench_empty_state_is_stable(tmp_path, monkeypatch) -> None:
     }
 
 
+def test_workbench_review_tasks_are_persisted_open_and_principal_assigned(tmp_path, monkeypatch) -> None:
+    app = make_app(tmp_path)
+    base = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        organization = Organization(slug="acme", name="Acme", status="active")
+        manager = seed_user(db, organization, "hiring_manager", "manager@example.test")
+        other = seed_user(db, organization, "hiring_manager", "other@example.test")
+        owner = seed_user(db, organization, "recruiting_admin", "owner@example.test")
+        job = Job(organization_id=organization.id, title="LLM Job", owner_id=owner.id, hiring_owner_id=manager.id, status="open", updated_at=base)
+        db.add(job); db.flush()
+        db.add(JobCollaborator(organization_id=organization.id,job_id=job.id,user_id=manager.id,access_role="job_manager"))
+        assigned=seed_application(db,job,owner,1,"review",base+timedelta(hours=3))
+        inferred_only=seed_application(db,job,owner,2,"review",base+timedelta(hours=2))
+        wrong_assignee=seed_application(db,job,owner,3,"review",base+timedelta(hours=1))
+        closed=seed_application(db,job,owner,4,"review",base)
+        tasks=[
+            ApplicationReviewTask(organization_id=organization.id,application_id=assigned.id,assignee_id=manager.id,status="open",ai_status="failed",safe_error_code="provider_unavailable"),
+            ApplicationReviewTask(organization_id=organization.id,application_id=wrong_assignee.id,assignee_id=other.id,status="open",ai_status="succeeded"),
+            ApplicationReviewTask(organization_id=organization.id,application_id=closed.id,assignee_id=manager.id,status="closed",ai_status="succeeded",closed_at=base),
+        ]
+        db.add_all(tasks); db.commit(); manager_principal=principal(manager)
+
+    monkeypatch.setattr(recruiting_api,"_principal",lambda request: manager_principal)
+    with TestClient(app) as client:
+        response=client.get("/api/v1/workbench")
+
+    review=response.json()["data"]["tasks"]["review"]
+    assert review["count"]==1
+    assert review["items"]==[{
+        "application_id":str(assigned.id),"candidate_id":str(assigned.candidate_id),"job_id":str(job.id),
+        "display_name":"Candidate 1","current_title":"Title 1","location":"Location 1","source":"source-1",
+        "stage":"review","updated_at":(base+timedelta(hours=3)).replace(tzinfo=None).isoformat(),"task_id":str(tasks[0].id),
+        "ai_status":"failed","config_warning":False,
+        "candidate_link":f"/candidates/{assigned.candidate_id}?tab=evidence&application={assigned.id}&job={job.id}",
+    }]
+    assert "provider_unavailable" not in response.text
+    assert str(inferred_only.id) not in str(review)
+
+
 @pytest.mark.parametrize("role", ["system_admin", "interviewer", "unknown"])
 def test_workbench_requires_recruiting_read_role(tmp_path, monkeypatch, role) -> None:
     app = make_app(tmp_path)
@@ -285,7 +324,7 @@ def test_workbench_requires_authentication(tmp_path) -> None:
 
 @pytest.mark.parametrize(
     ("role", "access_role", "expected_review_tasks"),
-    [("recruiter", "job_recruiter", 0), ("hiring_manager", "job_manager", 1)],
+    [("recruiter", "job_recruiter", 0), ("hiring_manager", "job_manager", 0)],
 )
 def test_workbench_is_collaborator_scoped_and_cross_tenant_non_disclosing(
     tmp_path, monkeypatch, role, access_role, expected_review_tasks
@@ -366,7 +405,7 @@ def test_workbench_query_count_is_bounded(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 200
     selects = [statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]
-    assert len(selects) <= 2
+    assert len(selects) <= 3
 
 
 def test_workbench_openapi_enforces_bounded_non_sensitive_contract(tmp_path) -> None:

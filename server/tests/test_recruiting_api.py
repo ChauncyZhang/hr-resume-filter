@@ -14,6 +14,7 @@ from server.app.identity.models import Department, Organization, User, UserRole,
 from server.app.identity.policy import Principal
 from server.app.identity.security import PasswordService
 from server.app.main import create_app
+from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.recruiting import api as recruiting_api
 from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, CandidateEvent, CandidateNote, DownloadTicket, FileObject, IdempotencyRecord, JobJdVersion, Resume, ScreeningRuleVersion
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
@@ -118,8 +119,9 @@ def seed_screening_results(db, application, file_id, actor_id, results):
     db.add(run); db.flush()
     item = ScreeningItem(organization_id=application.organization_id, run_id=run.id, file_object_id=file_id, candidate_id=application.candidate_id, resume_id=application.resume_id, application_id=application.id, status="scored", attempts=1)
     db.add(item); db.flush()
+    stored_results=[]
     for engine, score, recommendation, created_at in results:
-        db.add(ScreeningResult(
+        result=ScreeningResult(
             organization_id=application.organization_id,
             item_id=item.id,
             application_id=application.id,
@@ -134,7 +136,29 @@ def seed_screening_results(db, application, file_id, actor_id, results):
             risks=[],
             questions=[],
             created_at=created_at,
-        ))
+        )
+        db.add(result); stored_results.append(result)
+    db.flush()
+    return item,stored_results
+
+
+def seed_llm_evaluation(db, application, actor_id, result, score, recommendation, created_at):
+    item=db.get(ScreeningItem,result.item_id); item.llm_status="succeeded"; item.llm_attempts=1
+    prompt=PromptVersion(organization_id=application.organization_id,name=f"screening-{result.id}",version_number=2,content={"system":"private prompt"},content_hash=hashlib.sha256(str(result.id).encode()).hexdigest(),created_by=actor_id)
+    config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==application.organization_id))
+    if config is None:
+        config=LlmProviderConfig(organization_id=application.organization_id,provider_id="approved",model="model",encrypted_api_key=b"private-key",enabled=True,allowed_job_ids=[],version=1,created_by=actor_id,updated_by=actor_id)
+    db.add_all([prompt,config]); db.flush()
+    invocation=LlmInvocation(organization_id=application.organization_id,config_id=config.id,prompt_version_id=prompt.id,screening_result_id=result.id,provider_id=config.provider_id,model=config.model,request_field_manifest=["job_description","resume_text"],status="succeeded",usage={})
+    db.add(invocation); db.flush()
+    remaining=score; values=[]
+    for maximum in (40,25,15,10,10):
+        value=min(maximum,remaining); values.append(value); remaining-=value
+    evaluation=LlmScreeningEvaluation(organization_id=application.organization_id,screening_result_id=result.id,invocation_id=invocation.id,prompt_version_id=prompt.id,score=score,recommendation=recommendation,dimensions=[
+        {"key":key,"score":value,"evidence":[f"evidence-{key}"],"gaps":[]}
+        for key,value in zip(("core_capability","experience_depth","role_seniority","transferability","explicit_constraints"),values)
+    ],summary="persisted summary",strengths=["persisted strength"],gaps=["persisted gap"],risks=["persisted risk"],interview_questions=["persisted question"],created_at=created_at)
+    db.add(evaluation); db.flush(); return evaluation
 
 
 def seed_same_candidate_cross_job(app, recruiter_id):
@@ -936,11 +960,13 @@ def test_candidate_list_returns_selected_application_and_latest_screening_result
         matching = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=matching_job.id, resume_id=matching_resume.id, owner_id=first_owner_id, stage="review", source="upload", updated_at=base)
         newer = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=newer_job.id, resume_id=newer_resume.id, owner_id=second_owner_id, stage="new", source="manual", updated_at=base + timedelta(hours=1))
         db.add_all([matching, newer]); db.flush()
-        seed_screening_results(db, matching, matching_file.id, admin_id, [
+        _,matching_results=seed_screening_results(db, matching, matching_file.id, admin_id, [
             ("rule-old", 95, "优先沟通", base),
             ("rule-latest", 81, "可沟通", base + timedelta(minutes=1)),
         ])
-        seed_screening_results(db, newer, newer_file.id, admin_id, [("rule-newer", 60, "暂缓", base)])
+        _,newer_results=seed_screening_results(db, newer, newer_file.id, admin_id, [("rule-newer", 60, "暂缓", base)])
+        seed_llm_evaluation(db,matching,admin_id,matching_results[-1],72,"建议评审",base+timedelta(minutes=2))
+        seed_llm_evaluation(db,newer,admin_id,newer_results[-1],91,"优先评审",base+timedelta(minutes=2))
         db.commit()
         ids = {
             "candidate": str(candidate.id),
@@ -956,10 +982,11 @@ def test_candidate_list_returns_selected_application_and_latest_screening_result
         unfiltered = client.get("/api/v1/candidates")
         filtered = client.get(
             "/api/v1/candidates",
-            params={"job_id": ids["matching_job"], "stage": "review", "source": "upload", "owner_id": ids["first_owner"], "min_score": 80},
+            params={"job_id": ids["matching_job"], "stage": "review", "source": "upload", "owner_id": ids["first_owner"], "min_score": 70},
         )
-        above_latest = client.get("/api/v1/candidates", params={"job_id": ids["matching_job"], "min_score": 90})
+        above_latest = client.get("/api/v1/candidates", params={"job_id": ids["matching_job"], "min_score": 80})
         owner_filtered = client.get("/api/v1/candidates", params={"owner_id": ids["first_owner"], "limit": 1})
+        history = client.get(f"/api/v1/candidates/{ids['candidate']}/applications")
 
     assert unfiltered.status_code == filtered.status_code == above_latest.status_code == 200
     assert unfiltered.json()["data"][0]["application"]["id"] == ids["newer_application"]
@@ -979,6 +1006,15 @@ def test_candidate_list_returns_selected_application_and_latest_screening_result
             "updated_at": base.replace(tzinfo=None).isoformat(),
             "rule_score": 81,
             "recommendation": "可沟通",
+            "route_result": "review",
+            "ai_score": 72,
+            "ai_recommendation": "建议评审",
+            "llm_status": "succeeded",
+            "llm_error_code": None,
+            "llm_evaluation": {
+                "score":72,"recommendation":"建议评审","dimensions":filtered.json()["data"][0]["application"]["llm_evaluation"]["dimensions"],
+                "summary":"persisted summary","strengths":["persisted strength"],"gaps":["persisted gap"],"risks":["persisted risk"],"questions":["persisted question"],
+            },
         },
     }]
     assert filtered.json()["data"][0]["id"] == ids["candidate"]
@@ -988,6 +1024,10 @@ def test_candidate_list_returns_selected_application_and_latest_screening_result
         {"id": ids["first_owner"], "name": "First Owner"},
         {"id": str(second_owner_id), "name": "Second Owner"},
     ]
+    matching_history=next(row for row in history.json()["data"] if row["id"]==ids["matching_application"])
+    assert matching_history["ai_score"]==72
+    assert matching_history["llm_evaluation"]["dimensions"]==filtered.json()["data"][0]["application"]["llm_evaluation"]["dimensions"]
+    assert "private prompt" not in history.text and "private-key" not in history.text
 
 
 def test_candidate_list_never_selects_or_filters_on_unauthorized_applications(tmp_path) -> None:
@@ -1048,7 +1088,8 @@ def test_candidate_list_min_score_excludes_missing_results_and_validates_range(t
         scored_app = Application(organization_id=admin.organization_id, candidate_id=scored.id, job_id=job.id, resume_id=scored_resume.id, owner_id=admin_id)
         missing_app = Application(organization_id=admin.organization_id, candidate_id=missing.id, job_id=job.id, resume_id=missing_resume.id, owner_id=admin_id, stage="rejected")
         db.add_all([scored_app, missing_app]); db.flush()
-        seed_screening_results(db, scored_app, scored_file.id, admin_id, [("scored", 0, "暂缓", datetime(2026, 3, 1, tzinfo=timezone.utc))])
+        _,results=seed_screening_results(db, scored_app, scored_file.id, admin_id, [("scored", 0, "暂缓", datetime(2026, 3, 1, tzinfo=timezone.utc))])
+        seed_llm_evaluation(db,scored_app,admin_id,results[-1],65,"建议评审",datetime(2026,3,1,0,1,tzinfo=timezone.utc))
         db.commit()
         scored_id, missing_id = str(scored.id), str(missing.id)
 
@@ -1056,6 +1097,7 @@ def test_candidate_list_min_score_excludes_missing_results_and_validates_range(t
         login(client, "score-list@example.test")
         unfiltered = client.get("/api/v1/candidates")
         minimum = client.get("/api/v1/candidates", params={"min_score": 0})
+        llm_minimum = client.get("/api/v1/candidates", params={"min_score": 60})
         below = client.get("/api/v1/candidates", params={"min_score": -1})
         above = client.get("/api/v1/candidates", params={"min_score": 101})
 
@@ -1063,8 +1105,34 @@ def test_candidate_list_min_score_excludes_missing_results_and_validates_range(t
     assert rows[missing_id]["application"]["rule_score"] is None
     assert rows[missing_id]["application"]["recommendation"] is None
     assert [row["id"] for row in minimum.json()["data"]] == [scored_id]
+    assert [row["id"] for row in llm_minimum.json()["data"]] == [scored_id]
+    assert llm_minimum.json()["data"][0]["application"]["rule_score"]==0
+    assert llm_minimum.json()["data"][0]["application"]["ai_score"]==65
     assert below.status_code == above.status_code == 422
     assert below.json()["code"] == above.json()["code"] == "validation_failed"
+
+
+def test_candidate_list_and_detail_project_safe_final_ai_failure(tmp_path) -> None:
+    app=make_app(tmp_path); admin_id=seed_user(app,"recruiting_admin","failed-list@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin=db.get(User,admin_id); job=Job(organization_id=admin.organization_id,title="Failed AI",owner_id=admin_id)
+        candidate=Candidate(organization_id=admin.organization_id,display_name="Failed AI Candidate")
+        file=FileObject(organization_id=admin.organization_id,storage_key="private/failed-ai",original_filename="failed.pdf",mime_type="application/pdf",size_bytes=1,sha256="9"*64,uploaded_by=admin_id)
+        db.add_all([job,candidate,file]); db.flush(); resume=Resume(organization_id=admin.organization_id,candidate_id=candidate.id,file_object_id=file.id,version_number=1); db.add(resume); db.flush()
+        application=Application(organization_id=admin.organization_id,candidate_id=candidate.id,job_id=job.id,resume_id=resume.id,owner_id=admin_id,stage="review"); db.add(application); db.flush()
+        item,results=seed_screening_results(db,application,file.id,admin_id,[("legacy",99,"优先沟通",datetime(2026,4,1,tzinfo=timezone.utc))])
+        item.llm_status="failed"; item.llm_safe_error_code="candidate_alice_provider_body"; item.llm_attempts=3; db.commit(); candidate_id=str(candidate.id)
+    with TestClient(app) as client:
+        login(client,"failed-list@example.test")
+        listing=client.get("/api/v1/candidates")
+        history=client.get(f"/api/v1/candidates/{candidate_id}/applications")
+    for projection in (listing.json()["data"][0]["application"],history.json()["data"][0]):
+        assert projection["route_result"]=="review"
+        assert projection["ai_score"] is None
+        assert projection["ai_recommendation"]=="AI评分不可用"
+        assert projection["llm_evaluation"] is None
+        assert projection["llm_error_code"]=="internal_error"
+    assert "candidate_alice_provider_body" not in listing.text+history.text
 
 
 def test_candidate_list_searches_profile_and_contact_fields(tmp_path) -> None:

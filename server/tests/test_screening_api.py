@@ -118,6 +118,101 @@ def enrich_item(db,item_id,name,*,score=81,recommendation="可沟通",created_at
     db.add(result); db.commit()
     return candidate,result
 
+def add_llm_evaluation(db,item,result,*,score=72,recommendation="建议评审",created_at=None):
+    run=db.get(ScreeningRun,item.run_id)
+    prompt=PromptVersion(organization_id=item.organization_id,name=f"screening-{uuid.uuid4()}",version_number=2,content={"system":"private prompt"},content_hash=uuid.uuid4().hex*2,created_by=run.created_by)
+    config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==item.organization_id))
+    if config is None: config=LlmProviderConfig(organization_id=item.organization_id,provider_id="approved",model="model",encrypted_api_key=b"private-key",enabled=True,allowed_job_ids=[],version=1,created_by=run.created_by,updated_by=run.created_by)
+    db.add_all([prompt,config]); db.flush()
+    invocation=LlmInvocation(organization_id=item.organization_id,config_id=config.id,prompt_version_id=prompt.id,screening_result_id=result.id,provider_id=config.provider_id,model=config.model,request_field_manifest=["job_description","resume_text"],status="succeeded",usage={})
+    db.add(invocation); db.flush()
+    remaining=score; values=[]
+    for maximum in (40,25,15,10,10): value=min(maximum,remaining); values.append(value); remaining-=value
+    evaluation=LlmScreeningEvaluation(organization_id=item.organization_id,screening_result_id=result.id,invocation_id=invocation.id,prompt_version_id=prompt.id,score=score,recommendation=recommendation,dimensions=[
+        {"key":key,"score":value,"evidence":["Python"],"gaps":[]}
+        for key,value in zip(("core_capability","experience_depth","role_seniority","transferability","explicit_constraints"),values)
+    ],summary="适合进入用人经理评审",strengths=["Python"],gaps=["团队规模"],risks=["到岗时间"],interview_questions=["请介绍 RAG 项目"])
+    if created_at is not None: evaluation.created_at=created_at
+    db.add(evaluation); db.flush()
+    return evaluation
+
+def test_screening_item_projects_latest_persisted_llm_route_and_dimensions(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"llm-run"}).json()["data"]
+        uploaded=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("llm.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":"llm-item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            candidate,result=enrich_item(db,uploaded["id"],"LLM Candidate",score=99,recommendation="优先沟通")
+            item=db.get(ScreeningItem,uuid.UUID(uploaded["id"])); aggregate=db.get(ScreeningRun,item.run_id)
+            resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1,parsed_text="private resume")
+            db.add(resume); db.flush()
+            application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="review",source="screening")
+            db.add(application); db.flush(); item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id
+            item.llm_status="succeeded"; item.llm_attempts=1
+            add_llm_evaluation(db,item,result,score=65,recommendation="建议评审",created_at=datetime.now(timezone.utc)-timedelta(minutes=1))
+            add_llm_evaluation(db,item,result,created_at=datetime.now(timezone.utc))
+            db.commit()
+        response=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers)
+
+    body=response.json()["data"][0]
+    assert body["route_result"]=="review"
+    assert body["ai_score"]==72
+    assert body["ai_recommendation"]=="建议评审"
+    assert body["llm_evaluation"]["recommendation"]=="建议评审"
+    assert len(body["llm_evaluation"]["dimensions"])==5
+    assert body["rule_result"]["score"]==99
+
+def test_screening_final_ai_failure_has_no_synthetic_evaluation_or_private_error(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"failed-run"}).json()["data"]
+        uploaded=client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":("failed.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":"failed-item"}).json()["data"]
+        with app.state.identity_store.sync_session() as db:
+            candidate,result=enrich_item(db,uploaded["id"],"Failed LLM Candidate")
+            item=db.get(ScreeningItem,uuid.UUID(uploaded["id"])); aggregate=db.get(ScreeningRun,item.run_id)
+            resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1)
+            db.add(resume); db.flush()
+            application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="review",source="screening")
+            db.add(application); db.flush(); item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id
+            item.llm_status="failed"; item.llm_safe_error_code="provider_unavailable"; item.llm_attempts=3
+            db.commit()
+        response=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers)
+
+    body=response.json()["data"][0]
+    assert body["route_result"]=="review"
+    assert body["ai_score"] is None
+    assert body["ai_recommendation"]=="AI评分不可用"
+    assert body["llm_evaluation"] is None
+    assert body["llm_error_code"]=="provider_unavailable"
+    assert "private" not in response.text.casefold()
+
+def test_screening_run_summary_counts_terminal_routes_without_rule_recommendations(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"summary-run"}).json()["data"]
+        uploaded=[client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"{name}.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":name}).json()["data"] for name in ("review","deferred","file-failed")]
+        with app.state.identity_store.sync_session() as db:
+            for index,stage in enumerate(("review","deferred")):
+                candidate,result=enrich_item(db,uploaded[index]["id"],f"Candidate {stage}",score=100 if stage=="deferred" else 0,recommendation="优先沟通" if stage=="deferred" else "暂缓")
+                item=db.get(ScreeningItem,uuid.UUID(uploaded[index]["id"])); aggregate=db.get(ScreeningRun,item.run_id)
+                resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1)
+                db.add(resume); db.flush()
+                application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage=stage,source="screening")
+                db.add(application); db.flush(); item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id
+                item.llm_status="failed" if stage=="review" else "succeeded"; item.llm_safe_error_code="provider_unavailable" if stage=="review" else None
+            failed=db.get(ScreeningItem,uuid.UUID(uploaded[2]["id"])); failed.status="failed"; failed.safe_error_code="unsupported_format"
+            aggregate=db.get(ScreeningRun,failed.run_id); aggregate.status="completed"; aggregate.processed_count=3; aggregate.succeeded_count=2; aggregate.failed_count=1
+            db.commit()
+        detail=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers).json()["data"]
+        listing=client.get("/api/v1/screening-runs",headers=headers).json()["data"][0]
+
+    expected={"manager_review_count":1,"deferred_count":1,"ai_unavailable_count":1,"file_failed_count":1}
+    assert {key:detail[key] for key in expected}==expected
+    assert {key:listing[key] for key in expected}==expected
+
 def test_screening_api_create_upload_read_replay_and_scope(tmp_path):
     app,storage,job_id=app_and_seed(tmp_path)
     with TestClient(app) as client:
