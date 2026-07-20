@@ -4,6 +4,8 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import func, select
 
+from server.app.governance import audit as governance_audit
+from server.app.governance.audit import AuditValidationError
 from server.app.identity.models import AuditLog, Job, Organization, User
 from server.app.recruiting.models import (
     Application,
@@ -183,7 +185,6 @@ def test_final_llm_failure_fails_open_without_fake_score_or_internal_commit(tmp_
             "to_stage",
             "ai_status",
             "recommendation",
-            "score",
             "safe_error_code",
         }
         assert "private" not in str(audit.metadata_json).lower()
@@ -200,7 +201,7 @@ def test_failure_route_normalizes_unsafe_error_text_before_persistence(tmp_path)
             actor_user_id=case.creator_id,
             score=None,
             ai_status="failed",
-            safe_error_code="candidate@example.test provider raw body",
+            safe_error_code="candidate_alice_resume_prompt",
             trace_id="trace-safe",
         )
         task = db.scalar(select(ApplicationReviewTask))
@@ -209,7 +210,29 @@ def test_failure_route_normalizes_unsafe_error_text_before_persistence(tmp_path)
         )
         assert task.safe_error_code == "internal_error"
         assert audit.metadata_json["safe_error_code"] == "internal_error"
-        assert "candidate@example.test" not in str(audit.metadata_json)
+        assert "candidate_alice_resume_prompt" not in str(audit.metadata_json)
+
+
+def test_router_uses_central_audit_metadata_validation(tmp_path, monkeypatch):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="audit-boundary")
+    monkeypatch.setitem(
+        governance_audit.EVENT_METADATA_ALLOWLIST,
+        "screening.terminal_routed",
+        {},
+    )
+    with app.state.identity_store.sync_session() as db:
+        with pytest.raises(AuditValidationError, match="application_id"):
+            route_llm_screening_terminal(
+                db,
+                organization_id=case.organization_id,
+                item_id=case.item_id,
+                actor_user_id=case.creator_id,
+                score=85,
+                ai_status="succeeded",
+                safe_error_code=None,
+                trace_id="trace-audit-boundary",
+            )
 
 
 def test_repeated_and_stale_routing_does_not_duplicate_side_effects(tmp_path):
@@ -242,6 +265,43 @@ def test_repeated_and_stale_routing_does_not_duplicate_side_effects(tmp_path):
         assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 1
         assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 1
         assert db.scalar(select(func.count(TalentPoolMembership.id))) == 0
+        assert db.scalar(
+            select(func.count(AuditLog.id)).where(
+                AuditLog.event_type == "screening.terminal_routed"
+            )
+        ) == 1
+
+
+def test_invalid_stale_callback_is_noop_after_locked_application_left_new(tmp_path):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="invalid-stale")
+    with app.state.identity_store.sync_session() as db:
+        first = route_llm_screening_terminal(
+            db,
+            organization_id=case.organization_id,
+            item_id=case.item_id,
+            actor_user_id=case.creator_id,
+            score=60,
+            ai_status="succeeded",
+            safe_error_code=None,
+            trace_id="trace-first",
+        )
+        stale = route_llm_screening_terminal(
+            db,
+            organization_id=case.organization_id,
+            item_id=case.item_id,
+            actor_user_id=case.creator_id,
+            score=999,
+            ai_status="not_a_terminal_status",
+            safe_error_code="candidate_alice_resume_prompt",
+            trace_id="trace-stale-invalid",
+        )
+        assert stale.routed is False
+        assert stale.stage == first.stage == "review"
+        assert stale.score == first.score == 60
+        assert stale.recommendation == first.recommendation == "建议评审"
+        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 1
+        assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 1
         assert db.scalar(
             select(func.count(AuditLog.id)).where(
                 AuditLog.event_type == "screening.terminal_routed"

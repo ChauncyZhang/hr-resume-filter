@@ -90,3 +90,44 @@ def test_append_audit_rejects_metadata_string_over_event_limit() -> None:
             trace_id="trace-governance-3",
             metadata={"safe_error_code": "x" * 65},
         )
+
+
+def test_append_audit_accepts_screening_terminal_routed_safe_metadata() -> None:
+    actor = SimpleNamespace(user_id=uuid4(), organization_id=uuid4())
+    application_id = uuid4()
+    item_id = uuid4()
+    with Session(create_engine("sqlite://")) as db:
+        log = append_audit(
+            db,
+            actor=actor,
+            category="recruiting",
+            event_type="screening.terminal_routed",
+            outcome="success",
+            trace_id="trace-screening-route",
+            resource_type="application",
+            resource_id=application_id,
+            metadata={
+                "application_id": str(application_id),
+                "item_id": str(item_id),
+                "from_stage": "new",
+                "to_stage": "review",
+                "ai_status": "failed",
+                "recommendation": "AI评分不可用",
+                "safe_error_code": "provider_unavailable",
+            },
+        )
+        assert log.metadata_json["safe_error_code"] == "provider_unavailable"
+
+
+def test_append_audit_rejects_unknown_screening_route_metadata_key() -> None:
+    actor = SimpleNamespace(user_id=uuid4(), organization_id=uuid4())
+    with pytest.raises(AuditValidationError, match="metadata key 'provider_body'"):
+        append_audit(
+            Session(create_engine("sqlite://")),
+            actor=actor,
+            category="recruiting",
+            event_type="screening.terminal_routed",
+            outcome="success",
+            trace_id="trace-screening-route",
+            metadata={"provider_body": "not allowed"},
+        )

@@ -49,7 +49,7 @@ def test_review_task_normalizes_unsafe_failure_code(tmp_path):
             application=db.get(Application, case.application_id),
             job=db.get(Job, case.job_id),
             ai_status="failed",
-            safe_error_code="candidate@example.test raw provider response",
+            safe_error_code="candidate_alice_resume_prompt",
         )
         assert task.safe_error_code == "internal_error"
 

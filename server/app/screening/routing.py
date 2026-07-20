@@ -4,6 +4,7 @@ from typing import Literal
 
 from sqlalchemy import select
 
+from server.app.governance.audit import append_audit
 from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.models import AuditLog, Job, User
 from server.app.recruiting.models import (
@@ -11,8 +12,10 @@ from server.app.recruiting.models import (
     ApplicationStageEvent,
     Candidate,
 )
-from server.app.recruiting.tasks import ensure_review_task
-from server.app.queue.service import normalize_safe_code
+from server.app.recruiting.tasks import (
+    ensure_review_task,
+    normalize_llm_terminal_safe_error_code,
+)
 from server.app.screening.models import ScreeningItem, ScreeningRun
 from server.app.talent.service import ensure_deferred_membership
 
@@ -55,7 +58,7 @@ def _requested_outcome(score, ai_status, safe_error_code):
     return derive_screening_outcome(score)
 
 
-def _previous_result(db, application, fallback_outcome, fallback_score):
+def _previous_result(db, application):
     audit = db.scalar(
         select(AuditLog)
         .where(
@@ -68,10 +71,16 @@ def _previous_result(db, application, fallback_outcome, fallback_score):
         .limit(1)
     )
     metadata = audit.metadata_json if audit is not None else {}
+    recommendation = metadata.get("recommendation")
+    if not isinstance(recommendation, str):
+        recommendation = "暂缓" if application.stage == "deferred" else "已流转"
+    persisted_score = metadata.get("score")
+    if not isinstance(persisted_score, int) or isinstance(persisted_score, bool):
+        persisted_score = None
     return ScreeningRoutingResult(
-        recommendation=metadata.get("recommendation", fallback_outcome.recommendation),
+        recommendation=recommendation,
         stage=application.stage,
-        score=metadata.get("score", fallback_score),
+        score=persisted_score,
         routed=False,
     )
 
@@ -88,9 +97,6 @@ def route_llm_screening_terminal(
     trace_id: str,
     transferable_capabilities=(),
 ):
-    outcome = _requested_outcome(score, ai_status, safe_error_code)
-    if ai_status == "failed":
-        safe_error_code = normalize_safe_code(safe_error_code)
     item_identity = db.execute(
         select(
             ScreeningItem.candidate_id,
@@ -143,10 +149,14 @@ def route_llm_screening_terminal(
     if application is None:
         raise ScreeningRoutingConflict("application_unavailable")
     if application.stage != "new":
-        return _previous_result(db, application, outcome, score)
+        return _previous_result(db, application)
 
-    actor_exists = db.scalar(
-        select(User.id).where(
+    outcome = _requested_outcome(score, ai_status, safe_error_code)
+    if ai_status == "failed":
+        safe_error_code = normalize_llm_terminal_safe_error_code(safe_error_code)
+
+    actor = db.scalar(
+        select(User).where(
             User.organization_id == organization_id,
             User.id == actor_user_id,
         )
@@ -163,7 +173,7 @@ def route_llm_screening_terminal(
             Job.id == application.job_id,
         )
     )
-    if actor_exists is None or run is None or job is None:
+    if actor is None or run is None or job is None:
         raise ScreeningRoutingConflict("routing_context_unavailable")
 
     application.stage = outcome.stage
@@ -176,9 +186,11 @@ def route_llm_screening_terminal(
         "to_stage": outcome.stage,
         "ai_status": ai_status,
         "recommendation": outcome.recommendation,
-        "score": score,
-        "safe_error_code": safe_error_code,
     }
+    if score is not None:
+        metadata["score"] = score
+    if safe_error_code is not None:
+        metadata["safe_error_code"] = safe_error_code
     db.add(
         ApplicationStageEvent(
             organization_id=organization_id,
@@ -188,18 +200,16 @@ def route_llm_screening_terminal(
             payload=dict(metadata),
         )
     )
-    db.add(
-        AuditLog(
-            organization_id=organization_id,
-            actor_user_id=actor_user_id,
-            category="screening",
-            event_type="screening.terminal_routed",
-            outcome="success",
-            resource_type="application",
-            resource_id=application.id,
-            trace_id=trace_id,
-            metadata_json=dict(metadata),
-        )
+    append_audit(
+        db,
+        actor=actor,
+        category="recruiting",
+        event_type="screening.terminal_routed",
+        outcome="success",
+        resource_type="application",
+        resource_id=application.id,
+        trace_id=trace_id,
+        metadata=metadata,
     )
     if outcome.stage == "review":
         ensure_review_task(

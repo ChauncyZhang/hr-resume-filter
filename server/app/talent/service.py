@@ -10,6 +10,7 @@ from server.app.talent.models import TalentPool, TalentPoolMembership
 
 
 DEFERRED_POOL_SYSTEM_KEY = "ai_screening_deferred"
+DEFERRED_POOL_DISPLAY_NAME = "AI 初筛暂缓"
 
 
 def _aware(value: datetime) -> datetime:
@@ -38,6 +39,23 @@ def _pool_owner_id(db, organization_id, fallback_id):
     ) or fallback_id
 
 
+def _system_pool_names():
+    yield DEFERRED_POOL_DISPLAY_NAME
+    index = 1
+    while True:
+        suffix = "" if index == 1 else f"-{index}"
+        yield f"{DEFERRED_POOL_DISPLAY_NAME} [{DEFERRED_POOL_SYSTEM_KEY}{suffix}]"
+        index += 1
+
+
+def _refresh_pool_retention(pool, retention_days):
+    if pool.retention_days != retention_days:
+        pool.retention_days = retention_days
+        pool.version += 1
+        pool.updated_at = datetime.now(timezone.utc)
+    return pool
+
+
 def _ensure_system_pool(db, organization_id, fallback_owner_id):
     retention_days = db.scalar(
         select(RetentionPolicy.talent_pool_days).where(
@@ -48,28 +66,37 @@ def _ensure_system_pool(db, organization_id, fallback_owner_id):
         raise ValueError("retention_policy_unavailable")
     pool = _load_system_pool(db, organization_id, lock=True)
     if pool is not None:
-        pool.retention_days = retention_days
-        return pool
+        return _refresh_pool_retention(pool, retention_days)
 
-    pool = TalentPool(
-        organization_id=organization_id,
-        name="AI 初筛暂缓",
-        purpose="保存 LLM 初筛分低于 60 的候选人",
-        visibility="recruiting_team",
-        owner_id=_pool_owner_id(db, organization_id, fallback_owner_id),
-        system_key=DEFERRED_POOL_SYSTEM_KEY,
-        suitable_roles=[],
-        retention_days=retention_days,
-    )
-    try:
-        with db.begin_nested():
-            db.add(pool)
-            db.flush()
-    except IntegrityError:
-        pool = _load_system_pool(db, organization_id, lock=True)
-        if pool is None:
-            raise
-    return pool
+    owner_id = _pool_owner_id(db, organization_id, fallback_owner_id)
+    for name in _system_pool_names():
+        pool = TalentPool(
+            organization_id=organization_id,
+            name=name,
+            purpose="保存 LLM 初筛分低于 60 的候选人",
+            visibility="recruiting_team",
+            owner_id=owner_id,
+            system_key=DEFERRED_POOL_SYSTEM_KEY,
+            suitable_roles=[],
+            retention_days=retention_days,
+        )
+        try:
+            with db.begin_nested():
+                db.add(pool)
+                db.flush()
+            return pool
+        except IntegrityError:
+            existing = _load_system_pool(db, organization_id, lock=True)
+            if existing is not None:
+                return _refresh_pool_retention(existing, retention_days)
+            name_taken = db.scalar(
+                select(TalentPool.id).where(
+                    TalentPool.organization_id == organization_id,
+                    TalentPool.name == name,
+                )
+            )
+            if name_taken is None:
+                raise
 
 
 def ensure_deferred_membership(

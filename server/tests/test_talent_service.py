@@ -83,6 +83,18 @@ def test_deferred_membership_upsert_does_not_duplicate_pool_or_membership(tmp_pa
             transferable_capabilities=["A", "B", "C", "D", "E", "ignored"],
         )
         db.flush()
+        pool = db.get(TalentPool, first.pool_id)
+        initial_pool_version = pool.version
+        ensure_deferred_membership(
+            db,
+            application=application,
+            candidate=candidate,
+            job=job,
+            run=run,
+            score=15,
+            transferable_capabilities=["Unchanged retention"],
+        )
+        assert pool.version == initial_pool_version
         policy.talent_pool_days = 400
         second = ensure_deferred_membership(
             db,
@@ -98,8 +110,58 @@ def test_deferred_membership_upsert_does_not_duplicate_pool_or_membership(tmp_pa
         pool = db.get(TalentPool, second.pool_id)
         assert pool.owner_id == case.creator_id
         assert pool.retention_days == 400
+        assert pool.version == initial_pool_version + 1
+        ensure_deferred_membership(
+            db,
+            application=application,
+            candidate=candidate,
+            job=job,
+            run=run,
+            score=25,
+            transferable_capabilities=["Still 400 days"],
+        )
+        assert pool.version == initial_pool_version + 1
         assert db.scalar(select(func.count(TalentPool.id))) == 1
         assert db.scalar(select(func.count(TalentPoolMembership.id))) == 1
+
+
+def test_system_deferred_pool_uses_backup_name_when_normal_pool_owns_display_name(
+    tmp_path,
+):
+    app = make_app(tmp_path)
+    case = seed_routing_case(app, suffix="pool-name-conflict")
+    with app.state.identity_store.sync_session() as db:
+        ordinary = TalentPool(
+            organization_id=case.organization_id,
+            name="AI 初筛暂缓",
+            purpose="Ordinary recruiter-managed pool",
+            visibility="private",
+            owner_id=case.creator_id,
+            system_key=None,
+            suitable_roles=[],
+            retention_days=730,
+        )
+        db.add(ordinary)
+        db.flush()
+        membership = ensure_deferred_membership(
+            db,
+            application=db.get(Application, case.application_id),
+            candidate=db.get(Candidate, case.candidate_id),
+            job=db.get(Job, case.job_id),
+            run=db.get(ScreeningRun, case.run_id),
+            score=59,
+        )
+        db.flush()
+
+        system_pool = db.get(TalentPool, membership.pool_id)
+        assert system_pool.id != ordinary.id
+        assert system_pool.system_key == DEFERRED_POOL_SYSTEM_KEY
+        assert system_pool.name != ordinary.name
+        assert system_pool.name.startswith("AI 初筛暂缓")
+        assert ordinary.system_key is None
+        assert ordinary.purpose == "Ordinary recruiter-managed pool"
+        assert ordinary.visibility == "private"
+        assert db.scalar(select(func.count(TalentPool.id))) == 2
 
 
 def test_deferred_membership_rejects_cross_tenant_run_context(tmp_path):
