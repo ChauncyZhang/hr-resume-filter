@@ -56,7 +56,7 @@ export function NotificationMenu({ groups, total, onOpenCandidate, onOpenGroup }
             <header><span className={`status-dot ${group.tone}`} /><strong>{group.label}</strong><small>{group.count}</small><button type="button" onClick={() => openGroup(group)}>查看全部<ChevronRight size={14} /></button></header>
             {group.items.slice(0, 3).map((item) => <button className="notification-item" type="button" key={item.applicationId} onClick={() => openCandidate(item)}>
               <span className={`notification-item-icon ${group.tone}`}><UserRound size={16} /></span>
-              <span><strong>{item.name}</strong><small>{item.position} · {item.city}</small></span>
+              <span><strong>{item.name}</strong><small>{item.position} · {item.city}</small>{item.aiLabel && <small role="status">{item.aiLabel}</small>}</span>
               <ChevronRight size={16} />
             </button>)}
           </section>)}

@@ -401,6 +401,15 @@
   .pool-table-row > *,
   .talent-table-row > * { min-width: 0; overflow-wrap: anywhere; }
 
+  .talent-table-row > [role="cell"]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 500;
+  }
+
   .candidate-detail-hero,
   .pool-detail-hero { padding: 16px; }
   .candidate-profile { align-items: flex-start; }

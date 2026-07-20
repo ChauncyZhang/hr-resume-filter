@@ -11,6 +11,7 @@ test("report normalization maps server stages and rates without fixture-derived 
       total_applications: 4,
       stages: [
         { stage: "new", current_count: 2, average_time_in_stage_seconds: 86400 },
+        { stage: "deferred", current_count: 3, average_time_in_stage_seconds: 7200 },
         { stage: "interviewing", current_count: 1, average_time_in_stage_seconds: 129600 },
         { stage: "rejected", current_count: 1, average_time_in_stage_seconds: 3600 },
       ],
@@ -33,6 +34,7 @@ test("report normalization maps server stages and rates without fixture-derived 
   assert.equal(report.canExport, true);
   assert.deepEqual(report.stages.map((item) => [item.stage, item.currentCount, item.averageDays]), [
     ["新简历", 2, 1],
+    ["AI 初筛暂缓", 3, 0.1],
     ["面试中", 1, 1.5],
     ["已淘汰", 1, 0],
   ]);

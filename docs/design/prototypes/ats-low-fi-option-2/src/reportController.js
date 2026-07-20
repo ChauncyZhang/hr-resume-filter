@@ -3,6 +3,7 @@ import { apiClient } from "./apiClient.js";
 const STAGE_TO_UI = {
   new: "新简历",
   review: "待复核",
+  deferred: "AI 初筛暂缓",
   contact: "待沟通",
   interview_pending: "待安排",
   interviewing: "面试中",

@@ -521,17 +521,21 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   useEffect(() => {
     if (route.kind !== "candidates" || route.mode !== "detail" || !route.id) return;
     const local = candidateRecords.find((candidate) => candidate.id === route.id || candidate.candidateId === route.id);
-    if (local) {
+    if (local && local.serverBacked !== true) {
       setSelectedCandidate(local);
       setCandidateDetailState(null);
       return;
     }
-    if (candidateDetailState?.context?.candidateId === route.id) return;
-    void loadServerCandidate({
+    const routeCandidateContext = {
       candidateId: route.id,
       applicationId: route.searchParams.get("application") || undefined,
       jobId: route.searchParams.get("job") || undefined,
-    });
+    };
+    const loadedContext = candidateDetailState?.context;
+    if (loadedContext?.candidateId === routeCandidateContext.candidateId
+      && loadedContext?.applicationId === routeCandidateContext.applicationId
+      && loadedContext?.jobId === routeCandidateContext.jobId) return;
+    void loadServerCandidate(routeCandidateContext);
   }, [candidateDetailState, candidateRecords, route.id, route.kind, route.mode, route.searchParams]);
 
   useEffect(() => {
@@ -679,9 +683,9 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
     window.setTimeout(() => setToast(""), 2200);
   }
 
-  function drillDownReport({ position, stage }) {
+  function drillDownReport({ jobId, stage }) {
     setSelectedCandidate(null);
-    navigate(candidateListPath({ jobId: position === "全部职位" ? "全部职位" : position, stage }));
+    navigate(candidateListPath({ jobId, stage }));
   }
 
   const persistRecentServerTask = useCallback((task) => {
@@ -1055,7 +1059,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
               <header><h3>今日待办</h3><button type="button" onClick={() => navigate("/candidates")}>查看全部<ChevronRight size={14} /></button></header>
               {canPerformAction(currentRole, "评审候选人") && <div className="rail-group">
                 <div className="rail-group-title"><span className="status-dot red" />待用人经理评审（{workbenchTasks.review.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待复核" }))}>查看全部</button></div>
-                {workbenchTasks.review.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openWorkbenchReviewCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small>{candidate.configWarning && <small>岗位未配置用人经理</small>}</button>)}
+                {workbenchTasks.review.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openWorkbenchReviewCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small>{candidate.aiLabel && <small role="status">{candidate.aiLabel}</small>}{candidate.configWarning && <small>岗位未配置用人经理</small>}</button>)}
                 {workbenchTasks.review.count === 0 && <p>暂无待评审候选人</p>}
               </div>}
               {canPerformAction(currentRole, "安排面试") && <div className="rail-group">

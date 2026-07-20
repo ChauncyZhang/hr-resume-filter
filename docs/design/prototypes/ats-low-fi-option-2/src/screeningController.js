@@ -122,6 +122,7 @@ function normalizeFile(item) {
     id: safeString(item?.id),
     name: safeString(item?.filename),
     candidateId: safeString(item?.candidate_id) || null,
+    applicationId: safeString(item?.application_id) || null,
     candidate: safeString(item?.candidate_name),
     status,
     routeResult,

@@ -507,6 +507,17 @@ test("maps review and deferred routes to automatic outcome labels", () => {
   assert.deepEqual(files.map(({ routeLabel }) => routeLabel), ["已转交用人经理", "已暂缓"]);
 });
 
+test("screening items preserve the exact application identity for duplicate applications", () => {
+  const [file] = normalizeScreeningTask(run(), [item({
+    candidate_id: "candidate-1",
+    application_id: "application-repeat-2",
+    route_result: "review",
+  })]).files;
+
+  assert.equal(file.candidateId, "candidate-1");
+  assert.equal(file.applicationId, "application-repeat-2");
+});
+
 test("safely degrades malformed LLM evaluation values", () => {
   const [result] = normalizeScreeningTask(run(), [item({
     route_result: "review",

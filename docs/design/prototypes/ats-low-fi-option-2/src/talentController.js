@@ -1,5 +1,27 @@
 import { apiClient } from "./apiClient.js";
 
+export function createLatestMembershipRequest() {
+  let generation = 0;
+  let activeController = null;
+  return {
+    start() {
+      activeController?.abort();
+      const controller = new AbortController();
+      const requestGeneration = ++generation;
+      activeController = controller;
+      return {
+        signal: controller.signal,
+        isCurrent: () => requestGeneration === generation && activeController === controller && !controller.signal.aborted,
+      };
+    },
+    cancel() {
+      generation += 1;
+      activeController?.abort();
+      activeController = null;
+    },
+  };
+}
+
 const VISIBILITY_TO_UI = {
   private: "仅自己可见",
   recruiting_team: "招聘团队可见",

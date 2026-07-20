@@ -30,8 +30,40 @@ test("deferred rows refer once while ordinary pools keep reactivation", () => {
   assert.match(source, /转交用人经理/);
   assert.match(source, /已转交用人经理/);
   assert.match(source, /member\.sourceStage === "用人经理复核"/);
-  assert.match(source, /disabled=\{[^}]*referringMemberId === member\.id/);
+  assert.match(source, /disabled=\{member\.sourceStage === "用人经理复核" \|\| Boolean\(referringMemberId\)\}/);
   assert.match(source, /重新激活/);
+});
+
+test("deferred talent rows expose table semantics and mobile field labels", () => {
+  assert.match(source, /className="talent-table" role="table" aria-label="AI 初筛暂缓人才"/);
+  assert.match(source, /className="talent-table-head" role="row"/);
+  assert.equal((source.match(/role="columnheader"/g) || []).length >= 8, true);
+  for (const label of ["人才", "原岗位", "最终分", "暂缓时间", "主要缺口", "跟进负责人", "状态", "操作"]) {
+    assert.match(source, new RegExp(`role="cell" data-label="${label}"`));
+  }
+  const css = readFileSync(new URL("./product-theme-people.css", import.meta.url), "utf8");
+  assert.match(css, /\.talent-table-row > \[role="cell"\]::before[\s\S]*content: attr\(data-label\)/);
+});
+
+test("membership request generations reject a late response from the previous pool", async () => {
+  const support = await import("./talentController.js");
+  assert.equal(typeof support.createLatestMembershipRequest, "function");
+  const requests = support.createLatestMembershipRequest();
+  const accepted = [];
+  let resolveA;
+  const responseA = new Promise((resolve) => { resolveA = resolve; });
+  const a = requests.start();
+  const completionA = responseA.then((value) => { if (a.isCurrent()) accepted.push(value); });
+  const b = requests.start();
+  accepted.push(b.isCurrent() ? "pool-b" : "invalid-b");
+  resolveA("pool-a");
+  await completionA;
+
+  assert.equal(a.signal.aborted, true);
+  assert.deepEqual(accepted, ["pool-b"]);
+  assert.match(source, /memberLoadRef\.current\.start\(\)/);
+  assert.match(source, /signal: operation\.signal/);
+  assert.match(source, /operation\.isCurrent\(\)/);
 });
 
 test("referral replaces the membership in place and refreshes the workbench without changing route state", () => {

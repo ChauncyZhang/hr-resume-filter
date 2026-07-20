@@ -104,6 +104,7 @@ export function canOpenCandidateReview(file, serverBacked) {
 export function candidateReviewContext(file, task) {
   return {
     candidateId: file.candidateId,
+    applicationId: file.applicationId,
     jobId: task.jobId,
     position: task.position,
     evidence: {

@@ -115,7 +115,7 @@ test("candidate list omits empty and all-selector filters and preserves null evi
   assert.equal(result.records[0].id, "candidate-2");
   assert.equal(result.records[0].stage, "无当前申请");
   assert.equal(result.records[0].score, "-");
-  assert.equal(result.records[0].recommendation, "待人工复核");
+  assert.equal(result.records[0].recommendation, "不提供当前 AI 结论");
   assert.equal(result.records[0].historicalRule, null);
 });
 
@@ -312,6 +312,23 @@ test("failed LLM status never falls back to stale evaluation or transient eviden
   assert.equal(review.recommendation, "AI评分不可用");
   assert.deepEqual(review.dimensions, []);
   assert.deepEqual(review.strengths, []);
+});
+
+test("candidate review without a current LLM projection stays neutral and keeps legacy rules historical", () => {
+  const review = normalizeCandidateReview({
+    candidate: { id: candidateId, display_name: "候选人" },
+    applications: [{
+      id: "application-legacy", candidate_id: candidateId, job_id: jobId, stage: "review", version: 1,
+      rule_score: 91, recommendation: "旧规则建议推进",
+    }],
+    resumes: [], notes: [], timeline: [],
+    context: { candidateId, applicationId: "application-legacy", jobId, actor: {}, evidence: {} },
+  });
+
+  assert.equal(review.recommendation, "不提供当前 AI 结论");
+  assert.equal(review.score, null);
+  assert.deepEqual(review.dimensions, []);
+  assert.deepEqual(review.historicalRule, { score: 91, recommendation: "旧规则建议推进" });
 });
 
 test("normalization refuses cross-job fallback and preserves masked contacts only", () => {

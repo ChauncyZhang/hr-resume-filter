@@ -24,6 +24,12 @@ test("candidate detail scheduling preserves a server-backed candidate id", () =>
   assert.match(appSource, /setScheduleCandidateId\(candidate\?\.id \|\| candidate\?\.candidateId \|\| null\)/);
 });
 
+test("a server candidate list summary never short-circuits a direct detail load", () => {
+  assert.match(appSource, /local && local\.serverBacked !== true/);
+  assert.match(appSource, /loadServerCandidate\(routeCandidateContext\)/);
+  assert.doesNotMatch(appSource, /if \(local\) \{\s*setSelectedCandidate\(local\)/);
+});
+
 test("schedule form hydrates an asynchronously loaded candidate without replacing a user selection", () => {
   assert.match(scheduleSource, /resolveScheduleCandidateId\(record, candidateId, fallback\)/);
   assert.match(scheduleSource, /candidateId: resolveScheduleCandidateId/);

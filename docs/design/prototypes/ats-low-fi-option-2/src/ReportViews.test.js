@@ -44,3 +44,11 @@ test("screening quality panel ignores a returned rulePassRate value", () => {
   assert.match(html, /LLM 成功率/);
   assert.doesNotMatch(html, /9137|规则通过率|解析、规则和 LLM 独立统计/);
 });
+
+test("report funnel drills into candidates with the stable job id including deferred stage", () => {
+  assert.match(source, /onDrillDown\(\{ jobId: filters\.jobId \|\| "全部职位", stage: item\.stage \}\)/);
+  assert.doesNotMatch(source, /onDrillDown\(\{ position:/);
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  assert.match(appSource, /function drillDownReport\(\{ jobId, stage \}\)/);
+  assert.match(appSource, /candidateListPath\(\{ jobId, stage \}\)/);
+});

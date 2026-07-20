@@ -444,13 +444,14 @@ test("server result opens review only from a completed row with a candidate id",
 
 test("server candidate context keeps identity separate from automatic screening fields", () => {
   const context = helpers.candidateReviewContext({
-    candidateId: "candidate-1", candidate: "未核验姓名", email: "derived@example.com",
+    candidateId: "candidate-1", applicationId: "application-repeat-2", candidate: "未核验姓名", email: "derived@example.com",
     score: 78, recommendation: "建议评审", routeResult: "review", routeLabel: "已转交用人经理",
     dimensions: [{ label: "技能经验", score: 82, evidence: ["Python"], gaps: ["Kubernetes"] }], strengths: ["经验匹配"], risks: ["规模待确认"],
   }, { jobId: "job-1", position: "AI 工程师" });
 
   assert.deepEqual(context, {
     candidateId: "candidate-1",
+    applicationId: "application-repeat-2",
     jobId: "job-1",
     position: "AI 工程师",
     evidence: {

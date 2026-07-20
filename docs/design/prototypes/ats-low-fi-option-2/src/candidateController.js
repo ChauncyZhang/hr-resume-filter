@@ -68,7 +68,7 @@ function normalizeLlmEvidence(application, contextEvidence) {
     score: unavailable ? null : safeScore(persisted?.score ?? application?.ai_score ?? source.score),
     recommendation: unavailable
       ? "AI评分不可用"
-      : safeString(persisted?.recommendation ?? application?.ai_recommendation ?? source.recommendation, "待人工复核"),
+      : safeString(persisted?.recommendation ?? application?.ai_recommendation ?? source.recommendation).trim() || "不提供当前 AI 结论",
     summary: safeString(source.summary),
     dimensions: normalizeDimensions(source.dimensions),
     strengths: safeArray(source.strengths).map((item) => safeString(item).trim()).filter(Boolean),
@@ -135,7 +135,7 @@ function normalizeTimelineEvent(item, actor) {
 function normalizeCandidateListItem(candidate) {
   const application = candidate?.application || null;
   const score = safeScore(application?.ai_score);
-  const recommendation = safeString(application?.ai_recommendation, "待人工复核");
+  const recommendation = safeString(application?.ai_recommendation).trim() || "不提供当前 AI 结论";
   const candidateId = safeString(candidate?.id);
   const applicationId = safeString(application?.id);
   return {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./product-theme-people.css";
 import {
   ArrowLeft,
@@ -22,7 +22,7 @@ import {
   X,
 } from "lucide-react";
 import { buildResumeDocument } from "./resumeDocument.js";
-import { buildReactivatedCandidateSummary } from "./talentController.js";
+import { buildReactivatedCandidateSummary, createLatestMembershipRequest } from "./talentController.js";
 import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
 
 export const initialTalentPools = [
@@ -340,23 +340,23 @@ function DeferredPoolDetail({ pool, pools, memberships, candidates, positions, o
     <p className="field-hint" role="status" aria-live="polite">{referralMessage}</p>
     <section className="pool-detail-panel">
       <div className="pool-detail-toolbar"><label className="pool-search"><Search size={16} /><input aria-label="搜索暂缓人才" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索姓名、原岗位、缺口或负责人" /></label></div>
-      {status === "loading" && memberships.length === 0 ? <div className="talent-empty" role="status"><RefreshCw size={24} /><strong>正在加载暂缓人才</strong></div> : status === "error" && memberships.length === 0 ? <div className="talent-empty" role="alert"><CircleAlert size={24} /><strong>暂缓人才加载失败</strong><span>{error}</span><button className="button secondary" type="button" onClick={onRetry}>重试</button></div> : <div className="talent-table">
-        <div className="talent-table-head"><span>人才</span><span>原岗位</span><span>最终分</span><span>暂缓时间</span><span>主要缺口</span><span>跟进负责人</span><span>状态</span><span>操作</span></div>
-        {filtered.map(({ member, candidate }) => <div className="talent-table-row" key={member.id}>
-          <button className="talent-person" type="button" aria-label={`查看人才详情：${candidate.name}`} onClick={() => setSelectedMemberId(member.id)}><span>{candidate.name.slice(-1)}</span><span><strong>{candidate.name}</strong><small>{candidate.role} · {candidate.city}</small></span></button>
-          <span>{member.originalJob.title || "来源申请不可见"}</span>
-          <span>{member.finalScore ?? "不可见"}</span>
-          <span>{member.deferredAt || "未记录"}</span>
-          <span><small>{member.mainGaps.join("；") || "未记录"}</small></span>
-          <span>{member.owner}</span>
-          <span>{member.sourceStage}</span>
-          <span><button className="button primary small" type="button" aria-label={`转交用人经理：${candidate.name}`} disabled={member.sourceStage === "用人经理复核" || referringMemberId === member.id} onClick={() => void refer(member)}>{member.sourceStage === "用人经理复核" ? "已转交用人经理" : referringMemberId === member.id ? "正在转交" : "转交用人经理"}</button></span>
+      {status === "loading" && memberships.length === 0 ? <div className="talent-empty" role="status"><RefreshCw size={24} /><strong>正在加载暂缓人才</strong></div> : status === "error" && memberships.length === 0 ? <div className="talent-empty" role="alert"><CircleAlert size={24} /><strong>暂缓人才加载失败</strong><span>{error}</span><button className="button secondary" type="button" onClick={onRetry}>重试</button></div> : <div className="talent-table" role="table" aria-label="AI 初筛暂缓人才">
+        <div className="talent-table-head" role="row"><span role="columnheader">人才</span><span role="columnheader">原岗位</span><span role="columnheader">最终分</span><span role="columnheader">暂缓时间</span><span role="columnheader">主要缺口</span><span role="columnheader">跟进负责人</span><span role="columnheader">状态</span><span role="columnheader">操作</span></div>
+        {filtered.map(({ member, candidate }) => <div className="talent-table-row" role="row" key={member.id}>
+          <span role="cell" data-label="人才"><button className="talent-person" type="button" aria-label={`查看人才详情：${candidate.name}`} onClick={() => setSelectedMemberId(member.id)}><span>{candidate.name.slice(-1)}</span><span><strong>{candidate.name}</strong><small>{candidate.role} · {candidate.city}</small></span></button></span>
+          <span role="cell" data-label="原岗位">{member.originalJob.title || "来源申请不可见"}</span>
+          <span role="cell" data-label="最终分">{member.finalScore ?? "不可见"}</span>
+          <span role="cell" data-label="暂缓时间">{member.deferredAt || "未记录"}</span>
+          <span role="cell" data-label="主要缺口"><small>{member.mainGaps.join("；") || "未记录"}</small></span>
+          <span role="cell" data-label="跟进负责人">{member.owner}</span>
+          <span role="cell" data-label="状态">{member.sourceStage}</span>
+          <span role="cell" data-label="操作"><button className="button primary small" type="button" aria-label={`转交用人经理：${candidate.name}`} disabled={member.sourceStage === "用人经理复核" || Boolean(referringMemberId)} onClick={() => void refer(member)}>{member.sourceStage === "用人经理复核" ? "已转交用人经理" : referringMemberId === member.id ? "正在转交" : "转交用人经理"}</button></span>
         </div>)}
         {filtered.length === 0 && <div className="talent-empty"><Search size={24} /><strong>没有符合条件的暂缓人才</strong><span>调整搜索条件后重试。</span></div>}
         {nextCursor && <div className="talent-load-more"><button className="button secondary" type="button" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "正在加载" : "加载更多人才"}</button></div>}
       </div>}
     </section>
-    {selected && <MemberDrawer key={selected.member.id} member={selected.member} candidate={selected.candidate} pool={pool} pools={pools} positions={positions} onClose={() => setSelectedMemberId(null)} onUpdate={onUpdateMember} onMove={onMove} onRemove={(member) => { onRemove(member); setSelectedMemberId(null); }} onRefer={refer} referring={referringMemberId === selected.member.id} onReactivateCandidate={onReactivateCandidate} onOpenCandidate={onOpenCandidate} onNotify={onNotify} />}
+    {selected && <MemberDrawer key={selected.member.id} member={selected.member} candidate={selected.candidate} pool={pool} pools={pools} positions={positions} onClose={() => setSelectedMemberId(null)} onUpdate={onUpdateMember} onMove={onMove} onRemove={(member) => { onRemove(member); setSelectedMemberId(null); }} onRefer={refer} referring={Boolean(referringMemberId)} onReactivateCandidate={onReactivateCandidate} onOpenCandidate={onOpenCandidate} onNotify={onNotify} />}
   </div>;
 }
 
@@ -372,6 +372,8 @@ function PoolDetail({ pool, pools, memberships, candidates, positions, onBack, o
 export function TalentPoolWorkspace({ mode, setMode, selectedPoolId, setSelectedPoolId, pools = [], setPools, memberships = [], setMemberships, candidates, positions, onReactivateCandidate, onReferralComplete = () => {}, onOpenCandidate, onNotify, controller, actorId, pageActionHost }) {
   const serverBacked = Boolean(controller);
   const [serverState, setServerState] = useState({ poolStatus: serverBacked ? "loading" : "ready", pools: [], poolCursor: null, loadingPools: false, memberStatus: "idle", memberships: [], memberCursor: null, loadingMembers: false, error: "" });
+  const memberLoadRef = useRef(null);
+  if (!memberLoadRef.current) memberLoadRef.current = createLatestMembershipRequest();
   const activePools = serverBacked ? serverState.pools : pools;
   const activeMemberships = serverBacked ? serverState.memberships : memberships;
   const selectedPool = activePools.find((item) => item.id === selectedPoolId);
@@ -389,17 +391,21 @@ export function TalentPoolWorkspace({ mode, setMode, selectedPoolId, setSelected
 
   async function loadMembers(poolId, { cursor = null, append = false } = {}) {
     if (!controller || !poolId) return;
+    const operation = memberLoadRef.current.start();
     setServerState((current) => ({ ...current, memberStatus: append ? current.memberStatus : "loading", loadingMembers: append, error: "" }));
     try {
-      const page = await controller.listMemberships(poolId, { limit: 50, cursor: cursor || undefined });
+      const page = await controller.listMemberships(poolId, { limit: 50, cursor: cursor || undefined }, { signal: operation.signal });
+      if (!operation.isCurrent()) return;
       setServerState((current) => ({ ...current, memberStatus: "ready", memberships: append ? [...current.memberships, ...page.records] : page.records, memberCursor: page.nextCursor, loadingMembers: false }));
-    } catch {
+    } catch (error) {
+      if (!operation.isCurrent() || error?.name === "AbortError") return;
       setServerState((current) => ({ ...current, memberStatus: "error", loadingMembers: false, error: "请检查网络后重试。" }));
     }
   }
 
   useEffect(() => { if (controller) void loadPools(); }, [controller]);
   useEffect(() => { if (controller && mode === "detail" && selectedPoolId) void loadMembers(selectedPoolId); }, [controller, mode, selectedPoolId]);
+  useEffect(() => () => memberLoadRef.current.cancel(), [controller]);
 
   function openPool(id) { setSelectedPoolId(id); setMode("detail"); }
   async function createPool(pool) { if (!serverBacked) { setPools((current) => [pool, ...current]); return pool; } try { const created = await controller.createPool(pool, actorId); if (!created) return null; setServerState((current) => ({ ...current, pools: [created, ...current.pools] })); onNotify("人才库已创建"); return created; } catch { onNotify("人才库创建失败，请检查名称和权限后重试"); return null; } }

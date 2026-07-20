@@ -53,3 +53,10 @@ test("review notifications use the dedicated workbench review navigation", () =>
   assert.match(appSource, /<NotificationMenu[^>]*onOpenCandidate=\{openWorkbenchTaskCandidate\}/);
   assert.match(appSource, /candidate\.taskId \? openWorkbenchReviewCandidate\(candidate\) : openCandidate\(candidate\)/);
 });
+
+test("manager review rows and notifications render the controller AI availability label", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  const menuSource = readFileSync(new URL("./NotificationMenu.jsx", import.meta.url), "utf8");
+  assert.match(appSource, /candidate\.aiLabel && <small[^>]*>\{candidate\.aiLabel\}<\/small>/);
+  assert.match(menuSource, /item\.aiLabel && <small[^>]*>\{item\.aiLabel\}<\/small>/);
+});
