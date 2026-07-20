@@ -16,6 +16,7 @@ from server.app.screening.scanner import ScanResult
 from server.app.screening.storage import StorageWriteFailed
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.llm.screening import SCREENING_SYSTEM_PROMPT
+from server.app.screening.routing import route_llm_screening_terminal
 
 _RETRYABLE={"scanner_unavailable","scanner_error","storage_unavailable"}
 def _uuid(item_id,name): return uuid.uuid5(uuid.UUID(str(item_id)),name)
@@ -136,10 +137,12 @@ class ScreeningPipeline:
             item.status="scored"; item.safe_error_code=None
             if config and config.enabled and config.encrypted_api_key is not None and allowed:
                 prompt=_ensure_screening_prompt(db,organization_id,config.updated_by)
-                QueueRepository(db).enqueue(organization_id,"screening.llm_score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"screening_result_id":str(existing.id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key=f"llm:{item.id}:{config.version}:{prompt.id}",trace_id=getattr(job,"trace_id",None),max_attempts=3)
+                QueueRepository(db).enqueue(organization_id,"screening.llm_score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"screening_result_id":str(existing.id),"application_id":str(item.application_id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key=f"llm:{item.id}:{config.version}:{prompt.id}",trace_id=getattr(job,"trace_id",None),max_attempts=3)
                 item.llm_status="queued"; item.llm_safe_error_code=None; item.llm_finished_at=None; item.finished_at=None
             else:
-                item.llm_status="skipped"; item.llm_safe_error_code=None; item.llm_finished_at=item.llm_finished_at or datetime.now(timezone.utc); item.finished_at=item.finished_at or datetime.now(timezone.utc)
+                skip_code="llm_job_not_allowed" if config and not allowed else "llm_config_disabled"
+                item.llm_status="skipped"; item.llm_safe_error_code=skip_code; item.llm_finished_at=item.llm_finished_at or datetime.now(timezone.utc); item.finished_at=item.finished_at or datetime.now(timezone.utc)
+                route_llm_screening_terminal(db,organization_id=organization_id,item_id=item.id,actor_user_id=run.created_by,score=None,ai_status="failed",safe_error_code=skip_code,trace_id=getattr(job,"trace_id",None) or f"screening:{item.id}")
             self._aggregate(db,run); db.commit()
     async def _retry_or_finish(self,job,organization_id,item_id,code,stage):
         final=getattr(job,"attempts",1)>=getattr(job,"max_attempts",3)

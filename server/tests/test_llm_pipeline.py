@@ -14,12 +14,14 @@ from server.app.screening.schemas import LlmEvaluationOut
 from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.identity.models import AuditLog
-from server.app.recruiting.models import Application, ApplicationStageEvent, JobJdVersion, Resume
+from server.app.recruiting.models import Application, ApplicationReviewTask, ApplicationStageEvent, JobJdVersion, Resume
 from server.app.screening.llm_pipeline import LlmScreeningPipeline
+from server.app.screening.routing import route_llm_screening_terminal
 from server.app.screening.terminal import finalize_llm_dead_letter
 from server.app.screening.models import ScreeningItem, ScreeningResult as RuleResult, ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.llm.security import ApiKeyCipher
+from server.app.talent.models import TalentPoolMembership
 from server.tests.test_screening_pipeline import seeded_pipeline
 from server.tests.test_screening_api import login
 
@@ -55,6 +57,34 @@ class Gateway:
         if isinstance(self.outcome, Exception):
             raise self.outcome
         return self.outcome
+
+
+def screening_evaluation(score):
+    remaining = score
+    dimensions = []
+    for key, limit in (
+        ("core_capability", 35),
+        ("experience_depth", 25),
+        ("role_seniority", 20),
+        ("transferability", 10),
+        ("explicit_constraints", 10),
+    ):
+        dimension_score = min(remaining, limit)
+        remaining -= dimension_score
+        dimensions.append({"key": key, "score": dimension_score, "evidence": [], "gaps": []})
+    return ScreeningEvaluation(
+        ScreeningResult(
+            score=score,
+            dimensions=dimensions,
+            summary="Safe summary",
+            strengths=[],
+            gaps=[],
+            risks=[],
+            questions=[],
+        ),
+        1,
+        {},
+    )
 
 
 def prepared(tmp_path, *, allowed_job_ids=None):
@@ -118,6 +148,16 @@ def terminal_llm_failure(app, job, code="provider_unavailable"):
         item.llm_finished_at = item.created_at
         item.finished_at = item.created_at
         run = db.get(ScreeningRun, item.run_id)
+        route_llm_screening_terminal(
+            db,
+            organization_id=item.organization_id,
+            item_id=item.id,
+            actor_user_id=run.created_by,
+            score=None,
+            ai_status="failed",
+            safe_error_code=code,
+            trace_id="terminal-fixture",
+        )
         aggregate_run(db, run)
         db.commit()
         return item.id, run.id, item.application_id
@@ -306,6 +346,41 @@ def test_success_commits_running_before_provider_and_is_replay_safe(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("score", "expected_stage", "review_tasks", "memberships"),
+    [(60, "review", 1, 0), (59, "deferred", 0, 1)],
+)
+def test_success_routes_real_score_boundary_once(tmp_path, score, expected_stage, review_tasks, memberships):
+    app, cipher, job = prepared(tmp_path)
+    pipeline = LlmScreeningPipeline(
+        app.state.identity_store.sync_session,
+        Gateway(screening_evaluation(score)),
+        cipher,
+    )
+
+    asyncio.run(pipeline.evaluate_item(job))
+    asyncio.run(pipeline.evaluate_item(job))
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        application = db.get(Application, item.application_id)
+        evaluation = db.scalar(select(LlmScreeningEvaluation))
+        assert application.stage == expected_stage
+        assert evaluation.score == score
+        assert sum(value["score"] for value in evaluation.dimensions) == score
+        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 1
+        assert db.scalar(select(func.count(ApplicationReviewTask.id))) == review_tasks
+        assert db.scalar(select(func.count(TalentPoolMembership.id))) == memberships
+
+
+def test_llm_queue_payload_carries_application_id(tmp_path):
+    app, _cipher, job = prepared(tmp_path)
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        assert job.payload["application_id"] == str(item.application_id)
+
+
+@pytest.mark.parametrize(
     ("change", "code"),
     [
         (lambda config, run: setattr(config, "enabled", False), "llm_config_disabled"),
@@ -331,6 +406,10 @@ def test_changed_disabled_or_nonallowed_config_skips_without_provider(tmp_path, 
         assert item.status == "scored" and item.llm_status == "skipped" and item.llm_safe_error_code == code and item.finished_at
         assert invocation.status == "failed" and invocation.safe_error_code == code
         assert db.get(ScreeningRun, item.run_id).status == "completed"
+        assert db.get(Application, item.application_id).stage == "review"
+        task = db.scalar(select(ApplicationReviewTask))
+        assert task.ai_status == "failed" and task.safe_error_code == code
+        assert db.scalar(select(func.count(LlmScreeningEvaluation.id))) == 0
 
 
 def test_deleted_config_revokes_call_and_completes_with_rule_result(tmp_path):
@@ -357,6 +436,10 @@ def test_transient_provider_failure_retries_then_exhausts_to_partial(tmp_path, s
         item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
         assert item.status == "scored" and item.llm_status == "queued" and item.llm_finished_at is None
         assert db.get(ScreeningRun, item.run_id).status == "llm_scoring"
+        assert db.get(Application, item.application_id).stage == "new"
+        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 0
+        assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 0
+        assert db.scalar(select(func.count(TalentPoolMembership.id))) == 0
 
     job.attempts = job.max_attempts
     with pytest.raises(PermanentJobError) as exhausted:
@@ -367,6 +450,68 @@ def test_transient_provider_failure_retries_then_exhausts_to_partial(tmp_path, s
         assert item.status == "scored" and item.llm_status == "failed" and item.llm_finished_at and item.finished_at
         assert db.get(ScreeningRun, item.run_id).status == "partial"
         assert db.scalar(select(func.count(LlmInvocation.id))) == 2
+        assert db.get(Application, item.application_id).stage == "review"
+        assert db.scalar(select(func.count(LlmScreeningEvaluation.id))) == 0
+        task = db.scalar(select(ApplicationReviewTask))
+        assert task.ai_status == "failed" and task.safe_error_code == safe_code
+
+
+@pytest.mark.parametrize(
+    "safe_code",
+    [
+        "provider_unavailable",
+        "provider_quota_or_rate_limited",
+        "provider_response_invalid",
+        "llm_config_disabled",
+    ],
+)
+def test_final_llm_failure_routes_to_review_with_null_score(tmp_path, safe_code):
+    app, cipher, job = prepared(tmp_path)
+    job.attempts = job.max_attempts
+    pipeline = LlmScreeningPipeline(
+        app.state.identity_store.sync_session,
+        Gateway(GatewayError(safe_code)),
+        cipher,
+    )
+
+    with pytest.raises(PermanentJobError) as failed:
+        asyncio.run(pipeline.evaluate_item(job))
+    assert failed.value.safe_code == safe_code
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        application = db.get(Application, item.application_id)
+        task = db.scalar(select(ApplicationReviewTask))
+        assert item.llm_status == "failed"
+        assert application.stage == "review"
+        assert db.scalar(select(LlmScreeningEvaluation)) is None
+        assert task.ai_status == "failed" and task.safe_error_code == safe_code
+
+
+def test_final_llm_failure_normalizes_unknown_code_before_any_persistence(tmp_path):
+    app, cipher, job = prepared(tmp_path)
+    job.attempts = job.max_attempts
+    private_code = "candidate_alice_resume_prompt"
+
+    with pytest.raises(PermanentJobError) as failed:
+        asyncio.run(
+            LlmScreeningPipeline(
+                app.state.identity_store.sync_session,
+                Gateway(GatewayError(private_code)),
+                cipher,
+            ).evaluate_item(job)
+        )
+    assert failed.value.safe_code == "internal_error"
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        invocation = db.scalar(select(LlmInvocation))
+        task = db.scalar(select(ApplicationReviewTask))
+        audit = db.scalar(select(AuditLog).where(AuditLog.event_type == "screening.terminal_routed"))
+        assert item.llm_safe_error_code == "internal_error"
+        assert invocation.safe_error_code == "internal_error"
+        assert task.safe_error_code == "internal_error"
+        assert private_code not in repr(audit.metadata_json)
 
 
 def test_permanent_provider_failure_is_terminal_and_tenant_payload_cannot_cross_load(tmp_path):
@@ -511,3 +656,7 @@ def test_llm_dead_letter_preserves_rule_result_and_is_idempotent(tmp_path):
         assert item.status=="scored" and item.llm_status=="failed" and item.llm_safe_error_code=="llm_handler_failed" and item.finished_at
         assert run.status=="partial" and run.succeeded_count==1 and run.failed_count==0 and run.finished_at and run.version>=2
         assert db.get(Application,item.application_id).stage=="review" and db.scalar(select(func.count(RuleResult.id)))==1
+        assert db.scalar(select(func.count(LlmScreeningEvaluation.id)))==0
+        task=db.scalar(select(ApplicationReviewTask))
+        assert task.ai_status=="failed" and task.safe_error_code=="llm_handler_failed"
+        assert db.scalar(select(func.count(ApplicationStageEvent.id)))==1

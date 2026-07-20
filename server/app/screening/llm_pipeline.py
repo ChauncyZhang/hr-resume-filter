@@ -11,9 +11,11 @@ from server.app.llm.redaction import redact_screening_text
 from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.recruiting.models import Candidate, JobJdVersion, Resume
+from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.screening.actions import CandidateTombstoned, lock_candidate_screening_item
+from server.app.screening.routing import derive_screening_outcome, route_llm_screening_terminal
 
 
 _TRANSIENT_ERRORS = {"provider_unavailable", "provider_quota_or_rate_limited", "provider_response_invalid"}
@@ -79,6 +81,16 @@ class LlmScreeningPipeline:
                 item.llm_safe_error_code = skip_code
                 item.llm_attempts = max(item.llm_attempts, attempt_no)
                 finished_at=datetime.now(timezone.utc); item.llm_finished_at = item.llm_finished_at or finished_at; item.finished_at=item.finished_at or finished_at
+                route_llm_screening_terminal(
+                    db,
+                    organization_id=ids["organization_id"],
+                    item_id=ids["screening_item_id"],
+                    actor_user_id=run.created_by,
+                    score=None,
+                    ai_status="failed",
+                    safe_error_code=skip_code,
+                    trace_id=getattr(job, "trace_id", None) or f"llm:{queue_job_id}",
+                )
                 aggregate_run(db, run)
                 db.commit()
                 return
@@ -142,7 +154,7 @@ class LlmScreeningPipeline:
                 invocation_id=invocation.id,
                 prompt_version_id=ids["prompt_version_id"],
                 score=facts.score,
-                recommendation=self._recommendation(facts.score),
+                recommendation=derive_screening_outcome(facts.score).recommendation,
                 summary=facts.summary,
                 strengths=facts.strengths,
                 gaps=facts.gaps,
@@ -153,10 +165,22 @@ class LlmScreeningPipeline:
             item.llm_status = "succeeded"
             item.llm_safe_error_code = None
             finished_at=datetime.now(timezone.utc); item.llm_finished_at = item.llm_finished_at or finished_at; item.finished_at=item.finished_at or finished_at
+            db.flush()
+            route_llm_screening_terminal(
+                db,
+                organization_id=ids["organization_id"],
+                item_id=ids["screening_item_id"],
+                actor_user_id=run.created_by,
+                score=facts.score,
+                ai_status="succeeded",
+                safe_error_code=None,
+                trace_id=getattr(job, "trace_id", None) or f"llm:{queue_job_id}",
+            )
             aggregate_run(db, run)
             db.commit()
 
     def _finish_failure(self, job, ids, queue_job_id, attempt_no, input_sha256, code, retryable):
+        code = normalize_llm_terminal_safe_error_code(code)
         with self.sessions() as db:
             candidate_id=db.scalar(select(ScreeningItem.candidate_id).where(ScreeningItem.organization_id==ids["organization_id"],ScreeningItem.id==ids["screening_item_id"]))
             if candidate_id is None:
@@ -189,6 +213,16 @@ class LlmScreeningPipeline:
                     item.llm_finished_at=None; item.finished_at=None
                 else:
                     finished_at=datetime.now(timezone.utc); item.llm_finished_at=item.llm_finished_at or finished_at; item.finished_at=item.finished_at or finished_at
+                    route_llm_screening_terminal(
+                        db,
+                        organization_id=ids["organization_id"],
+                        item_id=ids["screening_item_id"],
+                        actor_user_id=run.created_by,
+                        score=None,
+                        ai_status="failed",
+                        safe_error_code=code,
+                        trace_id=getattr(job, "trace_id", None) or f"llm:{queue_job_id}",
+                    )
                 aggregate_run(db, run)
                 db.commit()
         if retryable:
@@ -207,6 +241,7 @@ class LlmScreeningPipeline:
         values = {name: _payload_uuid(payload, name) for name in (
             "organization_id", "screening_item_id", "screening_result_id", "config_id", "prompt_version_id"
         )}
+        values["application_id"] = _payload_uuid(payload, "application_id") if "application_id" in payload else None
         try:
             values["config_version"] = int(payload["config_version"])
         except (KeyError, TypeError, ValueError):
@@ -229,6 +264,8 @@ class LlmScreeningPipeline:
             .join(BackgroundJob, and_(BackgroundJob.organization_id == ScreeningItem.organization_id, BackgroundJob.id == queue_job_id))
             .where(ScreeningItem.organization_id == ids["organization_id"], ScreeningItem.id == ids["screening_item_id"], ScreeningItem.status == "scored", Candidate.deleted_at.is_(None))
         )
+        if ids["application_id"] is not None:
+            statement = statement.where(ScreeningItem.application_id == ids["application_id"])
         if lock_item:
             statement = statement.with_for_update()
         return db.execute(statement).one_or_none()
@@ -253,14 +290,6 @@ class LlmScreeningPipeline:
         if not isinstance(system_prompt, str) or not system_prompt.strip():
             raise PermanentJobError("llm_prompt_invalid")
         return system_prompt
-
-    @staticmethod
-    def _recommendation(score):
-        if score >= 85:
-            return "优先评审"
-        if score >= 60:
-            return "建议评审"
-        return "暂缓"
 
     @staticmethod
     def _skip_code(config, run, expected_version):

@@ -8,7 +8,7 @@ from server.app.main import create_app
 from server.app.queue.models import BackgroundJob
 from server.app.queue.repository import QueueRepository
 from server.app.queue.runtime import DatabaseQueueGateway
-from server.app.recruiting.models import FileObject,JobJdVersion,ScreeningRuleVersion
+from server.app.recruiting.models import ApplicationReviewTask,FileObject,JobJdVersion,ScreeningRuleVersion
 from server.app.screening.models import ScreeningItem,ScreeningRun
 from server.app.screening.terminal import finalize_screening_dead_letter,screening_terminal_callbacks
 from server.app.worker.main import Worker
@@ -27,5 +27,6 @@ def test_unexpected_parse_and_score_exhaustion_atomically_finalize_domain_facts(
     asyncio.run(worker._poll_once()); asyncio.run(worker._poll_once())
     with app.state.identity_store.sync_session() as db:
         assert set(db.scalars(select(BackgroundJob.status).where(BackgroundJob.id.in_(job_ids))))=={"dead_letter"}; stored=[db.get(ScreeningItem,item_id) for item_id in item_ids]; aggregate=db.get(ScreeningRun,run_id); assert all(item.status=="failed" and item.finished_at and item.safe_error_code=="handler_failed" for item in stored); assert aggregate.status=="failed" and aggregate.processed_count==2 and aggregate.failed_count==2
+        assert db.scalar(select(func.count(ApplicationReviewTask.id)))==0
         for job_id in job_ids: finalize_screening_dead_letter(db,db.get(BackgroundJob,job_id),"handler_failed",db.get(BackgroundJob,job_id).updated_at)
         db.commit(); assert db.get(ScreeningRun,run_id).processed_count==2

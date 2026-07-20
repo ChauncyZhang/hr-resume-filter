@@ -1,6 +1,6 @@
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 from collections.abc import Mapping
 
@@ -77,9 +77,11 @@ class MapField:
 @dataclass(frozen=True)
 class PayloadSchema:
     fields: Mapping[str, FieldPolicy]
+    optional_fields: Mapping[str, FieldPolicy] = field(default_factory=dict)
     def validate(self, payload: Mapping[str, object]) -> dict[str, object]:
-        if not isinstance(payload, Mapping) or set(payload) != set(self.fields): raise UnsafePayload("payload fields do not match registered schema")
-        return {key: policy.validate(payload[key]) for key, policy in self.fields.items()}
+        if not isinstance(payload, Mapping) or not set(self.fields) <= set(payload) or not set(payload) <= set(self.fields) | set(self.optional_fields): raise UnsafePayload("payload fields do not match registered schema")
+        policies = {**self.fields, **self.optional_fields}
+        return {key: policies[key].validate(value) for key, value in payload.items()}
 
 
 class PayloadPolicyRegistry:
@@ -106,7 +108,7 @@ class PayloadPolicyRegistry:
 DEFAULT_PAYLOAD_POLICIES = PayloadPolicyRegistry()
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.parse_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"parser_version":IdentifierField()}))
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"jd_version_id":OpaqueIdField(),"rule_version_id":OpaqueIdField(),"rule_engine_version":IdentifierField()}))
-DEFAULT_PAYLOAD_POLICIES.register_job("screening.llm_score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"screening_result_id":OpaqueIdField(),"config_id":OpaqueIdField(),"config_version":IntegerField(1,2147483647),"prompt_version_id":OpaqueIdField()}))
+DEFAULT_PAYLOAD_POLICIES.register_job("screening.llm_score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"screening_result_id":OpaqueIdField(),"config_id":OpaqueIdField(),"config_version":IntegerField(1,2147483647),"prompt_version_id":OpaqueIdField()},{"application_id":OpaqueIdField()}))
 DEFAULT_PAYLOAD_POLICIES.register_job(
     "governance.delete_candidate",
     PayloadSchema(

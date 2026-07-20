@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from sqlalchemy import func,select
 
-from server.app.recruiting.models import Application,Candidate,FileObject,Resume
+from server.app.recruiting.models import Application,ApplicationReviewTask,Candidate,FileObject,Resume
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
@@ -83,8 +83,9 @@ def test_clean_parse_then_score_is_replay_safe_and_auto_sends_completed_resume_t
     asyncio.run(pipeline.score_item(score_job)); asyncio.run(pipeline.score_item(score_job))
     with app.state.identity_store.sync_session() as db:
         assert db.scalar(select(func.count(Candidate.id)))==1 and db.scalar(select(func.count(Resume.id)))==1 and db.scalar(select(func.count(Application.id)))==1 and db.scalar(select(func.count(ScreeningResult.id)))==1
-        application=db.scalar(select(Application)); result=db.scalar(select(ScreeningResult)); completed=db.get(ScreeningRun,uuid.UUID(run["id"]))
+        application=db.scalar(select(Application)); result=db.scalar(select(ScreeningResult)); completed=db.get(ScreeningRun,uuid.UUID(run["id"])); task=db.scalar(select(ApplicationReviewTask))
         assert application.stage=="review" and application.version==2 and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1 and db.scalar(select(ScreeningItem.finished_at)).isoformat()
+        assert task.ai_status=="failed" and task.safe_error_code=="llm_config_disabled"
 
 def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))
@@ -96,7 +97,7 @@ def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_
         stored=db.get(ScreeningItem,uuid.UUID(item["id"])); aggregate=db.get(ScreeningRun,uuid.UUID(run["id"])); jobs=list(db.scalars(select(BackgroundJob).where(BackgroundJob.type=="screening.llm_score_item"))); prompt=db.scalar(select(PromptVersion))
         assert stored.status=="scored" and stored.llm_status=="queued" and stored.finished_at is None
         assert aggregate.status=="llm_scoring" and aggregate.processed_count==0
-        assert len(jobs)==1 and jobs[0].payload=={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"screening_result_id":str(db.scalar(select(ScreeningResult.id))),"config_id":str(db.scalar(select(LlmProviderConfig.id))),"config_version":3,"prompt_version_id":str(prompt.id)}
+        assert len(jobs)==1 and jobs[0].payload=={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"screening_result_id":str(db.scalar(select(ScreeningResult.id))),"application_id":str(stored.application_id),"config_id":str(db.scalar(select(LlmProviderConfig.id))),"config_version":3,"prompt_version_id":str(prompt.id)}
         assert "resume" not in str(jobs[0].payload).lower() and "jd" not in jobs[0].payload
         assert prompt.version_number==2 and prompt.content["schema_version"]=="screening-evaluation-v2"
         assert "recommendation" in prompt.content["system"] and "must not" in prompt.content["system"]

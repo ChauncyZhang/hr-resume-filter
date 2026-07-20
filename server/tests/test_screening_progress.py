@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from server.app.screening.progress import summarize_progress
+import inspect
+
+from server.app.screening.progress import aggregate_run, summarize_progress
 
 
 def item(status, llm_status="not_requested"):
@@ -24,3 +26,10 @@ def test_progress_combines_rule_failures_and_llm_states_truthfully():
 
     terminal=summarize_progress([item("failed"),item("scored","skipped"),item("scored","succeeded")],3)
     assert terminal==(3,2,1,"partial")
+
+
+def test_aggregate_run_only_aggregates_and_does_not_transition_applications():
+    source = inspect.getsource(aggregate_run)
+
+    assert "transition_application_record" not in source
+    assert "Application.stage" not in source
