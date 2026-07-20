@@ -684,11 +684,15 @@ return {
 };
 ```
 
+Consume the real Task 5 dimension contract (`key`, `score`, `evidence`, `gaps`) and map known keys to localized display labels in the client. Preserve parser/file `error_code` separately from `llm_error_code`. The normalized run property for `manager_review_count` must be consumed end to end without aliases that tests can bypass.
+
 Remove `bulkAction`, undo-bulk state, selected row state, rule-score decision text, and HR review summary from current-flow rendering. Keep single-file technical retry for parser failures and explicitly retryable LLM jobs.
 
 - [ ] **Step 4: Render the new result columns and summaries**
 
 Use columns: `流转结果`, `候选人 / 文件`, `处理状态`, `LLM 结论`, `最终分`, `维度评分`, `主要优势与风险`, `查看候选人`. Show `AI评分不可用` with a neutral warning and `已转交用人经理`, not as a failed candidate.
+
+The desktop result grid must expose row/column semantics to assistive technology. When the header is visually hidden on narrow screens, every value must retain a visible or accessible field label so scores and conclusions remain understandable out of column context.
 
 - [ ] **Step 5: Make task totals match server route outcomes**
 
