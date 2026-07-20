@@ -590,6 +590,10 @@ For final failure, return `ai_score: null`, `ai_recommendation: "AI评分不可�
 
 Add run-summary fields `manager_review_count`, `deferred_count`, `ai_unavailable_count`, and `file_failed_count`. Derive them from item/application terminal state and never from rule recommendations.
 
+The immutable automatic route is the latest `screening.terminal_routed` audit for the screening application, not the application's mutable current stage. Screening-item and candidate projections, plus run counters, must continue to report the persisted route after later contact/interview progression or deferred referral. Applications without a terminal-routing audit must not be inferred as LLM-routed merely because their current stage is `review` or `deferred`.
+
+When a fail-open LLM outcome is explicitly retried and later succeeds, preserve the already granted manager-review route, append a refreshed terminal-routing audit carrying the latest AI status/score/recommendation, and refresh any still-open review task from `failed` to `succeeded`. Do not move a progressed application backwards or create duplicate stage events, tasks, or audits for replayed callbacks.
+
 - [ ] **Step 5: Add deferred-to-review referral without creating a new application**
 
 Create `ReviewReferralInput` with no client-controlled stage or assignee. The endpoint must lock membership/source application, require `source.stage == "deferred"`, require an open job and valid hiring owner/fallback owner, transition the same application to `review`, create its stage event/audit/open review task, and preserve the membership as source history. Repeated idempotency key returns the same application.
