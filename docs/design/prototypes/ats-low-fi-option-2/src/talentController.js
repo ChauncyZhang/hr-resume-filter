@@ -11,9 +11,15 @@ const UI_TO_STATUS = Object.fromEntries(Object.entries(STATUS_TO_UI).map(([api, 
 const APPLICATION_STAGE_TO_UI = {
   new: "新简历",
   screening: "筛选中",
+  review: "用人经理复核",
+  deferred: "AI 初筛暂缓",
+  contact: "待沟通",
+  interview_pending: "待安排",
+  interviewing: "面试中",
   communication: "待沟通",
   interview: "面试中",
   decision: "待决策",
+  passed: "已通过",
   hired: "已录用",
   rejected: "已淘汰",
   withdrawn: "已撤回",
@@ -101,6 +107,7 @@ export function normalizeTalentPool(value) {
     id,
     serverBacked: true,
     name: safeString(value?.name, "未命名人才库"),
+    systemKey: safeString(value?.system_key),
     purpose: safeString(value?.purpose),
     suitableRoles: safeArray(value?.suitable_roles).filter((item) => typeof item === "string"),
     ownerId: safeString(value?.owner?.id),
@@ -126,6 +133,11 @@ export function normalizeTalentMembership(value) {
   const sourceJobId = safeString(source?.job_id);
   const sourceJobTitle = safeString(source?.job_title, "历史职位");
   const tags = safeArray(value?.tags).filter((item) => typeof item === "string");
+  const deferredScreening = source && value?.deferred_screening && typeof value.deferred_screening === "object"
+    ? value.deferred_screening
+    : null;
+  const finalScore = typeof deferredScreening?.final_score === "number" ? deferredScreening.final_score : null;
+  const mainGaps = safeArray(deferredScreening?.main_gaps).filter((item) => typeof item === "string");
   const candidate = {
     id: candidateId,
     candidateId,
@@ -158,6 +170,11 @@ export function normalizeTalentMembership(value) {
     candidateId,
     candidate,
     sourceApplicationId,
+    originalJob: { id: sourceJobId, title: source ? sourceJobTitle : "" },
+    sourceStage: redactedSource ? "来源申请不可见" : APPLICATION_STAGE_TO_UI[source?.stage] || "状态未知",
+    finalScore,
+    deferredAt: dateOnly(deferredScreening?.deferred_at),
+    mainGaps,
     suitableRoles: safeArray(value?.suitable_roles).filter((item) => typeof item === "string"),
     tags,
     ownerId: safeString(value?.owner?.id),
@@ -306,6 +323,23 @@ export function createTalentController({ client = apiClient, idSource = () => gl
         method: "POST", body: retainedBody, idempotencyKey, ...options,
       }));
       return payload?.data ?? null;
+    },
+    async referToReview(memberId, memberVersion, options = {}) {
+      const id = requireId(memberId, "talent_membership_required");
+      const version = requireVersion(memberVersion);
+      const body = {};
+      const intent = `membership:review-referral:${id}:${version}`;
+      const payload = await mutate(intent, body, (idempotencyKey, retainedBody) => client.request(`/api/v1/talent-pool-memberships/${encodeURIComponent(id)}/review-referrals`, {
+        method: "POST",
+        body: retainedBody,
+        ifMatch: `"${version}"`,
+        idempotencyKey,
+        ...options,
+      }));
+      return {
+        application: payload?.data?.application ?? null,
+        membership: normalizeTalentMembership(payload?.data?.membership),
+      };
     },
   };
 }
