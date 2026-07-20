@@ -90,6 +90,7 @@ def build_screening_handlers(settings,storage_client,bucket):
     from server.app.screening.scanner import ClamAvScanner
     from server.app.screening.storage import PipelineStorage
     from server.app.screening.llm_pipeline import LlmScreeningPipeline
+    from server.app.screening.terminal import LlmTerminalFinalizer
     from server.app.llm.gateway import OpenAiCompatibleGateway
     from server.app.llm.policy import ProviderAllowlist
     from server.app.llm.security import ApiKeyCipher
@@ -103,8 +104,9 @@ def build_screening_handlers(settings,storage_client,bucket):
     deployed_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
     allowlist=DatabaseProviderCatalog(sessions,deployed_allowlist,allow_http=settings.environment!="production")
     llm_pipeline=LlmScreeningPipeline(sessions,OpenAiCompatibleGateway(allowlist),ApiKeyCipher(llm_key.encode()))
+    llm_finalizer=LlmTerminalFinalizer(sessions)
     report_export=ReportExportJobHandler(sessions,MinioExportStorage(storage_client,bucket))
-    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"reports.export":report_export}
+    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"screening.llm_finalize_terminal":llm_finalizer,"reports.export":report_export}
 
 
 def build_governance_handlers(settings: Settings, governance: GovernanceSettings):

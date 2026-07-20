@@ -1,10 +1,15 @@
+import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DisconnectionError, OperationalError, TimeoutError as SqlAlchemyTimeoutError
 
 from server.app.llm.models import LlmProviderConfig, PromptVersion
-from server.app.queue.service import normalize_safe_code
+from server.app.queue.models import BackgroundJob
+from server.app.queue.repository import QueueRepository
+from server.app.queue.service import RetryableJobError, normalize_safe_code
 from server.app.recruiting.models import Application, Candidate, JobJdVersion, Resume
 from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
 from server.app.screening.models import ScreeningItem, ScreeningResult, ScreeningRun
@@ -19,6 +24,9 @@ _LLM_PAYLOAD_FIELDS = (
     "application_id",
     "config_id",
     "prompt_version_id",
+)
+_LLM_REQUIRED_PAYLOAD_FIELDS = tuple(
+    name for name in _LLM_PAYLOAD_FIELDS if name != "application_id"
 )
 _LLM_WORKER_EXHAUSTION_CODES = {
     "handler_failed": "llm_handler_failed",
@@ -105,7 +113,7 @@ def _llm_dead_letter_context(session, job):
     )
 
     payload_invalid = (
-        any(values[name] is None for name in _LLM_PAYLOAD_FIELDS)
+        any(values[name] is None for name in _LLM_REQUIRED_PAYLOAD_FIELDS)
         or values["organization_id"] != organization_id
         or config_version is None
         or config_version < 1
@@ -117,7 +125,7 @@ def _llm_dead_letter_context(session, job):
     if item.status != "scored":
         return _LlmDeadLetterContext(item, run, "llm_job_payload_invalid")
     if (
-        values["application_id"] != item.application_id
+        (values["application_id"] is not None and values["application_id"] != item.application_id)
         or application.candidate_id != item.candidate_id
         or application.resume_id != item.resume_id
         or run is None
@@ -199,6 +207,144 @@ def _llm_dead_letter_safe_code(value):
     return None
 
 
+def _llm_finalizer_payload(job, safe_code):
+    _, values, config_version = _llm_payload(job)
+    source_payload = job.payload if isinstance(getattr(job, "payload", None), dict) else {}
+    trusted_organization_id = _uuid_value(getattr(job, "organization_id", None))
+    source_job_id = _uuid_value(getattr(job, "id", None))
+    if (
+        trusted_organization_id is None
+        or source_job_id is None
+        or values["screening_item_id"] is None
+    ):
+        return None
+
+    terminal_code = _llm_dead_letter_safe_code(safe_code)
+    disposition = "route"
+    malformed_relationship = (
+        any(
+            values[name] is None
+            for name in ("screening_result_id", "config_id", "prompt_version_id")
+        )
+        or config_version is None
+        or config_version < 1
+        or ("application_id" in source_payload and values["application_id"] is None)
+    )
+    if values["organization_id"] != trusted_organization_id or malformed_relationship:
+        terminal_code, disposition = "llm_job_payload_invalid", "technical"
+    elif terminal_code is None:
+        terminal_code, disposition = "internal_error", "technical"
+    payload = {
+        "organization_id": str(trusted_organization_id),
+        "source_job_id": str(source_job_id),
+        "screening_item_id": str(values["screening_item_id"]),
+        "terminal_safe_error_code": terminal_code,
+        "terminal_disposition": disposition,
+    }
+    for name in ("screening_result_id", "application_id", "config_id", "prompt_version_id"):
+        if values[name] is not None:
+            payload[name] = str(values[name])
+    if config_version is not None and config_version >= 1:
+        payload["config_version"] = config_version
+    return payload
+
+
+def _enqueue_llm_terminal_finalizer(session, job, safe_code):
+    payload = _llm_finalizer_payload(job, safe_code)
+    if payload is None:
+        return
+    dedupe_key = f"llm-terminal:{job.id}"
+    existing = session.scalar(
+        select(BackgroundJob.id).where(
+            BackgroundJob.organization_id == job.organization_id,
+            BackgroundJob.type == "screening.llm_finalize_terminal",
+            BackgroundJob.dedupe_key == dedupe_key,
+        )
+    )
+    if existing is not None:
+        return
+    QueueRepository(session).enqueue(
+        job.organization_id,
+        "screening.llm_finalize_terminal",
+        payload,
+        dedupe_key=dedupe_key,
+        trace_id=f"llm-finalize:{job.id}",
+        max_attempts=3,
+    )
+
+
+def _source_job_matches_finalizer(session, job):
+    source_job_id = _uuid_value(job.payload.get("source_job_id"))
+    source = session.scalar(
+        select(BackgroundJob).where(
+            BackgroundJob.organization_id == job.organization_id,
+            BackgroundJob.id == source_job_id,
+            BackgroundJob.type == "screening.llm_score_item",
+        )
+    )
+    return (
+        source is not None
+        and source.status == "dead_letter"
+        and _llm_finalizer_payload(source, source.last_error_code) == job.payload
+    )
+
+
+class LlmTerminalFinalizer:
+    def __init__(self, sessions):
+        self._sessions = sessions
+
+    async def __call__(self, job):
+        try:
+            await asyncio.to_thread(self._finalize, job)
+        except (OperationalError, DisconnectionError, SqlAlchemyTimeoutError):
+            raise RetryableJobError("queue_unavailable") from None
+
+    def _finalize(self, job):
+        with self._sessions.begin() as session:
+            context = _llm_dead_letter_context(session, job)
+            if context.item is None or context.already_terminal:
+                return
+            if not _source_job_matches_finalizer(session, job):
+                context = _LlmDeadLetterContext(
+                    context.item, context.run, "llm_job_payload_invalid"
+                )
+            disposition = job.payload.get("terminal_disposition")
+            terminal_code = normalize_llm_terminal_safe_error_code(
+                job.payload.get("terminal_safe_error_code")
+            )
+            now = _database_now(session)
+            if context.technical_code is not None:
+                _finish_llm_technical_failure(session, context, now)
+                return
+            if disposition != "route" or terminal_code == "internal_error":
+                _finish_llm_technical_failure(
+                    session,
+                    _LlmDeadLetterContext(context.item, context.run, terminal_code),
+                    now,
+                )
+                return
+            route_llm_screening_terminal(
+                session,
+                organization_id=job.organization_id,
+                item_id=context.item.id,
+                actor_user_id=context.run.created_by,
+                score=None,
+                ai_status="failed",
+                safe_error_code=terminal_code,
+                trace_id=getattr(job, "trace_id", None) or f"llm-finalize:{job.id}",
+            )
+            context.item.llm_status = "failed"
+            context.item.llm_safe_error_code = terminal_code
+            context.item.llm_finished_at = context.item.llm_finished_at or now
+            context.item.finished_at = context.item.finished_at or now
+            aggregate_run(session, context.run)
+
+
+def _database_now(session):
+    value = session.scalar(select(text("CURRENT_TIMESTAMP")))
+    return datetime.fromisoformat(value) if isinstance(value, str) else value
+
+
 def finalize_screening_dead_letter(session, job, safe_code, now):
     item_id = _uuid_value(getattr(job, "payload", {}).get("screening_item_id"))
     if item_id is None:
@@ -218,36 +364,7 @@ def finalize_screening_dead_letter(session, job, safe_code, now):
 
 
 def finalize_llm_dead_letter(session, job, safe_code, now):
-    context = _llm_dead_letter_context(session, job)
-    if context.item is None or context.already_terminal:
-        return
-    if context.technical_code is not None:
-        _finish_llm_technical_failure(session, context, now)
-        return
-
-    terminal_code = _llm_dead_letter_safe_code(safe_code)
-    if terminal_code is None:
-        _finish_llm_technical_failure(
-            session,
-            _LlmDeadLetterContext(context.item, context.run, "internal_error"),
-            now,
-        )
-        return
-    route_llm_screening_terminal(
-        session,
-        organization_id=job.organization_id,
-        item_id=context.item.id,
-        actor_user_id=context.run.created_by,
-        score=None,
-        ai_status="failed",
-        safe_error_code=terminal_code,
-        trace_id=getattr(job, "trace_id", None) or f"llm-dead:{job.id}",
-    )
-    context.item.llm_status = "failed"
-    context.item.llm_safe_error_code = terminal_code
-    context.item.llm_finished_at = context.item.llm_finished_at or now
-    context.item.finished_at = context.item.finished_at or now
-    aggregate_run(session, context.run)
+    _enqueue_llm_terminal_finalizer(session, job, safe_code)
 
 
 def screening_terminal_callbacks():

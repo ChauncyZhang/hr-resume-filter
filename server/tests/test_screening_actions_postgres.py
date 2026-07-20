@@ -70,6 +70,8 @@ def test_postgres_concurrent_llm_retry_enqueues_once_and_preserves_rule_facts():
         assert retried.llm_started_at is None and retried.llm_finished_at is None and retried.finished_at is None
         assert len(jobs) == 2 and db.get(BackgroundJob, old_job_id).status == "dead_letter"
         assert sum(job.status == "queued" for job in jobs) == 1 and len({job.dedupe_key for job in jobs}) == 2
+        active_job = next(job for job in jobs if job.status == "queued")
+        assert active_job.payload["application_id"] == str(application_id)
         assert db.scalar(select(func.count(ScreeningResult.id)).where(ScreeningResult.item_id == item_id)) == 1
         assert db.get(Application, application_id).stage == "new"
         assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type == "screening.item_retried")) == 1

@@ -110,6 +110,25 @@ DEFAULT_PAYLOAD_POLICIES.register_job("screening.parse_item", PayloadSchema({"or
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"jd_version_id":OpaqueIdField(),"rule_version_id":OpaqueIdField(),"rule_engine_version":IdentifierField()}))
 DEFAULT_PAYLOAD_POLICIES.register_job("screening.llm_score_item", PayloadSchema({"organization_id":OpaqueIdField(),"screening_item_id":OpaqueIdField(),"screening_result_id":OpaqueIdField(),"config_id":OpaqueIdField(),"config_version":IntegerField(1,2147483647),"prompt_version_id":OpaqueIdField()},{"application_id":OpaqueIdField()}))
 DEFAULT_PAYLOAD_POLICIES.register_job(
+    "screening.llm_finalize_terminal",
+    PayloadSchema(
+        {
+            "organization_id": OpaqueIdField(),
+            "source_job_id": OpaqueIdField(),
+            "screening_item_id": OpaqueIdField(),
+            "terminal_safe_error_code": IdentifierField(),
+            "terminal_disposition": EnumField({"route", "technical"}),
+        },
+        {
+            "screening_result_id": OpaqueIdField(),
+            "application_id": OpaqueIdField(),
+            "config_id": OpaqueIdField(),
+            "config_version": IntegerField(1, 2147483647),
+            "prompt_version_id": OpaqueIdField(),
+        },
+    ),
+)
+DEFAULT_PAYLOAD_POLICIES.register_job(
     "governance.delete_candidate",
     PayloadSchema(
         {

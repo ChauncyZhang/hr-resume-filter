@@ -84,7 +84,7 @@ def retry_screening_item(db,organization_id,item_id,trace_id,actor_user_id=None)
         jd=db.scalar(select(JobJdVersion).where(JobJdVersion.organization_id==organization_id,JobJdVersion.id==run.jd_version_id))
         resume=db.scalar(select(Resume).where(Resume.organization_id==organization_id,Resume.id==item.resume_id)) if item.resume_id else None
         if not is_llm_retryable(item,run,result,config,prompt,jd,resume): raise ScreeningItemNotRetryable
-        job=QueueRepository(db).enqueue(organization_id,"screening.llm_score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"screening_result_id":str(result.id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key=f"llm-retry:{item.id}:{uuid.uuid4()}",trace_id=trace_id,max_attempts=3)
+        job=QueueRepository(db).enqueue(organization_id,"screening.llm_score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"screening_result_id":str(result.id),"application_id":str(item.application_id),"config_id":str(config.id),"config_version":config.version,"prompt_version_id":str(prompt.id)},dedupe_key=f"llm-retry:{item.id}:{uuid.uuid4()}",trace_id=trace_id,max_attempts=3)
         item.llm_status="queued"; item.llm_safe_error_code=None; item.llm_started_at=None; item.llm_finished_at=None; item.finished_at=None
         run.finished_at=None
         aggregate_run(db,run); _audit_retry(db,item,actor_user_id,trace_id,"llm")

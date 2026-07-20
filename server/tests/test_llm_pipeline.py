@@ -5,19 +5,19 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 
 from server.app.llm.gateway import GatewayError
 from server.app.llm.models import LlmInvocation, LlmProviderConfig, LlmScreeningEvaluation, PromptVersion
 from server.app.llm.screening import MAX_RESUME_CHARS,ScreeningEvaluation, ScreeningResult
 from server.app.screening.schemas import LlmEvaluationOut
 from server.app.queue.models import BackgroundJob
-from server.app.queue.service import PermanentJobError, RetryableJobError
+from server.app.queue.service import PermanentJobError, RetryableJobError, normalize_safe_code
 from server.app.identity.models import AuditLog
 from server.app.recruiting.models import Application, ApplicationReviewTask, ApplicationStageEvent, Candidate, JobJdVersion, Resume
 from server.app.screening.llm_pipeline import LlmScreeningPipeline
 from server.app.screening.routing import route_llm_screening_terminal
-from server.app.screening.terminal import finalize_llm_dead_letter
+from server.app.screening.terminal import LlmTerminalFinalizer, finalize_llm_dead_letter
 from server.app.screening.models import ScreeningItem, ScreeningResult as RuleResult, ScreeningRun
 from server.app.screening.progress import aggregate_run
 from server.app.llm.security import ApiKeyCipher
@@ -163,6 +163,34 @@ def terminal_llm_failure(app, job, code="provider_unavailable"):
         return item.id, run.id, item.application_id
 
 
+def run_llm_terminal_finalizer(app, job, callback_code, *, repeat_callback=False):
+    with app.state.identity_store.sync_session() as db:
+        source = db.get(BackgroundJob, job.id)
+        source.payload = dict(job.payload)
+        source.status = "dead_letter"
+        source.attempts = source.max_attempts
+        source.last_error_code = normalize_safe_code(callback_code)
+        finalize_llm_dead_letter(db, source, callback_code, datetime.now(timezone.utc))
+        if repeat_callback:
+            finalize_llm_dead_letter(db, source, callback_code, datetime.now(timezone.utc))
+        db.commit()
+    with app.state.identity_store.sync_session() as db:
+        finalizer = db.scalar(
+            select(BackgroundJob).where(
+                BackgroundJob.type == "screening.llm_finalize_terminal",
+                BackgroundJob.dedupe_key == f"llm-terminal:{job.id}",
+            )
+        )
+        detached = SimpleNamespace(
+            id=finalizer.id,
+            organization_id=finalizer.organization_id,
+            payload=dict(finalizer.payload),
+            trace_id=finalizer.trace_id,
+        )
+    asyncio.run(LlmTerminalFinalizer(app.state.identity_store.sync_session)(detached))
+    return detached
+
+
 @pytest.mark.parametrize(
     ("code", "expected"),
     [
@@ -233,6 +261,7 @@ def test_manual_llm_retry_requeues_current_dependencies_and_is_idempotent(tmp_pa
             "organization_id": str(item.organization_id),
             "screening_item_id": str(item.id),
             "screening_result_id": str(result_id),
+            "application_id": str(application_id),
             "config_id": str(config.id),
             "config_version": current_config_version,
             "prompt_version_id": str(prompt_id),
@@ -647,19 +676,56 @@ def test_run_api_includes_safe_llm_degradation_summary(tmp_path):
     assert response.json()["data"]["error_summary"]=={"provider_auth_failed":1}
 
 
-def test_llm_dead_letter_preserves_rule_result_and_is_idempotent(tmp_path):
+@pytest.mark.parametrize("callback_code", ["provider_unavailable", "handler_failed", "lease_expired"])
+def test_llm_dead_letter_preserves_rule_result_and_is_idempotent(tmp_path, callback_code):
     app,_cipher,job=prepared(tmp_path); now=datetime.now(timezone.utc)
-    with app.state.identity_store.sync_session() as db:
-        finalize_llm_dead_letter(db,job,"handler_failed",now); finalize_llm_dead_letter(db,job,"handler_failed",now); db.commit()
+    run_llm_terminal_finalizer(app, job, callback_code, repeat_callback=True)
     with app.state.identity_store.sync_session() as db:
         item=db.get(ScreeningItem,uuid.UUID(job.payload["screening_item_id"])); run=db.get(ScreeningRun,item.run_id)
-        assert item.status=="scored" and item.llm_status=="failed" and item.llm_safe_error_code=="llm_handler_failed" and item.finished_at
+        expected_code = "llm_handler_failed" if callback_code in {"handler_failed", "lease_expired"} else callback_code
+        assert item.status=="scored" and item.llm_status=="failed" and item.llm_safe_error_code==expected_code and item.finished_at
         assert run.status=="partial" and run.succeeded_count==1 and run.failed_count==0 and run.finished_at and run.version>=2
         assert db.get(Application,item.application_id).stage=="review" and db.scalar(select(func.count(RuleResult.id)))==1
         assert db.scalar(select(func.count(LlmScreeningEvaluation.id)))==0
         task=db.scalar(select(ApplicationReviewTask))
-        assert task.ai_status=="failed" and task.safe_error_code=="llm_handler_failed"
+        assert task.ai_status=="failed" and task.safe_error_code==expected_code
         assert db.scalar(select(func.count(ApplicationStageEvent.id)))==1
+
+
+def test_llm_source_terminal_callback_only_accesses_background_jobs(tmp_path):
+    app, _cipher, job = prepared(tmp_path)
+    statements = []
+    engine = app.state.identity_store.engine
+    def capture(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        with app.state.identity_store.sync_session() as db:
+            source = db.get(BackgroundJob, job.id)
+            source.status = "dead_letter"
+            source.attempts = source.max_attempts
+            source.last_error_code = "handler_failed"
+            statements.clear()
+            finalize_llm_dead_letter(db, source, "handler_failed", datetime.now(timezone.utc))
+            db.commit()
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    sql = "\n".join(statements)
+    assert "background_jobs" in sql
+    assert all(
+        table not in sql
+        for table in (
+            "candidates",
+            "screening_items",
+            "applications",
+            "screening_results",
+            "resumes",
+            "job_jd_versions",
+            "prompt_versions",
+            "llm_provider_configs",
+        )
+    )
 
 
 @pytest.mark.parametrize(
@@ -672,6 +738,7 @@ def test_llm_dead_letter_preserves_rule_result_and_is_idempotent(tmp_path):
         ("missing_resume", "handler_failed", "llm_job_payload_invalid"),
         ("tenant_mismatch", "handler_failed", "llm_job_payload_invalid"),
         ("application_mismatch", "handler_failed", "llm_job_payload_invalid"),
+        ("application_malformed", "handler_failed", "llm_job_payload_invalid"),
         ("application_missing", "handler_failed", "internal_error"),
         ("candidate_deleted", "handler_failed", "internal_error"),
         ("unclassified_cause", "private resume provider body", "internal_error"),
@@ -702,6 +769,8 @@ def test_llm_dead_letter_relational_failure_is_technical_and_idempotent(
             job.payload = {**job.payload, "organization_id": str(uuid.uuid4())}
         elif broken_relation == "application_mismatch":
             job.payload = {**job.payload, "application_id": str(uuid.uuid4())}
+        elif broken_relation == "application_malformed":
+            job.payload = {**job.payload, "application_id": "not-an-id"}
         elif broken_relation == "application_missing":
             result = db.get(RuleResult, uuid.UUID(job.payload["screening_result_id"]))
             result.application_id = None
@@ -711,10 +780,9 @@ def test_llm_dead_letter_relational_failure_is_technical_and_idempotent(
         queue_job.status = "dead_letter"
         db.commit()
 
-    with app.state.identity_store.sync_session() as db:
-        finalize_llm_dead_letter(db, job, callback_code, now)
-        finalize_llm_dead_letter(db, job, callback_code, now)
-        db.commit()
+    run_llm_terminal_finalizer(
+        app, job, callback_code, repeat_callback=True
+    )
 
     with app.state.identity_store.sync_session() as db:
         item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
