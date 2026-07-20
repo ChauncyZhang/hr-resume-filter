@@ -38,11 +38,13 @@ test("candidate list safely encodes supported filters and normalizes server rows
             job_title: "平台 & AI",
             owner_id: "owner-1",
             owner_name: "张小北",
-            stage: "review",
+            stage: "deferred",
             source: "本地上传",
             updated_at: "2026-07-13T10:00:00+00:00",
             rule_score: 81,
             recommendation: "可沟通",
+            ai_score: 76,
+            ai_recommendation: "暂缓",
           },
         }],
         meta: {
@@ -81,17 +83,16 @@ test("candidate list safely encodes supported filters and normalizes server rows
     role: "AI & RAG 工程师",
     company: "",
     position: "平台 & AI",
-    stage: "待复核",
-    score: 81,
-    ruleScore: 81,
-    recommendation: "可沟通",
+    stage: "AI 初筛暂缓",
+    score: 76,
+    recommendation: "暂缓",
     source: "本地上传",
     owner: "张小北",
     city: "北京",
     phone: "138****2468",
     email: "li***@mail.com",
     lastActivity: "07/13 18:00",
-    evidence: { ruleScore: 81, recommendation: "可沟通" },
+    historicalRule: { score: 81, recommendation: "可沟通" },
   });
 });
 
@@ -114,9 +115,8 @@ test("candidate list omits empty and all-selector filters and preserves null evi
   assert.equal(result.records[0].id, "candidate-2");
   assert.equal(result.records[0].stage, "无当前申请");
   assert.equal(result.records[0].score, "-");
-  assert.equal(result.records[0].ruleScore, null);
   assert.equal(result.records[0].recommendation, "待人工复核");
-  assert.deepEqual(result.records[0].evidence, { ruleScore: null, recommendation: "待人工复核" });
+  assert.equal(result.records[0].historicalRule, null);
 });
 
 test("candidate list omits an empty minimum score instead of coercing it to zero", async () => {
@@ -193,7 +193,19 @@ test("candidate review loads the exact selected application when the same candid
       if (path === `/api/v1/candidates/${candidateId}/applications`) return response([
         { id: "application-other", candidate_id: candidateId, job_id: "job-2", job_title: "平台工程师", resume_id: "resume-2", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: null, version: 4, updated_at: "2026-07-12T09:00:00+00:00" },
         { id: "application-older", candidate_id: candidateId, job_id: jobId, job_title: "AI 工程师", resume_id: "resume-old", owner_id: "user-2", stage: "rejected", source: "manual", human_conclusion: "暂不合适：历史申请", version: 5, updated_at: "2026-07-12T10:00:00+00:00" },
-        { id: "application-1", candidate_id: candidateId, job_id: jobId, job_title: "AI 工程师", resume_id: "resume-1", owner_id: "user-1", stage: "review", source: "本地上传", human_conclusion: "需要补充：确认到岗时间", version: 2, updated_at: "2026-07-13T09:00:00+00:00" },
+        { id: "application-1", candidate_id: candidateId, job_id: jobId, job_title: "AI 工程师", resume_id: "resume-1", owner_id: "user-1", stage: "review", source: "本地上传", human_conclusion: "需要补充：确认到岗时间", version: 2, updated_at: "2026-07-13T09:00:00+00:00", rule_score: 81, recommendation: "可沟通", ai_score: 86, ai_recommendation: "建议评审", llm_status: "succeeded", llm_evaluation: {
+          score: 86,
+          recommendation: "建议评审",
+          summary: "核心能力与岗位高度匹配。",
+          dimensions: [
+            { key: "core_capability", score: 34, evidence: ["主导 RAG 平台"], gaps: [] },
+            { key: "experience_depth", score: 24, evidence: ["5 年研发经验"], gaps: ["规模待核验"] },
+            { key: "role_seniority", score: 16, evidence: ["负责方案设计"], gaps: [] },
+            { key: "transferability", score: 7, evidence: ["跨行业交付"], gaps: [] },
+            { key: "explicit_constraints", score: 5, evidence: ["地点符合"], gaps: ["到岗时间未知"] },
+          ],
+          strengths: ["RAG 交付经验"], gaps: ["Kubernetes 未体现"], risks: ["项目规模待确认"], questions: ["请说明最大项目规模"],
+        } },
       ]);
       if (path === `/api/v1/candidates/${candidateId}/resumes`) return response([
         { id: "resume-old", candidate_id: candidateId, version_number: 1, created_at: "2026-07-12T08:00:00+00:00" },
@@ -218,7 +230,7 @@ test("candidate review loads the exact selected application when the same candid
 
   const review = await createCandidateController({ client }).loadReview({
     candidateId, applicationId: "application-1", jobId, position: "AI 工程师", actor: { id: "user-1", name: "张小北" },
-    evidence: { ruleScore: 81, llmScore: 78, recommendation: "可沟通", matched: "Python、RAG", missing: "Kubernetes", risk: "项目规模待确认" },
+    evidence: { score: 12, recommendation: "不应采用临时结果", dimensions: [], strengths: [], risks: [] },
   });
 
   assert.equal(calls.length, 5);
@@ -236,7 +248,18 @@ test("candidate review loads the exact selected application when the same candid
   assert.equal(review.timeline[0].action, "新简历 → 待复核；原因：筛选后人工复核");
   assert.equal(review.timeline[0].actor, "张小北");
   assert.equal(review.timeline[1].action, "更新职位申请");
-  assert.equal(review.ruleScore, 81);
+  assert.equal(review.candidateId, candidateId);
+  assert.equal(review.applicationId, "application-1");
+  assert.equal(review.jobId, jobId);
+  assert.equal(review.score, 86);
+  assert.equal(review.recommendation, "建议评审");
+  assert.equal(review.llmSummary, "核心能力与岗位高度匹配。");
+  assert.deepEqual(review.dimensions[0], { key: "core_capability", label: "核心能力匹配", score: 34, evidence: ["主导 RAG 平台"], gaps: [] });
+  assert.deepEqual(review.strengths, ["RAG 交付经验"]);
+  assert.deepEqual(review.gaps, ["Kubernetes 未体现"]);
+  assert.deepEqual(review.risks, ["项目规模待确认"]);
+  assert.deepEqual(review.questions, ["请说明最大项目规模"]);
+  assert.deepEqual(review.historicalRule, { score: 81, recommendation: "可沟通" });
   assert.equal(review.summary, "负责企业级 RAG 和 Agent 平台交付。");
   assert.deepEqual(review.skills, ["Python", "RAG", "Agent"]);
   assert.equal(review.experience, "5 年大模型应用研发经验");
@@ -246,6 +269,49 @@ test("candidate review loads the exact selected application when the same candid
     ["application-older", "AI 工程师", "已淘汰"],
     ["application-1", "AI 工程师", "待复核"],
   ]);
+});
+
+test("candidate review preserves ScreeningViews LLM evidence when opened from a screening result", () => {
+  const review = normalizeCandidateReview({
+    candidate: { id: candidateId, display_name: "候选人" },
+    applications: [], resumes: [], notes: [], timeline: [],
+    context: { candidateId, applicationId: "application-screening", jobId, position: "AI 工程师", actor: {}, evidence: {
+      score: 79,
+      recommendation: "建议评审",
+      dimensions: [{ label: "核心能力匹配", score: 31, evidence: ["Python"], gaps: ["Go 未体现"] }],
+      strengths: ["后端经验"],
+      gaps: ["行业经验未知"],
+      risks: ["到岗时间未知"],
+      questions: ["何时可到岗？"],
+      summary: "具备核心后端经验。",
+    } },
+  });
+
+  assert.equal(review.candidateId, candidateId);
+  assert.equal(review.applicationId, "application-screening");
+  assert.equal(review.jobId, jobId);
+  assert.equal(review.score, 79);
+  assert.deepEqual(review.dimensions[0].evidence, ["Python"]);
+  assert.deepEqual(review.strengths, ["后端经验"]);
+  assert.deepEqual(review.risks, ["到岗时间未知"]);
+});
+
+test("failed LLM status never falls back to stale evaluation or transient evidence", () => {
+  const review = normalizeCandidateReview({
+    candidate: { id: candidateId, display_name: "候选人" },
+    applications: [{
+      id: "application-1", candidate_id: candidateId, job_id: jobId, stage: "review", version: 1,
+      llm_status: "failed", ai_score: null, ai_recommendation: "AI评分不可用",
+      llm_evaluation: { score: 92, recommendation: "建议评审", dimensions: [{ key: "core_capability", score: 35, evidence: ["陈旧证据"], gaps: [] }] },
+    }],
+    resumes: [], notes: [], timeline: [],
+    context: { candidateId, applicationId: "application-1", jobId, actor: {}, evidence: { score: 88, recommendation: "陈旧临时结论", strengths: ["陈旧优势"] } },
+  });
+
+  assert.equal(review.score, null);
+  assert.equal(review.recommendation, "AI评分不可用");
+  assert.deepEqual(review.dimensions, []);
+  assert.deepEqual(review.strengths, []);
 });
 
 test("normalization refuses cross-job fallback and preserves masked contacts only", () => {
@@ -262,14 +328,10 @@ test("normalization refuses cross-job fallback and preserves masked contacts onl
   assert.equal(review.email, "未提供");
 });
 
-test("saving a human conclusion is versioned and never transitions the application", async () => {
-  const calls = [];
-  const client = { async request(path, options) { calls.push({ path, options }); return response({ id: "application-1", stage: "review", version: 3, human_conclusion: options.body.human_conclusion }); } };
-  const saved = await createCandidateController({ client }).saveConclusion({ id: "application-1", version: 2 }, "暂不合适", "缺少生产经验");
-
-  assert.deepEqual(calls, [{ path: "/api/v1/applications/application-1", options: { method: "PATCH", ifMatch: '"2"', body: { human_conclusion: "暂不合适：缺少生产经验" } } }]);
-  assert.equal(saved.stage, "review");
-  assert.equal(saved.version, 3);
+test("candidate controller exposes workflow actions without the removed conclusion mutation", () => {
+  const controller = createCandidateController();
+  assert.equal(controller.saveConclusion, undefined);
+  assert.equal(typeof controller.workflowAction, "function");
 });
 
 test("workflow actions use semantic commands, require business reasons, and send idempotency plus version", async () => {

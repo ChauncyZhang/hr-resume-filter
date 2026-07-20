@@ -65,6 +65,14 @@ const stageWorkflowActions = {
   已通过: ["offer_accepted", "offer_declined"],
 };
 
+const llmDimensionLabels = {
+  core_capability: "核心能力匹配",
+  experience_depth: "经验深度",
+  role_seniority: "职级匹配",
+  transferability: "经验可迁移性",
+  explicit_constraints: "明确约束",
+};
+
 export function candidateWorkflowActions(stage, role) {
   return (stageWorkflowActions[stage] || [])
     .map((id) => ({ id, ...workflowActions[id] }))
@@ -75,6 +83,7 @@ export function candidateNextStep(stage) {
   return ({
     新简历: "筛选完成后自动提交评审",
     待复核: "等待用人经理评审",
+    "AI 初筛暂缓": "等待后续岗位匹配或人工查看",
     待沟通: "HR 安排面试",
     待安排: "HR 安排面试",
     面试中: "等待面试官提交反馈",
@@ -364,18 +373,11 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
   const [selectedWorkflowAction, setSelectedWorkflowAction] = useState(null);
   const [note, setNote] = useState("");
   const [tagInput, setTagInput] = useState("");
-  const [conclusion, setConclusion] = useState(candidate.humanConclusion || "");
-  const [conclusionReason, setConclusionReason] = useState(candidate.humanConclusionReason || "");
   const [pendingAction, setPendingAction] = useState("");
   const [actionError, setActionError] = useState("");
   const [conflict, setConflict] = useState(false);
   const [previewState, setPreviewState] = useState(null);
   const previewRequestRef = useRef(null);
-
-  useEffect(() => {
-    setConclusion(candidate.humanConclusion || "");
-    setConclusionReason(candidate.humanConclusionReason || "");
-  }, [candidate.humanConclusion, candidate.humanConclusionReason, candidate.id]);
 
   useEffect(() => {
     const url = previewState?.file?.url;
@@ -426,15 +428,6 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
     }
     update({ stage: action.target, version: candidate.version + 1, lastActivity: "刚刚", applications: candidate.applications.map((item, index) => index === 0 ? { ...item, state: action.target } : item), timeline: [{ time: "刚刚", actor: actorName, action: `${action.label}${reason ? `；原因：${reason}` : ""}` }, ...candidate.timeline] });
     setSelectedWorkflowAction(null); onNotify(`${action.label}已提交`);
-  }
-
-  async function saveConclusion() {
-    if (!candidate.serverBacked) {
-      update({ humanConclusion: conclusion, timeline: [{ time: "刚刚", actor: actorName, action: `更新人工结论：${conclusion}${conclusionReason ? `；${conclusionReason}` : ""}` }, ...candidate.timeline] });
-      onNotify("人工结论已保存");
-      return;
-    }
-    await runServerAction("conclusion", () => controller.saveConclusion(candidate.application, conclusion, conclusionReason), "人工结论已保存");
   }
 
   async function loadPreview() {
@@ -491,7 +484,7 @@ function CandidateDetail({ candidate, role, onBack, backLabel, onUpdate, onNotif
     <div className="candidate-detail-layout"><main className="candidate-detail-main"><section className="candidate-detail-panel"><div className="candidate-detail-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => onTabChange(item)}>{item}</button>)}</div>
       {tab === "档案与简历" && <div className="candidate-tab-content profile-tab"><section><h3>候选人摘要</h3><p>{candidate.summary}</p></section><section><h3>技能</h3><div className="candidate-skill-tags">{candidate.skills.length ? candidate.skills.map((item) => <span key={item}>{item}</span>) : <span>暂无结构化技能</span>}</div></section><div className="profile-facts"><div><BriefcaseBusiness size={18} /><span><strong>工作经验</strong><small>{candidate.experience}</small></span></div><div><GraduationCap size={18} /><span><strong>教育经历</strong><small>{candidate.education}</small></span></div><div className="resume-detail-row"><FileText size={18} /><span><strong>当前简历</strong><small>{candidate.serverBacked ? resumeDisplayName(candidate.resume) : `${candidate.name}_简历.pdf · 解析质量良好`}</small>{candidate.serverBacked && candidate.resume?.id && <span className="resume-inline-actions"><button type="button" onClick={() => void loadPreview()}><Eye size={14} />预览</button><button type="button" onClick={() => void downloadResume()}><Download size={14} />下载</button></span>}</span></div></div></div>}
       {tab === "职位申请" && <div className="candidate-tab-content"><div className="applications-table"><div><span>职位</span><span>状态</span><span>{candidate.serverBacked ? "最近更新" : "申请日期"}</span><span>来源</span></div>{candidate.applications.map((item) => <div key={`${item.position}-${item.created}`}><strong>{item.position}</strong><StageTag stage={item.state} /><span>{item.created}</span><span>{item.source}</span></div>)}</div></div>}
-      {tab === "筛选证据" && <div className="candidate-tab-content evidence-grid"><section className="rule-evidence"><header><FileText size={18} /><div><h3>规则评分</h3><span>{candidate.serverBacked ? "本次筛选结果" : "岗位规则 v3 · 今天 10:30"}</span></div><strong>{candidate.ruleScore ?? "—"}</strong></header><p>命中：{candidate.matched}</p><p>缺失：{candidate.missing}</p><p>风险：{candidate.risk}</p></section><section className="llm-evidence"><header><Sparkles size={18} /><div><h3>LLM 辅助评分</h3><span>{candidate.serverBacked ? "本次筛选结果" : "OpenAI 兼容接口 · 今天 10:30"}</span></div><strong>{candidate.llmScore ?? "—"}</strong></header><p>{candidate.llmReason}</p><small>此内容为 AI 辅助建议，不替代人工结论。</small></section><section className="human-evidence"><header><UserRoundCheck size={18} /><div><h3>人工结论</h3><span>由招聘团队维护</span></div></header><div className="conclusion-options">{["建议推进", "需要补充", "暂不合适"].map((item) => <button type="button" disabled={pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} key={item} className={conclusion === item ? "active" : ""} onClick={() => setConclusion(item)}>{item}</button>)}</div><textarea rows="3" disabled={pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} value={conclusionReason} onChange={(event) => setConclusionReason(event.target.value)} placeholder="补充人工判断依据" /><button className="button primary" type="button" disabled={!conclusion || pendingAction === "conclusion" || (candidate.serverBacked && !candidate.application)} onClick={() => void saveConclusion()}>{pendingAction === "conclusion" ? "保存中" : "保存人工结论"}</button></section></div>}
+      {tab === "筛选证据" && <div className="candidate-tab-content evidence-grid"><section className="llm-evidence" aria-labelledby="candidate-llm-evidence-title"><header><Sparkles size={18} /><div><h3 id="candidate-llm-evidence-title">AI 筛选结果</h3><span>当前持久化评估</span></div><strong aria-label={candidate.score == null ? "AI评分不可用" : `最终分 ${candidate.score}`}>{candidate.score ?? "—"}</strong></header>{candidate.recommendation === "AI评分不可用" ? <div className="candidate-muted" role="status">AI评分不可用</div> : <><p><strong>结论：</strong>{candidate.recommendation || "—"}</p><p>{candidate.llmSummary || "暂无评估摘要。"}</p><div className="llm-dimensions">{(candidate.dimensions || []).map((dimension) => <section key={dimension.key || dimension.label}><header><h4>{dimension.label || llmDimensionLabels[dimension.key]}</h4><strong>{dimension.score ?? "—"}</strong></header><div><strong>证据</strong>{dimension.evidence?.length ? <ul>{dimension.evidence.map((item) => <li key={item}>{item}</li>)}</ul> : <p>暂无证据</p>}</div><div><strong>缺口</strong>{dimension.gaps?.length ? <ul>{dimension.gaps.map((item) => <li key={item}>{item}</li>)}</ul> : <p>暂无缺口</p>}</div></section>)}</div><div className="llm-evidence-groups"><section><h4>优势</h4>{candidate.strengths?.length ? <ul>{candidate.strengths.map((item) => <li key={item}>{item}</li>)}</ul> : <p>暂无优势记录</p>}</section><section><h4>缺口</h4>{candidate.gaps?.length ? <ul>{candidate.gaps.map((item) => <li key={item}>{item}</li>)}</ul> : <p>暂无缺口记录</p>}</section><section><h4>风险</h4>{candidate.risks?.length ? <ul>{candidate.risks.map((item) => <li key={item}>{item}</li>)}</ul> : <p>暂无风险记录</p>}</section><section><h4>建议问题</h4>{candidate.questions?.length ? <ul>{candidate.questions.map((item) => <li key={item}>{item}</li>)}</ul> : <p>暂无建议问题</p>}</section></div></>}</section>{candidate.historicalRule && <details className="historical-rule"><summary>旧版规则结果</summary><p>历史分数：{candidate.historicalRule.score ?? "—"}</p><p>历史建议：{candidate.historicalRule.recommendation || "—"}</p></details>}</div>}
       {tab === "面试与反馈" && <div className="candidate-tab-content"><div className="candidate-interview-toolbar"><div><h3>面试记录</h3><span>安排、通知和反馈统一记录在候选人时间线中。</span></div>{canScheduleCurrent && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}</div>{candidate.interviews.length ? <div className="interview-feedback-list">{candidate.interviews.map((item) => <section key={item.time}><header><div><strong>{item.round}</strong><span>{item.time}</span></div><span className="feedback-result">{item.result}</span></header><p>面试官：{item.interviewer}</p><blockquote>{item.feedback}</blockquote>{onOpenInterviewFeedback && item.interviewId && <button className="button secondary" type="button" onClick={() => onOpenInterviewFeedback(item.interviewId)}>查看面试详情</button>}</section>)}</div> : <div className="candidate-empty compact"><MessageSquareText size={23} /><strong>暂无面试记录</strong><span>{candidate.stage === "待安排" ? "可以为该候选人创建第一场面试。" : "面试将在 HR 完成安排后显示。"}</span>{canScheduleCurrent && <button className="button primary" type="button" onClick={() => onScheduleInterview(candidate)}><CalendarDays size={16} />安排面试</button>}</div>}</div>}
       {tab === "时间线" && <div className="candidate-tab-content candidate-timeline">{candidate.timeline.map((item, index) => <div key={`${item.time}-${index}`}><span /><div><strong>{item.action}</strong><p>{item.actor} · {item.time}</p></div></div>)}{candidate.timeline.length === 0 && <div className="candidate-muted">暂无可见时间线记录</div>}</div>}
     </section></main><aside className="candidate-context"><section><h3>当前申请</h3><dl><div><dt>应聘职位</dt><dd>{candidate.position}</dd></div><div><dt>当前状态</dt><dd><StageTag stage={candidate.stage} /></dd></div><div><dt>负责人</dt><dd>{candidate.owner}</dd></div><div><dt>下一步</dt><dd>{nextStep}</dd></div><div><dt>最近进展</dt><dd>{candidate.lastActivity || "未记录"}</dd></div></dl><p className="candidate-auto-stage-note">状态会在完成业务动作后自动更新，无需手动维护。</p></section><CandidateGovernance candidate={candidate} role={role} onNotify={onNotify} />{!candidate.serverBacked && <section><h3>标签</h3><div className="context-tags">{candidate.tags.map((item) => <span key={item}>{item}</span>)}</div><div className="inline-add"><input value={tagInput} onChange={(event) => setTagInput(event.target.value)} placeholder="添加标签" /><button type="button" aria-label="添加标签" onClick={addTag}><Plus size={15} /></button></div></section>}<section><h3>招聘备注</h3>{notes.map((item, index) => <p className="saved-note" key={typeof item === "object" ? item.id : `${item}-${index}`}>{typeof item === "object" ? item.body : item}</p>)}{notes.length === 0 && <p className="candidate-muted">暂无招聘备注</p>}<textarea rows="4" disabled={pendingAction === "note"} value={note} onChange={(event) => setNote(event.target.value)} placeholder="记录沟通重点或后续事项" /><button className="button secondary full" type="button" disabled={!note.trim() || pendingAction === "note"} onClick={() => void addNote()}>{pendingAction === "note" ? "保存中" : "保存备注"}</button></section></aside></div>

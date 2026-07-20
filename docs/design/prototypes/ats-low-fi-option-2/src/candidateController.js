@@ -3,6 +3,7 @@ import { apiClient } from "./apiClient.js";
 const API_TO_UI_STAGE = {
   new: "新简历",
   review: "待复核",
+  deferred: "AI 初筛暂缓",
   contact: "待沟通",
   interview_pending: "待安排",
   interviewing: "面试中",
@@ -15,6 +16,13 @@ const API_TO_UI_STAGE = {
 
 const UI_TO_API_STAGE = Object.fromEntries(Object.entries(API_TO_UI_STAGE).map(([api, ui]) => [ui, api]));
 const CONCLUSIONS = new Set(["建议推进", "需要补充", "暂不合适"]);
+const DIMENSION_LABELS = {
+  core_capability: "核心能力匹配",
+  experience_depth: "经验深度",
+  role_seniority: "职级匹配",
+  transferability: "经验可迁移性",
+  explicit_constraints: "明确约束",
+};
 
 function safeString(value, fallback = "") {
   return typeof value === "string" ? value : fallback;
@@ -22,6 +30,52 @@ function safeString(value, fallback = "") {
 
 function safeArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function safeScore(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function historicalRule(application) {
+  const score = safeScore(application?.rule_score);
+  const recommendation = safeString(application?.recommendation).trim();
+  return score !== null || recommendation ? { score, recommendation } : null;
+}
+
+function normalizeDimensions(value) {
+  return safeArray(value).flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const key = safeString(item.key);
+    const label = safeString(item.label, DIMENSION_LABELS[key] || key).trim();
+    if (!label) return [];
+    return [{
+      ...(key ? { key } : {}),
+      label,
+      score: safeScore(item.score),
+      evidence: safeArray(item.evidence).map((entry) => safeString(entry).trim()).filter(Boolean),
+      gaps: safeArray(item.gaps).map((entry) => safeString(entry).trim()).filter(Boolean),
+    }];
+  });
+}
+
+function normalizeLlmEvidence(application, contextEvidence) {
+  const unavailable = application?.llm_status === "failed" && application?.ai_score == null;
+  const persisted = !unavailable && application?.llm_evaluation && typeof application.llm_evaluation === "object"
+    ? application.llm_evaluation
+    : null;
+  const source = persisted || (!unavailable ? contextEvidence : null) || {};
+  return {
+    score: unavailable ? null : safeScore(persisted?.score ?? application?.ai_score ?? source.score),
+    recommendation: unavailable
+      ? "AI评分不可用"
+      : safeString(persisted?.recommendation ?? application?.ai_recommendation ?? source.recommendation, "待人工复核"),
+    summary: safeString(source.summary),
+    dimensions: normalizeDimensions(source.dimensions),
+    strengths: safeArray(source.strengths).map((item) => safeString(item).trim()).filter(Boolean),
+    gaps: safeArray(source.gaps).map((item) => safeString(item).trim()).filter(Boolean),
+    risks: safeArray(source.risks).map((item) => safeString(item).trim()).filter(Boolean),
+    questions: safeArray(source.questions).map((item) => safeString(item).trim()).filter(Boolean),
+  };
 }
 
 function codedError(code, message) {
@@ -80,8 +134,8 @@ function normalizeTimelineEvent(item, actor) {
 
 function normalizeCandidateListItem(candidate) {
   const application = candidate?.application || null;
-  const ruleScore = Number.isInteger(application?.rule_score) ? application.rule_score : null;
-  const recommendation = safeString(application?.recommendation, "待人工复核");
+  const score = safeScore(application?.ai_score);
+  const recommendation = safeString(application?.ai_recommendation, "待人工复核");
   const candidateId = safeString(candidate?.id);
   const applicationId = safeString(application?.id);
   return {
@@ -96,8 +150,7 @@ function normalizeCandidateListItem(candidate) {
     company: "",
     position: safeString(application?.job_title, "无当前申请"),
     stage: application ? (API_TO_UI_STAGE[application.stage] || "未知阶段") : "无当前申请",
-    score: ruleScore ?? "-",
-    ruleScore,
+    score: score ?? "-",
     recommendation,
     source: safeString(application?.source, "未记录"),
     owner: safeString(application?.owner_name, "未分配"),
@@ -105,7 +158,7 @@ function normalizeCandidateListItem(candidate) {
     phone: contactValue(candidate?.contacts, "phone"),
     email: contactValue(candidate?.contacts, "email"),
     lastActivity: displayDateTime(application?.updated_at || candidate?.updated_at),
-    evidence: { ruleScore, recommendation },
+    historicalRule: historicalRule(application),
   };
 }
 
@@ -148,6 +201,7 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
     ? safeArray(resumes).find((item) => item?.id === application.resume_id) || null
     : null;
   const evidence = context.evidence || {};
+  const llmEvidence = normalizeLlmEvidence(application, evidence);
   const parsedConclusion = parseConclusion(application?.human_conclusion);
   const actorOwnsApplication = application?.owner_id && application.owner_id === context.actor?.id;
   const matched = safeString(evidence.matched);
@@ -156,6 +210,9 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
 
   return {
     id: candidateId,
+    candidateId,
+    applicationId: safeString(application?.id, safeString(context.applicationId)),
+    jobId: safeString(application?.job_id, safeString(context.jobId)),
     serverBacked: true,
     name: safeString(candidate?.display_name, "未命名候选人"),
     role: safeString(candidate?.current_title, "当前职称未填写"),
@@ -163,15 +220,20 @@ export function normalizeCandidateReview({ candidate, applications, resumes, not
     city: safeString(candidate?.location, "地点未填写"),
     phone: contactValue(candidate?.contacts, "phone"),
     email: contactValue(candidate?.contacts, "email"),
-    position: safeString(context.position, "当前职位"),
+    position: safeString(application?.job_title, safeString(context.position, "当前职位")),
     stage: application ? (API_TO_UI_STAGE[application.stage] || "未知阶段") : "无当前申请",
     source: safeString(application?.source, "未记录"),
     owner: actorOwnsApplication ? safeString(context.actor?.name, "当前 HR") : "招聘负责人",
     lastActivity: displayDateTime(application?.updated_at || candidate?.updated_at),
-    recommendation: safeString(evidence.recommendation, "待人工复核"),
-    score: Number.isInteger(evidence.ruleScore) ? evidence.ruleScore : null,
-    ruleScore: Number.isInteger(evidence.ruleScore) ? evidence.ruleScore : null,
-    llmScore: Number.isInteger(evidence.llmScore) ? evidence.llmScore : null,
+    recommendation: llmEvidence.recommendation,
+    score: llmEvidence.score,
+    llmSummary: llmEvidence.summary,
+    dimensions: llmEvidence.dimensions,
+    strengths: llmEvidence.strengths,
+    gaps: llmEvidence.gaps,
+    risks: llmEvidence.risks,
+    questions: llmEvidence.questions,
+    historicalRule: historicalRule(application),
     matched: matched || "暂无命中项",
     missing: safeString(evidence.missing, "暂无缺失项"),
     risk: safeString(evidence.risk, "暂无已记录风险"),
@@ -265,17 +327,6 @@ export function createCandidateController({ client = apiClient, idempotencyKey =
     });
   }
 
-  async function saveConclusion(application, conclusion, reason = "", { signal } = {}) {
-    if (!application?.id || !Number.isInteger(application.version)) throw codedError("APPLICATION_REQUIRED", "application required");
-    if (!CONCLUSIONS.has(conclusion)) throw codedError("CONCLUSION_REQUIRED", "conclusion required");
-    const detail = safeString(reason).trim();
-    const humanConclusion = detail ? `${conclusion}：${detail}` : conclusion;
-    const result = await client.request(`/api/v1/applications/${application.id}`, {
-      method: "PATCH", ifMatch: `"${application.version}"`, body: { human_conclusion: humanConclusion }, ...signalOption(signal),
-    });
-    return result?.data;
-  }
-
   async function workflowAction(application, action, reason = "", { signal } = {}) {
     const detail = safeString(reason).trim();
     const supported = new Set(["review_approved", "review_rejected", "hiring_approved", "hiring_rejected", "offer_accepted", "offer_declined"]);
@@ -312,7 +363,7 @@ export function createCandidateController({ client = apiClient, idempotencyKey =
     return client.download("/api/v1/download-tickets/consume", { method: "POST", body: { token: ticket?.data?.token }, ...signalOption(signal) });
   }
 
-  return { listCandidates, listJobs, loadReview, saveConclusion, workflowAction, addNote, previewResume, getResumeFile, downloadResume };
+  return { listCandidates, listJobs, loadReview, workflowAction, addNote, previewResume, getResumeFile, downloadResume };
 }
 
 export const candidateController = createCandidateController();
