@@ -703,32 +703,31 @@ def get_workbench(request: Request, response: Response):
                     if len(task["items"]) < 5:
                         task["items"].append(item)
 
-            review_rows=db.execute(select(
-                ApplicationReviewTask.id.label("task_id"),
-                ApplicationReviewTask.ai_status,
-                Application.id.label("application_id"),Application.candidate_id,Application.job_id,
-                Application.source,literal("review").label("stage"),Application.updated_at,Candidate.display_name,Candidate.current_title,Candidate.location,
-                Job.hiring_owner_id,
-            ).join(Application,and_(Application.organization_id==ApplicationReviewTask.organization_id,Application.id==ApplicationReviewTask.application_id)).join(Candidate,and_(Candidate.organization_id==Application.organization_id,Candidate.id==Application.candidate_id)).join(Job,and_(Job.organization_id==Application.organization_id,Job.id==Application.job_id)).where(
-                ApplicationReviewTask.organization_id==principal.organization_id,
-                ApplicationReviewTask.assignee_id==principal.user_id,
-                ApplicationReviewTask.status=="open",
-                Application.job_id.in_(jobs_by_id),
-                Candidate.deleted_at.is_(None),
-                AUTH.job_predicate(principal,RecruitingAction.READ,Job),
-            ).order_by(Application.updated_at.desc(),ApplicationReviewTask.id.desc())).all()
-            review_task=tasks["review"]
-            review_task["count"]=len(review_rows)
-            for row in review_rows[:5]:
-                item=_workbench_candidate_data(row)
-                item.update({
-                    "stage":"review",
-                    "task_id":str(row.task_id),
-                    "ai_status":row.ai_status,
-                    "config_warning":row.hiring_owner_id is None,
-                    "candidate_link":f"/candidates/{row.candidate_id}?tab=evidence&application={row.application_id}&job={row.job_id}",
-                })
-                review_task["items"].append(item)
+        review_rows=db.execute(select(
+            ApplicationReviewTask.id.label("task_id"),
+            ApplicationReviewTask.ai_status,
+            Application.id.label("application_id"),Application.candidate_id,Application.job_id,
+            Application.source,literal("review").label("stage"),Application.updated_at,Candidate.display_name,Candidate.current_title,Candidate.location,
+            Job.hiring_owner_id,
+        ).join(Application,and_(Application.organization_id==ApplicationReviewTask.organization_id,Application.id==ApplicationReviewTask.application_id)).join(Candidate,and_(Candidate.organization_id==Application.organization_id,Candidate.id==Application.candidate_id)).join(Job,and_(Job.organization_id==Application.organization_id,Job.id==Application.job_id)).where(
+            ApplicationReviewTask.organization_id==principal.organization_id,
+            ApplicationReviewTask.assignee_id==principal.user_id,
+            ApplicationReviewTask.status=="open",
+            Candidate.deleted_at.is_(None),
+            AUTH.job_predicate(principal,RecruitingAction.READ,Job),
+        ).order_by(Application.updated_at.desc(),ApplicationReviewTask.id.desc())).all()
+        review_task=tasks["review"]
+        review_task["count"]=len(review_rows)
+        for row in review_rows[:5]:
+            item=_workbench_candidate_data(row)
+            item.update({
+                "stage":"review",
+                "task_id":str(row.task_id),
+                "ai_status":row.ai_status,
+                "config_warning":row.hiring_owner_id is None,
+                "candidate_link":f"/candidates/{row.candidate_id}?tab=evidence&application={row.application_id}&job={row.job_id}",
+            })
+            review_task["items"].append(item)
 
         return {
             "data": {
@@ -1058,14 +1057,41 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
                 updated_at = datetime.fromisoformat(decoded["value"])
                 query = query.where(or_(sort_updated_at < updated_at, and_(sort_updated_at == updated_at, Candidate.id < UUID(decoded["id"]))))
             except Exception as error: return _problem_for(request, InvalidCursor() if not isinstance(error, InvalidCursor) else error)
-        rows = db.execute(query.order_by(sort_updated_at.desc(), Candidate.id.desc()).limit(limit + 1)).all()
+        if min_score is None:
+            rows = db.execute(query.order_by(sort_updated_at.desc(), Candidate.id.desc()).limit(limit + 1)).all()
+            application_ids = [application_id for _, application_id, _ in rows if application_id is not None]
+            summaries = _candidate_application_summaries(db, principal.organization_id, application_ids)
+        else:
+            rows = []
+            summaries = {}
+            scan_query = query
+            while len(rows) < limit + 1:
+                batch = db.execute(scan_query.order_by(sort_updated_at.desc(), Candidate.id.desc()).limit(limit + 1)).all()
+                if not batch:
+                    break
+                batch_application_ids = [application_id for _, application_id, _ in batch if application_id is not None]
+                batch_summaries = _candidate_application_summaries(db, principal.organization_id, batch_application_ids)
+                for row in batch:
+                    application_id = row.application_id
+                    summary = batch_summaries.get(application_id)
+                    if summary is None or summary["ai_score"] is None or summary["ai_score"] < min_score:
+                        continue
+                    rows.append(row)
+                    summaries[application_id] = summary
+                    if len(rows) == limit + 1:
+                        break
+                if len(rows) == limit + 1 or len(batch) < limit + 1:
+                    break
+                last_scanned = batch[-1]
+                scan_query = query.where(or_(
+                    sort_updated_at < last_scanned.sort_updated_at,
+                    and_(sort_updated_at == last_scanned.sort_updated_at, Candidate.id < last_scanned[0].id),
+                ))
         next_cursor = None
         if len(rows) > limit:
             last = rows[limit - 1]
             next_cursor = request.app.state.recruiting_cursor.encode(str(principal.organization_id), cursor_sort, last.sort_updated_at.isoformat(), str(last[0].id))
             rows = rows[:limit]
-        application_ids = [application_id for _, application_id, _ in rows if application_id is not None]
-        summaries = _candidate_application_summaries(db, principal.organization_id, application_ids)
         data = []
         for candidate, application_id, _ in rows:
             item = _candidate_data(db, candidate, principal)
@@ -1075,7 +1101,8 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
         facet_application = aliased(Application)
         facet_job = aliased(Job)
         facet_owner = aliased(User)
-        owner_query = select(facet_owner.id, facet_owner.display_name).select_from(facet_application).join(
+        owner_columns=(facet_application.id,facet_owner.id,facet_owner.display_name) if min_score is not None else (facet_owner.id,facet_owner.display_name)
+        owner_query = select(*owner_columns).select_from(facet_application).join(
             facet_job,
             and_(facet_job.organization_id == facet_application.organization_id, facet_job.id == facet_application.job_id),
         ).join(
@@ -1104,8 +1131,21 @@ def list_candidates(request: Request, job_id: UUID | None = None, stage: str | N
             _candidate_scope(principal),
         )
         if q: owner_query = owner_query.where(_candidate_search_condition(request, q))
-        owner_rows = db.execute(owner_query.distinct().order_by(facet_owner.display_name, facet_owner.id)).all()
-        owners = [{"id": str(facet_owner_id), "name": facet_owner_name} for facet_owner_id, facet_owner_name in owner_rows]
+        owner_query=owner_query.order_by(facet_owner.display_name,facet_owner.id)
+        if min_score is not None:
+            owner_rows=db.execute(owner_query.order_by(facet_application.id)).all()
+            owner_application_ids=[application_id for application_id,_,_ in owner_rows]
+            owner_projections={}
+            for offset in range(0,len(owner_application_ids),500):
+                owner_projections.update(_screening_projections_for_applications(db,principal.organization_id,owner_application_ids[offset:offset+500]))
+            owner_rows=[row for row in owner_rows if (owner_projections.get(row[0]) or {}).get("ai_score") is not None and owner_projections[row[0]]["ai_score"]>=min_score]
+            owners=[]; seen_owner_ids=set()
+            for _,facet_owner_id,facet_owner_name in owner_rows:
+                if facet_owner_id in seen_owner_ids: continue
+                seen_owner_ids.add(facet_owner_id); owners.append({"id":str(facet_owner_id),"name":facet_owner_name})
+        else:
+            owner_rows=db.execute(owner_query.distinct()).all()
+            owners=[{"id":str(facet_owner_id),"name":facet_owner_name} for facet_owner_id,facet_owner_name in owner_rows]
         return {"data": data, "meta": {"limit": limit, "next_cursor": next_cursor, "owners": owners}}
 
 

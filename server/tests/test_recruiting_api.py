@@ -1145,6 +1145,25 @@ def test_candidate_list_and_detail_project_safe_final_ai_failure(tmp_path) -> No
         assert projection["llm_error_code"]=="internal_error"
     assert "candidate_alice_provider_body" not in listing.text+history.text
 
+def test_candidate_min_score_excludes_stale_evaluation_after_final_ai_failure(tmp_path) -> None:
+    app=make_app(tmp_path); admin_id=seed_user(app,"recruiting_admin","failed-filter@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin=db.get(User,admin_id); job=Job(organization_id=admin.organization_id,title="Failed filter",owner_id=admin_id)
+        candidate=Candidate(organization_id=admin.organization_id,display_name="Failed filter candidate")
+        file=FileObject(organization_id=admin.organization_id,storage_key="private/failed-filter",original_filename="failed-filter.pdf",mime_type="application/pdf",size_bytes=1,sha256="8"*64,uploaded_by=admin_id)
+        db.add_all([job,candidate,file]); db.flush(); resume=Resume(organization_id=admin.organization_id,candidate_id=candidate.id,file_object_id=file.id,version_number=1); db.add(resume); db.flush()
+        application=Application(organization_id=admin.organization_id,candidate_id=candidate.id,job_id=job.id,resume_id=resume.id,owner_id=admin_id,stage="review"); db.add(application); db.flush()
+        item,results=seed_screening_results(db,application,file.id,admin_id,[("failed-filter",50,"暂缓",datetime(2026,4,3,tzinfo=timezone.utc))])
+        seed_llm_evaluation(db,application,admin_id,results[-1],65,"建议评审",datetime(2026,4,3,0,1,tzinfo=timezone.utc)); item.llm_status="failed"; item.llm_safe_error_code="provider_unavailable"
+        seed_terminal_route_audit(db,application,item,admin_id,ai_status="failed",score=None,safe_error_code="provider_unavailable",created_at=datetime(2026,4,3,0,2,tzinfo=timezone.utc)); db.commit()
+    with TestClient(app) as client:
+        login(client,"failed-filter@example.test")
+        unfiltered=client.get("/api/v1/candidates")
+        filtered=client.get("/api/v1/candidates",params={"min_score":60})
+    assert unfiltered.json()["data"][0]["application"]["ai_score"] is None
+    assert filtered.status_code==200
+    assert filtered.json()["data"]==[]
+
 def test_candidate_projection_does_not_infer_route_without_valid_terminal_audit(tmp_path) -> None:
     app=make_app(tmp_path); admin_id=seed_user(app,"recruiting_admin","invalid-route@example.test")
     with app.state.identity_store.sync_session() as db:

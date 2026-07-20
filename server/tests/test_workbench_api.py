@@ -297,6 +297,28 @@ def test_workbench_review_tasks_are_persisted_open_and_principal_assigned(tmp_pa
     assert str(inferred_only.id) not in str(review)
 
 
+def test_workbench_review_tasks_are_not_limited_to_latest_twenty_jobs(tmp_path, monkeypatch) -> None:
+    app=make_app(tmp_path); base=datetime(2026,7,1,tzinfo=timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        organization=Organization(slug="acme",name="Acme",status="active")
+        admin=seed_user(db,organization,"recruiting_admin","admin-window@example.test")
+        old_job=Job(organization_id=organization.id,title="Old task job",owner_id=admin.id,status="open",updated_at=base)
+        newer_jobs=[Job(organization_id=organization.id,title=f"New job {index}",owner_id=admin.id,status="open",updated_at=base+timedelta(hours=index+1)) for index in range(20)]
+        db.add_all([old_job,*newer_jobs]); db.flush()
+        application=seed_application(db,old_job,admin,90,"contact",base)
+        task=ApplicationReviewTask(organization_id=organization.id,application_id=application.id,assignee_id=admin.id,status="open",ai_status="succeeded")
+        db.add(task); db.commit(); admin_principal=principal(admin)
+    monkeypatch.setattr(recruiting_api,"_principal",lambda request:admin_principal)
+    with TestClient(app) as client:
+        response=client.get("/api/v1/workbench")
+    body=response.json()["data"]
+    assert len(body["jobs"])==20
+    assert str(old_job.id) not in {job["id"] for job in body["jobs"]}
+    assert body["tasks"]["review"]["count"]==1
+    assert body["tasks"]["review"]["items"][0]["task_id"]==str(task.id)
+    assert body["tasks"]["review"]["items"][0]["application_id"]==str(application.id)
+
+
 @pytest.mark.parametrize("role", ["system_admin", "interviewer", "unknown"])
 def test_workbench_requires_recruiting_read_role(tmp_path, monkeypatch, role) -> None:
     app = make_app(tmp_path)
