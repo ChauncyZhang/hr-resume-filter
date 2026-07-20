@@ -14,7 +14,7 @@ from server.app.screening.schemas import LlmEvaluationOut
 from server.app.queue.models import BackgroundJob
 from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.identity.models import AuditLog
-from server.app.recruiting.models import Application, ApplicationReviewTask, ApplicationStageEvent, JobJdVersion, Resume
+from server.app.recruiting.models import Application, ApplicationReviewTask, ApplicationStageEvent, Candidate, JobJdVersion, Resume
 from server.app.screening.llm_pipeline import LlmScreeningPipeline
 from server.app.screening.routing import route_llm_screening_terminal
 from server.app.screening.terminal import finalize_llm_dead_letter
@@ -660,3 +660,70 @@ def test_llm_dead_letter_preserves_rule_result_and_is_idempotent(tmp_path):
         task=db.scalar(select(ApplicationReviewTask))
         assert task.ai_status=="failed" and task.safe_error_code=="llm_handler_failed"
         assert db.scalar(select(func.count(ApplicationStageEvent.id)))==1
+
+
+@pytest.mark.parametrize(
+    ("broken_relation", "callback_code", "expected_code"),
+    [
+        ("missing_result", "handler_failed", "llm_job_payload_invalid"),
+        ("missing_prompt", "handler_failed", "llm_job_payload_invalid"),
+        ("missing_config", "handler_failed", "llm_job_payload_invalid"),
+        ("config_version_mismatch", "handler_failed", "llm_job_payload_invalid"),
+        ("missing_resume", "handler_failed", "llm_job_payload_invalid"),
+        ("tenant_mismatch", "handler_failed", "llm_job_payload_invalid"),
+        ("application_mismatch", "handler_failed", "llm_job_payload_invalid"),
+        ("application_missing", "handler_failed", "internal_error"),
+        ("candidate_deleted", "handler_failed", "internal_error"),
+        ("unclassified_cause", "private resume provider body", "internal_error"),
+    ],
+)
+def test_llm_dead_letter_relational_failure_is_technical_and_idempotent(
+    tmp_path, broken_relation, callback_code, expected_code
+):
+    app, _cipher, job = prepared(tmp_path)
+    now = datetime.now(timezone.utc)
+    with app.state.identity_store.sync_session() as db:
+        queue_job = db.get(BackgroundJob, job.id)
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        application_id = item.application_id
+        if broken_relation == "missing_result":
+            job.payload = {**job.payload, "screening_result_id": str(uuid.uuid4())}
+        elif broken_relation == "missing_prompt":
+            job.payload = {**job.payload, "prompt_version_id": str(uuid.uuid4())}
+        elif broken_relation == "missing_config":
+            job.payload = {**job.payload, "config_id": str(uuid.uuid4())}
+        elif broken_relation == "config_version_mismatch":
+            job.payload = {**job.payload, "config_version": job.payload["config_version"] + 1}
+        elif broken_relation == "missing_resume":
+            result = db.get(RuleResult, uuid.UUID(job.payload["screening_result_id"]))
+            result.resume_id = None
+            item.resume_id = None
+        elif broken_relation == "tenant_mismatch":
+            job.payload = {**job.payload, "organization_id": str(uuid.uuid4())}
+        elif broken_relation == "application_mismatch":
+            job.payload = {**job.payload, "application_id": str(uuid.uuid4())}
+        elif broken_relation == "application_missing":
+            result = db.get(RuleResult, uuid.UUID(job.payload["screening_result_id"]))
+            result.application_id = None
+            item.application_id = None
+        elif broken_relation == "candidate_deleted":
+            db.get(Candidate, item.candidate_id).deleted_at = now
+        queue_job.status = "dead_letter"
+        db.commit()
+
+    with app.state.identity_store.sync_session() as db:
+        finalize_llm_dead_letter(db, job, callback_code, now)
+        finalize_llm_dead_letter(db, job, callback_code, now)
+        db.commit()
+
+    with app.state.identity_store.sync_session() as db:
+        item = db.get(ScreeningItem, uuid.UUID(job.payload["screening_item_id"]))
+        application = db.get(Application, application_id)
+        assert item.llm_status == "failed"
+        assert item.llm_safe_error_code == expected_code
+        assert item.finished_at and item.llm_finished_at
+        assert application.stage == "new"
+        assert db.scalar(select(func.count(ApplicationReviewTask.id))) == 0
+        assert db.scalar(select(func.count(ApplicationStageEvent.id))) == 0
+        assert db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type == "screening.terminal_routed")) == 0
+        assert db.get(ScreeningRun, item.run_id).status == "partial"
