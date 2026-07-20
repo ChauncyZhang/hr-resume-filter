@@ -72,6 +72,27 @@ function isStageGroup(group, stage, allowedJobIds) {
     && group.items.every((item) => isCandidate(item, stage) && allowedJobIds.has(item.job_id));
 }
 
+function reviewCandidateLink(item) {
+  return `/candidates/${item.candidate_id}?tab=evidence&application=${item.application_id}&job=${item.job_id}`;
+}
+
+function isReviewTask(item) {
+  return isCandidate(item, "review")
+    && isNonEmptyString(item.task_id)
+    && (item.ai_status === "succeeded" || item.ai_status === "failed")
+    && typeof item.config_warning === "boolean"
+    && item.candidate_link === reviewCandidateLink(item);
+}
+
+function isReviewTaskGroup(group) {
+  return isObject(group)
+    && isCount(group.count)
+    && Array.isArray(group.items)
+    && group.items.length <= 5
+    && group.items.length <= group.count
+    && group.items.every(isReviewTask);
+}
+
 function isJob(job) {
   if (
     !isObject(job)
@@ -108,11 +129,14 @@ function validateEnvelope(response) {
     || interviews.pending_feedback.length !== 0
   ) throw invalidResponse();
   const jobIds = new Set(payload.jobs.map((job) => job.id));
-  const taskStages = ["review", "interview_pending", "decision", "passed"];
-  if (!taskStages.every((stage) => (
+  const taskStages = ["interview_pending", "decision", "passed"];
+  if (
+    !isReviewTaskGroup(taskGroups.review)
+    || !taskStages.every((stage) => (
     isStageGroup(taskGroups[stage], stage, jobIds)
     && taskGroups[stage].count === payload.jobs.reduce((total, job) => total + job.stages[stage].count, 0)
-  ))) throw invalidResponse();
+    ))
+  ) throw invalidResponse();
   return payload;
 }
 
@@ -130,12 +154,12 @@ function displayDateTime(value) {
   }).format(date);
 }
 
-function normalizeItem(item, jobNames) {
+function normalizeItem(item, jobNames, { allowUnknownJob = false } = {}) {
   const applicationId = safeString(item?.application_id);
   const candidateId = safeString(item?.candidate_id);
   const jobId = safeString(item?.job_id);
   const stage = safeString(item?.stage);
-  if (!applicationId || !candidateId || !jobId || !STAGES[stage] || !jobNames.has(jobId)) return null;
+  if (!applicationId || !candidateId || !jobId || !STAGES[stage] || (!allowUnknownJob && !jobNames.has(jobId))) return null;
   return {
     id: applicationId,
     applicationId,
@@ -145,7 +169,7 @@ function normalizeItem(item, jobNames) {
     name: safeString(item?.display_name, "未命名候选人"),
     role: safeString(item?.current_title, "当前职称未填写"),
     company: "",
-    position: jobNames.get(jobId),
+    position: jobNames.get(jobId) || "职位信息不可用",
     stage: STAGES[stage],
     source: safeString(item?.source, "未记录"),
     city: safeString(item?.location, "地点未填写"),
@@ -170,6 +194,24 @@ function normalizeTaskGroup(group, apiStage, jobNames) {
   };
 }
 
+function normalizeReviewTaskGroup(group, jobNames) {
+  return {
+    count: safeCount(group?.count),
+    items: safeArray(group?.items).map((item) => {
+      const candidate = normalizeItem(item, jobNames, { allowUnknownJob: true });
+      if (!candidate) return null;
+      return {
+        ...candidate,
+        taskId: item.task_id,
+        aiStatus: item.ai_status,
+        aiLabel: item.ai_status === "failed" ? "AI评分不可用" : "",
+        configWarning: item.config_warning,
+        candidateLink: item.candidate_link,
+      };
+    }).filter(Boolean),
+  };
+}
+
 function normalizeWorkbench(payload) {
   const rawJobs = safeArray(payload?.jobs).filter((job) => safeString(job?.id) && safeString(job?.title));
   const jobNames = new Map(rawJobs.map((job) => [job.id, job.title]));
@@ -191,7 +233,7 @@ function normalizeWorkbench(payload) {
     generatedAt: safeString(payload?.generated_at),
     jobs,
     tasks: {
-      review: normalizeTaskGroup(tasks.review, "review", jobNames),
+      review: normalizeReviewTaskGroup(tasks.review, jobNames),
       interviewPending: normalizeTaskGroup(tasks.interview_pending, "interview_pending", jobNames),
       decision: normalizeTaskGroup(tasks.decision, "decision", jobNames),
       passed: normalizeTaskGroup(tasks.passed, "passed", jobNames),

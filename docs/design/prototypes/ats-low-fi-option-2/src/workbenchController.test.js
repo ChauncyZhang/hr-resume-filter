@@ -7,6 +7,7 @@ import workbenchController, { createWorkbenchController } from "./workbenchContr
 const JOB_ID = "11111111-1111-4111-8111-111111111111";
 const CANDIDATE_ID = "22222222-2222-4222-8222-222222222222";
 const APPLICATION_ID = "33333333-3333-4333-8333-333333333333";
+const TASK_ID = "66666666-6666-4666-8666-666666666666";
 
 function item(changes = {}) {
   return {
@@ -19,6 +20,18 @@ function item(changes = {}) {
     source: "upload",
     stage: "review",
     updated_at: "2026-07-13T03:05:00Z",
+    ...changes,
+  };
+}
+
+function reviewTask(changes = {}) {
+  const candidate = item(changes);
+  return {
+    ...candidate,
+    task_id: TASK_ID,
+    ai_status: "succeeded",
+    config_warning: false,
+    candidate_link: `/candidates/${candidate.candidate_id}?tab=evidence&application=${candidate.application_id}&job=${candidate.job_id}`,
     ...changes,
   };
 }
@@ -45,7 +58,7 @@ function response(changes = {}) {
         },
       }],
       tasks: {
-        review: { count: 1, items: [item()] },
+        review: { count: 1, items: [reviewTask()] },
         interview_pending: { count: 7, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444" })] },
         decision: { count: 0, items: [] },
         passed: { count: 1, items: [item({ stage: "passed", application_id: "55555555-5555-4555-8555-555555555555" })] },
@@ -93,6 +106,14 @@ test("load requests the scoped workbench once and maps stages and candidate navi
   });
   assert.equal(result.tasks.interviewPending.count, 7);
   assert.equal(result.tasks.review.count, 1);
+  assert.deepEqual(result.tasks.review.items[0], {
+    ...result.jobs[0].stages["待复核"].items[0],
+    taskId: TASK_ID,
+    aiStatus: "succeeded",
+    aiLabel: "",
+    configWarning: false,
+    candidateLink: `/candidates/${CANDIDATE_ID}?tab=evidence&application=${APPLICATION_ID}&job=${JOB_ID}`,
+  });
   assert.equal(result.tasks.passed.count, 1);
   assert.equal(result.tasks.interviewPending.items[0].position, "AI 工程师");
   assert.deepEqual(result.interviews, { available: false, upcoming: [], pendingFeedback: [] });
@@ -121,7 +142,7 @@ test("load applies safe display fallbacks to valid nullable workbench fields", a
         },
       ],
       tasks: {
-        review: { count: 1, items: [item({ current_title: null, location: null })] },
+        review: { count: 1, items: [reviewTask({ current_title: null, location: null })] },
         interview_pending: { count: 0, items: [] },
         decision: { count: 0, items: [] },
         passed: { count: 0, items: [] },
@@ -137,12 +158,90 @@ test("load applies safe display fallbacks to valid nullable workbench fields", a
   assert.equal(result.jobs[0].stages["待复核"].items[0].role, "当前职称未填写");
   assert.equal(result.jobs[0].stages["待复核"].items[0].city, "地点未填写");
   assert.deepEqual(result.tasks, {
-    review: { count: 1, items: [{ ...result.jobs[0].stages["待复核"].items[0] }] },
+    review: { count: 1, items: [{
+      ...result.jobs[0].stages["待复核"].items[0],
+      taskId: TASK_ID,
+      aiStatus: "succeeded",
+      aiLabel: "",
+      configWarning: false,
+      candidateLink: `/candidates/${CANDIDATE_ID}?tab=evidence&application=${APPLICATION_ID}&job=${JOB_ID}`,
+    }] },
     interviewPending: { count: 0, items: [] },
     decision: { count: 0, items: [] },
     passed: { count: 0, items: [] },
   });
   assert.deepEqual(result.interviews, { available: false, upcoming: [], pendingFeedback: [] });
+});
+
+test("review tasks keep their persisted contract independently of visible jobs and stage totals", async () => {
+  const hiddenJobId = "77777777-7777-4777-8777-777777777777";
+  const hiddenApplicationId = "88888888-8888-4888-8888-888888888888";
+  const hiddenCandidateId = "99999999-9999-4999-8999-999999999999";
+  const client = { async request() {
+    return response({
+      tasks: {
+        review: {
+          count: 2,
+          items: [reviewTask({
+            application_id: hiddenApplicationId,
+            candidate_id: hiddenCandidateId,
+            job_id: hiddenJobId,
+            task_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            ai_status: "failed",
+            config_warning: true,
+            candidate_link: `/candidates/${hiddenCandidateId}?tab=evidence&application=${hiddenApplicationId}&job=${hiddenJobId}`,
+          })],
+        },
+        interview_pending: response().data.tasks.interview_pending,
+        decision: response().data.tasks.decision,
+        passed: response().data.tasks.passed,
+      },
+    });
+  } };
+
+  const result = await createWorkbenchController({ client }).load();
+
+  assert.equal(result.jobs[0].stages["待复核"].count, 1);
+  assert.equal(result.tasks.review.count, 2);
+  assert.equal(result.tasks.review.items.length, 1);
+  assert.deepEqual(result.tasks.review.items[0], {
+    id: hiddenApplicationId,
+    applicationId: hiddenApplicationId,
+    candidateId: hiddenCandidateId,
+    jobId: hiddenJobId,
+    serverBacked: true,
+    name: "李嘉明",
+    role: "AI 算法工程师",
+    company: "",
+    position: "职位信息不可用",
+    stage: "待复核",
+    source: "upload",
+    city: "北京",
+    lastActivity: new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date("2026-07-13T03:05:00Z")),
+    evidence: {},
+    taskId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    aiStatus: "failed",
+    aiLabel: "AI评分不可用",
+    configWarning: true,
+    candidateLink: `/candidates/${hiddenCandidateId}?tab=evidence&application=${hiddenApplicationId}&job=${hiddenJobId}`,
+  });
+});
+
+test("review task fields fail closed when the persisted navigation contract is malformed", async () => {
+  for (const review of [
+    reviewTask({ task_id: null }),
+    reviewTask({ ai_status: "pending" }),
+    reviewTask({ config_warning: "true" }),
+    reviewTask({ candidate_link: "/candidates/wrong?tab=evidence" }),
+  ]) {
+    const client = { async request() {
+      return response({ tasks: { ...response().data.tasks, review: { count: 1, items: [review] } } });
+    } };
+    await assert.rejects(
+      createWorkbenchController({ client }).load(),
+      (error) => error?.code === "WORKBENCH_INVALID_RESPONSE",
+    );
+  }
 });
 
 test("load rejects a malformed successful response instead of presenting it as an empty workbench", async () => {
@@ -158,7 +257,6 @@ test("load rejects a malformed successful response instead of presenting it as a
     response({ tasks: { review: { count: 1, items: null }, interview_pending: { count: 0, items: [] }, decision: { count: 0, items: [] }, passed: { count: 0, items: [] } } }),
     response({ jobs: [{ ...response().data.jobs[0], active_count: 1, stages: { ...response().data.jobs[0].stages, review: { count: 0, items: [item()] } } }] }),
     response({ jobs: [{ ...response().data.jobs[0], stages: { ...response().data.jobs[0].stages, review: { count: 1, items: [item({ job_id: "99999999-9999-4999-8999-999999999999" })] } } }] }),
-    response({ tasks: { review: { count: 1, items: [item({ job_id: "99999999-9999-4999-8999-999999999999" })] }, interview_pending: { count: 1, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444" })] }, decision: { count: 0, items: [] }, passed: { count: 1, items: [item({ stage: "passed", application_id: "55555555-5555-4555-8555-555555555555" })] } } }),
     response({ interviews: null }),
     response({ interviews: { available: true, upcoming: [], pending_feedback: [] } }),
     response({ interviews: { available: false, upcoming: [{ id: "fixture" }], pending_feedback: [] } }),
@@ -195,6 +293,9 @@ test("workbench shell keeps real tasks accessible across loading and narrow layo
   assert.match(appSource, /aria-pressed=\{activeWorkbenchJob\.id === job\.id\}/);
   assert.match(appSource, /navigate\(candidateListPath\(\{ jobId: activeWorkbenchJob\.id, stage: name \}\)\)/);
   assert.match(appSource, /candidateOrigin\?\.activeNav === "工作台" \? "返回工作台"/);
+  assert.match(appSource, /candidateDetailPath\(candidate, "筛选证据", "\/workbench"\)/);
+  assert.match(appSource, /candidate\.configWarning && <small>岗位未配置用人经理<\/small>/);
+  assert.match(appSource, /onReferralComplete=\{\(\) => void loadWorkbench\(\)\}/);
   assert.match(appSource, /role="alert"/);
   assert.doesNotMatch(appSource, /面试日历（未来 7 天）<\/h3><button/);
   assert.doesNotMatch(appSource, /key=\{candidate\.name\}/);

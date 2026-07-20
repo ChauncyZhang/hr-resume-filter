@@ -774,6 +774,17 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
     navigate(candidateDetailPath(candidate));
   }
 
+  function openWorkbenchReviewCandidate(candidate) {
+    setCandidateOrigin({ activeNav: "工作台", screeningTask: null, screeningViewState: null });
+    setScreeningTask(null);
+    navigate(candidateDetailPath(candidate, "筛选证据", "/workbench"));
+    void loadServerCandidate({ candidateId: candidate.candidateId, applicationId: candidate.applicationId, jobId: candidate.jobId, position: candidate.position, evidence: candidate.evidence });
+  }
+
+  function openWorkbenchTaskCandidate(candidate) {
+    candidate.taskId ? openWorkbenchReviewCandidate(candidate) : openCandidate(candidate);
+  }
+
   function backFromCandidateDetail() {
     candidateLoadRef.current?.abort();
     candidateLoadRef.current = null;
@@ -948,7 +959,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
             {!screeningTask && activeNav === "设置" && route.returnTo && <button className="button secondary" type="button" onClick={() => navigate(route.returnTo)}>返回职位编辑</button>}
             {!screeningTask && activeNav === "工作台" && <button className="organization-context" type="button" onClick={() => navigate(settingsPath("组织与权限", "部门"))}><Building2 size={16} /><span>当前组织</span><ChevronDown size={15} /></button>}
             {!screeningTask && activeNav === "工作台" && <label className="global-search"><Search size={17} /><input aria-label="全局搜索候选人或职位" value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && globalSearch.trim()) navigate(candidateListPath({ q: globalSearch })); }} placeholder="搜索职位、候选人或关键字" /><kbd>⌘ K</kbd></label>}
-            {!screeningTask && activeNav === "工作台" && <NotificationMenu groups={notificationGroups} total={notificationCount} onOpenCandidate={openCandidate} onOpenGroup={(stage) => navigate(candidateListPath({ stage }))} />}
+            {!screeningTask && activeNav === "工作台" && <NotificationMenu groups={notificationGroups} total={notificationCount} onOpenCandidate={openWorkbenchTaskCandidate} onOpenGroup={(stage) => navigate(candidateListPath({ stage }))} />}
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             <span className="page-primary-action-host" ref={setPageActionHost} />
             <IconButton label="个人设置" className="mobile-profile-action" onClick={() => setProfileOpen(true)}><UserRound size={18} /></IconButton>
@@ -1044,7 +1055,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
               <header><h3>今日待办</h3><button type="button" onClick={() => navigate("/candidates")}>查看全部<ChevronRight size={14} /></button></header>
               {canPerformAction(currentRole, "评审候选人") && <div className="rail-group">
                 <div className="rail-group-title"><span className="status-dot red" />待用人经理评审（{workbenchTasks.review.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待复核" }))}>查看全部</button></div>
-                {workbenchTasks.review.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.review.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openWorkbenchReviewCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small>{candidate.configWarning && <small>岗位未配置用人经理</small>}</button>)}
                 {workbenchTasks.review.count === 0 && <p>暂无待评审候选人</p>}
               </div>}
               {canPerformAction(currentRole, "安排面试") && <div className="rail-group">
@@ -1109,7 +1120,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
         )}
 
         {!screeningTask && activeNav === "人才库" && (
-          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={updateSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onOpenCandidate={openCandidate} onNotify={notify} controller={talentController} actorId={session.user?.id} pageActionHost={pageActionHost} />
+          <TalentPoolWorkspace mode={talentMode} setMode={setTalentMode} selectedPoolId={selectedPoolId} setSelectedPoolId={updateSelectedPoolId} pools={talentPools} setPools={setTalentPools} memberships={talentMemberships} setMemberships={setTalentMemberships} candidates={candidateRecords} positions={positionRecords} onReactivateCandidate={reactivateTalent} onReferralComplete={() => void loadWorkbench()} onOpenCandidate={openCandidate} onNotify={notify} controller={talentController} actorId={session.user?.id} pageActionHost={pageActionHost} />
         )}
 
         {!screeningTask && activeNav === "报表" && (

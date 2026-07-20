@@ -47,3 +47,9 @@ test("notification menu is an operable accessible popover", () => {
   assert.match(source, /onOpenCandidate\(item\)/);
   assert.match(source, /onOpenGroup\(group\.stage\)/);
 });
+
+test("review notifications use the dedicated workbench review navigation", () => {
+  const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+  assert.match(appSource, /<NotificationMenu[^>]*onOpenCandidate=\{openWorkbenchTaskCandidate\}/);
+  assert.match(appSource, /candidate\.taskId \? openWorkbenchReviewCandidate\(candidate\) : openCandidate\(candidate\)/);
+});
