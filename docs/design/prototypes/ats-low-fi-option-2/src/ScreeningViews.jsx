@@ -177,18 +177,17 @@ export function screeningDisplayOutcome(file) {
   };
 }
 
-function serverCount(source, keys) {
-  const value = keys.map((key) => source?.[key]).find((item) => Number.isInteger(item) && item >= 0);
-  return value ?? 0;
+function serverCount(value) {
+  return Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 export function screeningSummaryCounts(task) {
-  const source = task?.serverCounts || task?.outcomeCounts || task?.summary || task || {};
+  const source = task?.serverCounts || {};
   return [
-    { label: "已转交用人经理", value: serverCount(source, ["managerHandoff", "managerHandoffCount", "routedToManager", "routedToManagerCount", "routed_to_manager_count"]) },
-    { label: "已暂缓", value: serverCount(source, ["deferred", "deferredCount", "deferred_count"]) },
-    { label: "AI评分不可用", value: serverCount(source, ["aiUnavailable", "aiUnavailableCount", "ai_unavailable_count"]) },
-    { label: "文件处理失败", value: serverCount(source, ["fileFailed", "fileFailedCount", "file_failed_count"]) },
+    { label: "已转交用人经理", value: serverCount(source.managerReviewCount) },
+    { label: "已暂缓", value: serverCount(source.deferredCount) },
+    { label: "AI评分不可用", value: serverCount(source.aiUnavailableCount) },
+    { label: "文件处理失败", value: serverCount(source.fileFailedCount) },
   ];
 }
 
@@ -580,11 +579,11 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
       {(counts.失败 > 0 || counts.部分成功 > 0) && task.status !== "running" && <div className="partial-warning"><CircleAlert size={18} /><div><strong>部分文件需要处理</strong><span>单文件失败没有影响其他简历。可在对应行查看原因并单独重试。</span></div></div>}
 
       <section className="task-results-panel">
-        <header className="results-header"><div><h3>逐文件结果</h3><span>{task.serverBacked ? `本机批次备注：${task.note}` : task.note}</span></div><div className="result-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索候选人或文件名" /></div></header>
+        <header className="results-header"><div><h3 id="screening-results-title">逐文件结果</h3><span>{task.serverBacked ? `本机批次备注：${task.note}` : task.note}</span></div><div className="result-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索候选人或文件名" /></div></header>
         <div className="result-status-tabs">{["全部", "处理中", "成功", "部分成功", "失败"].map((item) => <button key={item} type="button" className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item}<span>{counts[item]}</span></button>)}</div>
 
-        <div className="screening-table">
-          <div className="screening-table-head"><span>流转结果</span><span>候选人/文件</span><span>处理状态</span><span>LLM结论</span><span>最终分</span><span>维度评分</span><span>主要优势与风险</span><span>查看候选人</span></div>
+        <div className="screening-table" role="table" aria-labelledby="screening-results-title">
+          <div className="screening-table-head" role="row"><span role="columnheader">流转结果</span><span role="columnheader">候选人/文件</span><span role="columnheader">处理状态</span><span role="columnheader">LLM结论</span><span role="columnheader">最终分</span><span role="columnheader">维度评分</span><span role="columnheader">主要优势与风险</span><span role="columnheader">查看候选人</span></div>
           {filtered.map((file) => {
             const outcome = screeningDisplayOutcome(file);
             const dimensions = normalizeScreeningDimensions(file.dimensions);
@@ -592,15 +591,21 @@ export function ScreeningTaskView({ task: initialTask, initialViewState, onTaskC
             const risks = normalizeTextList(file.risks);
             const retryAction = screeningRetryAction(file);
             const canOpen = canOpenCandidateReview(file, task.serverBacked);
-            return <div className="screening-row" key={file.id}>
-              <span className={`screening-route ${file.routeResult || "pending"}`}>{outcome.routeLabel}</span>
-              <span className="screening-candidate-file"><strong>{candidateDisplayName(file, task.serverBacked)}</strong><small>{file.name}</small></span>
-              <span><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{(file.status === "failed" || file.status === "cancelled") && <X size={13} />}{statusLabel(file.status)}</span></span>
-              <span className="recommendation-cell">{outcome.recommendation}</span>
-              <span className="final-score"><strong>{outcome.score ?? "—"}</strong></span>
-              <span className="dimension-cell">{dimensions.length > 0 ? dimensions.map((dimension) => <span key={dimension.label} title={[...dimension.evidence, ...dimension.gaps].join("；") || undefined}><b>{dimension.label}</b><strong>{dimension.score ?? "—"}</strong></span>) : <span className="empty-value">—</span>}</span>
-              <span className="strength-risk-cell"><strong>{strengths.length > 0 ? `优势：${strengths.join("；")}` : "优势：—"}</strong><small>{risks.length > 0 ? `风险：${risks.join("；")}` : `风险：${serverIssueMessage(file)}`}</small>{!task.serverBacked && file.traceId && <small>追踪 ID：{file.traceId}</small>}{retryAction && <button type="button" disabled={retryingIds.includes(file.id)} onClick={() => retry(file.id, retryAction.kind)}>{retryAction.kind === "llm" ? <Redo2 size={14} /> : <RotateCcw size={14} />}{retryingIds.includes(file.id) ? "重试中" : retryAction.label}</button>}</span>
-              <button className="screening-candidate-link" type="button" disabled={!canOpen} title={!canOpen ? (task.serverBacked && !file.candidateId ? "服务端尚未生成候选人记录" : "处理成功后可查看候选人") : undefined} onClick={() => onOpenCandidate(task.serverBacked ? { serverBacked: true, ...candidateReviewContext(file, task) } : { name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ...candidateReviewContext(file, task).evidence }, { taskId: task.id, query, filter })}><span>查看</span><ChevronRight size={15} /></button>
+            const candidateName = candidateDisplayName(file, task.serverBacked);
+            const status = statusLabel(file.status);
+            const score = outcome.score ?? "—";
+            const dimensionSummary = dimensions.length > 0 ? dimensions.map((dimension) => `${dimension.label} ${dimension.score ?? "—"}分`).join("；") : "—";
+            const strengthSummary = strengths.length > 0 ? `优势：${strengths.join("；")}` : "优势：—";
+            const riskSummary = risks.length > 0 ? `风险：${risks.join("；")}` : `风险：${serverIssueMessage(file)}`;
+            return <div className="screening-row" role="row" key={file.id}>
+              <span className={`screening-route ${file.routeResult || "pending"}`} role="cell" data-label="流转结果" aria-label={`流转结果：${outcome.routeLabel}`}>{outcome.routeLabel}</span>
+              <span className="screening-candidate-file" role="cell" data-label="候选人/文件" aria-label={`候选人/文件：${candidateName}，${file.name}`}><strong>{candidateName}</strong><small>{file.name}</small></span>
+              <span role="cell" data-label="处理状态" aria-label={`处理状态：${status}`}><span className={`file-state ${fileStatusClass(file.status)}`}>{file.status === "queued" && <Clock3 size={13} />}{file.status === "success" && <Check size={13} />}{file.status === "partial" && <CircleAlert size={13} />}{(file.status === "failed" || file.status === "cancelled") && <X size={13} />}{status}</span></span>
+              <span className="recommendation-cell" role="cell" data-label="LLM结论" aria-label={`LLM结论：${outcome.recommendation}`}>{outcome.recommendation}</span>
+              <span className="final-score" role="cell" data-label="最终分" aria-label={`最终分：${score}`}><strong>{score}</strong></span>
+              <span className="dimension-cell" role="cell" data-label="维度评分" aria-label={`维度评分：${dimensionSummary}`}>{dimensions.length > 0 ? dimensions.map((dimension) => <span key={dimension.label} title={[...dimension.evidence, ...dimension.gaps].join("；") || undefined}><b>{dimension.label}</b><strong>{dimension.score ?? "—"}</strong></span>) : <span className="empty-value">—</span>}</span>
+              <span className="strength-risk-cell" role="cell" data-label="主要优势与风险" aria-label={`主要优势与风险：${strengthSummary}；${riskSummary}`}><strong>{strengthSummary}</strong><small>{riskSummary}</small>{!task.serverBacked && file.traceId && <small>追踪 ID：{file.traceId}</small>}{retryAction && <button type="button" disabled={retryingIds.includes(file.id)} onClick={() => retry(file.id, retryAction.kind)}>{retryAction.kind === "llm" ? <Redo2 size={14} /> : <RotateCcw size={14} />}{retryingIds.includes(file.id) ? "重试中" : retryAction.label}</button>}</span>
+              <span className="screening-candidate-action" role="cell" data-label="查看候选人"><button className="screening-candidate-link" type="button" aria-label={`查看候选人：${candidateName}`} disabled={!canOpen} title={!canOpen ? (task.serverBacked && !file.candidateId ? "服务端尚未生成候选人记录" : "处理成功后可查看候选人") : undefined} onClick={() => onOpenCandidate(task.serverBacked ? { serverBacked: true, ...candidateReviewContext(file, task) } : { name: file.candidate, role: task.position, company: "", age: "本批次", fileId: file.id, email: file.email, phone: file.phone, source: task.source, ...candidateReviewContext(file, task).evidence }, { taskId: task.id, query, filter })}><span>查看</span><ChevronRight size={15} /></button></span>
             </div>;
           })}
         </div>

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { after, before, test } from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 let helpers;
@@ -128,7 +130,7 @@ test("screening dimensions render five valid scores and malformed optional data 
 
 test("screening summary uses the four server counters without recomputing rows", () => {
   assert.deepEqual(helpers.screeningSummaryCounts({
-    serverCounts: { managerHandoff: 8, deferred: 3, aiUnavailable: 2, fileFailed: 1 },
+    serverCounts: { managerReviewCount: 8, deferredCount: 3, aiUnavailableCount: 2, fileFailedCount: 1 },
     files: [{ routeResult: "deferred", status: "failed" }],
   }), [
     { label: "已转交用人经理", value: 8 },
@@ -136,6 +138,59 @@ test("screening summary uses the four server counters without recomputing rows",
     { label: "AI评分不可用", value: 2 },
     { label: "文件处理失败", value: 1 },
   ]);
+  assert.deepEqual(helpers.screeningSummaryCounts({
+    managerReviewCount: 99,
+    files: Array.from({ length: 4 }, () => ({ routeResult: "review" })),
+  }).map((item) => item.value), [0, 0, 0, 0]);
+});
+
+test("screening result grid exposes table semantics and understandable mobile field labels", () => {
+  const task = {
+    id: "run-1",
+    position: "AI 工程师",
+    status: "complete",
+    completed: 1,
+    total: 1,
+    source: "BOSS 直聘",
+    creator: "张小北",
+    createdAt: "刚刚",
+    note: "语义测试",
+    serverBacked: true,
+    serverCounts: { managerReviewCount: 1, deferredCount: 0, aiUnavailableCount: 0, fileFailedCount: 0 },
+    files: [{
+      id: "item-1",
+      name: "候选人.pdf",
+      candidate: "张三",
+      candidateId: "candidate-1",
+      status: "success",
+      routeResult: "review",
+      routeLabel: "已转交用人经理",
+      recommendation: "建议评审",
+      score: 72,
+      dimensions: [{ label: "岗位匹配", score: 80, evidence: [], gaps: [] }],
+      strengths: ["经验匹配"],
+      risks: ["到岗时间待确认"],
+    }],
+  };
+  const html = renderToStaticMarkup(createElement(helpers.ScreeningTaskView, {
+    task,
+    onTaskChange() {},
+    onBack() {},
+    onOpenCandidate() {},
+    onNotify() {},
+  }));
+
+  assert.match(html, /role="table"[^>]*aria-labelledby="screening-results-title"/);
+  assert.equal((html.match(/role="columnheader"/g) || []).length, 8);
+  assert.equal((html.match(/role="cell"/g) || []).length, 8);
+  for (const label of ["流转结果", "候选人/文件", "处理状态", "LLM结论", "最终分", "维度评分", "主要优势与风险", "查看候选人"]) {
+    assert.match(html, new RegExp(`data-label="${label}"`));
+  }
+  assert.match(html, /aria-label="LLM结论：建议评审"/);
+  assert.match(html, /aria-label="最终分：72"/);
+
+  const css = readFileSync(new URL("./product-theme-jobs-screening.css", import.meta.url), "utf8");
+  assert.match(css, /content:\s*attr\(data-label\)/);
 });
 
 test("screening source has the eight automatic columns and no removed manual path", () => {
