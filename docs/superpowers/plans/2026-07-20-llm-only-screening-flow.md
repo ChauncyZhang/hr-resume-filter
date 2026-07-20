@@ -415,6 +415,7 @@ git commit -m "feat: route LLM screening outcomes automatically"
 - Modify: `server/app/screening/progress.py`
 - Modify: `server/app/screening/pipeline.py`
 - Modify: `server/app/queue/payloads.py`
+- Modify: `server/app/queue/repository.py`
 - Modify: `server/app/worker/main.py`
 - Modify: `server/tests/test_llm_pipeline.py`
 - Modify: `server/tests/test_screening_dead_letter_postgres.py`
