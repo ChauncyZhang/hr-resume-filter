@@ -160,6 +160,14 @@ def seed_llm_evaluation(db, application, actor_id, result, score, recommendation
     ],summary="persisted summary",strengths=["persisted strength"],gaps=["persisted gap"],risks=["persisted risk"],interview_questions=["persisted question"],created_at=created_at)
     db.add(evaluation); db.flush(); return evaluation
 
+def seed_terminal_route_audit(db,application,item,actor_id,*,route="review",ai_status="succeeded",score=72,safe_error_code=None,created_at=None):
+    metadata={"application_id":str(application.id),"item_id":str(item.id),"from_stage":"new","to_stage":route,"ai_status":ai_status,"recommendation":"AI评分不可用" if ai_status=="failed" else "建议评审" if route=="review" else "暂缓"}
+    if score is not None: metadata["score"]=score
+    if safe_error_code is not None: metadata["safe_error_code"]=safe_error_code
+    audit=AuditLog(organization_id=application.organization_id,actor_user_id=actor_id,category="recruiting",event_type="screening.terminal_routed",outcome="success",resource_type="application",resource_id=application.id,trace_id="projection-test",metadata_json=metadata)
+    if created_at is not None: audit.created_at=created_at
+    db.add(audit); db.flush(); return audit
+
 
 def seed_same_candidate_cross_job(app, recruiter_id):
     with app.state.identity_store.sync_session() as db:
@@ -960,13 +968,14 @@ def test_candidate_list_returns_selected_application_and_latest_screening_result
         matching = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=matching_job.id, resume_id=matching_resume.id, owner_id=first_owner_id, stage="review", source="upload", updated_at=base)
         newer = Application(organization_id=admin.organization_id, candidate_id=candidate.id, job_id=newer_job.id, resume_id=newer_resume.id, owner_id=second_owner_id, stage="new", source="manual", updated_at=base + timedelta(hours=1))
         db.add_all([matching, newer]); db.flush()
-        _,matching_results=seed_screening_results(db, matching, matching_file.id, admin_id, [
+        matching_item,matching_results=seed_screening_results(db, matching, matching_file.id, admin_id, [
             ("rule-old", 95, "优先沟通", base),
             ("rule-latest", 81, "可沟通", base + timedelta(minutes=1)),
         ])
         _,newer_results=seed_screening_results(db, newer, newer_file.id, admin_id, [("rule-newer", 60, "暂缓", base)])
         seed_llm_evaluation(db,matching,admin_id,matching_results[-1],72,"建议评审",base+timedelta(minutes=2))
         seed_llm_evaluation(db,newer,admin_id,newer_results[-1],91,"优先评审",base+timedelta(minutes=2))
+        seed_terminal_route_audit(db,matching,matching_item,admin_id,created_at=base+timedelta(minutes=3))
         db.commit()
         ids = {
             "candidate": str(candidate.id),
@@ -1119,9 +1128,11 @@ def test_candidate_list_and_detail_project_safe_final_ai_failure(tmp_path) -> No
         candidate=Candidate(organization_id=admin.organization_id,display_name="Failed AI Candidate")
         file=FileObject(organization_id=admin.organization_id,storage_key="private/failed-ai",original_filename="failed.pdf",mime_type="application/pdf",size_bytes=1,sha256="9"*64,uploaded_by=admin_id)
         db.add_all([job,candidate,file]); db.flush(); resume=Resume(organization_id=admin.organization_id,candidate_id=candidate.id,file_object_id=file.id,version_number=1); db.add(resume); db.flush()
-        application=Application(organization_id=admin.organization_id,candidate_id=candidate.id,job_id=job.id,resume_id=resume.id,owner_id=admin_id,stage="review"); db.add(application); db.flush()
+        application=Application(organization_id=admin.organization_id,candidate_id=candidate.id,job_id=job.id,resume_id=resume.id,owner_id=admin_id,stage="contact"); db.add(application); db.flush()
         item,results=seed_screening_results(db,application,file.id,admin_id,[("legacy",99,"优先沟通",datetime(2026,4,1,tzinfo=timezone.utc))])
-        item.llm_status="failed"; item.llm_safe_error_code="candidate_alice_provider_body"; item.llm_attempts=3; db.commit(); candidate_id=str(candidate.id)
+        item.llm_status="failed"; item.llm_safe_error_code="candidate_alice_provider_body"; item.llm_attempts=3
+        seed_llm_evaluation(db,application,admin_id,results[-1],65,"建议评审",datetime(2026,4,1,0,1,tzinfo=timezone.utc)); item.llm_status="failed"; item.llm_safe_error_code="candidate_alice_provider_body"
+        seed_terminal_route_audit(db,application,item,admin_id,ai_status="failed",score=None,safe_error_code="internal_error"); db.commit(); candidate_id=str(candidate.id)
     with TestClient(app) as client:
         login(client,"failed-list@example.test")
         listing=client.get("/api/v1/candidates")
@@ -1133,6 +1144,33 @@ def test_candidate_list_and_detail_project_safe_final_ai_failure(tmp_path) -> No
         assert projection["llm_evaluation"] is None
         assert projection["llm_error_code"]=="internal_error"
     assert "candidate_alice_provider_body" not in listing.text+history.text
+
+def test_candidate_projection_does_not_infer_route_without_valid_terminal_audit(tmp_path) -> None:
+    app=make_app(tmp_path); admin_id=seed_user(app,"recruiting_admin","invalid-route@example.test")
+    with app.state.identity_store.sync_session() as db:
+        admin=db.get(User,admin_id); job=Job(organization_id=admin.organization_id,title="Invalid route",owner_id=admin_id); db.add(job); db.flush()
+        candidate_ids=[]
+        for index in range(3):
+            candidate=Candidate(organization_id=admin.organization_id,display_name=f"Invalid route {index}")
+            file=FileObject(organization_id=admin.organization_id,storage_key=f"private/invalid-route-{index}",original_filename=f"{index}.pdf",mime_type="application/pdf",size_bytes=1,sha256=str(index)*64,uploaded_by=admin_id)
+            db.add_all([candidate,file]); db.flush(); resume=Resume(organization_id=admin.organization_id,candidate_id=candidate.id,file_object_id=file.id,version_number=1); db.add(resume); db.flush()
+            application=Application(organization_id=admin.organization_id,candidate_id=candidate.id,job_id=job.id,resume_id=resume.id,owner_id=admin_id,stage="review"); db.add(application); db.flush()
+            item,results=seed_screening_results(db,application,file.id,admin_id,[(f"invalid-{index}",70,"可沟通",datetime(2026,4,2,tzinfo=timezone.utc))])
+            seed_llm_evaluation(db,application,admin_id,results[-1],70,"建议评审",datetime(2026,4,2,0,1,tzinfo=timezone.utc))
+            if index:
+                audit=seed_terminal_route_audit(db,application,item,admin_id)
+                audit.metadata_json={**audit.metadata_json,**({"to_stage":"contact"} if index==1 else {"ai_status":"pending"})}
+            candidate_ids.append(str(candidate.id))
+        db.commit()
+    with TestClient(app) as client:
+        login(client,"invalid-route@example.test")
+        response=client.get("/api/v1/candidates")
+    assert response.status_code==200
+    for row in response.json()["data"]:
+        assert row["id"] in candidate_ids
+        assert row["application"]["route_result"] is None
+        assert row["application"]["ai_score"]==70
+        assert row["application"]["llm_evaluation"]["score"]==70
 
 
 def test_candidate_list_searches_profile_and_contact_fields(tmp_path) -> None:

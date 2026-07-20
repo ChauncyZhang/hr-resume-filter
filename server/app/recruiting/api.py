@@ -13,6 +13,7 @@ from sqlalchemy import and_, exists, func, literal, or_, select
 from sqlalchemy.orm import aliased
 
 from server.app.governance.retention import recalculate_candidate_retention
+from server.app.governance.audit import AuditValidationError, _validate_metadata
 from server.app.identity.api import problem, session_token
 from server.app.identity.models import AuditLog, Department, Job, JobCollaborator, User, UserRole, UserStatus
 from server.app.identity.policy import Principal
@@ -25,7 +26,7 @@ from server.app.recruiting.models import (
 )
 from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.app.llm.models import LlmScreeningEvaluation
-from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
+from server.app.recruiting.tasks import LLM_TERMINAL_SAFE_ERROR_CODES, normalize_llm_terminal_safe_error_code
 from server.app.screening.rules import RuleSnapshotError,normalize_rule_content
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.http import content_disposition
@@ -347,21 +348,67 @@ def _latest_llm_evaluations(organization_id: UUID):
     ).where(LlmScreeningEvaluation.organization_id==organization_id).subquery()
 
 
+def _validated_terminal_routes(db,organization_id:UUID,application_ids:list[UUID]):
+    if not application_ids: return {}
+    item_rows=db.execute(select(ScreeningItem.id,ScreeningItem.application_id).where(
+        ScreeningItem.organization_id==organization_id,
+        ScreeningItem.application_id.in_(application_ids),
+    )).all()
+    item_applications={item_id:application_id for item_id,application_id in item_rows}
+    audits=db.scalars(select(AuditLog).where(
+        AuditLog.organization_id==organization_id,
+        AuditLog.category=="recruiting",
+        AuditLog.event_type=="screening.terminal_routed",
+        AuditLog.outcome=="success",
+        AuditLog.resource_type=="application",
+        AuditLog.resource_id.in_(application_ids),
+    ).order_by(AuditLog.created_at.desc(),AuditLog.id.desc())).all()
+    routes={}; seen=set()
+    for audit in audits:
+        application_id=audit.resource_id
+        if application_id in seen: continue
+        seen.add(application_id)
+        try:
+            metadata=_validate_metadata("screening.terminal_routed",audit.metadata_json)
+            item_id=UUID(metadata["item_id"])
+        except (AuditValidationError,KeyError,TypeError,ValueError):
+            continue
+        route=metadata.get("to_stage"); ai_status=metadata.get("ai_status")
+        if (
+            metadata.get("application_id")!=str(application_id)
+            or metadata.get("from_stage")!="new"
+            or item_applications.get(item_id)!=application_id
+            or route not in {"review","deferred"}
+            or ai_status not in {"succeeded","failed"}
+        ):
+            continue
+        score=metadata.get("score")
+        safe_error_code=metadata.get("safe_error_code")
+        if ai_status=="succeeded":
+            if not isinstance(score,int) or isinstance(score,bool) or not 0<=score<=100 or safe_error_code is not None:
+                continue
+        else:
+            if route!="review" or score is not None or safe_error_code not in LLM_TERMINAL_SAFE_ERROR_CODES:
+                continue
+        routes[application_id]={"route_result":route,"ai_status":ai_status,"safe_error_code":safe_error_code}
+    return routes
+
+
 def _screening_projections_for_applications(db,organization_id:UUID,application_ids:list[UUID]):
     if not application_ids: return {}
     latest_result=_latest_screening_results(organization_id); latest_evaluation=_latest_llm_evaluations(organization_id)
     rows=db.execute(select(
-        Application.id,Application.stage,ScreeningItem.llm_status,ScreeningItem.llm_safe_error_code,
+        Application.id,ScreeningItem.llm_status,
         latest_evaluation.c.evaluation_id,latest_evaluation.c.score,latest_evaluation.c.recommendation,
         latest_evaluation.c.dimensions,latest_evaluation.c.summary,latest_evaluation.c.strengths,
         latest_evaluation.c.gaps,latest_evaluation.c.risks,latest_evaluation.c.interview_questions,
     ).join(latest_result,and_(latest_result.c.organization_id==Application.organization_id,latest_result.c.application_id==Application.id,latest_result.c.result_rank==1)).join(ScreeningItem,and_(ScreeningItem.organization_id==Application.organization_id,ScreeningItem.id==latest_result.c.item_id)).outerjoin(latest_evaluation,and_(latest_evaluation.c.organization_id==Application.organization_id,latest_evaluation.c.screening_result_id==latest_result.c.screening_result_id,latest_evaluation.c.evaluation_rank==1)).where(Application.organization_id==organization_id,Application.id.in_(application_ids))).all()
-    projections={}
+    routes=_validated_terminal_routes(db,organization_id,application_ids); projections={}
     for row in rows:
-        route_result=row.stage if row.stage in ("review","deferred") else None
-        evaluation=None if row.evaluation_id is None else {"score":row.score,"recommendation":row.recommendation,"dimensions":list(row.dimensions or []),"summary":row.summary,"strengths":list(row.strengths or []),"gaps":list(row.gaps or []),"risks":list(row.risks or []),"questions":list(row.interview_questions or [])}
-        unavailable=evaluation is None and route_result=="review" and row.llm_status in ("failed","skipped") and row.llm_safe_error_code is not None
-        projections[row.id]={"route_result":route_result,"ai_score":row.score if evaluation is not None else None,"ai_recommendation":row.recommendation if evaluation is not None else "AI评分不可用" if unavailable else None,"llm_status":row.llm_status,"llm_error_code":normalize_llm_terminal_safe_error_code(row.llm_safe_error_code) if unavailable else None,"llm_evaluation":evaluation}
+        route=routes.get(row.id); route_result=route["route_result"] if route else None
+        evaluation=None if row.evaluation_id is None or route is not None and route["ai_status"]=="failed" else {"score":row.score,"recommendation":row.recommendation,"dimensions":list(row.dimensions or []),"summary":row.summary,"strengths":list(row.strengths or []),"gaps":list(row.gaps or []),"risks":list(row.risks or []),"questions":list(row.interview_questions or [])}
+        unavailable=evaluation is None and route is not None and route["ai_status"]=="failed"
+        projections[row.id]={"route_result":route_result,"ai_score":row.score if evaluation is not None else None,"ai_recommendation":row.recommendation if evaluation is not None else "AI评分不可用" if unavailable else None,"llm_status":route["ai_status"] if route else row.llm_status,"llm_error_code":normalize_llm_terminal_safe_error_code(route["safe_error_code"]) if unavailable else None,"llm_evaluation":evaluation}
     return projections
 
 
@@ -666,7 +713,6 @@ def get_workbench(request: Request, response: Response):
                 ApplicationReviewTask.organization_id==principal.organization_id,
                 ApplicationReviewTask.assignee_id==principal.user_id,
                 ApplicationReviewTask.status=="open",
-                Application.stage=="review",
                 Application.job_id.in_(jobs_by_id),
                 Candidate.deleted_at.is_(None),
                 AUTH.job_predicate(principal,RecruitingAction.READ,Job),

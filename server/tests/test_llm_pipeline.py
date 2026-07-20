@@ -660,7 +660,7 @@ def test_screening_items_api_exposes_only_bounded_llm_result(tmp_path):
     assert response.status_code==200
     item=response.json()["data"][0]
     assert item["llm_status"]=="succeeded" and item["llm_error_code"] is None and item["llm_attempts"]==1
-    assert item["llm_evaluation"]=={"score":91,"recommendation":"优先评审","summary":"Strong Python match","strengths":["Python services"],"gaps":[],"risks":["Confirm availability"],"questions":["Describe a scaling incident"]}
+    assert item["llm_evaluation"]=={"score":91,"recommendation":"优先评审","dimensions":[dimension.model_dump() for dimension in Gateway().outcome.result.dimensions],"summary":"Strong Python match","strengths":["Python services"],"gaps":[],"risks":["Confirm availability"],"questions":["Describe a scaling incident"]}
     assert all(value not in response.text for value in ("input_sha256","prompt_version_id","request_field_manifest","sk-private","system_prompt","provider_response"))
 
 

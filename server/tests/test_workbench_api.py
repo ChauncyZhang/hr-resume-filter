@@ -269,7 +269,7 @@ def test_workbench_review_tasks_are_persisted_open_and_principal_assigned(tmp_pa
         job = Job(organization_id=organization.id, title="LLM Job", owner_id=owner.id, hiring_owner_id=manager.id, status="open", updated_at=base)
         db.add(job); db.flush()
         db.add(JobCollaborator(organization_id=organization.id,job_id=job.id,user_id=manager.id,access_role="job_manager"))
-        assigned=seed_application(db,job,owner,1,"review",base+timedelta(hours=3))
+        assigned=seed_application(db,job,owner,1,"contact",base+timedelta(hours=3))
         inferred_only=seed_application(db,job,owner,2,"review",base+timedelta(hours=2))
         wrong_assignee=seed_application(db,job,owner,3,"review",base+timedelta(hours=1))
         closed=seed_application(db,job,owner,4,"review",base)

@@ -8,7 +8,7 @@ from fastapi import APIRouter,File,Header,Query,Request,UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy import and_,case,exists,func,or_,select
 from server.app.identity.models import AuditLog,Job,User
-from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load_job,_principal,_problem_for
+from server.app.recruiting.api import AUTH,_denied,_idempotency,_job_scope,_load_job,_principal,_problem_for,_validated_terminal_routes
 from server.app.recruiting.authorization import RecruitingAction
 from server.app.recruiting.models import Application,Candidate,FileObject,IdempotencyRecord,JobJdVersion,Resume,ScreeningRuleVersion
 from server.app.recruiting.tasks import normalize_llm_terminal_safe_error_code
@@ -40,13 +40,15 @@ def _empty_route_summary(): return {"manager_review_count":0,"deferred_count":0,
 def _route_summaries(db,organization_id,run_ids):
     run_ids=list(run_ids)
     if not run_ids: return {}
-    rows=db.execute(select(ScreeningItem.run_id,ScreeningItem.status,ScreeningItem.llm_status,ScreeningItem.llm_safe_error_code,Application.id,Application.stage).outerjoin(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id.in_(run_ids))).all()
+    rows=db.execute(select(ScreeningItem.run_id,ScreeningItem.status,Application.id).outerjoin(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(ScreeningItem.organization_id==organization_id,ScreeningItem.run_id.in_(run_ids))).all()
+    routes=_validated_terminal_routes(db,organization_id,[application_id for _,_,application_id in rows if application_id is not None])
     summaries={run_id:_empty_route_summary() for run_id in run_ids}
-    for run_id,item_status,llm_status,llm_error_code,application_id,application_stage in rows:
+    for run_id,item_status,application_id in rows:
         summary=summaries[run_id]
-        if application_stage=="review": summary["manager_review_count"]+=1
-        if application_stage=="deferred": summary["deferred_count"]+=1
-        if application_id is not None and application_stage!="new" and llm_status in ("failed","skipped") and llm_error_code: summary["ai_unavailable_count"]+=1
+        route=routes.get(application_id)
+        if route and route["route_result"]=="review": summary["manager_review_count"]+=1
+        if route and route["route_result"]=="deferred": summary["deferred_count"]+=1
+        if route and route["ai_status"]=="failed": summary["ai_unavailable_count"]+=1
         if item_status=="failed": summary["file_failed_count"]+=1
     return summaries
 def _review_progress(db,organization_id,run_ids):
@@ -67,14 +69,15 @@ def _run_data(run,error_summary=None,job_title=None,created_by_name=None,review_
     data.update(review_progress or _empty_review_progress())
     data.update(route_summary or _empty_route_summary())
     return data
-def _item_data(item,file,application=None,evaluation=None,candidate=None,rule_result=None,llm_retryable=False):
+def _item_data(item,file,application=None,evaluation=None,candidate=None,rule_result=None,llm_retryable=False,terminal_route=None):
+    if terminal_route is not None and terminal_route["ai_status"]=="failed": evaluation=None
     llm_evaluation=None if evaluation is None else {"score":evaluation.score,"recommendation":evaluation.recommendation,"dimensions":list(evaluation.dimensions or []),"summary":evaluation.summary,"strengths":evaluation.strengths,"gaps":evaluation.gaps,"risks":evaluation.risks,"questions":evaluation.interview_questions}
     rule_data=None if rule_result is None or item.status!="scored" else {"score":rule_result.rule_score,"recommendation":rule_result.recommendation,"required_hits":rule_result.required_hits,"required_missing":rule_result.required_missing,"bonus_hits":rule_result.bonus_hits,"risks":rule_result.risks}
     human_reviewed=application is not None and (application.human_conclusion is not None or application.stage not in ("new","review"))
-    route_result=application.stage if application is not None and application.stage in ("review","deferred") else None
-    ai_unavailable=evaluation is None and route_result=="review" and item.llm_status in ("failed","skipped") and item.llm_safe_error_code is not None
-    llm_error_code=normalize_llm_terminal_safe_error_code(item.llm_safe_error_code) if ai_unavailable else None
-    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"llm_retryable":llm_retryable,"candidate_id":str(candidate.id) if candidate else None,"candidate_name":candidate.display_name if candidate else None,"rule_result":rule_data,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"human_reviewed":human_reviewed,"route_result":route_result,"ai_score":evaluation.score if evaluation is not None else None,"ai_recommendation":evaluation.recommendation if evaluation is not None else "AI评分不可用" if ai_unavailable else None,"llm_status":item.llm_status,"llm_error_code":llm_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
+    route_result=terminal_route["route_result"] if terminal_route else None
+    ai_unavailable=evaluation is None and terminal_route is not None and terminal_route["ai_status"]=="failed"
+    llm_error_code=normalize_llm_terminal_safe_error_code(terminal_route["safe_error_code"]) if ai_unavailable else None
+    return {"id":str(item.id),"run_id":str(item.run_id),"filename":file.original_filename,"mime_type":file.mime_type,"size_bytes":file.size_bytes,"status":item.status,"parser_version":item.parser_version,"parse_quality":item.parse_quality,"error_code":item.safe_error_code,"attempts":item.attempts,"created_at":item.created_at.isoformat(),"retryable":item.status=="failed" and item.safe_error_code in RECOVERABLE_CODES,"llm_retryable":llm_retryable,"candidate_id":str(candidate.id) if candidate else None,"candidate_name":candidate.display_name if candidate else None,"rule_result":rule_data,"application_stage":application.stage if application else None,"application_version":application.version if application else None,"human_reviewed":human_reviewed,"route_result":route_result,"ai_score":evaluation.score if evaluation is not None else None,"ai_recommendation":evaluation.recommendation if evaluation is not None else "AI评分不可用" if ai_unavailable else None,"llm_status":terminal_route["ai_status"] if terminal_route else item.llm_status,"llm_error_code":llm_error_code,"llm_attempts":item.llm_attempts,"llm_evaluation":llm_evaluation}
 def _load_run(db,principal,run_id,action=RecruitingAction.READ,lock=False):
     query=select(ScreeningRun).join(Job,and_(Job.organization_id==ScreeningRun.organization_id,Job.id==ScreeningRun.job_id)).where(ScreeningRun.organization_id==principal.organization_id,ScreeningRun.id==run_id,_job_scope(principal,action))
     return db.scalar(query.with_for_update() if lock else query)
@@ -306,11 +309,12 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             except Exception: return _problem(request,422,"validation_failed")
         rows=db.execute(query.order_by(ScreeningItem.created_at,ScreeningItem.id).limit(limit+1)).all(); next_cursor=None
         if len(rows)>limit: next_cursor=request.app.state.recruiting_cursor.encode(str(principal.organization_id),f"screening-items:{run_id}",rows[limit-1][0].created_at.isoformat(),str(rows[limit-1][0].id)); rows=rows[:limit]
-        item_ids=[item.id for item,_ in rows]; applications={}; candidates={}; rule_results={}; evaluations={}; resumes={}; llm_config=None; llm_prompt=None; jd_version=None
+        item_ids=[item.id for item,_ in rows]; applications={}; candidates={}; rule_results={}; evaluations={}; resumes={}; terminal_routes={}; llm_config=None; llm_prompt=None; jd_version=None
         if item_ids:
             enrichment_scope=(ScreeningItem.organization_id==principal.organization_id,ScreeningItem.run_id==run.id,ScreeningItem.id.in_(item_ids))
             application_rows=db.execute(select(ScreeningItem.id,Application).join(Application,and_(Application.organization_id==ScreeningItem.organization_id,Application.id==ScreeningItem.application_id)).where(*enrichment_scope)).all()
             applications={item_id:application for item_id,application in application_rows}
+            terminal_routes=_validated_terminal_routes(db,principal.organization_id,[application.id for _,application in application_rows])
             candidate_rows=db.execute(select(ScreeningItem.id,Candidate).join(Candidate,and_(Candidate.organization_id==ScreeningItem.organization_id,Candidate.id==ScreeningItem.candidate_id)).where(*enrichment_scope,Candidate.deleted_at.is_(None))).all()
             candidates={item_id:candidate for item_id,candidate in candidate_rows}
             result_rows=db.execute(select(ScreeningResult.item_id,ScreeningResult).join(ScreeningItem,and_(ScreeningItem.organization_id==ScreeningResult.organization_id,ScreeningItem.id==ScreeningResult.item_id)).where(*enrichment_scope).order_by(ScreeningResult.created_at.desc(),ScreeningResult.id.desc())).all()
@@ -322,4 +326,4 @@ def list_items(run_id:UUID,request:Request,status:str|None=None,cursor:str|None=
             jd_version=db.scalar(select(JobJdVersion).where(JobJdVersion.organization_id==principal.organization_id,JobJdVersion.id==run.jd_version_id))
             llm_config=db.scalar(select(LlmProviderConfig).where(LlmProviderConfig.organization_id==principal.organization_id))
             llm_prompt=db.scalar(select(PromptVersion).where(PromptVersion.organization_id==principal.organization_id,PromptVersion.name=="screening-evaluation").order_by(PromptVersion.version_number.desc()).limit(1))
-        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.id),evaluations.get(item.id),candidates.get(item.id),rule_results.get(item.id),is_llm_retryable(item,run,rule_results.get(item.id),llm_config,llm_prompt,jd_version,resumes.get(item.resume_id))) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response
+        response=JSONResponse({"data":[_item_data(item,stored,applications.get(item.id),evaluations.get(item.id),candidates.get(item.id),rule_results.get(item.id),is_llm_retryable(item,run,rule_results.get(item.id),llm_config,llm_prompt,jd_version,resumes.get(item.resume_id)),terminal_routes.get(item.application_id)) for item,stored in rows],"meta":{"limit":limit,"next_cursor":next_cursor}}); response.headers["Cache-Control"]="no-store"; return response

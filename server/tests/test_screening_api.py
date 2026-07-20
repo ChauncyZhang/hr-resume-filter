@@ -136,6 +136,14 @@ def add_llm_evaluation(db,item,result,*,score=72,recommendation="建议评审",c
     db.add(evaluation); db.flush()
     return evaluation
 
+def add_terminal_route_audit(db,item,application,*,route="review",ai_status="succeeded",score=72,safe_error_code=None,created_at=None):
+    metadata={"application_id":str(application.id),"item_id":str(item.id),"from_stage":"new","to_stage":route,"ai_status":ai_status,"recommendation":"AI评分不可用" if ai_status=="failed" else "建议评审" if route=="review" else "暂缓"}
+    if score is not None: metadata["score"]=score
+    if safe_error_code is not None: metadata["safe_error_code"]=safe_error_code
+    audit=AuditLog(organization_id=item.organization_id,actor_user_id=application.owner_id,category="recruiting",event_type="screening.terminal_routed",outcome="success",resource_type="application",resource_id=application.id,trace_id="projection-test",metadata_json=metadata)
+    if created_at is not None: audit.created_at=created_at
+    db.add(audit); db.flush(); return audit
+
 def test_screening_item_projects_latest_persisted_llm_route_and_dimensions(tmp_path):
     app,_,job_id=app_and_seed(tmp_path)
     with TestClient(app) as client:
@@ -147,9 +155,10 @@ def test_screening_item_projects_latest_persisted_llm_route_and_dimensions(tmp_p
             item=db.get(ScreeningItem,uuid.UUID(uploaded["id"])); aggregate=db.get(ScreeningRun,item.run_id)
             resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1,parsed_text="private resume")
             db.add(resume); db.flush()
-            application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="review",source="screening")
+            application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="contact",source="screening")
             db.add(application); db.flush(); item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id
             item.llm_status="succeeded"; item.llm_attempts=1
+            add_terminal_route_audit(db,item,application)
             add_llm_evaluation(db,item,result,score=65,recommendation="建议评审",created_at=datetime.now(timezone.utc)-timedelta(minutes=1))
             add_llm_evaluation(db,item,result,created_at=datetime.now(timezone.utc))
             db.commit()
@@ -174,9 +183,11 @@ def test_screening_final_ai_failure_has_no_synthetic_evaluation_or_private_error
             item=db.get(ScreeningItem,uuid.UUID(uploaded["id"])); aggregate=db.get(ScreeningRun,item.run_id)
             resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1)
             db.add(resume); db.flush()
-            application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="review",source="screening")
+            application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="contact",source="screening")
             db.add(application); db.flush(); item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id
             item.llm_status="failed"; item.llm_safe_error_code="provider_unavailable"; item.llm_attempts=3
+            add_llm_evaluation(db,item,result,score=65,recommendation="建议评审")
+            add_terminal_route_audit(db,item,application,ai_status="failed",score=None,safe_error_code="provider_unavailable")
             db.commit()
         response=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers)
 
@@ -200,9 +211,10 @@ def test_screening_run_summary_counts_terminal_routes_without_rule_recommendatio
                 item=db.get(ScreeningItem,uuid.UUID(uploaded[index]["id"])); aggregate=db.get(ScreeningRun,item.run_id)
                 resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1)
                 db.add(resume); db.flush()
-                application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage=stage,source="screening")
+                application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="contact" if stage=="review" else "review",source="screening")
                 db.add(application); db.flush(); item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id
                 item.llm_status="failed" if stage=="review" else "succeeded"; item.llm_safe_error_code="provider_unavailable" if stage=="review" else None
+                add_terminal_route_audit(db,item,application,route=stage,ai_status="failed" if stage=="review" else "succeeded",score=None if stage=="review" else 50,safe_error_code="provider_unavailable" if stage=="review" else None)
             failed=db.get(ScreeningItem,uuid.UUID(uploaded[2]["id"])); failed.status="failed"; failed.safe_error_code="unsupported_format"
             aggregate=db.get(ScreeningRun,failed.run_id); aggregate.status="completed"; aggregate.processed_count=3; aggregate.succeeded_count=2; aggregate.failed_count=1
             db.commit()
@@ -212,6 +224,28 @@ def test_screening_run_summary_counts_terminal_routes_without_rule_recommendatio
     expected={"manager_review_count":1,"deferred_count":1,"ai_unavailable_count":1,"file_failed_count":1}
     assert {key:detail[key] for key in expected}==expected
     assert {key:listing[key] for key in expected}==expected
+
+def test_screening_route_projection_rejects_missing_or_invalid_terminal_audit_metadata(tmp_path):
+    app,_,job_id=app_and_seed(tmp_path)
+    with TestClient(app) as client:
+        headers=login(client,"admin@example.test")
+        run=client.post(f"/api/v1/jobs/{job_id}/screening-runs",json={},headers={**headers,"Idempotency-Key":"audit-validation-run"}).json()["data"]
+        uploaded=[client.post(f"/api/v1/screening-runs/{run['id']}/items",files={"file":(f"audit-{index}.txt",b"Python","text/plain")},headers={**headers,"Idempotency-Key":f"audit-validation-item-{index}"}).json()["data"] for index in range(3)]
+        with app.state.identity_store.sync_session() as db:
+            for index,uploaded_item in enumerate(uploaded):
+                candidate,result=enrich_item(db,uploaded_item["id"],f"Audit Candidate {index}")
+                item=db.get(ScreeningItem,uuid.UUID(uploaded_item["id"])); aggregate=db.get(ScreeningRun,item.run_id)
+                resume=Resume(organization_id=item.organization_id,candidate_id=candidate.id,file_object_id=item.file_object_id,version_number=1,parsed_text="Python"); db.add(resume); db.flush()
+                application=Application(organization_id=item.organization_id,candidate_id=candidate.id,job_id=aggregate.job_id,resume_id=resume.id,owner_id=aggregate.created_by,stage="review",source="screening"); db.add(application); db.flush()
+                item.resume_id=resume.id; item.application_id=application.id; result.application_id=application.id; result.resume_id=resume.id; item.llm_status="failed"; item.llm_safe_error_code="provider_unavailable"
+                if index:
+                    audit=add_terminal_route_audit(db,item,application,ai_status="failed",score=None,safe_error_code="provider_unavailable")
+                    audit.metadata_json={**audit.metadata_json,**({"to_stage":"contact"} if index==1 else {"ai_status":"pending"})}
+            db.commit()
+        rows=client.get(f"/api/v1/screening-runs/{run['id']}/items",headers=headers).json()["data"]
+        detail=client.get(f"/api/v1/screening-runs/{run['id']}",headers=headers).json()["data"]
+    assert all(row["route_result"] is None and row["ai_recommendation"] is None and row["llm_error_code"] is None for row in rows)
+    assert {key:detail[key] for key in ("manager_review_count","deferred_count","ai_unavailable_count")}=={"manager_review_count":0,"deferred_count":0,"ai_unavailable_count":0}
 
 def test_screening_api_create_upload_read_replay_and_scope(tmp_path):
     app,storage,job_id=app_and_seed(tmp_path)
