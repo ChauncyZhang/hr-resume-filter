@@ -241,10 +241,10 @@ function JobForm({ initialJob, initialDraft, departments, owners, ownersStatus, 
               <label>必须条件<textarea rows="3" value={values.mustHave} onChange={(event) => change("mustHave", event.target.value)} placeholder="用顿号分隔" /></label>
               <label>加分项<textarea rows="3" value={values.niceToHave} onChange={(event) => change("niceToHave", event.target.value)} placeholder="用顿号分隔" /></label>
             </div></section>
-            <section className="form-section recruitment-config"><header><span>3</span><div><h3>招聘配置</h3><p>选择招聘流程，并配置规则评分后的 AI 辅助评估。</p></div></header><div className="job-fields">
+            <section className="form-section recruitment-config"><header><span>3</span><div><h3>招聘配置</h3><p>选择招聘流程；LLM 是当前唯一的评分和路由来源。</p></div></header><div className="job-fields">
               <label>流程模板<select aria-label="流程模板" value={values.process} onChange={(event) => change("process", event.target.value)}>{Object.keys(processTemplates).map((template) => <option key={template} value={template}>{template}</option>)}</select>{errors.process && <small className="field-error">{errors.process}</small>}</label>
               <div className="process-summary"><strong>阶段摘要</strong><span>{processTemplates[values.process].join(" → ")}</span></div>
-              <label className="toggle-row ai-evaluation-row"><span><Bot size={18} /><span><strong>AI 简历评估</strong><small>规则评分后补充匹配分、结论和理由。</small></span></span><input aria-label="AI 简历评估" type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
+              <label className="toggle-row ai-evaluation-row"><span><Bot size={18} /><span><strong>AI 简历评估</strong><small>启用后由 LLM 直接生成最终分、结论、理由和路由结果。</small></span></span><input aria-label="AI 简历评估" type="checkbox" checked={values.llmEnabled} onChange={(event) => change("llmEnabled", event.target.checked)} /></label>
             </div></section>
           </div>
           <aside className="form-summary"><h3>发布检查</h3><div className="completion-ring"><strong>{completion}/5</strong><span>关键项已完成</span></div>{[["职位名称", values.name], ["所属部门", values.departmentId], ["公开 JD", values.jd], ["筛选条件", values.mustHave], ["招聘流程", values.process]].map(([label, value]) => <div className={value ? "check-row done" : "check-row"} key={label}>{value ? <Check size={15} /> : <Clock3 size={15} />}<span>{label}</span></div>)}</aside>

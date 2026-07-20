@@ -33,7 +33,7 @@ import { TalentPoolWorkspace } from "./TalentPoolViews.jsx";
 import { ReportWorkspace } from "./ReportViews.jsx";
 import { SettingsWorkspace } from "./SettingsViews.jsx";
 import { canPerformAction, getAllowedNavItems, getAllowedSettingsSections, getDefaultNavItem } from "./roleCapabilities.js";
-import { addTalentMemberships, applyScreeningResults, reactivateTalentCandidate, recalculatePositionCounts } from "./ux08Workflow.js";
+import { reactivateTalentCandidate, recalculatePositionCounts } from "./ux08Workflow.js";
 import { AccessDeniedView, LoginView, SessionLoadingView } from "./LoginView.jsx";
 import { InviteAcceptView } from "./InviteAcceptView.jsx";
 import { ProfileSettings } from "./ProfileSettings.jsx";
@@ -724,17 +724,6 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
     setTalentMemberships(next.memberships);
   }
 
-  function applyScreeningAction({ action, files, task }) {
-    const previous = workflowState();
-    const targetStage = action === "标记淘汰" ? "已淘汰" : "待复核";
-    let next = applyScreeningResults(previous, { task, files, targetStage });
-    const candidateIds = files.map((file) => next.candidates.find((candidate) => file.email ? candidate.email === file.email : candidate.name === file.candidate)?.id).filter(Boolean);
-    if (action === "加入人才库") next = addTalentMemberships(next, { candidateIds, poolId: "POOL-FOLLOW", actor: roleIdentity.name });
-    if (action === "添加标签") next.candidates = next.candidates.map((candidate) => candidateIds.includes(candidate.id) && !candidate.tags.includes("批量复核") ? { ...candidate, tags: [...candidate.tags, "批量复核"] } : candidate);
-    applyWorkflowState(next);
-    return { previousState: previous, affectedCount: new Set(candidateIds).size };
-  }
-
   function openJobForm() {
     updateSelectedJob(null);
     navigate("/jobs/new");
@@ -1135,7 +1124,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
           <section className="module-placeholder"><div><BriefcaseBusiness size={26} /><h2>{activeNav}</h2><p>该模块将在后续 UX 任务中继续完善。</p></div></section>
         )}
 
-        {screeningTask && route.kind === "screening" && <ScreeningTaskView task={screeningTask} initialViewState={{ taskId: screeningTask.id, query: route.query || screeningViewState?.query || "", filter: route.status || screeningViewState?.filter || "全部", selected: screeningViewState?.selected || [] }} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => navigate("/screening/tasks")} onOpenCandidate={openCandidate} onNotify={notify} onApplyResults={applyScreeningAction} onUndoResults={applyWorkflowState} />}
+        {screeningTask && route.kind === "screening" && <ScreeningTaskView task={screeningTask} initialViewState={{ taskId: screeningTask.id, query: route.query || screeningViewState?.query || "", filter: route.status || screeningViewState?.filter || "全部", selected: screeningViewState?.selected || [] }} controller={screeningController} onTaskChange={handleTaskChange} onBack={() => navigate("/screening/tasks")} onOpenCandidate={openCandidate} onNotify={notify} />}
       </main>
 
       {importOpen && <ImportWizard activeJob={activeJob} recentTask={recentTask} controller={screeningController} onClose={() => setImportOpen(false)} onCreateTask={(task) => { setImportOpen(false); handleTaskChange(task); navigate(screeningTaskPath(task.id)); }} onRunCreated={persistRecentServerTask} onResumeTask={(task) => { setImportOpen(false); setScreeningTask(task); navigate(screeningTaskPath(task.id)); }} onNotify={notify} actorName={roleIdentity.name} />}

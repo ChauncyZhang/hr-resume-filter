@@ -149,6 +149,40 @@ test("screening summary uses the four server counters without recomputing rows",
   assert.equal("serverCounts" in task, false);
 });
 
+test("ScreeningTaskView renders all four server counters instead of recomputing its rows", () => {
+  const task = controllerHelpers.normalizeScreeningTask({
+    id: "run-rendered-summary",
+    job_title: "AI 工程师",
+    status: "completed",
+    processed_count: 1,
+    total_count: 1,
+    manager_review_count: 8,
+    deferred_count: 3,
+    ai_unavailable_count: 2,
+    file_failed_count: 1,
+  }, [{
+    id: "only-row",
+    filename: "唯一一行.pdf",
+    status: "success",
+    route_result: "deferred",
+    ai_recommendation: "暂缓",
+    ai_score: 42,
+    llm_status: "succeeded",
+  }]);
+  const html = renderToStaticMarkup(createElement(helpers.ScreeningTaskView, {
+    task,
+    onTaskChange() {},
+    onBack() {},
+    onOpenCandidate() {},
+    onNotify() {},
+  }));
+
+  assert.match(html, /<strong>8<\/strong><span>已转交用人经理<\/span>/);
+  assert.match(html, /<strong>3<\/strong><span>已暂缓<\/span>/);
+  assert.match(html, /<strong>2<\/strong><span>AI评分不可用<\/span>/);
+  assert.match(html, /<strong>1<\/strong><span>文件处理失败<\/span>/);
+});
+
 test("screening file errors take priority over simultaneous LLM failure metadata", () => {
   const task = controllerHelpers.normalizeScreeningTask({ id: "run-errors" }, [
     {
@@ -222,6 +256,70 @@ test("technical screening failures render no contradictory route, LLM conclusion
   assert.match(row, /文件解析失败/);
 });
 
+test("ScreeningTaskView renders final LLM and technical failures with distinct routing evidence", () => {
+  const task = controllerHelpers.normalizeScreeningTask({
+    id: "run-rendered-failures",
+    job_title: "AI 工程师",
+    status: "partial",
+    processed_count: 2,
+    total_count: 2,
+    manager_review_count: 1,
+    deferred_count: 0,
+    ai_unavailable_count: 1,
+    file_failed_count: 1,
+  }, [{
+    id: "llm-final-failure",
+    filename: "LLM失败.pdf",
+    candidate_name: "李雷",
+    status: "success",
+    route_result: "review",
+    ai_score: 96,
+    ai_recommendation: "陈旧推荐",
+    llm_status: "failed",
+    llm_error_code: "provider_unavailable",
+    llm_evaluation: {
+      dimensions: [{ key: "core_capability", score: 96, evidence: ["陈旧AI证据"] }],
+      strengths: ["陈旧AI优势"],
+    },
+  }, {
+    id: "technical-file-failure",
+    filename: "解析失败.pdf",
+    candidate_name: "韩梅梅",
+    status: "failed",
+    error_code: "parse_failed",
+    route_result: "review",
+    ai_score: 91,
+    ai_recommendation: "陈旧技术推荐",
+    llm_status: "failed",
+    llm_evaluation: {
+      dimensions: [{ key: "core_capability", score: 91, evidence: ["陈旧技术AI证据"] }],
+      strengths: ["陈旧技术AI优势"],
+    },
+  }]);
+  const html = renderToStaticMarkup(createElement(helpers.ScreeningTaskView, {
+    task,
+    onTaskChange() {},
+    onBack() {},
+    onOpenCandidate() {},
+    onNotify() {},
+  }));
+  const rows = [...html.matchAll(/<div class="screening-row"[\s\S]*?<\/div>/g)].map(([row]) => row);
+  const llmFailureRow = rows.find((row) => row.includes("LLM失败.pdf"));
+  const technicalFailureRow = rows.find((row) => row.includes("解析失败.pdf"));
+
+  assert.ok(llmFailureRow);
+  assert.match(llmFailureRow, /aria-label="流转结果：已转交用人经理"[^>]*>已转交用人经理<\/span>/);
+  assert.match(llmFailureRow, /aria-label="LLM结论：AI评分不可用"[^>]*>AI评分不可用<\/span>/);
+  assert.match(llmFailureRow, /aria-label="最终分：—"/);
+  assert.doesNotMatch(llmFailureRow, /陈旧推荐|陈旧AI证据|陈旧AI优势/);
+
+  assert.ok(technicalFailureRow);
+  assert.match(technicalFailureRow, /aria-label="流转结果：未流转"[^>]*>未流转<\/span>/);
+  assert.match(technicalFailureRow, /aria-label="LLM结论：未进入AI评分"[^>]*>未进入AI评分<\/span>/);
+  assert.match(technicalFailureRow, /aria-label="最终分：—"/);
+  assert.doesNotMatch(technicalFailureRow, /已转交用人经理|AI评分不可用|陈旧技术推荐|陈旧技术AI证据|陈旧技术AI优势/);
+});
+
 test("screening result grid exposes table semantics and understandable mobile field labels", () => {
   const task = {
     ...controllerHelpers.normalizeScreeningTask({
@@ -290,6 +388,21 @@ test("screening import and demo flow contains only LLM automatic scoring and rou
   assert.match(source, /LLM 自动评分/);
   assert.match(source, /自动路由/);
   assert.match(source, /不淘汰候选人/);
+});
+
+test("job configuration describes LLM as the only scoring and routing source", () => {
+  const source = readFileSync(new URL("./JobViews.jsx", import.meta.url), "utf8");
+
+  assert.match(source, /LLM 是当前唯一的评分和路由来源/);
+  assert.doesNotMatch(source, /规则评分后|规则评分\s*\+\s*LLM 辅助评估|LLM 辅助评估/);
+});
+
+test("App no longer wires screening result apply or undo callbacks into ScreeningTaskView", () => {
+  const source = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
+
+  assert.doesNotMatch(source, /function applyScreeningAction/);
+  assert.doesNotMatch(source, /onApplyResults=/);
+  assert.doesNotMatch(source, /onUndoResults=/);
 });
 
 test("cancelled tasks never describe progress as completed", () => {
