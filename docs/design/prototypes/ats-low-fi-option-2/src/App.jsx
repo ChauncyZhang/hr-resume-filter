@@ -910,7 +910,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
         role={drawerViewport && menuOpen ? "dialog" : undefined}
         aria-modal={drawerViewport && menuOpen ? "true" : undefined}
         aria-label={drawerViewport && menuOpen ? "主导航抽屉" : undefined}
-        inert={drawerViewport && !menuOpen ? "" : undefined}
+        inert={drawerViewport && !menuOpen}
       >
         <div className="brand"><img src="/favicon.svg" alt="" /><span><strong>BeyondCandidate</strong><small>候选人全流程招聘平台</small></span></div>
         <nav ref={navigationRef} id="primary-navigation" aria-label="主导航">

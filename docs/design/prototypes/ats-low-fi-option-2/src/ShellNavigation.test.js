@@ -120,6 +120,8 @@ test("application shell uses BrowserRouter and URL-derived route state", async (
   assert.match(appSource, /parseAppRoute\(location\)/);
   assert.match(appSource, /clearJobCreateDraft/);
   assert.match(appSource, /interviewController\.get\(route\.id/);
+  assert.match(appSource, /inert=\{drawerViewport && !menuOpen\}/);
+  assert.doesNotMatch(appSource, /inert=\{drawerViewport && !menuOpen \? "" : undefined\}/);
   assert.doesNotMatch(appSource, /createAppHistory/);
 });
 
