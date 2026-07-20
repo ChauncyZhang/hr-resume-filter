@@ -249,11 +249,36 @@ resolve and validate every DNS answer, pin one public address for the TLS reques
 redirects. The settings connection test sends only a constant health-check prompt; it never sends
 JD or resume content.
 
-When LLM evaluation is enabled, an empty job allowlist applies to every job in the tenant; a
-non-empty list limits evaluation to those job IDs. Deterministic rule results remain authoritative
-fallback facts. LLM failure never changes an application stage and leaves the run partially
-completed with a safe error code. Successful bounded LLM facts are stored separately and exposed
-without prompts, provider bodies, input hashes, or API keys.
+## LLM-only screening flow
+
+This section describes new screening tasks in the server ATS. The local desktop tool documented in
+the repository root is a separate legacy product; its local rule scoring and optional LLM mode do
+not describe this server flow.
+
+For a new server screening task, the LLM is the only scoring source. It returns five bounded
+dimensions totaling 100 points: core capability (35), experience depth (25), role seniority (20),
+transferability (10), and explicit constraints (10). The server derives the recommendation and
+route from that total:
+
+- 85-100: `优先评审`; automatically enter hiring-manager review.
+- 60-84: `建议评审`; automatically enter hiring-manager review.
+- 0-59: `暂缓`; automatically enter the system-managed AI deferred talent pool.
+
+After the final LLM attempt fails, the server fails open to hiring-manager review with `score=null`
+and displays `AI评分不可用`. It never invents a score, routes the candidate from a legacy rule
+result, or creates an HR manual-review step. Status changes are driven by these routing actions;
+HR users do not edit screening status manually.
+
+Parsing failures, malware detection, unsupported formats, missing files, candidate-creation
+failures, and similar pre-routing failures remain technical failures. They do not become an LLM
+recommendation or an automatic talent decision.
+
+Historical rule results and prompt v1 records remain read-only compatibility data. New prompts,
+scores, routing decisions, and reports do not use them. Current LLM facts are exposed without
+prompt text, provider bodies, input hashes, or API keys.
+
+An empty LLM job allowlist applies to every job in the tenant; a non-empty list limits evaluation
+to those job IDs.
 
 Before evaluation, the worker removes recognized email/phone values, labeled name/address fields,
 and the known candidate display name, then applies strict input limits. This deterministic
