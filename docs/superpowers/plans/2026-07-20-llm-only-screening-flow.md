@@ -694,6 +694,8 @@ Use columns: `流转结果`, `候选人 / 文件`, `处理状态`, `LLM 结论`,
 
 The desktop result grid must expose row/column semantics to assistive technology. When the header is visually hidden on narrow screens, every value must retain a visible or accessible field label so scores and conclusions remain understandable out of column context.
 
+Render the four normalized counts from the task's real top-level controller shape in an end-to-end test. Technical file/parser failures take display precedence over any inconsistent LLM failure metadata because they never reached a valid AI-routing outcome. Remove all remaining current-flow copy that presents rule scoring or rule fallback as part of the active screening process.
+
 - [ ] **Step 5: Make task totals match server route outcomes**
 
 Render exactly four counters: `已转交用人经理`, `已暂缓`, `AI评分不可用`, and `文件处理失败`. Do not infer them from rule result presence.
