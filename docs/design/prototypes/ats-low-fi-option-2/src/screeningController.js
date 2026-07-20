@@ -52,44 +52,61 @@ export function normalizeScreeningRunSummary(run) {
     total: safeCount(safeRun.total_count),
     succeeded: safeCount(safeRun.succeeded_count),
     failed: safeCount(safeRun.failed_count),
-    reviewTotal: safeCount(safeRun.review_total_count),
-    reviewed: safeCount(safeRun.reviewed_count),
-    reviewPending: safeCount(safeRun.review_pending_count),
-    reviewApproved: safeCount(safeRun.review_approved_count),
-    reviewRejected: safeCount(safeRun.review_rejected_count),
-    reviewStatus: safeString(safeRun.review_status) || "not_applicable",
+    managerReviewCount: safeCount(safeRun.manager_review_count),
+    deferredCount: safeCount(safeRun.deferred_count),
+    aiUnavailableCount: safeCount(safeRun.ai_unavailable_count),
+    fileFailedCount: safeCount(safeRun.file_failed_count),
     createdAt: safeString(safeRun.created_at),
     serverBacked: true,
   };
 }
 
+function routeLabel(routeResult) {
+  if (routeResult === "review") return "已转交用人经理";
+  if (routeResult === "deferred") return "已暂缓";
+  if (routeResult === "ai_unavailable") return "AI评分不可用";
+  if (routeResult === "file_failed") return "文件处理失败";
+  return "";
+}
+
+function normalizeDimension(dimension) {
+  if (!isRecord(dimension)) return null;
+  return {
+    label: safeString(dimension.label),
+    score: safeScore(dimension.score),
+    evidence: safeStrings(dimension.evidence),
+    gaps: safeStrings(dimension.gaps),
+  };
+}
+
+function normalizeLlmEvaluation(value) {
+  if (!isRecord(value)) return null;
+  return {
+    dimensions: Array.isArray(value.dimensions)
+      ? value.dimensions.slice(0, 5).map(normalizeDimension).filter(Boolean)
+      : [],
+    evidence: safeStrings(value.evidence),
+    gaps: safeStrings(value.gaps),
+    strengths: safeStrings(value.strengths),
+    risks: safeStrings(value.risks),
+  };
+}
+
 function normalizeFile(item) {
-  const ruleResult = isRecord(item?.rule_result) ? item.rule_result : null;
-  const llmEvaluation = isRecord(item?.llm_evaluation) ? item.llm_evaluation : null;
-  const hasFinalRuleResult = item?.status === "scored" && ruleResult !== null;
+  const routeResult = safeString(item?.route_result);
+  const llmFailed = item?.llm_status === "failed";
+  const llmEvaluation = llmFailed ? null : normalizeLlmEvaluation(item?.llm_evaluation);
   let status = item?.status === "queued" ? "queued" : "running";
 
   if (item?.status === "failed") {
     status = "failed";
   } else if (item?.status === "cancelled") {
     status = "cancelled";
-  } else if (hasFinalRuleResult && item?.llm_status === "failed") {
+  } else if (llmFailed) {
     status = "partial";
-  } else if (hasFinalRuleResult && SUCCESSFUL_LLM_STATUSES.has(item?.llm_status)) {
+  } else if (routeResult && SUCCESSFUL_LLM_STATUSES.has(item?.llm_status)) {
     status = "success";
   }
-
-  const matched = [
-    ...safeStrings(ruleResult?.required_hits),
-    ...safeStrings(ruleResult?.bonus_hits),
-  ].join("、");
-  const risks = [
-    ...safeStrings(ruleResult?.risks),
-    ...safeStrings(llmEvaluation?.risks),
-  ].join("、");
-  const error = status === "partial"
-    ? safeString(item?.llm_error_code)
-    : status === "failed" ? safeString(item?.error_code) : "";
 
   return {
     id: safeString(item?.id),
@@ -97,17 +114,18 @@ function normalizeFile(item) {
     candidateId: safeString(item?.candidate_id) || null,
     candidate: safeString(item?.candidate_name),
     status,
-    ruleScore: safeScore(ruleResult?.score),
-    llmScore: safeScore(llmEvaluation?.score),
-    matched,
-    missing: safeStrings(ruleResult?.required_missing).join("、"),
-    recommendation: safeString(ruleResult?.recommendation),
-    risk: risks,
-    error,
-    application_stage: safeString(item?.application_stage) || null,
-    application_version: Number.isInteger(item?.application_version) ? item.application_version : null,
-    humanReviewed: item?.human_reviewed === true,
+    routeResult,
+    routeLabel: routeLabel(routeResult),
+    score: llmFailed ? null : safeScore(item?.ai_score),
+    recommendation: llmFailed ? "AI评分不可用" : safeString(item?.ai_recommendation),
     llmStatus: safeString(item?.llm_status),
+    error: safeString(item?.llm_error_code),
+    llmEvaluation,
+    dimensions: llmEvaluation?.dimensions ?? [],
+    evidence: llmEvaluation?.evidence ?? [],
+    gaps: llmEvaluation?.gaps ?? [],
+    strengths: llmEvaluation?.strengths ?? [],
+    risks: llmEvaluation?.risks ?? [],
     retryable: item?.retryable === true,
     llmRetryable: item?.llm_retryable === true,
   };
@@ -249,41 +267,6 @@ export function createScreeningController({
     return resourceData(response);
   }
 
-  async function bulkAction(runId, items, { signal } = {}) {
-    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/bulk-actions`, {
-      method: "POST",
-      body: { command: "advance_to_review", items },
-      idempotencyKey: createIdempotencyKey(),
-      ...withSignal(signal),
-    });
-    const data = resourceData(response);
-    return {
-      applied: safeCount(data?.applied_count),
-      already_applied: safeCount(data?.already_applied_count),
-      undo_items: Array.isArray(data?.applications) ? data.applications
-        .filter((application) => isRecord(application)
-          && application.result === "applied"
-          && safeString(application.item_id)
-          && Number.isInteger(application.version)
-          && application.version > 0)
-        .map((application) => ({ item_id: application.item_id, expected_application_version: application.version })) : [],
-    };
-  }
-
-  async function undoBulkAction(runId, items, { signal } = {}) {
-    const response = await client.request(`/api/v1/screening-runs/${encodeURIComponent(runId)}/bulk-actions`, {
-      method: "POST",
-      body: { command: "undo_advance_to_new", items },
-      idempotencyKey: createIdempotencyKey(),
-      ...withSignal(signal),
-    });
-    const data = resourceData(response);
-    return {
-      applied: safeCount(data?.applied_count),
-      already_applied: safeCount(data?.already_applied_count),
-    };
-  }
-
   async function pollRun(runId, { signal, intervalMs = 1000, onSnapshot } = {}) {
     const generation = (pollGenerations.get(runId) ?? 0) + 1;
     pollGenerations.set(runId, generation);
@@ -307,7 +290,7 @@ export function createScreeningController({
     }
   }
 
-  return { listJobs, listRuns, createRun, uploadFiles, startRun, cancelRun, getRun, getItems, retryItem, bulkAction, undoBulkAction, pollRun };
+  return { listJobs, listRuns, createRun, uploadFiles, startRun, cancelRun, getRun, getItems, retryItem, pollRun };
 }
 
 export const screeningController = createScreeningController();

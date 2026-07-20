@@ -95,12 +95,10 @@ test("lists screening tasks from the server and preserves job and creator contex
       processed_count: 5,
       succeeded_count: 4,
       failed_count: 1,
-      review_total_count: 5,
-      reviewed_count: 2,
-      review_pending_count: 3,
-      review_approved_count: 1,
-      review_rejected_count: 0,
-      review_status: "in_progress",
+      manager_review_count: 2,
+      deferred_count: 1,
+      ai_unavailable_count: 1,
+      file_failed_count: 1,
       created_at: "2026-07-17T08:00:00+00:00",
     }],
     meta: { limit: 50, next_cursor: null },
@@ -118,12 +116,10 @@ test("lists screening tasks from the server and preserves job and creator contex
     total: 5,
     succeeded: 4,
     failed: 1,
-    reviewTotal: 5,
-    reviewed: 2,
-    reviewPending: 3,
-    reviewApproved: 1,
-    reviewRejected: 0,
-    reviewStatus: "in_progress",
+    managerReviewCount: 2,
+    deferredCount: 1,
+    aiUnavailableCount: 1,
+    fileFailedCount: 1,
     createdAt: "2026-07-17T08:00:00+00:00",
     serverBacked: true,
   }]);
@@ -136,7 +132,7 @@ test("drops malformed job and item records without creating blank UI rows", asyn
 
   assert.deepEqual(await controller.listJobs(), [{ id: "job-1", title: "AI 工程师" }]);
 
-  const task = normalizeScreeningTask(run(), [null, { id: 7, filename: "bad.pdf" }, item({ id: "item-2", llm_status: "unknown", status: "scored", rule_result: { score: 80 } })]);
+  const task = normalizeScreeningTask(run(), [null, { id: 7, filename: "bad.pdf" }, item({ id: "item-2", llm_status: "unknown", status: "scored", route_result: "review" })]);
   assert.equal(task.files.length, 1);
   assert.equal(task.files[0].id, "item-2");
   assert.equal(task.files[0].status, "running");
@@ -239,93 +235,6 @@ test("keeps cancelled file items distinct from failures", () => {
   assert.equal(task.files[0].error, "");
 });
 
-test("maps candidate, rule, LLM, risk, and application fields while retaining rule facts on LLM failure", () => {
-  const task = normalizeScreeningTask(run({ status: "partial", processed_count: 1, total_count: 1 }), [item({
-    status: "scored",
-    llm_status: "failed",
-    llm_error_code: "provider_rate_limited",
-    candidate_id: "candidate-1",
-    candidate_name: "林启舟",
-    retryable: true,
-    llm_retryable: true,
-    application_stage: "screening",
-    application_version: 4,
-    rule_result: {
-      score: 88,
-      recommendation: "优先沟通",
-      required_hits: ["Python"],
-      bonus_hits: ["PostgreSQL"],
-      required_missing: ["Kubernetes"],
-      risks: ["需确认到岗时间"],
-    },
-  })]);
-
-  assert.deepEqual(task.files[0], {
-    id: "item-1",
-    name: "resume.pdf",
-    candidateId: "candidate-1",
-    candidate: "林启舟",
-    status: "partial",
-    ruleScore: 88,
-    llmScore: null,
-    matched: "Python、PostgreSQL",
-    missing: "Kubernetes",
-    recommendation: "优先沟通",
-    risk: "需确认到岗时间",
-    error: "provider_rate_limited",
-    application_stage: "screening",
-    application_version: 4,
-    humanReviewed: false,
-    llmStatus: "failed",
-    retryable: true,
-    llmRetryable: true,
-  });
-});
-
-test("marks rule failures failed and completed rule/LLM combinations successful", () => {
-  const files = normalizeScreeningTask(run({ status: "completed", processed_count: 4, total_count: 4 }), [
-    item({ id: "failed", status: "failed", error_code: "parse_failed" }),
-    item({ id: "succeeded", status: "scored", llm_status: "succeeded", rule_result: { score: 80 }, llm_evaluation: { score: 76 } }),
-    item({ id: "skipped", status: "scored", llm_status: "skipped", rule_result: { score: 70 } }),
-    item({ id: "rules-only", status: "scored", llm_status: "not_requested", rule_result: { score: 60 } }),
-  ]).files;
-
-  assert.deepEqual(files.map(({ status }) => status), ["failed", "success", "success", "success"]);
-  assert.equal(files[0].error, "parse_failed");
-  assert.equal(files[1].ruleScore, 80);
-  assert.equal(files[1].llmScore, 76);
-  assert.equal(files[2].llmStatus, "skipped");
-  assert.equal(files[3].llmStatus, "not_requested");
-});
-
-test("normalizes the server human-review marker on each screening result", () => {
-  const [pending, reviewed] = normalizeScreeningTask(run({ status: "completed", processed_count: 2, total_count: 2 }), [
-    item({ id: "pending", status: "scored", rule_result: { score: 80 }, human_reviewed: false, application_stage: "new" }),
-    item({ id: "reviewed", status: "scored", rule_result: { score: 82 }, human_reviewed: true, application_stage: "review" }),
-  ]).files;
-
-  assert.equal(pending.humanReviewed, false);
-  assert.equal(reviewed.humanReviewed, true);
-});
-
-test("malformed optional result fields normalize to safe null and empty display values", () => {
-  const normalized = normalizeScreeningTask(run({ total_count: "bad", processed_count: null }), [item({
-    candidate_name: { unsafe: true },
-    rule_result: { score: "88", required_hits: "Python", risks: [{ unsafe: true }] },
-    llm_evaluation: [],
-    application_version: "4",
-  })]);
-
-  assert.equal(normalized.completed, 0);
-  assert.equal(normalized.total, 0);
-  assert.equal(normalized.files[0].candidate, "");
-  assert.equal(normalized.files[0].ruleScore, null);
-  assert.equal(normalized.files[0].llmScore, null);
-  assert.equal(normalized.files[0].matched, "");
-  assert.equal(normalized.files[0].risk, "");
-  assert.equal(normalized.files[0].application_version, null);
-});
-
 test("polling fetches ordered snapshots immediately, waits between rounds, and stops terminally without overlap", async () => {
   const calls = [];
   const waits = [];
@@ -366,7 +275,7 @@ test("polling reads terminal items after the terminal run and emits that final i
   const client = { request(path) {
     if (path.endsWith("?limit=100")) {
       events.push("items-requested");
-      return Promise.resolve({ data: [item({ status: "scored", rule_result: { score: 92 } })] });
+      return Promise.resolve({ data: [item({ status: "scored", route_result: "review", ai_score: 92 })] });
     }
     events.push("run-requested");
     return terminalRun.promise.then((response) => {
@@ -472,59 +381,132 @@ test("retry uses its endpoint and a fresh idempotency key each time", async () =
   assert.deepEqual(client.calls.map(({ options }) => options.idempotencyKey), ["retry-1", "retry-2"]);
 });
 
-test("bulk advance posts selected item versions with a fresh key and abort signal", async () => {
-  const signal = new AbortController().signal;
-  const client = createClient([
-    { data: { applied_count: 1, already_applied_count: 1, applications: [
-      { item_id: "item/1", version: 4, result: "applied" },
-      { item_id: "item-2", version: 8, result: "already_applied" },
-      { item_id: "unsafe", version: "9", result: "applied" },
-    ] } },
-    { data: { applied_count: 0, already_applied_count: 2 } },
-    { data: { applied_count: 1, already_applied_count: 0 } },
-  ]);
-  let key = 0;
-  const controller = createScreeningController({ client, createIdempotencyKey: () => `bulk-${++key}` });
-  const items = [
-    { item_id: "item/1", expected_application_version: 3 },
-    { item_id: "item-2", expected_application_version: 7 },
-  ];
+test("normalizes the four automatic outcome counters directly from the run", () => {
+  const task = normalizeScreeningTask(run({
+    manager_review_count: 4,
+    deferred_count: 3,
+    ai_unavailable_count: 2,
+    file_failed_count: 1,
+    review_total_count: 99,
+    review_pending_count: 98,
+  }), []);
 
-  assert.deepEqual(await controller.bulkAction("run/1", items, { signal }), {
-    applied: 1,
-    already_applied: 1,
-    undo_items: [{ item_id: "item/1", expected_application_version: 4 }],
-  });
-  await controller.bulkAction("run/1", items, { signal });
-  await controller.undoBulkAction("run/1", [{ item_id: "item/1", expected_application_version: 4 }], { signal });
+  assert.equal(task.managerReviewCount, 4);
+  assert.equal(task.deferredCount, 3);
+  assert.equal(task.aiUnavailableCount, 2);
+  assert.equal(task.fileFailedCount, 1);
+  assert.equal("reviewTotal" in task, false);
+  assert.equal("reviewPending" in task, false);
+});
 
-  assert.deepEqual(client.calls, [
-    {
-      path: "/api/v1/screening-runs/run%2F1/bulk-actions",
-      options: {
-        method: "POST",
-        body: { command: "advance_to_review", items },
-        idempotencyKey: "bulk-1",
-        signal,
-      },
+test("normalizes only Task 5 automatic outcome fields and all five LLM dimensions", () => {
+  const dimensions = Array.from({ length: 5 }, (_, index) => ({
+    label: `dimension-${index + 1}`,
+    score: 60 + index,
+    evidence: [`evidence-${index + 1}`],
+    gaps: [`gap-${index + 1}`],
+  }));
+  const [result] = normalizeScreeningTask(run(), [item({
+    status: "scored",
+    route_result: "review",
+    ai_score: 72,
+    ai_recommendation: "建议评审",
+    llm_status: "succeeded",
+    llm_error_code: null,
+    llm_evaluation: {
+      dimensions,
+      evidence: ["多年平台经验"],
+      gaps: ["行业经验待确认"],
+      strengths: ["系统设计"],
+      risks: ["到岗时间"],
     },
-    {
-      path: "/api/v1/screening-runs/run%2F1/bulk-actions",
-      options: {
-        method: "POST",
-        body: { command: "advance_to_review", items },
-        idempotencyKey: "bulk-2",
-        signal,
-      },
+    rule_result: { score: 12, recommendation: "淘汰", required_hits: ["legacy"] },
+  })]).files;
+
+  assert.equal(result.routeResult, "review");
+  assert.equal(result.routeLabel, "已转交用人经理");
+  assert.equal(result.score, 72);
+  assert.equal(result.recommendation, "建议评审");
+  assert.deepEqual(result.dimensions, dimensions);
+  assert.deepEqual(result.evidence, ["多年平台经验"]);
+  assert.deepEqual(result.gaps, ["行业经验待确认"]);
+  assert.deepEqual(result.strengths, ["系统设计"]);
+  assert.deepEqual(result.risks, ["到岗时间"]);
+  assert.equal("ruleScore" in result, false);
+  assert.equal("matched" in result, false);
+  assert.equal("humanReviewed" in result, false);
+});
+
+test("maps review and deferred routes to automatic outcome labels", () => {
+  const files = normalizeScreeningTask(run(), [
+    item({ id: "review", route_result: "review" }),
+    item({ id: "deferred", route_result: "deferred" }),
+  ]).files;
+
+  assert.deepEqual(files.map(({ routeLabel }) => routeLabel), ["已转交用人经理", "已暂缓"]);
+});
+
+test("safely degrades malformed LLM evaluation values", () => {
+  const [result] = normalizeScreeningTask(run(), [item({
+    route_result: "review",
+    ai_score: "72",
+    ai_recommendation: { unsafe: true },
+    llm_status: "succeeded",
+    llm_error_code: { unsafe: true },
+    llm_evaluation: {
+      dimensions: [
+        { label: "valid", score: 80, evidence: ["proof", 7], gaps: "none" },
+        null,
+        "bad",
+        { label: { unsafe: true }, score: "90", evidence: null, gaps: [{ unsafe: true }] },
+        { label: "fifth", score: Number.NaN, evidence: [], gaps: [] },
+        { label: "ignored-sixth", score: 100 },
+      ],
+      evidence: "bad",
+      gaps: [null],
+      strengths: ["safe", 9],
+      risks: { unsafe: true },
     },
-    {
-      path: "/api/v1/screening-runs/run%2F1/bulk-actions",
-      options: {
-        method: "POST",
-        body: { command: "undo_advance_to_new", items: [{ item_id: "item/1", expected_application_version: 4 }] },
-        idempotencyKey: "bulk-3",
-        signal,
-      },
-    },
+  })]).files;
+
+  assert.equal(result.score, null);
+  assert.equal(result.recommendation, "");
+  assert.equal(result.error, "");
+  assert.deepEqual(result.dimensions, [
+    { label: "valid", score: 80, evidence: ["proof"], gaps: [] },
+    { label: "", score: null, evidence: [], gaps: [] },
+    { label: "fifth", score: null, evidence: [], gaps: [] },
   ]);
+  assert.deepEqual(result.evidence, []);
+  assert.deepEqual(result.gaps, []);
+  assert.deepEqual(result.strengths, ["safe"]);
+  assert.deepEqual(result.risks, []);
+});
+
+test("final LLM failure has no score or fabricated evaluation and keeps manager handoff", () => {
+  const [result] = normalizeScreeningTask(run(), [item({
+    status: "scored",
+    route_result: "review",
+    ai_score: 91,
+    ai_recommendation: "推荐",
+    llm_status: "failed",
+    llm_error_code: "provider_unavailable",
+    llm_evaluation: { dimensions: [{ label: "legacy", score: 91 }], strengths: ["legacy"] },
+  })]).files;
+
+  assert.equal(result.score, null);
+  assert.equal(result.recommendation, "AI评分不可用");
+  assert.equal(result.routeLabel, "已转交用人经理");
+  assert.equal(result.llmEvaluation, null);
+  assert.deepEqual(result.dimensions, []);
+  assert.deepEqual(result.strengths, []);
+  assert.equal(result.error, "provider_unavailable");
+});
+
+test("controller exposes retryItem but no bulk or undo API", () => {
+  const controller = createScreeningController({ client: createClient() });
+
+  assert.equal(typeof controller.retryItem, "function");
+  assert.equal("bulkAction" in controller, false);
+  assert.equal("undoBulkAction" in controller, false);
 });
