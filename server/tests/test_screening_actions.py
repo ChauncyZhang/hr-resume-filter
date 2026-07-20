@@ -85,7 +85,12 @@ def test_bulk_advance_treats_auto_submitted_review_as_already_applied(tmp_path):
         cannot_undo_already=client.post(f"/api/v1/screening-runs/{run['id']}/bulk-actions",json={"command":"undo_advance_to_new","items":[{"item_id":item["id"],"expected_application_version":version}]},headers={**headers,"Idempotency-Key":"undo-already"})
         assert cannot_undo_already.status_code==409
     with app.state.identity_store.sync_session() as db:
-        assert db.get(Application,application_id).stage=="review" and db.scalar(select(func.count(ApplicationStageEvent.id)))==1 and db.scalar(select(func.count(AuditLog.id)).where(AuditLog.event_type=="application.stage_changed"))==1
+        route_audit=db.scalar(select(AuditLog).where(AuditLog.event_type=="screening.terminal_routed"))
+        assert db.get(Application,application_id).stage=="review" and db.scalar(select(func.count(ApplicationStageEvent.id)))==1
+        assert route_audit is not None
+        assert route_audit.metadata_json["application_id"]==str(application_id)
+        assert route_audit.metadata_json["from_stage"]=="new" and route_audit.metadata_json["to_stage"]=="review"
+        assert route_audit.metadata_json["ai_status"]=="failed"
 
 def test_auto_submitted_review_cannot_be_undone_as_a_bulk_advance(tmp_path):
     app,run,item=scored_item(tmp_path)
