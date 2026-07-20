@@ -25,6 +25,13 @@ function notificationCandidate(stage, index, name) {
 
 function notificationWorkbench() {
   const review = notificationCandidate("review", 1, "陈曦");
+  const reviewTask = {
+    ...review,
+    task_id: "40000000-0000-4000-8000-000000000001",
+    ai_status: "succeeded",
+    config_warning: false,
+    candidate_link: `/candidates/${review.candidate_id}?tab=evidence&application=${review.application_id}&job=${review.job_id}`,
+  };
   const passed = notificationCandidate("passed", 2, "李嘉杨");
   const empty = { count: 0, items: [] };
   return {
@@ -38,7 +45,7 @@ function notificationWorkbench() {
       active_count: 2,
       stages: { new: empty, review: { count: 1, items: [review] }, contact: empty, interview_pending: empty, interviewing: empty, decision: empty, passed: { count: 1, items: [passed] } },
     }],
-    tasks: { review: { count: 1, items: [review] }, interview_pending: empty, decision: empty, passed: { count: 1, items: [passed] } },
+    tasks: { review: { count: 1, items: [reviewTask] }, interview_pending: empty, decision: empty, passed: { count: 1, items: [passed] } },
     interviews: { available: false, upcoming: [], pending_feedback: [] },
   };
 }
