@@ -1,6 +1,6 @@
 import asyncio,json,threading,time
 import pytest
-from server.app.llm.gateway import FIXED_PROBE_MAX_TOKENS,FIXED_PROBE_SYSTEM,FIXED_PROBE_USER,GatewayError,OpenAiCompatibleGateway,TransportResponse
+from server.app.llm.gateway import EVALUATION_MAX_TOKENS,FIXED_PROBE_MAX_TOKENS,FIXED_PROBE_SYSTEM,FIXED_PROBE_USER,GatewayError,OpenAiCompatibleGateway,TransportResponse
 from server.app.llm.policy import ProviderAllowlist,ProviderPolicyError
 from server.app.llm.security import ApiKeyCipher
 from server.app.llm.screening import ScreeningRequest
@@ -27,6 +27,7 @@ def test_gateway_pins_public_dns_uses_fixed_probe_and_maps_safe_errors():
     _,address,path,headers,body,_=transport.calls[0]; assert address=="8.8.8.8" and path=="/v1/chat/completions" and headers["Authorization"]=="Bearer sk-secret"
     document=json.loads(body); assert [message["content"] for message in document["messages"]]==[FIXED_PROBE_SYSTEM,FIXED_PROBE_USER]
     assert document["max_tokens"]==FIXED_PROBE_MAX_TOKENS==256
+    assert document["thinking"]=={"type":"disabled"}
     rendered=body.decode(); assert all(value not in rendered for value in ("resume","简历","13800000000","JD text"))
     for status,code in ((401,"provider_auth_failed"),(404,"provider_model_not_found"),(429,"provider_quota_or_rate_limited"),(302,"provider_redirect_rejected")):
         with pytest.raises(GatewayError) as raised: asyncio.run(OpenAiCompatibleGateway(policy,Transport(status)).test_connection("provider","model","secret"))
@@ -52,6 +53,39 @@ def test_evaluation_requires_and_sends_the_persisted_system_prompt():
 
     document=json.loads(transport.calls[0][4])
     assert document["messages"][0]=={"role":"system","content":"prompt loaded from PromptVersion"}
+    assert document["max_tokens"]==EVALUATION_MAX_TOKENS==8192
+    assert document["thinking"]=={"type":"disabled"}
+
+
+def test_evaluation_normalizes_common_openai_compatible_json_shapes():
+    policy=ProviderAllowlist({"provider":{"base_url":"https://provider.example/v1","models":["model"]}},resolver=resolver("8.8.8.8"))
+    provider_result={
+        "score":0,
+        "dimensions":{
+            key:{"key":key,"score":0,"evidence":"No evidence supplied.","gaps":"No evidence supplied."}
+            for key in ("core_capability","experience_depth","role_seniority","transferability","explicit_constraints")
+        },
+        "summary":"No matching evidence was supplied.",
+        "strengths":"No confirmed strengths.",
+        "gaps":"Insufficient resume detail.",
+        "risks":[],
+        "questions":"Please provide more project detail.",
+    }
+    body=json.dumps({"choices":[{"message":{"content":json.dumps(provider_result)}}]}).encode()
+
+    evaluation=asyncio.run(OpenAiCompatibleGateway(policy,Transport(body=body)).evaluate(
+        "provider","model","secret",ScreeningRequest(job_description="JD",resume_text="resume"),
+        system_prompt="return the screening JSON",
+    ))
+
+    assert [dimension.key for dimension in evaluation.result.dimensions]==[
+        "core_capability","experience_depth","role_seniority","transferability","explicit_constraints",
+    ]
+    assert evaluation.result.dimensions[0].evidence==["No evidence supplied."]
+    assert evaluation.result.dimensions[0].gaps==["No evidence supplied."]
+    assert evaluation.result.strengths==["No confirmed strengths."]
+    assert evaluation.result.gaps==["Insufficient resume detail."]
+    assert evaluation.result.questions==["Please provide more project detail."]
 
 def test_allowlist_rejects_arbitrary_url_features_and_models():
     for url in ("http://provider.example/v1","https://user:pass@provider.example/v1","https://provider.example:8443/v1","file:///tmp/model","https://provider.example/v1?target=x","https://xn--bcher-kva.example/v1","https://127.0.0.1/v1","https://169.254.169.254/v1"):

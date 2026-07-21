@@ -77,5 +77,5 @@ export function shouldHydrateScheduleCandidate(currentCandidateId, requestedCand
 }
 
 export function isScheduleCandidateEligible(candidate) {
-  return ["新简历", "待复核", "待沟通", "待安排", "面试中"].includes(candidate?.stage);
+  return ["新简历", "待复核", "待沟通", "待安排", "面试中", "待决策"].includes(candidate?.stage);
 }

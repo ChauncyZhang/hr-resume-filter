@@ -26,7 +26,7 @@ from server.app.queue.models import BackgroundJob
 from server.app.queue.payloads import IntegerField, OpaqueIdField, PayloadSchema, UnsafePayload
 from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError, RetryableJobError
-from server.app.recruiting.models import Application, Candidate
+from server.app.recruiting.models import Application, Candidate, Resume
 from server.app.recruiting.service import RecruitingService
 from server.app.reports.models import ExportCandidateMembership, ExportRecord
 from server.app.screening.models import ScreeningItem, ScreeningRun
@@ -284,6 +284,40 @@ class DeletionJobHandler:
 
     @staticmethod
     def _settle_screening_work(db, organization_id, candidate_id) -> None:
+        resume_ids = list(
+            db.scalars(
+                select(Resume.id).where(
+                    Resume.organization_id == organization_id,
+                    Resume.candidate_id == candidate_id,
+                )
+            )
+        )
+        queue = QueueRepository(db)
+        now = queue.database_now()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        if resume_ids:
+            profile_jobs = list(
+                db.scalars(
+                    select(BackgroundJob)
+                    .where(
+                        BackgroundJob.organization_id == organization_id,
+                        BackgroundJob.type == "screening.profile_resume",
+                        BackgroundJob.status.in_(("queued", "running")),
+                        BackgroundJob.payload["resume_id"].as_string().in_({str(value) for value in resume_ids}),
+                    )
+                    .order_by(BackgroundJob.id)
+                    .with_for_update()
+                )
+            )
+            for profile_job in profile_jobs:
+                lease_expires_at = profile_job.lease_expires_at
+                if lease_expires_at is not None and lease_expires_at.tzinfo is None:
+                    lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+                if profile_job.status == "running" and lease_expires_at is not None and lease_expires_at > now:
+                    raise RetryableJobError("deletion_screening_inflight")
+                if profile_job.status == "queued":
+                    queue.cancel(organization_id, profile_job.id)
         items = list(
             db.scalars(
                 select(ScreeningItem)
@@ -331,9 +365,6 @@ class DeletionJobHandler:
                 .with_for_update()
             )
         )
-        now = QueueRepository(db).database_now()
-        if now.tzinfo is None:
-            now = now.replace(tzinfo=timezone.utc)
         for job in jobs:
             item = items_by_id.get(str(job.payload.get("screening_item_id")))
             lease_expires_at = job.lease_expires_at
@@ -355,7 +386,6 @@ class DeletionJobHandler:
                 )
             ):
                 raise RetryableJobError("deletion_screening_inflight")
-        queue = QueueRepository(db)
         affected_run_ids = set()
         for job in jobs:
             if job.status == "queued":

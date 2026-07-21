@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AlertTriangle, Bot, CalendarDays, CheckCircle2, ChevronDown, Copy, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Users, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Bot, CalendarDays, CheckCircle2, ChevronDown, Copy, Database, FileClock, KeyRound, LockKeyhole, Plus, RefreshCw, Search, ShieldCheck, SlidersHorizontal, Trash2, Users, X } from "lucide-react";
 import { canEditAiSettings, canEditOrganizationSettings, canEditRetentionSettings, canViewAuditSettings, canViewDeletionApprovalQueue, canViewRetentionSettings, getAllowedSettingsSections } from "./roleCapabilities.js";
 import { createLlmSettingsController, getTestDisabledReason, releaseLlmSettingsSubscription } from "./llmSettings.js";
+import { createOcrSettingsController, getOcrTestDisabledReason, releaseOcrSettingsSubscription } from "./ocrSettings.js";
 import { createGovernanceSettingsController, releaseGovernanceSettingsSubscription } from "./governanceSettings.js";
 import { getInviteRoleOptions, organizationSettingsController } from "./organizationSettings.js";
 import { FeishuIntegrationSettings } from "./FeishuIntegrationSettings.jsx";
 import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
+import { workflowTemplateController } from "./workflowTemplateController.js";
 import "./product-theme-admin.css";
 
 const settingsSections = [
@@ -91,7 +93,7 @@ function PermissionNotice({ children }) {
   return <div className="settings-permission-notice"><LockKeyhole size={18} /><span>{children}</span></div>;
 }
 
-function OrganizationDrawer({ title, busy, onClose, children, footer }) {
+function OrganizationDrawer({ title, description, busy, onClose, children, footer }) {
   const drawerRef = useRef(null);
   const restoreTargetRef = useRef(typeof document === "undefined" ? null : document.activeElement);
   const busyRef = useRef(busy);
@@ -106,7 +108,7 @@ function OrganizationDrawer({ title, busy, onClose, children, footer }) {
     document.addEventListener("keydown", handleKeyDown);
     return () => { document.removeEventListener("keydown", handleKeyDown); manager.restoreFocus(); };
   }, []);
-  return <aside ref={drawerRef} className="settings-drawer organization-drawer" role="dialog" aria-modal="true" aria-label={title}><header><div><h2>{title}</h2><p>{title === "邀请成员" ? "发送一次性激活邀请，成员状态将显示为待激活。" : "创建一级部门供成员和职位归属使用。"}</p></div><button className="icon-button" type="button" aria-label="关闭" disabled={busy} onClick={onClose}><X size={20} /></button></header><div className="settings-drawer-body">{children}</div><footer>{footer}</footer></aside>;
+  return <aside ref={drawerRef} className="settings-drawer organization-drawer" role="dialog" aria-modal="true" aria-label={title}><header><div><h2>{title}</h2><p>{description || (title === "邀请成员" ? "发送一次性激活邀请，成员状态将显示为待激活。" : "创建一级部门供成员和职位归属使用。")}</p></div><button className="icon-button" type="button" aria-label="关闭" disabled={busy} onClick={onClose}><X size={20} /></button></header><div className="settings-drawer-body">{children}</div><footer>{footer}</footer></aside>;
 }
 
 function OrganizationSettings({
@@ -135,6 +137,7 @@ function OrganizationSettings({
   const [departmentName, setDepartmentName] = useState("");
   const [copied, setCopied] = useState(false);
   const inviteRoles = getInviteRoleOptions(role);
+  const activeDepartments = state.departments.filter((department) => department.status === "active");
   const busy = state.actionStatus === "saving";
   const invitationLink =
     state.invitation && typeof window !== "undefined"
@@ -167,6 +170,7 @@ function OrganizationSettings({
     setDrawer(null);
     setCopied(false);
     controller.dismissInvitation();
+    controller.clearDepartment();
   };
   async function submitInvite() {
     if (!validInvite || busy) return;
@@ -188,6 +192,26 @@ function OrganizationSettings({
       /* safe controller message is rendered */
     }
   }
+  async function openDepartment(department) {
+    setDrawer("department-detail");
+    setDepartmentName(department.name);
+    try {
+      await controller.loadDepartment(department.id);
+    } catch {
+      /* safe controller message is rendered */
+    }
+  }
+  async function updateDepartment(changes, successMessage) {
+    const detail = state.departmentDetail;
+    if (!detail || busy) return;
+    try {
+      const updated = await controller.updateDepartment(detail.id, changes);
+      setDepartmentName(updated.name);
+      onNotify(successMessage);
+    } catch {
+      /* safe controller message is rendered */
+    }
+  }
   async function copyInvitation() {
     try {
       await navigator.clipboard.writeText(invitationLink);
@@ -198,14 +222,14 @@ function OrganizationSettings({
   }
   function openCreateDrawer() {
     if (tab === "部门") {
-      setDrawer("department");
+      setDrawer("department-create");
       return;
     }
     controller.dismissInvitation();
     setInvite({
       displayName: "",
       email: "",
-      departmentId: state.departments[0]?.id || "",
+      departmentId: activeDepartments[0]?.id || "",
       role: inviteRoles[0]?.value || "",
     });
     setDrawer("invite");
@@ -320,12 +344,12 @@ function OrganizationSettings({
       {state.status === "ready" && tab === "部门" && (
         <div className="department-list">
           {state.departments.map((department) => (
-            <div key={department.id}>
-              <strong>{department.name}</strong>
+            <button type="button" key={department.id} onClick={() => void openDepartment(department)}>
+              <span className="department-name"><strong>{department.name}</strong><small className={department.status === "active" ? "status-ok" : "status-muted"}>{department.status === "active" ? "启用" : "已停用"}</small></span>
               <span>
                 {department.memberCount} 名成员 · {department.jobCount} 个职位
               </span>
-            </div>
+            </button>
           ))}
           {state.departments.length === 0 && (
             <div className="organization-empty">暂无部门</div>
@@ -434,7 +458,7 @@ function OrganizationSettings({
                   }
                 >
                   <option value="">请选择部门</option>
-                  {state.departments.map((department) => (
+                  {activeDepartments.map((department) => (
                     <option key={department.id} value={department.id}>
                       {department.name}
                     </option>
@@ -461,7 +485,7 @@ function OrganizationSettings({
           )}
         </OrganizationDrawer>
       )}
-      {drawer === "department" && (
+      {drawer === "department-create" && (
         <OrganizationDrawer
           title="新增部门"
           busy={busy}
@@ -503,6 +527,31 @@ function OrganizationSettings({
           </label>
         </OrganizationDrawer>
       )}
+      {drawer === "department-detail" && (
+        <OrganizationDrawer
+          title={state.departmentDetail?.name || departmentName || "部门详情"}
+          description="查看部门成员和关联职位，并管理部门状态。"
+          busy={busy}
+          onClose={closeDrawer}
+          footer={<button className="button secondary" type="button" disabled={busy} onClick={closeDrawer}>关闭</button>}
+        >
+          {state.departmentDetailStatus === "loading" && <div className="organization-state" role="status"><RefreshCw size={18} />正在加载部门详情…</div>}
+          {state.departmentDetailStatus === "error" && <div className="settings-error" role="alert"><AlertTriangle size={17} />{state.actionError}</div>}
+          {state.departmentDetailStatus === "ready" && state.departmentDetail && <>
+            {state.actionError && <div className="settings-error" role="alert"><AlertTriangle size={17} />{state.actionError}</div>}
+            <section className="department-detail-summary">
+              <label>部门名称<input data-dialog-initial-focus value={departmentName} disabled={!editable || busy} onChange={(event) => setDepartmentName(event.target.value)} /></label>
+              <div className="department-detail-actions">
+                {editable && <button className="button primary" type="button" disabled={busy || !departmentName.trim() || departmentName.trim() === state.departmentDetail.name} onClick={() => void updateDepartment({ name: departmentName.trim() }, "部门名称已更新")}>{busy ? "保存中…" : "保存名称"}</button>}
+                {editable && <button className="button secondary" type="button" disabled={busy} onClick={() => void updateDepartment({ status: state.departmentDetail.status === "active" ? "inactive" : "active" }, state.departmentDetail.status === "active" ? "部门已停用" : "部门已重新启用")}>{state.departmentDetail.status === "active" ? "停用部门" : "重新启用"}</button>}
+              </div>
+              <p>{state.departmentDetail.status === "active" ? "该部门可用于新职位和成员归属。" : "该部门已停用，历史成员和职位仍保留。"}</p>
+            </section>
+            <section className="department-detail-section"><h3>部门成员 <span>{state.departmentDetail.memberCount}</span></h3>{state.departmentDetail.members.length ? state.departmentDetail.members.map((member) => <div className="department-detail-row" key={member.id}><span><strong>{member.name}</strong><small>{member.roles.join("、") || "未分配角色"}</small></span><small>{member.status}</small></div>) : <p>暂无成员</p>}</section>
+            <section className="department-detail-section"><h3>关联职位 <span>{state.departmentDetail.jobCount}</span></h3>{state.departmentDetail.jobs.length ? state.departmentDetail.jobs.map((job) => <div className="department-detail-row" key={job.id}><strong>{job.name}</strong><small>{job.status}</small></div>) : <p>暂无关联职位</p>}</section>
+          </>}
+        </OrganizationDrawer>
+      )}
     </div>
   );
 }
@@ -511,11 +560,104 @@ function TemplateSettings({ role, onNotify, activeTab, onTabChange = () => {} })
   const editable = role === "招聘管理员";
   const tabs = role === "面试官" ? ["面试评价模板"] : ["招聘流程", "淘汰原因", "面试评价模板"];
   const tab = tabs.includes(activeTab) ? activeTab : tabs[0];
-  const [stages, setStages] = useState(["新简历", "待复核", "待沟通", "待安排", "面试中", "待决策", "已录用"]);
-  const [draftName, setDraftName] = useState("标准社招流程");
-  const [saveFailed, setSaveFailed] = useState(false);
-  function saveTemplate() { if (!saveFailed) { setSaveFailed(true); return; } setSaveFailed(false); onNotify("模板草稿已保存"); }
-  return <div className="settings-section"><div className="settings-section-heading"><div><h2>流程与评价模板</h2><p>管理招聘阶段、状态原因和结构化评价。</p></div></div>{!editable && <PermissionNotice>{role === "面试官" ? "你只能查看面试评价模板。" : "当前为只读模式，模板修改由招聘管理员完成。"}</PermissionNotice>}<div className="settings-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => onTabChange(item)}>{item}</button>)}</div>{tab === "招聘流程" && <section className="template-editor"><header><div><input disabled={!editable} value={draftName} onChange={(event) => setDraftName(event.target.value)} /><span>适用职位：AI 工程师、Java 后端工程师</span></div>{editable && <button className="button primary" type="button" onClick={saveTemplate}>{saveFailed ? "重试保存" : "保存模板"}</button>}</header>{saveFailed && <div className="settings-error"><AlertTriangle size={18} /><span>保存失败，草稿已保留。网络恢复后可直接重试。</span></div>}<div className="stage-editor">{stages.map((stage, index) => <div key={`${stage}-${index}`}><span>{index + 1}</span><input disabled={!editable} value={stage} onChange={(event) => setStages(stages.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} /><small>{["新简历", "面试中"].includes(stage) ? "进行中申请正在使用，不可删除" : "可调整"}</small>{editable && <button type="button" disabled={["新简历", "面试中"].includes(stage)} onClick={() => setStages(stages.filter((_, itemIndex) => itemIndex !== index))}>删除</button>}</div>)}</div></section>}{tab === "淘汰原因" && <div className="reason-list">{[["岗位要求不匹配", "必填", "启用"], ["候选人主动放弃", "必填", "启用"], ["薪资预期不匹配", "可选", "启用"], ["暂不招聘", "可选", "停用"]].map((item) => <div key={item[0]}><strong>{item[0]}</strong><span>{item[1]}</span><span>{item[2]}</span>{editable && <button type="button">编辑</button>}</div>)}</div>}{tab === "面试评价模板" && <div className="evaluation-template"><header><div><strong>技术岗位结构化评价</strong><span>适用：技术一面、技术二面</span></div>{editable && <button className="button secondary" type="button">编辑模板</button>}</header>{["专业能力", "问题解决", "沟通协作", "岗位匹配"].map((item) => <div key={item}><span>{item}</span><small>必填 · 需提升 / 一般 / 良好 / 优秀</small></div>)}<footer>结论：强烈推荐、推荐、保留、不推荐</footer></div>}</div>;
+  const [templates, setTemplates] = useState({ status: "idle", records: [] });
+  const [selectedId, setSelectedId] = useState("");
+  const [draft, setDraft] = useState({ name: "", rounds: [], status: "active" });
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const selected = templates.records.find((item) => item.id === selectedId) || null;
+
+  async function loadTemplates() {
+    setTemplates((current) => ({ ...current, status: "loading" }));
+    setError("");
+    try {
+      const records = await workflowTemplateController.list();
+      setTemplates({ status: "ready", records });
+      setSelectedId((current) => records.some((item) => item.id === current) ? current : records[0]?.id || "");
+    } catch {
+      setTemplates({ status: "error", records: [] });
+      setError("流程模板暂时无法加载，请重试。");
+    }
+  }
+
+  useEffect(() => {
+    if (tab === "招聘流程" && templates.status === "idle") void loadTemplates();
+  }, [tab, templates.status]);
+
+  useEffect(() => {
+    if (selected) setDraft({ name: selected.name, rounds: [...selected.rounds], status: selected.status });
+  }, [selectedId, selected?.version]);
+
+  function validate(values) {
+    if (!values.name.trim()) return "请填写模板名称。";
+    if (!values.rounds.length) return "至少保留一个面试轮次。";
+    if (values.rounds.some((item) => !item.trim())) return "请填写每个面试轮次的名称。";
+    if (new Set(values.rounds.map((item) => item.trim())).size !== values.rounds.length) return "面试轮次名称不能重复。";
+    return "";
+  }
+
+  async function saveTemplate() {
+    const validation = validate(draft);
+    if (validation || !selected) { setError(validation || "请选择要编辑的流程模板。"); return; }
+    setSaving(true); setError("");
+    try {
+      const saved = await workflowTemplateController.update(selected, draft);
+      setTemplates((current) => ({ ...current, records: current.records.map((item) => item.id === saved.id ? saved : item) }));
+      onNotify("流程模板已保存，职位将使用最新面试轮次");
+    } catch (requestError) {
+      setError(requestError?.status === 409 ? "模板已被其他人更新，请刷新后再保存。" : "保存失败，当前修改已保留，请重试。");
+    } finally { setSaving(false); }
+  }
+
+  async function createTemplate() {
+    const values = { name: newName, rounds: ["一面"] };
+    const validation = validate(values);
+    if (validation) { setError(validation); return; }
+    setSaving(true); setError("");
+    try {
+      const saved = await workflowTemplateController.create(values);
+      setTemplates((current) => ({ status: "ready", records: [...current.records, saved] }));
+      setSelectedId(saved.id); setCreating(false); setNewName("");
+      onNotify("流程模板已创建，可继续添加面试轮次");
+    } catch (requestError) {
+      setError(requestError?.status === 409 ? "已存在同名模板，请更换名称。" : "创建失败，请检查网络后重试。");
+    } finally { setSaving(false); }
+  }
+
+  function updateRound(index, value) {
+    setDraft((current) => ({ ...current, rounds: current.rounds.map((item, itemIndex) => itemIndex === index ? value : item) }));
+    setError("");
+  }
+
+  function moveRound(index, offset) {
+    setDraft((current) => {
+      const target = index + offset;
+      if (target < 0 || target >= current.rounds.length) return current;
+      const rounds = [...current.rounds];
+      [rounds[index], rounds[target]] = [rounds[target], rounds[index]];
+      return { ...current, rounds };
+    });
+  }
+
+  const flowContent = <>
+    <div className="settings-section-heading workflow-heading"><div><h2>招聘流程模板</h2><p>系统阶段自动流转；你只需要配置需要安排的面试轮次。</p></div>{editable && <button className="button primary" type="button" onClick={() => { setCreating(true); setError(""); }}><Plus size={16} />新建流程模板</button>}</div>
+    {creating && <div className="workflow-create"><label>模板名称<input autoFocus value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="例如：技术岗位三轮面试" /></label><div><button className="button secondary" type="button" disabled={saving} onClick={() => { setCreating(false); setNewName(""); }}>取消</button><button className="button primary" type="button" disabled={saving} onClick={() => void createTemplate()}>{saving ? "正在创建…" : "创建并编辑"}</button></div></div>}
+    {!editable && <PermissionNotice>当前为只读模式，流程模板修改由招聘管理员完成。</PermissionNotice>}
+    {templates.status === "loading" && <div className="organization-state" role="status"><RefreshCw size={18} />正在加载流程模板</div>}
+    {error && <div className="settings-error" role="alert"><AlertTriangle size={18} /><span>{error}</span>{templates.status === "error" && <button type="button" onClick={() => void loadTemplates()}>重试</button>}</div>}
+    {templates.status === "ready" && !templates.records.length && <div className="organization-empty"><strong>还没有招聘流程模板</strong><p>创建第一个模板后，职位即可选择并自动进入下一面。</p></div>}
+    {templates.status === "ready" && templates.records.length > 0 && <section className="template-editor workflow-template-editor">
+      <div className="workflow-template-toolbar"><label>选择模板<select value={selectedId} onChange={(event) => setSelectedId(event.target.value)}>{templates.records.map((item) => <option value={item.id} key={item.id}>{item.name}{item.status === "inactive" ? "（已停用）" : ""}</option>)}</select></label><span>{draft.rounds.length} 个面试轮次</span></div>
+      <div className="workflow-system-flow"><strong>自动招聘主线</strong><p>新简历 → 用人经理评审 → 待安排 → <b>{draft.rounds.join(" → ") || "面试轮次"}</b> → 待决策</p><small>评审通过、面试安排和反馈完成后，系统会自动更新候选人状态。</small></div>
+      <header><div><label>模板名称<input disabled={!editable} value={draft.name} onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))} /></label><span>面试完成后，若还有下一轮，候选人会自动进入“待安排”。</span></div>{editable && <button className="button primary" type="button" disabled={saving} onClick={() => void saveTemplate()}>{saving ? "正在保存…" : "保存模板"}</button>}</header>
+      <div className="stage-editor workflow-round-editor">{draft.rounds.map((round, index) => <div key={`${index}-${round}`}><span>{index + 1}</span><input aria-label={`第 ${index + 1} 轮名称`} disabled={!editable} value={round} onChange={(event) => updateRound(index, event.target.value)} /><small>{index === draft.rounds.length - 1 ? "完成后进入待决策" : `完成后自动进入${draft.rounds[index + 1] || "下一轮"}待安排`}</small>{editable && <div className="workflow-round-actions"><button type="button" title="上移" aria-label={`上移${round}`} disabled={index === 0} onClick={() => moveRound(index, -1)}><ArrowUp size={16} /></button><button type="button" title="下移" aria-label={`下移${round}`} disabled={index === draft.rounds.length - 1} onClick={() => moveRound(index, 1)}><ArrowDown size={16} /></button><button type="button" title="删除" aria-label={`删除${round}`} disabled={draft.rounds.length === 1} onClick={() => setDraft((current) => ({ ...current, rounds: current.rounds.filter((_, itemIndex) => itemIndex !== index) }))}><Trash2 size={16} /></button></div>}</div>)}</div>
+      {editable && <div className="workflow-add-round"><button className="button secondary" type="button" onClick={() => setDraft((current) => ({ ...current, rounds: [...current.rounds, `${["一", "二", "三", "四", "五"][current.rounds.length] || current.rounds.length + 1}面`] }))}><Plus size={16} />添加面试轮次</button><small>至少保留一轮；可拖动替代操作由上移、下移按钮提供。</small></div>}
+    </section>}
+  </>;
+
+  return <div className="settings-section">{tab !== "招聘流程" && <div className="settings-section-heading"><div><h2>流程与评价模板</h2><p>管理招聘阶段、状态原因和结构化评价。</p></div></div>}<div className="settings-tabs">{tabs.map((item) => <button type="button" key={item} className={tab === item ? "active" : ""} onClick={() => onTabChange(item)}>{item}</button>)}</div>{tab === "招聘流程" && flowContent}{tab === "淘汰原因" && <div className="reason-list">{[["岗位要求不匹配", "必填", "启用"], ["候选人主动放弃", "必填", "启用"], ["薪资预期不匹配", "可选", "启用"], ["暂不招聘", "可选", "停用"]].map((item) => <div key={item[0]}><strong>{item[0]}</strong><span>{item[1]}</span><span>{item[2]}</span>{editable && <button type="button">编辑</button>}</div>)}</div>}{tab === "面试评价模板" && <div className="evaluation-template"><header><div><strong>技术岗位结构化评价</strong><span>适用：技术一面、技术二面</span></div>{editable && <button className="button secondary" type="button">编辑模板</button>}</header>{["专业能力", "问题解决", "沟通协作", "岗位匹配"].map((item) => <div key={item}><span>{item}</span><small>必填 · 需提升 / 一般 / 良好 / 优秀</small></div>)}<footer>结论：强烈推荐、推荐、保留、不推荐</footer></div>}</div>;
 }
 
 function formatTestTime(value) {
@@ -551,7 +693,7 @@ function ProviderCreateDrawer({ busy, error, onClose, onSubmit }) {
   return <><div className="provider-drawer-backdrop" onClick={busy ? undefined : onClose} /><aside className="settings-drawer provider-create-drawer" role="dialog" aria-modal="true" aria-label="添加 Provider"><header><div><h2>添加 Provider</h2><p>配置一个 OpenAI 兼容的模型服务。</p></div><button className="icon-button" type="button" aria-label="关闭" disabled={busy} onClick={onClose}><X size={19} /></button></header><form id="provider-create-form" className="settings-drawer-body" onSubmit={submit}>{error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{error}</div>}<label>显示名称<input autoFocus value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} placeholder="例如：智谱 BigModel" /></label><label>Provider 标识<input value={form.provider_id} onChange={(event) => setForm({ ...form, provider_id: event.target.value.trim().toLowerCase() })} placeholder="例如：bigmodel" /><small>仅支持小写字母、数字、下划线和连字符，保存后用于系统内部识别。</small></label><label>Base URL<input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} placeholder="https://example.com/v1" /><small>必须使用 HTTPS 和标准 443 端口，不能填写内网地址。</small></label><label>可用模型<textarea value={form.models} onChange={(event) => setForm({ ...form, models: event.target.value })} placeholder={"每行一个模型，例如：\nglm-5.2\nglm-4.5"} /><small>可使用换行或逗号分隔，模型名称必须与服务商控制台一致。</small></label></form><footer><button className="button secondary" type="button" disabled={busy} onClick={onClose}>取消</button><button className="button primary" type="submit" form="provider-create-form" disabled={!valid || busy}>{busy ? "添加中…" : "添加 Provider"}</button></footer></aside></>;
 }
 
-function AiSettings({ role, onNotify, onDirtyChange }) {
+function LlmSettingsSection({ role, onNotify, onDirtyChange }) {
   const editable = canEditAiSettings(role);
   const controller = useMemo(() => createLlmSettingsController(), [role]);
   const [viewState, setViewState] = useState(() => controller.getState());
@@ -565,11 +707,10 @@ function AiSettings({ role, onNotify, onDirtyChange }) {
     };
   }, [controller, onDirtyChange]);
   useEffect(() => { onDirtyChange?.(viewState.dirty); }, [viewState.dirty, onDirtyChange]);
-  if (role === "面试官") return <section className="settings-denied"><LockKeyhole size={31} /><h3>无 AI 设置权限</h3><p>面试官不能查看 Provider、模型范围或密钥状态。</p></section>;
   const { status, config, draft, replacingKey, replacementKey, dirty, error, message } = viewState;
-  if ((status === "idle" || status === "loading") && !config) return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>正在读取已保存的模型配置。</p></div></div><div className="llm-settings-loading" role="status"><RefreshCw size={18} />正在加载设置…</div></div>;
-  if (!config) return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>控制候选人文本是否发送到外部模型服务。</p></div></div><div className="llm-settings-load-error" role="alert"><AlertTriangle size={20} /><div><strong>设置加载失败</strong><p>{error}</p></div><button className="button secondary" type="button" onClick={() => controller.load()}>重试</button></div></div>;
-  if (!editable) return <div className="settings-section ai-settings"><div className="settings-section-heading"><div><h2>AI 设置</h2><p>查看组织当前使用的模型配置。</p></div></div><ReadOnlyAiSettings config={config} /></div>;
+  if ((status === "idle" || status === "loading") && !config) return <section className="ai-settings-block" aria-labelledby="llm-settings-title"><div className="ai-settings-block-heading"><div><h2 id="llm-settings-title">LLM 简历评估</h2><p>正在读取已保存的模型配置。</p></div></div><div className="llm-settings-loading" role="status"><RefreshCw size={18} />正在加载设置…</div></section>;
+  if (!config) return <section className="ai-settings-block" aria-labelledby="llm-settings-title"><div className="ai-settings-block-heading"><div><h2 id="llm-settings-title">LLM 简历评估</h2><p>控制候选人文本是否发送到外部模型服务。</p></div></div><div className="llm-settings-load-error" role="alert"><AlertTriangle size={20} /><div><strong>LLM 设置加载失败</strong><p>{error}</p></div><button className="button secondary" type="button" onClick={() => controller.load()}>重试</button></div></section>;
+  if (!editable) return <section className="ai-settings-block" aria-labelledby="llm-settings-title"><div className="ai-settings-block-heading"><div><h2 id="llm-settings-title">LLM 简历评估</h2><p>查看组织当前使用的简历评估模型配置。</p></div></div><ReadOnlyAiSettings config={config} /></section>;
 
   const providers = Object.keys(config.available_providers || {});
   const providerLabels = Object.fromEntries((config.provider_options || []).map((provider) => [provider.provider_id, provider.display_name]));
@@ -587,8 +728,8 @@ function AiSettings({ role, onNotify, onDirtyChange }) {
     if (succeeded) onNotify("Provider 已添加");
     return succeeded;
   }
-  return <div className="settings-section ai-settings">
-    <div className="settings-section-heading"><div><h2>AI 设置</h2><p>配置简历筛选使用的模型服务和数据外发范围。</p></div><button className="button secondary" type="button" disabled={dirty || status === "adding_provider"} title={dirty ? "请先保存或取消当前修改" : undefined} onClick={() => setAddingProvider(true)}><Plus size={16} />添加 Provider</button></div>
+  return <section className="ai-settings-block" aria-labelledby="llm-settings-title">
+    <div className="ai-settings-block-heading"><div><h2 id="llm-settings-title">LLM 简历评估</h2><p>配置简历筛选使用的模型服务和数据外发范围。</p></div><button className="button secondary" type="button" disabled={dirty || status === "adding_provider"} title={dirty ? "请先保存或取消当前修改" : undefined} onClick={() => setAddingProvider(true)}><Plus size={16} />添加 Provider</button></div>
     {error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{error}</div>}
     {message && <div className="llm-settings-message" role="status">{message}</div>}
     <section className="ai-governance"><ShieldCheck size={20} /><div><strong>数据外发控制</strong><p>只有系统管理员添加的 Provider 才可使用；候选人文本仅在启用后发送到所选服务。</p></div><label className="llm-enabled-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => controller.updateDraft({ enabled: event.target.checked })} />启用</label></section>
@@ -600,9 +741,76 @@ function AiSettings({ role, onNotify, onDirtyChange }) {
       <div className="llm-scope-summary"><strong>允许使用的岗位</strong><p>{scopeIds.length === 0 ? "全部岗位（空列表表示不限制岗位）" : `已限制为 ${scopeIds.length} 个岗位`}</p>{scopeIds.length > 0 && <code>{scopeIds.join("、")}</code>}<small>岗位选择器尚未开放；保存时会原样保留当前岗位 ID。</small></div>
     </div>
     <section className={`llm-test-result ${lastTestSucceeded ? "success" : lastTestFailed ? "error" : "idle"}`} aria-live="polite"><div>{lastTestSucceeded ? <CheckCircle2 size={20} /> : lastTestFailed ? <AlertTriangle size={20} /> : <Bot size={20} />}<span><strong>{status === "testing" ? "正在测试已保存的配置" : lastTestSucceeded ? "最近一次连接成功" : lastTestFailed ? "最近一次连接失败" : "尚未测试已保存的配置"}</strong><small>{lastTestSucceeded ? `耗时 ${config.last_test_latency_ms ?? "—"} ms · ${formatTestTime(config.last_tested_at)}` : lastTestFailed ? `安全错误码：${config.last_test_error_code || "未知"} · ${formatTestTime(config.last_tested_at)}` : "测试只使用服务器中最后保存的 Provider、模型和 API Key。"}</small>{testDisabledReason && <small className="llm-test-explanation">{testDisabledReason}</small>}</span></div><button className="button secondary" type="button" disabled={Boolean(testDisabledReason)} onClick={testConnection}>{status === "testing" && <RefreshCw size={15} />}测试连接</button></section>
-    <div className="settings-sticky-actions"><span>{status === "saving" ? "正在保存…" : status === "adding_provider" ? "正在添加 Provider…" : dirty ? "有尚未保存的修改" : "当前配置已保存"}</span>{dirty && <button className="button secondary" type="button" disabled={status === "saving" || status === "testing"} onClick={() => controller.discardDraft()}>取消修改</button>}<button className="button primary" type="button" disabled={saveDisabled} onClick={save}>{status === "saving" ? "保存中…" : "保存设置"}</button></div>
+    <div className="ai-section-actions"><span>{status === "saving" ? "正在保存…" : status === "adding_provider" ? "正在添加 Provider…" : dirty ? "LLM 有尚未保存的修改" : "LLM 配置已保存"}</span>{dirty && <button className="button secondary" type="button" disabled={status === "saving" || status === "testing"} onClick={() => controller.discardDraft()}>取消修改</button>}<button className="button primary" type="button" disabled={saveDisabled} onClick={save}>{status === "saving" ? "保存中…" : "保存 LLM 设置"}</button></div>
     {addingProvider && <ProviderCreateDrawer busy={status === "adding_provider"} error={error} onClose={() => setAddingProvider(false)} onSubmit={createProvider} />}
-  </div>;
+  </section>;
+}
+
+function ReadOnlyOcrSettings({ config }) {
+  const rows = [
+    ["enabled", "启用状态", (value) => value ? "已启用" : "未启用"],
+    ["provider_id", "Provider 标识", (value) => value || "—"],
+    ["base_url", "Base URL", (value) => value || "—"],
+    ["model", "模型 / 服务", (value) => value || "—"],
+    ["key_configured", "API Key", (value) => value === true ? "已安全配置" : value === false ? "尚未配置" : "状态不可见"],
+    ["last_test_status", "最近测试", (value) => value === "succeeded" ? "成功" : value === "failed" ? "失败" : "尚未测试"],
+    ["last_test_error_code", "安全错误码", (value) => value || "—"],
+    ["last_test_latency_ms", "测试耗时", (value) => Number.isFinite(value) ? `${value} ms` : "—"],
+    ["last_tested_at", "测试时间", formatTestTime],
+  ];
+  return <div className="llm-readonly"><PermissionNotice>招聘管理员仅可查看安全配置状态，修改和密钥管理由系统管理员完成。</PermissionNotice><dl>{rows.map(([key, label, format]) => <div key={key}><dt>{label}</dt><dd>{format(config[key])}</dd></div>)}</dl></div>;
+}
+
+function OcrSettingsSection({ role, onNotify, onDirtyChange }) {
+  const editable = canEditAiSettings(role);
+  const controller = useMemo(() => createOcrSettingsController(), [role]);
+  const [viewState, setViewState] = useState(() => controller.getState());
+  useEffect(() => {
+    const unsubscribe = controller.subscribe(setViewState);
+    controller.load();
+    return () => {
+      releaseOcrSettingsSubscription(controller, unsubscribe);
+      onDirtyChange?.(false);
+    };
+  }, [controller, onDirtyChange]);
+  useEffect(() => { onDirtyChange?.(viewState.dirty); }, [viewState.dirty, onDirtyChange]);
+
+  const { status, config, draft, replacingKey, replacementKey, dirty, error, message } = viewState;
+  if ((status === "idle" || status === "loading") && !config) return <section className="ai-settings-block ocr-settings" aria-labelledby="ocr-settings-title"><div className="ai-settings-block-heading"><div><h2 id="ocr-settings-title">OCR 文档识别</h2><p>正在读取已保存的 OCR 配置。</p></div></div><div className="llm-settings-loading" role="status"><RefreshCw size={18} />正在加载设置…</div></section>;
+  if (!config) return <section className="ai-settings-block ocr-settings" aria-labelledby="ocr-settings-title"><div className="ai-settings-block-heading"><div><h2 id="ocr-settings-title">OCR 文档识别</h2><p>仅在需要时识别无法直接提取文字的简历页面。</p></div></div><div className="llm-settings-load-error" role="alert"><AlertTriangle size={20} /><div><strong>OCR 设置加载失败</strong><p>{error}</p></div><button className="button secondary" type="button" onClick={() => controller.load()}>重试</button></div></section>;
+  if (!editable) return <section className="ai-settings-block ocr-settings" aria-labelledby="ocr-settings-title"><div className="ai-settings-block-heading"><div><h2 id="ocr-settings-title">OCR 文档识别</h2><p>仅扫描件或低质量 PDF 的页面图像会发送到外部 OCR 服务。</p></div></div><ReadOnlyOcrSettings config={config} /></section>;
+
+  const testDisabledReason = getOcrTestDisabledReason(viewState);
+  const saveMissingKey = draft.enabled && config.key_configured !== true && !replacementKey;
+  const requiredFieldsMissing = !draft.provider_id.trim() || !draft.base_url.trim() || !draft.model.trim();
+  const saveDisabled = ["saving", "testing"].includes(status) || !dirty || requiredFieldsMissing || saveMissingKey;
+  const lastTestFailed = config.last_test_status === "failed";
+  const lastTestSucceeded = config.last_test_status === "succeeded";
+  async function save() { if (await controller.save()) onNotify("OCR 设置已保存"); }
+  async function testConnection() { if (await controller.testConnection()) onNotify("OCR 连接测试成功"); }
+
+  return <section className="ai-settings-block ocr-settings" aria-labelledby="ocr-settings-title">
+    <div className="ai-settings-block-heading"><div><h2 id="ocr-settings-title">OCR 文档识别</h2><p>仅扫描件或低质量 PDF 的页面图像会发送到外部 OCR 服务；可直接提取文字的简历不会外发页面图像。</p></div></div>
+    {error && <div className="settings-error" role="alert"><AlertTriangle size={17} />{error}</div>}
+    {message && <div className="llm-settings-message" role="status">{message}</div>}
+    <section className="ai-governance"><ShieldCheck size={20} /><div><strong>页面图像外发控制</strong><p>启用后仍只处理扫描件或文字质量不足的 PDF 页面，不会把所有简历图片默认发送到外部服务。</p></div><label className="llm-enabled-toggle"><input type="checkbox" checked={draft.enabled} onChange={(event) => controller.updateDraft({ enabled: event.target.checked })} />启用</label></section>
+    <div className="settings-form ocr-settings-form">
+      <label>Provider 标识<input value={draft.provider_id} onChange={(event) => controller.updateDraft({ provider_id: event.target.value })} placeholder="例如：document-ai" autoComplete="off" /></label>
+      <label>模型 / 服务<input value={draft.model} onChange={(event) => controller.updateDraft({ model: event.target.value })} placeholder="例如：ocr-v2" autoComplete="off" /></label>
+      <label className="ocr-base-url">Base URL<input type="url" value={draft.base_url} onChange={(event) => controller.updateDraft({ base_url: event.target.value })} placeholder="https://ocr.example.com/v1" autoComplete="url" /></label>
+      <div className="llm-key-field"><span className="llm-field-label">API Key</span><div className="masked-key"><KeyRound size={16} aria-hidden="true" /><span>{config.key_configured ? "已安全配置" : "尚未配置"}</span><button type="button" onClick={() => replacingKey ? controller.cancelKeyReplacement() : controller.startKeyReplacement()}>{replacingKey ? "取消替换" : config.key_configured ? "替换" : "添加"}</button></div>{replacingKey && <label className="llm-replacement-key">新的 API Key<input type="password" autoComplete="new-password" value={replacementKey} onChange={(event) => controller.setReplacementKey(event.target.value)} placeholder="保存后不会再次显示" /></label>}{saveMissingKey && <small className="llm-field-hint">启用 OCR 前必须添加并保存 API Key。</small>}</div>
+    </div>
+    <section className={`llm-test-result ${lastTestSucceeded ? "success" : lastTestFailed ? "error" : "idle"}`} aria-live="polite"><div>{lastTestSucceeded ? <CheckCircle2 size={20} /> : lastTestFailed ? <AlertTriangle size={20} /> : <Bot size={20} />}<span><strong>{status === "testing" ? "正在测试已保存的 OCR 配置" : lastTestSucceeded ? "最近一次连接成功" : lastTestFailed ? "最近一次连接失败" : "尚未测试已保存的配置"}</strong><small>{lastTestSucceeded ? `耗时 ${config.last_test_latency_ms ?? "—"} ms · ${formatTestTime(config.last_tested_at)}` : lastTestFailed ? `安全错误码：${config.last_test_error_code || "未知"} · ${formatTestTime(config.last_tested_at)}` : "测试只使用服务器中最后保存的 Provider、Base URL、模型和 API Key。"}</small>{testDisabledReason && <small className="llm-test-explanation">{testDisabledReason}</small>}</span></div><button className="button secondary" type="button" disabled={Boolean(testDisabledReason)} onClick={testConnection}>{status === "testing" && <RefreshCw size={15} />}测试连接</button></section>
+    <div className="ai-section-actions"><span>{status === "saving" ? "正在保存…" : dirty ? "OCR 有尚未保存的修改" : "OCR 配置已保存"}</span>{dirty && <button className="button secondary" type="button" disabled={["saving", "testing"].includes(status)} onClick={() => controller.discardDraft()}>取消修改</button>}<button className="button primary" type="button" disabled={saveDisabled} onClick={save}>{status === "saving" ? "保存中…" : "保存 OCR 设置"}</button></div>
+  </section>;
+}
+
+function AiSettings({ role, onNotify, onDirtyChange }) {
+  const [llmDirty, setLlmDirty] = useState(false);
+  const [ocrDirty, setOcrDirty] = useState(false);
+  useEffect(() => { onDirtyChange?.(llmDirty || ocrDirty); }, [llmDirty, ocrDirty, onDirtyChange]);
+  if (role === "面试官") return <section className="settings-denied"><LockKeyhole size={31} /><h3>无 AI 设置权限</h3><p>面试官不能查看 Provider、模型范围或密钥状态。</p></section>;
+  return <div className="settings-section ai-settings"><div className="settings-section-heading ai-page-heading"><div><h2>AI 设置</h2><p>分别管理简历评估与文档识别服务；两个区域独立保存和测试。</p></div></div><LlmSettingsSection role={role} onNotify={onNotify} onDirtyChange={setLlmDirty} /><OcrSettingsSection role={role} onNotify={onNotify} onDirtyChange={setOcrDirty} /></div>;
 }
 
 function formatAuditTime(value) {
@@ -709,6 +917,12 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify, pageAct
   const visibleSettingsSections = settingsSections.filter(([label]) => allowedSettingsSections.includes(label));
   const activeSection = allowedSettingsSections.includes(section) ? section : allowedSettingsSections[0];
   const content = activeSection === "组织与权限" ? <OrganizationSettings role={currentRole} onNotify={onNotify} pageActionHost={pageActionHost} activeTab={organizationTab} onTabChange={(tab) => onRouteChange("组织与权限", tab)} /> : activeSection === "流程与评价模板" ? <TemplateSettings role={currentRole} onNotify={onNotify} activeTab={templateTab} onTabChange={(tab) => onRouteChange("流程与评价模板", tab)} /> : activeSection === "AI 设置" ? <AiSettings role={currentRole} onNotify={onNotify} onDirtyChange={setAiDirty} /> : activeSection === "飞书集成" ? <FeishuIntegrationSettings onNotify={onNotify} /> : activeSection === "审计与数据治理" ? <AuditSettings key={currentRole} role={currentRole} onNotify={onNotify} /> : <section className="settings-denied"><LockKeyhole size={31} /><h3>无设置权限</h3><p>当前账号未获得系统设置访问权限。</p></section>;
+  useEffect(() => {
+    if (!aiDirty) return undefined;
+    const preventUnsavedExit = (event) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", preventUnsavedExit);
+    return () => window.removeEventListener("beforeunload", preventUnsavedExit);
+  }, [aiDirty]);
   function openSection(nextSection) {
     if (activeSection === "AI 设置" && aiDirty && nextSection !== activeSection) {
       setPendingSection(nextSection);
@@ -721,5 +935,5 @@ export function SettingsWorkspace({ currentRole, onRoleChange, onNotify, pageAct
     onRouteChange(pendingSection, settingsDefaultTabs[pendingSection]);
     setPendingSection(null);
   }
-  return <div className="settings-page"><RoleSwitch value={currentRole} onChange={onRoleChange} /><div className="settings-layout"><nav className="settings-subnav" aria-label="设置导航">{visibleSettingsSections.map(([label, Icon]) => <button type="button" key={label} className={activeSection === label ? "active" : ""} aria-current={activeSection === label ? "page" : undefined} onClick={() => openSection(label)}><Icon size={17} />{label}</button>)}</nav><main className="settings-content">{content}</main></div>{pendingSection && <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label="AI 设置尚未保存"><header><div><h3>AI 设置尚未保存</h3><p>离开将放弃尚未保存的配置修改。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingSection(null)}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>未保存的 Provider、模型和 API Key 替换内容都会被清除。</span></div><footer><button className="button secondary" type="button" onClick={() => setPendingSection(null)}>继续编辑</button><button className="button danger" type="button" onClick={leaveAiSettings}>放弃修改并离开</button></footer></section></div>}</div>;
+  return <div className="settings-page"><RoleSwitch value={currentRole} onChange={onRoleChange} /><div className="settings-layout"><nav className="settings-subnav" aria-label="设置导航">{visibleSettingsSections.map(([label, Icon]) => <button type="button" key={label} className={activeSection === label ? "active" : ""} aria-current={activeSection === label ? "page" : undefined} onClick={() => openSection(label)}><Icon size={17} />{label}</button>)}</nav><main className="settings-content">{content}</main></div>{pendingSection && <div className="ux07-dialog-backdrop"><section className="ux07-dialog" role="dialog" aria-modal="true" aria-label="AI 设置尚未保存"><header><div><h3>AI 设置尚未保存</h3><p>离开将放弃 LLM 或 OCR 中尚未保存的配置修改。</p></div><button className="icon-button" type="button" aria-label="关闭" onClick={() => setPendingSection(null)}><X size={19} /></button></header><div className="ux07-danger-impact"><AlertTriangle size={22} /><span>未保存的 Provider、Base URL、模型和 API Key 替换内容都会被清除。</span></div><footer><button className="button secondary" type="button" onClick={() => setPendingSection(null)}>继续编辑</button><button className="button danger" type="button" onClick={leaveAiSettings}>放弃修改并离开</button></footer></section></div>}</div>;
 }

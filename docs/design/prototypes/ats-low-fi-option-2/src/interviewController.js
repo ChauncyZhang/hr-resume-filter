@@ -408,7 +408,13 @@ export function createInterviewController({ client = apiClient, idempotencyKey =
       body: id ? body : { application_id: requireId(form?.applicationId, "APPLICATION_ID_REQUIRED"), ...body },
       ...signalOption(signal),
     });
-    return { hard: safeArray(response?.data?.hard), soft: safeArray(response?.data?.soft) };
+    return {
+      hard: safeArray(response?.data?.hard),
+      soft: safeArray(response?.data?.soft),
+      calendarHard: safeArray(response?.data?.calendar_hard),
+      calendarSoft: safeArray(response?.data?.calendar_soft),
+      unconfirmed: safeArray(response?.data?.unconfirmed),
+    };
   }
 
   async function transition(record, target, { reason = null, signal } = {}) {

@@ -10,6 +10,7 @@ from server.app.integrations.feishu.provider import (
     CalendarEventRequest,
     FakeFeishuProvider,
     FeishuCredentials,
+    FreeBusyRequest,
     HttpFeishuProvider,
     OAuthIdentity,
     chunk_freebusy_requests,
@@ -157,6 +158,86 @@ def test_http_provider_adds_bound_users_as_internal_attendees() -> None:
         ],
         "need_notification": True,
     }
+
+
+def test_http_provider_parses_current_batch_freebusy_response_shape() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token"})
+        if request.url.path.endswith("/freebusy/batch"):
+            requests.append(request)
+            return httpx.Response(200, json={
+                "code": 0,
+                "data": {
+                    "freebusy_lists": [{
+                        "user_id": "ou_interviewer",
+                        "freebusy_items": [
+                            {
+                                "start_time": "2026-07-21T06:30:00Z",
+                                "end_time": "2026-07-21T07:30:00Z",
+                                "rsvp_status": "accept",
+                            },
+                            {
+                                "start_time": "2026-07-21T08:00:00Z",
+                                "end_time": "2026-07-21T08:30:00Z",
+                                "rsvp_status": "decline",
+                            },
+                        ],
+                    }],
+                },
+            })
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    provider = HttpFeishuProvider(httpx.Client(transport=httpx.MockTransport(handler)))
+    start = datetime(2026, 7, 21, 6, tzinfo=timezone.utc)
+    windows = provider.batch_freebusy(
+        FeishuCredentials("cli", "secret", "https://example.test/callback"),
+        FreeBusyRequest(("ou_interviewer",), start, start + timedelta(hours=3)),
+    )
+
+    assert [(window.user_id, window.starts_at, window.ends_at) for window in windows] == [(
+        "ou_interviewer",
+        datetime(2026, 7, 21, 6, 30, tzinfo=timezone.utc),
+        datetime(2026, 7, 21, 7, 30, tzinfo=timezone.utc),
+    )]
+    assert json.loads(requests[0].content) == {
+        "time_min": "2026-07-21T06:00:00+00:00",
+        "time_max": "2026-07-21T09:00:00+00:00",
+        "user_ids": ["ou_interviewer"],
+        "include_external_calendar": True,
+        "only_busy": True,
+        "need_rsvp_status": True,
+    }
+
+
+def test_http_provider_keeps_legacy_batch_freebusy_response_compatible() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token"})
+        return httpx.Response(200, json={
+            "code": 0,
+            "data": {
+                "freebusy_list": [{
+                    "user_id": "ou_interviewer",
+                    "freebusy": [{
+                        "start_time": "2026-07-21T06:30:00+00:00",
+                        "end_time": "2026-07-21T07:30:00+00:00",
+                    }],
+                }],
+            },
+        })
+
+    provider = HttpFeishuProvider(httpx.Client(transport=httpx.MockTransport(handler)))
+    start = datetime(2026, 7, 21, 6, tzinfo=timezone.utc)
+    windows = provider.batch_freebusy(
+        FeishuCredentials("cli", "secret", "https://example.test/callback"),
+        FreeBusyRequest(("ou_interviewer",), start, start + timedelta(hours=3)),
+    )
+
+    assert len(windows) == 1
+    assert windows[0].starts_at == datetime(2026, 7, 21, 6, 30, tzinfo=timezone.utc)
 
 
 def test_fake_provider_does_not_make_network_calls_and_exposes_oauth_identity() -> None:

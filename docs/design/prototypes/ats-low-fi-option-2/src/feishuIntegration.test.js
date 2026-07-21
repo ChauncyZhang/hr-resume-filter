@@ -105,14 +105,17 @@ test("Feishu callback errors guide unbound users back to a safe account-linking 
 });
 
 test("Login Settings and Profile expose only the requested Feishu entry points", async () => {
-  const [login, settings, profile, interviews] = await Promise.all([
+  const [login, inviteAccept, settings, profile, interviews] = await Promise.all([
     readFile(new URL("./LoginView.jsx", import.meta.url), "utf8"),
+    readFile(new URL("./InviteAcceptView.jsx", import.meta.url), "utf8"),
     readFile(new URL("./SettingsViews.jsx", import.meta.url), "utf8"),
     readFile(new URL("./ProfileSettings.jsx", import.meta.url), "utf8"),
     readFile(new URL("./InterviewViews.jsx", import.meta.url), "utf8"),
   ]);
   assert.match(login, /飞书登录/);
   assert.match(login, /getFeishuCallbackErrorCode/);
+  assert.match(inviteAccept, /startFeishuAuthorization\(\(\) => client\.authorizeFeishuLogin\(result\?\.organization_slug/);
+  assert.match(inviteAccept, /onAccepted\(result\?\.email/);
   assert.match(settings, /飞书集成/);
   assert.match(profile, /飞书账号/);
   assert.doesNotMatch(interviews, /Feishu|飞书/);

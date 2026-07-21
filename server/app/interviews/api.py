@@ -11,7 +11,7 @@ from sqlalchemy import and_, delete, exists, func, or_, select, text
 
 from server.app.governance.retention import recalculate_candidate_retention
 from server.app.identity.api import problem, session_token
-from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus
+from server.app.identity.models import AuditLog, Job, JobCollaborator, User, UserRole, UserStatus, WorkflowTemplate
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.integrations.feishu.sync import schedule_interview_sync
@@ -38,7 +38,8 @@ from server.app.interviews.schemas import (
 )
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.http import content_disposition
-from server.app.recruiting.models import Application, Candidate, FileObject, JobJdVersion, Resume
+from server.app.recruiting.workflow import next_interview_round, normalized_workflow_rounds
+from server.app.recruiting.models import Application, ApplicationStageEvent, Candidate, FileObject, JobJdVersion, Resume
 from server.app.recruiting.storage import (
     MAX_DOWNLOAD_BYTES,
     MAX_PREVIEW_BYTES,
@@ -64,7 +65,7 @@ ETAG = re.compile(r'^"(0|[1-9][0-9]*)"$')
 REQUIRED_RATINGS = {"professional_ability", "problem_solving", "communication", "role_fit"}
 INTERVIEW_ACCESS_ROLES = frozenset({"recruiting_admin", "recruiter", "hiring_manager", "interviewer"})
 INTERVIEW_PARTICIPANT_ROLES = ("recruiting_admin", "recruiter", "hiring_manager", "interviewer")
-INTERVIEW_SCHEDULABLE_STAGES = frozenset({"interview_pending", "interviewing"})
+INTERVIEW_SCHEDULABLE_STAGES = frozenset({"interview_pending", "interviewing", "decision"})
 
 
 class ScheduleConflict(Exception):
@@ -78,9 +79,69 @@ class InterviewTimeInPast(Exception):
     pass
 
 
+class InterviewRoundMismatch(Exception):
+    pass
+
+
+def _expected_interview_round(db, application: Application) -> tuple[bool, str | None]:
+    template_row = db.execute(
+        select(WorkflowTemplate.id, WorkflowTemplate.rounds)
+        .join(
+            Job,
+            and_(
+                Job.organization_id == WorkflowTemplate.organization_id,
+                Job.workflow_template_id == WorkflowTemplate.id,
+            ),
+        )
+        .where(
+            Job.organization_id == application.organization_id,
+            Job.id == application.job_id,
+        )
+    ).first()
+    if template_row is None:
+        return False, None
+    completed_rounds = db.scalars(select(Interview.round_name).where(
+        Interview.organization_id == application.organization_id,
+        Interview.application_id == application.id,
+        Interview.status == "feedback_completed",
+    )).all()
+    return True, next_interview_round(template_row.rounds, completed_rounds)
+
+
 def _advance_application_to_interviewing(db, application, *, principal, trace_id):
     if application.stage not in INTERVIEW_SCHEDULABLE_STAGES:
         raise InvalidStateTransition
+    if application.stage == "decision":
+        application.stage = "interviewing"
+        application.version += 1
+        application.updated_at = datetime.now(timezone.utc)
+        stage_payload = {
+            "from_stage": "decision",
+            "to_stage": "interviewing",
+            "reason": "additional_interview_scheduled",
+        }
+        db.add(ApplicationStageEvent(
+            organization_id=principal.organization_id,
+            application_id=application.id,
+            actor_user_id=principal.user_id,
+            event_type="application.stage_changed",
+            payload=stage_payload,
+        ))
+        db.add(AuditLog(
+            organization_id=principal.organization_id,
+            actor_user_id=principal.user_id,
+            event_type="application.stage_changed",
+            outcome="success",
+            resource_type="application",
+            resource_id=application.id,
+            trace_id=trace_id,
+            metadata_json=stage_payload,
+        ))
+        db.flush()
+        recalculate_candidate_retention(
+            db, principal.organization_id, application.candidate_id
+        )
+        return application
     target_index = RecruitingService.APPLICATION_PATH.index("interviewing")
     while application.stage != "interviewing":
         source_index = RecruitingService.APPLICATION_PATH.index(application.stage)
@@ -329,6 +390,57 @@ def _schedule_conflicts(
     return hard, soft
 
 
+def _realtime_availability_conflicts(
+    request: Request,
+    db,
+    organization_id: UUID,
+    participant_ids: list[UUID],
+    starts_at: datetime,
+    ends_at: datetime,
+    *,
+    exclude_interview_id: UUID | None = None,
+    buffer_minutes: int = 15,
+) -> tuple[list[UUID], list[UUID], list[UUID]]:
+    provider = getattr(
+        request.app.state,
+        "interview_availability_provider",
+        INTERNAL_AVAILABILITY_PROVIDER,
+    )
+    try:
+        rows = privacy_safe_availability(
+            provider.availability(
+                db=db,
+                organization_id=organization_id,
+                participant_ids=participant_ids,
+                starts_at=starts_at,
+                ends_at=ends_at,
+                buffer_minutes=buffer_minutes,
+                exclude_interview_id=exclude_interview_id,
+            ),
+            participant_ids,
+        )
+    except Exception:
+        return [], [], list(participant_ids)
+
+    hard: list[UUID] = []
+    soft: list[UUID] = []
+    unconfirmed: list[UUID] = []
+    for row in rows:
+        participant_id = UUID(row["participant_id"])
+        if row["status"] != "confirmed":
+            unconfirmed.append(participant_id)
+        for block in row["busy"]:
+            busy_start = datetime.fromisoformat(block["starts_at"])
+            busy_end = datetime.fromisoformat(block["ends_at"])
+            if starts_at < busy_end and busy_start < ends_at:
+                hard.append(participant_id)
+                break
+            if min(abs(starts_at - busy_end), abs(busy_start - ends_at)) < timedelta(minutes=buffer_minutes):
+                soft.append(participant_id)
+                break
+    return list(dict.fromkeys(hard)), list(dict.fromkeys(soft)), list(dict.fromkeys(unconfirmed))
+
+
 def _interview_data(db, interview: Interview) -> dict:
     application = db.get(Application, interview.application_id)
     candidate = db.get(Candidate, application.candidate_id)
@@ -400,10 +512,11 @@ def _advance_application_if_interviews_complete(
     db,
     organization_id: UUID,
     application_id: UUID,
+    current_round_name: str,
     *,
     actor_user_id: UUID,
     trace_id: str,
-) -> bool:
+) -> tuple[bool, str | None]:
     candidate_id = _lock_application_candidate_retention(
         db, organization_id, application_id
     )
@@ -417,28 +530,84 @@ def _advance_application_if_interviews_complete(
     )
     if application is None or application.candidate_id != candidate_id:
         raise InvalidStateTransition
-    active_statuses = db.scalars(
-        select(Interview.status).where(
+    template_rounds = db.scalar(
+        select(WorkflowTemplate.rounds)
+        .join(
+            Job,
+            and_(
+                Job.organization_id == WorkflowTemplate.organization_id,
+                Job.workflow_template_id == WorkflowTemplate.id,
+            ),
+        )
+        .where(
+            Job.organization_id == organization_id,
+            Job.id == application.job_id,
+        )
+    )
+    normalized_rounds = normalized_workflow_rounds(template_rounds)
+    managed_round = normalized_rounds is not None and current_round_name in normalized_rounds
+    status_query = select(Interview.status).where(
             Interview.organization_id == organization_id,
             Interview.application_id == application_id,
             Interview.status.not_in(("cancelled", "no_show")),
         )
-    ).all()
+    if managed_round:
+        status_query = status_query.where(Interview.round_name == current_round_name)
+    active_statuses = db.scalars(status_query).all()
     if not active_statuses or any(status != "feedback_completed" for status in active_statuses):
-        return False
+        return False, None
+    next_round_name = None
+    if managed_round:
+        round_index = normalized_rounds.index(current_round_name)
+        if round_index + 1 < len(normalized_rounds):
+            next_round_name = normalized_rounds[round_index + 1]
     if application.stage == "interviewing":
-        transition_application_record(
-            db,
-            organization_id,
-            application.id,
-            "decision",
-            expected_version=application.version,
-            actor_user_id=actor_user_id,
-            trace_id=trace_id,
-        )
-    elif application.stage != "decision":
+        if next_round_name is None:
+            transition_application_record(
+                db,
+                organization_id,
+                application.id,
+                "decision",
+                expected_version=application.version,
+                actor_user_id=actor_user_id,
+                trace_id=trace_id,
+            )
+        else:
+            application.stage = "interview_pending"
+            application.version += 1
+            application.updated_at = datetime.now(timezone.utc)
+            payload = {
+                "from_stage": "interviewing",
+                "to_stage": "interview_pending",
+                "next_round_name": next_round_name,
+                "application_advanced": True,
+            }
+            db.add(ApplicationStageEvent(
+                organization_id=organization_id,
+                application_id=application.id,
+                actor_user_id=actor_user_id,
+                event_type="application.stage_changed",
+                payload=payload,
+            ))
+            db.add(AuditLog(
+                organization_id=organization_id,
+                actor_user_id=actor_user_id,
+                event_type="application.stage_changed",
+                outcome="success",
+                resource_type="application",
+                resource_id=application.id,
+                trace_id=trace_id,
+                metadata_json={
+                    "from_stage": "interviewing",
+                    "to_stage": "interview_pending",
+                    "next_round_name": next_round_name,
+                },
+            ))
+            db.flush()
+            recalculate_candidate_retention(db, organization_id, application.candidate_id)
+    elif application.stage not in {"decision", "interview_pending"}:
         raise InvalidStateTransition
-    return True
+    return True, next_round_name
 
 
 def _lock_application_candidate_retention(db, organization_id, application_id):
@@ -791,6 +960,14 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                     or locked_application.candidate_id != candidate_id
                 ):
                     raise InvalidStateTransition
+                if locked_application.stage == "interview_pending":
+                    managed, expected_round = _expected_interview_round(
+                        db, locked_application
+                    )
+                    if managed and expected_round is None:
+                        raise InvalidStateTransition
+                    if managed and payload.round_name != expected_round:
+                        raise InterviewRoundMismatch
                 if not _lock_participants(db, principal.organization_id, participant_ids):
                     raise InvalidStateTransition
                 if _interview_time_in_past(payload.starts_at):
@@ -809,10 +986,18 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
                     payload.starts_at,
                     payload.ends_at,
                 )
-                if hard:
-                    raise ScheduleConflict("hard", hard)
-                if soft and not payload.allow_soft_conflict:
-                    raise ScheduleConflict("soft", soft)
+                calendar_hard, calendar_soft, _ = _realtime_availability_conflicts(
+                    request,
+                    db,
+                    principal.organization_id,
+                    participant_ids,
+                    payload.starts_at,
+                    payload.ends_at,
+                )
+                if hard or calendar_hard:
+                    raise ScheduleConflict("hard", [*hard, *calendar_hard])
+                if (soft or calendar_soft) and not payload.allow_soft_conflict:
+                    raise ScheduleConflict("soft", [*soft, *calendar_soft])
                 interview = Interview(
                     organization_id=principal.organization_id,
                     application_id=locked_application.id,
@@ -907,6 +1092,9 @@ def create_interview(payload: InterviewCreate, request: Request, idempotency_key
         except InterviewTimeInPast:
             db.rollback()
             return problem(request, 422, "interview_time_in_past", "The interview must start in the future.")
+        except InterviewRoundMismatch:
+            db.rollback()
+            return problem(request, 422, "interview_round_invalid", "The interview round is invalid.")
         except CandidateUnavailable:
             db.rollback()
             return _denied(request)
@@ -1011,9 +1199,18 @@ def patch_interview(interview_id: UUID, payload: InterviewPatch, request: Reques
             ends_at,
             exclude_interview_id=interview.id,
         )
-        if hard:
+        calendar_hard, calendar_soft, _ = _realtime_availability_conflicts(
+            request,
+            db,
+            principal.organization_id,
+            participant_ids,
+            starts_at,
+            ends_at,
+            exclude_interview_id=interview.id,
+        )
+        if hard or calendar_hard:
             return problem(request, 409, "schedule_hard_conflict", "One or more interviewers are unavailable.")
-        if soft and not payload.allow_soft_conflict:
+        if (soft or calendar_soft) and not payload.allow_soft_conflict:
             return problem(request, 409, "schedule_soft_conflict", "One or more interviewers have an adjacent interview.")
         previous = _schedule_snapshot(interview)
         try:
@@ -1106,7 +1303,22 @@ def check_new_interview_conflicts(payload: NewInterviewConflictInput, request: R
             payload.ends_at,
             buffer_minutes=payload.buffer_minutes,
         )
-        return {"data": {"hard": [str(value) for value in hard], "soft": [str(value) for value in soft]}}
+        calendar_hard, calendar_soft, unconfirmed = _realtime_availability_conflicts(
+            request,
+            db,
+            principal.organization_id,
+            payload.participant_ids,
+            payload.starts_at,
+            payload.ends_at,
+            buffer_minutes=payload.buffer_minutes,
+        )
+        return {"data": {
+            "hard": [str(value) for value in hard],
+            "soft": [str(value) for value in soft],
+            "calendar_hard": [str(value) for value in calendar_hard],
+            "calendar_soft": [str(value) for value in calendar_soft],
+            "unconfirmed": [str(value) for value in unconfirmed],
+        }}
 
 
 @router.post("/interviews/{interview_id}/conflicts", response_model=DataResource)
@@ -1133,7 +1345,23 @@ def check_conflicts(interview_id: UUID, payload: ScheduleInput, request: Request
             exclude_interview_id=interview.id,
             buffer_minutes=payload.buffer_minutes,
         )
-        return {"data": {"hard": [str(value) for value in hard], "soft": [str(value) for value in soft]}}
+        calendar_hard, calendar_soft, unconfirmed = _realtime_availability_conflicts(
+            request,
+            db,
+            principal.organization_id,
+            payload.participant_ids,
+            payload.starts_at,
+            payload.ends_at,
+            exclude_interview_id=interview.id,
+            buffer_minutes=payload.buffer_minutes,
+        )
+        return {"data": {
+            "hard": [str(value) for value in hard],
+            "soft": [str(value) for value in soft],
+            "calendar_hard": [str(value) for value in calendar_hard],
+            "calendar_soft": [str(value) for value in calendar_soft],
+            "unconfirmed": [str(value) for value in unconfirmed],
+        }}
 
 
 @router.post("/interviews/{interview_id}/transitions", response_model=DataResource)
@@ -1209,11 +1437,13 @@ def transition_interview(
                 locked.updated_at = datetime.now(timezone.utc)
                 db.flush()
                 application_advanced = False
+                next_round_name = None
                 if locked.status == "feedback_completed" or target in {"cancelled", "no_show"}:
-                    application_advanced = _advance_application_if_interviews_complete(
+                    application_advanced, next_round_name = _advance_application_if_interviews_complete(
                         db,
                         principal.organization_id,
                         locked.application_id,
+                        locked.round_name,
                         actor_user_id=principal.user_id,
                         trace_id=request.state.trace_id,
                     )
@@ -1228,6 +1458,7 @@ def transition_interview(
                             "to_status": locked.status,
                             "reason": payload.reason,
                             "application_advanced": application_advanced,
+                            "next_round_name": next_round_name,
                         },
                     )
                 )
@@ -1763,10 +1994,11 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                     locked_interview.version += 1
                     locked_interview.updated_at = now
                     db.flush()
-                    application_advanced = _advance_application_if_interviews_complete(
+                    application_advanced, next_round_name = _advance_application_if_interviews_complete(
                         db,
                         principal.organization_id,
                         locked_interview.application_id,
+                        locked_interview.round_name,
                         actor_user_id=principal.user_id,
                         trace_id=request.state.trace_id,
                     )
@@ -1779,6 +2011,7 @@ def submit_my_feedback(interview_id: UUID, request: Request, idempotency_key: st
                             payload={
                                 "required_feedback_count": len(required_ids),
                                 "application_advanced": application_advanced,
+                                "next_round_name": next_round_name,
                             },
                         )
                     )

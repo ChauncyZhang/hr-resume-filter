@@ -121,7 +121,7 @@ def accept_invitation(payload: InvitationAcceptRequest, request: Request):
             "Request origin or CSRF token is invalid.",
         )
     try:
-        email = request.app.state.identity_service.accept_password_invitation(
+        registration = request.app.state.identity_service.accept_password_invitation(
             payload.token, payload.password, trace_id=request.state.trace_id
         )
     except InvitationInvalidOrExpired:
@@ -131,7 +131,7 @@ def accept_invitation(payload: InvitationAcceptRequest, request: Request):
             "invitation_invalid_or_expired",
             "The invitation is invalid or expired.",
         )
-    return {"data": {"email": email}}
+    return {"data": registration}
 
 
 @router.get("/me")

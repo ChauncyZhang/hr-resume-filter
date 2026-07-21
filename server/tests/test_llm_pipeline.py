@@ -366,7 +366,7 @@ def test_success_commits_running_before_provider_and_is_replay_safe(tmp_path):
         assert evaluation.score == 91 and evaluation.interview_questions == ["Describe a scaling incident"]
         assert evaluation.dimensions == [dimension.model_dump() for dimension in gateway.outcome.result.dimensions]
         prompt = db.get(PromptVersion, uuid.UUID(job.payload["prompt_version_id"]))
-        assert prompt.version_number == 2
+        assert prompt.version_number == 3
         assert gateway.calls[0][4]["system_prompt"] == prompt.content["system"]
         persisted = repr((invocation.usage, invocation.safe_error_code, evaluation.summary, evaluation.strengths))
         assert "sk-private" not in persisted and "Python backend role" not in persisted

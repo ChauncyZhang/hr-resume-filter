@@ -29,6 +29,9 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert 'beyondcandidate-deploy-$releaseId' in POWERSHELL
     assert "--exclude=.tmp" in POWERSHELL
     assert "--exclude=.venv*" in POWERSHELL
+    assert '--force-local' not in POWERSHELL
+    assert 'Push-Location $localStaging' in POWERSHELL
+    assert 'tar -czf "source.tar.gz"' in POWERSHELL
     assert 'Join-Path $tempRoot "beyondcandidate-deploy-"' in POWERSHELL
     assert "Local staging cleanup was skipped" in POWERSHELL
     assert "[Parameter(ValueFromRemainingArguments" not in POWERSHELL
@@ -56,6 +59,12 @@ def test_remote_release_preserves_project_identity_and_rolls_back_services() -> 
     assert "10-provision-app-role.sh" in REMOTE_SHELL
     assert "shared-nginx-smoke.sh" in REMOTE_SHELL
     assert 'mv -Tf "$app_root/current.new" "$app_root/current"' in REMOTE_SHELL
+
+
+def test_release_writes_rollback_metadata_before_switching_current() -> None:
+    metadata_index = REMOTE_SHELL.index('> "$release_dir/deploy/release-info.txt"')
+    switch_index = REMOTE_SHELL.index('mv -Tf "$app_root/current.new" "$app_root/current"')
+    assert metadata_index < switch_index
 
 
 def test_release_inherits_shared_nginx_before_compose_validation() -> None:

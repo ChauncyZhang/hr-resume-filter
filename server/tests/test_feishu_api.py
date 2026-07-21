@@ -194,7 +194,7 @@ def test_oauth_login_activates_only_a_preinvited_user_and_consumes_state_once(fe
         assert db.get(User, admin_id) is not None
 
 
-def test_oauth_never_registers_or_email_matches_an_active_unbound_user(feishu_app) -> None:
+def test_oauth_email_matches_and_binds_an_active_unbound_user(feishu_app) -> None:
     app, client = feishu_app
     seed_user(app)
     csrf = login(client)
@@ -219,10 +219,13 @@ def test_oauth_never_registers_or_email_matches_an_active_unbound_user(feishu_ap
         follow_redirects=False,
     )
     assert response.status_code == 303
-    assert response.headers["location"] == "/?feishu_error=feishu_account_not_invited_or_bound"
+    assert response.headers["location"] == "/?feishu_status=connected"
+    assert "hr_session=" in response.headers["set-cookie"]
     with app.state.identity_store.sync_session() as db:
         assert db.query(User).count() == 1
-        assert db.query(FeishuIdentityBinding).count() == 0
+        binding = db.scalar(select(FeishuIdentityBinding))
+        assert binding is not None
+        assert binding.user_id == db.scalar(select(User.id))
 
 
 def test_authenticated_user_can_bind_read_status_and_unbind(feishu_app) -> None:

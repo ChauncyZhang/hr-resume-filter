@@ -71,7 +71,7 @@ def test_interview_openapi_registers_the_phase_4_contract(tmp_path) -> None:
 def test_interview_availability_is_privacy_safe_and_honors_exclude_and_buffer(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     with TestClient(app) as client:
         created, headers = create_interview(client, seed, payload=interview_payload(seed, starts_at=start))
         interview_id = created.json()["data"]["id"]
@@ -315,7 +315,7 @@ def seed_application(app):
 
 
 def interview_payload(seed, *, starts_at=None):
-    start = starts_at or datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    start = starts_at or datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     return {
         "application_id": str(seed["application_id"]),
         "round_name": "一面",
@@ -887,7 +887,7 @@ def test_revoked_recruiting_role_removes_historical_assignment_access(tmp_path) 
 def test_create_rejects_same_candidate_overlap_with_different_interviewer(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     with TestClient(app) as client:
         create_interview(client, seed, key="candidate-conflict-first", payload=interview_payload(seed, starts_at=start))
         overlapping = interview_payload(seed, starts_at=start)
@@ -933,7 +933,7 @@ def test_create_interview_rejects_a_past_start_time(tmp_path) -> None:
 def test_new_interview_conflicts_report_hard_candidate_overlap(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     with TestClient(app) as client:
         existing, headers = create_interview(
             client,
@@ -954,13 +954,14 @@ def test_new_interview_conflicts_report_hard_candidate_overlap(tmp_path) -> None
         )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"hard": [existing.json()["data"]["id"]], "soft": []}}
+    assert response.json()["data"]["hard"] == [existing.json()["data"]["id"]]
+    assert response.json()["data"]["soft"] == []
 
 
 def test_new_interview_conflicts_report_soft_adjacent_participant_booking(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     with TestClient(app) as client:
         existing, headers = create_interview(
             client,
@@ -982,13 +983,14 @@ def test_new_interview_conflicts_report_soft_adjacent_participant_booking(tmp_pa
         )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"hard": [], "soft": [existing.json()["data"]["id"]]}}
+    assert response.json()["data"]["hard"] == []
+    assert response.json()["data"]["soft"] == [existing.json()["data"]["id"]]
 
 
 def test_new_interview_conflicts_return_empty_when_schedule_is_available(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     with TestClient(app) as client:
         _, headers = create_interview(
             client,
@@ -1010,7 +1012,8 @@ def test_new_interview_conflicts_return_empty_when_schedule_is_available(tmp_pat
         )
 
     assert response.status_code == 200
-    assert response.json() == {"data": {"hard": [], "soft": []}}
+    assert response.json()["data"]["hard"] == []
+    assert response.json()["data"]["soft"] == []
 
 
 def test_new_interview_conflicts_require_application_scope_and_tenant_participants(tmp_path) -> None:
@@ -1018,8 +1021,8 @@ def test_new_interview_conflicts_require_application_scope_and_tenant_participan
     seed = seed_application(app)
     payload = {
         "application_id": str(seed["application_id"]),
-        "starts_at": datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc).isoformat(),
-        "ends_at": datetime(2026, 7, 20, 8, 45, tzinfo=timezone.utc).isoformat(),
+        "starts_at": datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc).isoformat(),
+        "ends_at": datetime(2099, 7, 20, 8, 45, tzinfo=timezone.utc).isoformat(),
         "participant_ids": [str(seed["interviewer_id"])],
         "buffer_minutes": 15,
     }
@@ -1082,8 +1085,8 @@ def test_new_interview_conflicts_require_application_scope_and_tenant_participan
 def test_reschedule_rejects_same_candidate_overlap_with_different_interviewer(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    first_start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
-    second_start = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    first_start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
+    second_start = datetime(2099, 7, 20, 12, 0, tzinfo=timezone.utc)
     second_payload = interview_payload(seed, starts_at=second_start)
     second_payload["participants"] = [
         {
@@ -1169,7 +1172,7 @@ def test_reschedule_preserves_history_and_transition_calendar_versions(tmp_path)
         created, headers = create_interview(client, seed)
         interview = created.json()["data"]
         interview_id = interview["id"]
-        new_start = datetime(2026, 7, 21, 9, 30, tzinfo=timezone.utc)
+        new_start = datetime(2099, 7, 21, 9, 30, tzinfo=timezone.utc)
 
         stale = client.patch(
             f"/api/v1/interviews/{interview_id}",
@@ -1193,7 +1196,7 @@ def test_reschedule_preserves_history_and_transition_calendar_versions(tmp_path)
         assert calendar.status_code == 200
         assert calendar.headers["content-type"].startswith("text/calendar")
         assert b"SEQUENCE:1\r\n" in calendar.content
-        assert b"DTSTART:20260721T093000Z\r\n" in calendar.content
+        assert b"DTSTART:20990721T093000Z\r\n" in calendar.content
         assert b"mailto:interview-admin@example.test\r\n" in calendar.content
         assert b"mailto:assigned@example.test\r\n" in calendar.content
 
@@ -1291,7 +1294,7 @@ def test_application_waits_for_all_active_interview_rounds_before_decision(tmp_p
             key="decision-gate-first",
             payload=interview_payload(
                 seed,
-                starts_at=datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc),
+                starts_at=datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc),
             ),
         )
         second, _ = create_interview(
@@ -1300,7 +1303,7 @@ def test_application_waits_for_all_active_interview_rounds_before_decision(tmp_p
             key="decision-gate-second",
             payload=interview_payload(
                 seed,
-                starts_at=datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc),
+                starts_at=datetime(2099, 7, 20, 12, 0, tzinfo=timezone.utc),
             ),
         )
         first_id = first.json()["data"]["id"]
@@ -1632,7 +1635,7 @@ def test_submitted_feedback_amendment_requires_its_author_reason_and_version(tmp
 def test_interview_list_uses_stable_signed_cursor_pagination(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    starts_at = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
+    starts_at = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
     with app.state.identity_store.sync_session() as database:
         application = database.get(Application, seed["application_id"])
         interviews = [
@@ -1693,7 +1696,7 @@ def test_interview_list_rejects_invalid_cross_filter_and_cross_tenant_cursors(tm
             client,
             seed,
             key="cursor-binding-second",
-            payload=interview_payload(seed, starts_at=datetime(2026, 7, 20, 10, 0, tzinfo=timezone.utc)),
+            payload=interview_payload(seed, starts_at=datetime(2099, 7, 20, 10, 0, tzinfo=timezone.utc)),
         )
         first = client.get(
             "/api/v1/interviews",
@@ -1761,8 +1764,8 @@ def test_calendar_download_commits_safe_audit_before_returning_file(tmp_path) ->
 def test_interview_list_conflicts_and_my_tasks_share_assignment_scope(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
-    first_start = datetime(2026, 7, 20, 8, 0, tzinfo=timezone.utc)
-    second_start = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+    first_start = datetime(2099, 7, 20, 8, 0, tzinfo=timezone.utc)
+    second_start = datetime(2099, 7, 20, 12, 0, tzinfo=timezone.utc)
     with TestClient(app) as client:
         first, admin_headers = create_interview(
             client,
@@ -1790,7 +1793,8 @@ def test_interview_list_conflicts_and_my_tasks_share_assignment_scope(tmp_path) 
             headers=admin_headers,
         )
         assert conflict.status_code == 200
-        assert conflict.json()["data"] == {"hard": [second_id], "soft": []}
+        assert conflict.json()["data"]["hard"] == [second_id]
+        assert conflict.json()["data"]["soft"] == []
 
         admin_list = client.get("/api/v1/interviews", headers=admin_headers)
         assert admin_list.status_code == 200

@@ -268,10 +268,14 @@ def _screening_job_for_candidate(
         )
         db.add(item)
         db.flush()
-        payload = {
-            "organization_id": str(organization_id),
-            "screening_item_id": str(item.id),
-        }
+        payload = (
+            {"organization_id": str(organization_id), "resume_id": str(resume.id)}
+            if job_type == "screening.profile_resume"
+            else {
+                "organization_id": str(organization_id),
+                "screening_item_id": str(item.id),
+            }
+        )
         queued = BackgroundJob(
             organization_id=organization_id,
             type=job_type,
@@ -308,6 +312,7 @@ def _screening_job_for_candidate(
     [
         ("screening.score_item", "parsed", "not_requested"),
         ("screening.llm_score_item", "scored", "queued"),
+        ("screening.profile_resume", "parsed", "not_requested"),
     ],
 )
 def test_claim_waits_for_active_screening_lease_before_side_effects(
@@ -343,6 +348,39 @@ def test_claim_waits_for_active_screening_lease_before_side_effects(
         assert db.get(DeletionRequest, request_id).status == "approved"
         assert db.get(BackgroundJob, queue_job_id).status == "running"
         assert db.scalar(select(DeletionArtifact.id)) is None
+
+
+def test_claim_cancels_queued_resume_profile_job(tmp_path) -> None:
+    from server.app.governance.worker import DeletionJobHandler
+
+    app = make_app(tmp_path)
+    organization_id, candidate_id, request_id = _approved_request(app)
+    item_id, queue_job_id, run_id = _screening_job_for_candidate(
+        app,
+        organization_id,
+        candidate_id,
+        request_id,
+        job_type="screening.profile_resume",
+        item_status="parsed",
+        llm_status="not_requested",
+        queue_status="queued",
+    )
+    handler = DeletionJobHandler(
+        sessions=app.state.identity_store.sync_session,
+        governance_engine=FakeGovernanceEngine(),
+        object_deleter=RecordingDeleter([]),
+        ledger=RecordingLedger([]),
+        resume_bucket="resumes",
+        export_bucket="resumes",
+    )
+
+    assert handler._claim(organization_id, request_id, 2, "profile-cancel") is False
+
+    with app.state.identity_store.sync_session() as db:
+        assert db.get(DeletionRequest, request_id).status == "executing"
+        assert db.get(BackgroundJob, queue_job_id).status == "cancelled"
+        assert db.get(ScreeningItem, item_id).status == "parsed"
+        assert db.get(ScreeningRun, run_id).processed_count == 0
 
 
 @pytest.mark.parametrize(

@@ -5,15 +5,21 @@ import time
 import pytest
 from pydantic import ValidationError
 
-from server.app.llm.gateway import GatewayError, OpenAiCompatibleGateway, TransportResponse
+from server.app.llm.gateway import EVALUATION_MAX_TOKENS, GatewayError, OpenAiCompatibleGateway, TransportResponse
 from server.app.llm.policy import ProviderAllowlist
 from server.app.llm.redaction import redact_screening_text
 from server.app.llm.screening import (
+    SCREENING_SYSTEM_PROMPT,
     MAX_JD_CHARS,
     MAX_RESUME_CHARS,
     ScreeningRequest,
     ScreeningResult,
 )
+
+
+def test_screening_prompt_requires_simplified_chinese_text_fields() -> None:
+    assert "Simplified Chinese" in SCREENING_SYSTEM_PROMPT
+    assert "summary, strengths, gaps" in SCREENING_SYSTEM_PROMPT
 
 
 def resolver(host, port, type):
@@ -209,7 +215,7 @@ def test_gateway_evaluate_reuses_pinned_transport_and_returns_bounded_facts():
     assert payload["messages"][0]["content"] == "persisted prompt v2"
     assert "Python backend role" in payload["messages"][1]["content"]
     assert set(json.loads(payload["messages"][1]["content"])) == {"job_description", "resume_text"}
-    assert payload["max_tokens"] == 800
+    assert payload["max_tokens"] == EVALUATION_MAX_TOKENS == 8192
 
 
 def test_gateway_evaluate_accepts_provider_specific_usage_details():

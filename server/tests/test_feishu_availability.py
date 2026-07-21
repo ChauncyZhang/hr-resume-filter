@@ -1,13 +1,14 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 
 from server.app.integrations.feishu.availability import FeishuAwareAvailabilityProvider
 from server.app.integrations.feishu.models import FeishuIdentityBinding, FeishuOrganizationConfig
 from server.app.integrations.feishu.provider import BusyWindow, FakeFeishuProvider, FeishuProviderError
 from server.app.identity.models import User
 from server.app.interviews.availability import INTERNAL_AVAILABILITY_PROVIDER
-from server.tests.test_interview_api import make_app, seed_application
+from server.tests.test_interview_api import interview_payload, login, make_app, seed_application
 
 
 def configured_provider(app, seed, *, bind=True):
@@ -79,7 +80,7 @@ def test_enabled_feishu_merges_external_busy_and_chunks_long_ranges(tmp_path) ->
     assert all(request.time_max - request.time_min <= timedelta(days=14) for request in provider.freebusy_requests)
 
 
-def test_enabled_feishu_never_reports_unbound_or_failed_calendar_as_free(tmp_path) -> None:
+def test_enabled_feishu_reports_unbound_or_failed_calendar_as_unconfirmed(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)
     tenant_id = organization_id(app, seed)
@@ -101,9 +102,60 @@ def test_enabled_feishu_never_reports_unbound_or_failed_calendar_as_free(tmp_pat
     provider, failing_adapter = configured_provider(failing_app, failing_seed)
     provider.failure = FeishuProviderError()
     with failing_app.state.identity_store.sync_session() as db:
-        with pytest.raises(FeishuProviderError):
-            failing_adapter.availability(
-                db=db, organization_id=failing_tenant_id,
-                participant_ids=[failing_seed["interviewer_id"]], starts_at=starts_at,
-                ends_at=starts_at + timedelta(days=7), buffer_minutes=15, exclude_interview_id=None,
-            )
+        rows = failing_adapter.availability(
+            db=db, organization_id=failing_tenant_id,
+            participant_ids=[failing_seed["interviewer_id"]], starts_at=starts_at,
+            ends_at=starts_at + timedelta(days=7), buffer_minutes=15, exclude_interview_id=None,
+        )
+    assert rows == [{"participant_id": str(failing_seed["interviewer_id"]), "status": "unknown", "busy": []}]
+
+
+def test_conflict_preflight_rechecks_feishu_and_fails_open_when_unavailable(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    provider, adapter = configured_provider(app, seed)
+    app.state.interview_availability_provider = adapter
+    start = datetime.now(timezone.utc) + timedelta(days=2)
+    provider.busy_windows = (BusyWindow("ou_interviewer", start, start + timedelta(minutes=45)),)
+    payload = interview_payload(seed, starts_at=start)
+    conflict_payload = {
+        "application_id": payload["application_id"],
+        "starts_at": payload["starts_at"],
+        "ends_at": payload["ends_at"],
+        "participant_ids": [str(seed["interviewer_id"])],
+        "buffer_minutes": 15,
+    }
+
+    with TestClient(app) as client:
+        headers = login(client, "interview-admin@example.test")
+        busy = client.post("/api/v1/interview-conflicts", json=conflict_payload, headers=headers)
+        provider.failure = FeishuProviderError()
+        unavailable = client.post("/api/v1/interview-conflicts", json=conflict_payload, headers=headers)
+
+    assert busy.status_code == 200
+    assert busy.json()["data"]["calendar_hard"] == [str(seed["interviewer_id"])]
+    assert unavailable.status_code == 200
+    assert unavailable.json()["data"]["calendar_hard"] == []
+    assert unavailable.json()["data"]["unconfirmed"] == [str(seed["interviewer_id"])]
+
+
+def test_create_interview_rechecks_feishu_busy_window_before_saving(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    provider, adapter = configured_provider(app, seed)
+    app.state.interview_availability_provider = adapter
+    start = datetime.now(timezone.utc) + timedelta(days=2)
+    provider.busy_windows = (BusyWindow("ou_interviewer", start, start + timedelta(minutes=45)),)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/interviews",
+            json=interview_payload(seed, starts_at=start),
+            headers={
+                **login(client, "interview-admin@example.test"),
+                "Idempotency-Key": "external-calendar-conflict",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "schedule_hard_conflict"

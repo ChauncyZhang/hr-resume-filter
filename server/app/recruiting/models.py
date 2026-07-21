@@ -63,6 +63,24 @@ class Resume(Record, Base):
     __table_args__ = (UniqueConstraint("organization_id", "id"), UniqueConstraint("organization_id", "candidate_id", "version_number"), UniqueConstraint("organization_id", "id", "candidate_id"), ForeignKeyConstraint(["organization_id", "candidate_id"], ["candidates.organization_id", "candidates.id"]), ForeignKeyConstraint(["organization_id", "file_object_id"], ["file_objects.organization_id", "file_objects.id"]))
 
 
+class ResumeProfile(Record, Base):
+    __tablename__ = "resume_profiles"
+    resume_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(16))
+    source: Mapped[str] = mapped_column(String(32))
+    profile_version: Mapped[str] = mapped_column(String(64))
+    safe_error_code: Mapped[str | None] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+    __table_args__ = (
+        UniqueConstraint("organization_id", "id"),
+        UniqueConstraint("organization_id", "resume_id"),
+        ForeignKeyConstraint(["organization_id", "resume_id"], ["resumes.organization_id", "resumes.id"], ondelete="CASCADE"),
+        CheckConstraint("status in ('ready','partial','unavailable')", name="ck_resume_profiles_status"),
+        CheckConstraint("source in ('rules','llm','ocr_rules','ocr_llm')", name="ck_resume_profiles_source"),
+    )
+
+
 class VersionRecord(Record):
     job_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     version_number: Mapped[int] = mapped_column(Integer)

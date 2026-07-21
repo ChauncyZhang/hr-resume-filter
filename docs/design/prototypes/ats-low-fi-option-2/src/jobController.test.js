@@ -13,6 +13,7 @@ const JOB_ID = "11111111-1111-4111-8111-111111111111";
 const DEPARTMENT_ID = "22222222-2222-4222-8222-222222222222";
 const OWNER_ID = "33333333-3333-4333-8333-333333333333";
 const HIRING_OWNER_ID = "44444444-4444-4444-8444-444444444444";
+const WORKFLOW_TEMPLATE_ID = "55555555-5555-4555-8555-555555555555";
 
 function apiJob(changes = {}) {
   return {
@@ -94,7 +95,7 @@ test("job form departments come from the organization directory instead of job f
     },
   } });
 
-  assert.deepEqual(await controller.listDepartments({ signal }), [{ id: DEPARTMENT_ID, name: "技术部" }]);
+  assert.deepEqual(await controller.listDepartments({ signal }), [{ id: DEPARTMENT_ID, name: "技术部", status: "active" }]);
   assert.equal(calls[0].signal, signal);
 });
 
@@ -434,6 +435,7 @@ test("saveDefinition maps the complete UI form for draft, publish, and versioned
     mustHave: " JavaScript、React， ",
     niceToHave: [" Vite ", ""],
     process: "  技术岗位标准流程  ",
+    workflowTemplateId: WORKFLOW_TEMPLATE_ID,
     llmEnabled: true,
   };
 
@@ -450,6 +452,7 @@ test("saveDefinition maps the complete UI form for draft, publish, and versioned
     description: "建设可靠的招聘平台。",
     location: "上海",
     process_template: "技术岗位标准流程",
+    workflow_template_id: WORKFLOW_TEMPLATE_ID,
     llm_enabled: true,
     must_have: ["JavaScript", "React"],
     nice_to_have: ["Vite"],

@@ -41,13 +41,13 @@ test("the candidate opened from detail remains visible ahead of server suggestio
   assert.deepEqual(mergeScheduleCandidateOptions(suggestions, pinned), [pinned, suggestions[0]]);
 });
 
-test("only interview-ready applications can continue to scheduling", () => {
+test("active applications and decision-stage extra rounds can continue to scheduling", () => {
   assert.equal(isScheduleCandidateEligible({ stage: "新简历" }), true);
   assert.equal(isScheduleCandidateEligible({ stage: "待复核" }), true);
   assert.equal(isScheduleCandidateEligible({ stage: "待沟通" }), true);
   assert.equal(isScheduleCandidateEligible({ stage: "待安排" }), true);
   assert.equal(isScheduleCandidateEligible({ stage: "面试中" }), true);
-  assert.equal(isScheduleCandidateEligible({ stage: "待决策" }), false);
+  assert.equal(isScheduleCandidateEligible({ stage: "待决策" }), true);
 });
 
 test("an assigned hiring manager can submit feedback for a future scheduled interview", () => {

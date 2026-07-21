@@ -252,7 +252,7 @@ class IdentityService:
 
     def accept_password_invitation(
         self, token: str, password: str, *, trace_id: str
-    ) -> str:
+    ) -> dict[str, str]:
         now = self.clock.current_time()
         with self.store.sync_session() as db:
             invitation = db.scalar(
@@ -285,8 +285,11 @@ class IdentityService:
                 )
             )
             email = invitation.user.email
+            organization_slug = db.scalar(
+                select(Organization.slug).where(Organization.id == invitation.organization_id)
+            )
             db.commit()
-            return email
+            return {"email": email, "organization_slug": organization_slug}
 
     def change_password(
         self,

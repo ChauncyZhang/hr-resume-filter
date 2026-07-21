@@ -4,11 +4,14 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 from sqlalchemy import func,select
 
-from server.app.recruiting.models import Application,ApplicationReviewTask,Candidate,FileObject,Resume
+from server.app.recruiting.models import Application,ApplicationReviewTask,Candidate,FileObject,Resume,ResumeProfile
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.queue.models import BackgroundJob
 from server.app.screening.pipeline import ScreeningPipeline,_PROMPT_CONTENT,_ensure_screening_prompt
+from server.app.llm.resume_profile import ResumeProfileResult
+from server.app.recruiting.profile_builder import ProfileBuild,ResumeProfileBuilder
+from server.app.recruiting.profile_jobs import ResumeProfileJobHandler,enqueue_missing_resume_profiles
 from server.app.screening.scanner import ScanResult
 from server.app.queue.service import PermanentJobError,RetryableJobError
 import pytest
@@ -78,7 +81,8 @@ def test_clean_parse_then_score_is_replay_safe_and_auto_sends_completed_resume_t
     assert scanner.calls==["scan"] and storage.calls[:3]==["open","copy","delete"]
     assert storage.streams and all(stream.close_count==1 for stream in storage.streams)
     with app.state.identity_store.sync_session() as db:
-        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); assert stored.status=="parsed" and stored.attempts==1 and stored.started_at==first_started and stored.finished_at is None and stored.candidate_id and stored.resume_id and stored.application_id
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); profile=db.scalar(select(ResumeProfile)); assert stored.status=="parsed" and stored.attempts==1 and stored.started_at==first_started and stored.finished_at is None and stored.candidate_id and stored.resume_id and stored.application_id
+        assert profile and profile.resume_id==stored.resume_id and profile.source=="rules"
         score_job=SimpleNamespace(organization_id=stored.organization_id,payload={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"jd_version_id":str(db.get(ScreeningRun,uuid.UUID(run["id"])).jd_version_id),"rule_version_id":str(db.get(ScreeningRun,uuid.UUID(run["id"])).rule_version_id),"rule_engine_version":"rule-v1"},attempts=1,max_attempts=3)
     asyncio.run(pipeline.score_item(score_job)); asyncio.run(pipeline.score_item(score_job))
     with app.state.identity_store.sync_session() as db:
@@ -86,6 +90,115 @@ def test_clean_parse_then_score_is_replay_safe_and_auto_sends_completed_resume_t
         application=db.scalar(select(Application)); result=db.scalar(select(ScreeningResult)); completed=db.get(ScreeningRun,uuid.UUID(run["id"])); task=db.scalar(select(ApplicationReviewTask))
         assert application.stage=="review" and application.version==2 and application.source=="screening" and result.rule_score<=100 and completed.status=="completed" and completed.processed_count==1 and db.scalar(select(ScreeningItem.finished_at)).isoformat()
         assert task.ai_status=="failed" and task.safe_error_code=="llm_config_disabled"
+
+def test_worker_startup_enqueues_missing_historical_resume_profiles(tmp_path):
+    app,pipeline,_,_,job,_,item=seeded_pipeline(tmp_path)
+    asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        db.query(ResumeProfile).delete()
+        db.commit()
+
+    assert enqueue_missing_resume_profiles(app.state.identity_store.sync_session)==1
+    with app.state.identity_store.sync_session() as db:
+        backfill=db.scalar(select(BackgroundJob).where(BackgroundJob.type=="screening.profile_resume"))
+        assert backfill.payload=={
+            "organization_id":str(backfill.organization_id),
+            "resume_id":str(db.get(ScreeningItem,uuid.UUID(item["id"])).resume_id),
+        }
+
+def test_profile_job_rejects_tenant_mismatch_before_processing(tmp_path):
+    app,pipeline,_,_,job,_,item=seeded_pipeline(tmp_path)
+    asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        resume_id=db.get(ScreeningItem,uuid.UUID(item["id"])).resume_id
+        organization_id=db.get(ScreeningItem,uuid.UUID(item["id"])).organization_id
+        db.query(ResumeProfile).delete(); db.commit()
+    handler=ResumeProfileJobHandler(app.state.identity_store.sync_session,None,None)
+    profile_job=SimpleNamespace(
+        organization_id=uuid.uuid4(),
+        payload={"organization_id":str(organization_id),"resume_id":str(resume_id)},
+    )
+    with pytest.raises(PermanentJobError,match="resume_profile_payload_invalid"):
+        asyncio.run(handler(profile_job))
+
+def test_job_independent_profile_uses_unrestricted_llm_without_application_job(tmp_path):
+    app,_,_,_,job,run,_=seeded_pipeline(tmp_path)
+    organization_id=uuid.UUID(job.payload["organization_id"])
+    with app.state.identity_store.sync_session() as db:
+        owner=db.get(ScreeningRun,uuid.UUID(run["id"])).created_by
+        db.add(LlmProviderConfig(
+            organization_id=organization_id,
+            provider_id="profile-provider",
+            model="profile-model",
+            encrypted_api_key=b"encrypted",
+            enabled=True,
+            allowed_job_ids=[],
+            version=1,
+            created_by=owner,
+            updated_by=owner,
+        ))
+        db.commit()
+
+    class Cipher:
+        def decrypt(self,value): return "secret"
+
+    class Gateway:
+        async def extract_resume_profile(self,*args,**kwargs):
+            result=ResumeProfileResult.model_validate({
+                "summary":"具备企业级 AI 项目交付经验。",
+                "summary_origin":"generated",
+                "skills":["Python"],
+                "experience":"负责 AI 平台研发。",
+                "education":None,
+                "evidence":{
+                    "summary":["负责 AI 平台研发"],
+                    "skills":["Python"],
+                    "experience":["负责 AI 平台研发"],
+                    "education":[],
+                },
+            })
+            return SimpleNamespace(result=result,usage={},latency_ms=12)
+
+    result=asyncio.run(ResumeProfileBuilder(
+        app.state.identity_store.sync_session,Gateway(),Cipher()
+    ).build(
+        organization_id,
+        job_id=None,
+        resume_text="Python\n负责 AI 平台研发",
+        candidate_name=None,
+        used_ocr=False,
+    ))
+    assert result.source=="llm" and result.status=="partial"
+
+def test_profile_job_does_not_restore_profile_after_candidate_is_deleted(tmp_path):
+    app,pipeline,_,_,job,_,item=seeded_pipeline(tmp_path)
+    asyncio.run(pipeline.parse_item(job))
+    with app.state.identity_store.sync_session() as db:
+        stored=db.get(ScreeningItem,uuid.UUID(item["id"])); resume_id=stored.resume_id
+        organization_id=stored.organization_id
+        db.query(ResumeProfile).delete(); db.commit()
+
+    class DeletingEnhancer:
+        async def enhance(self,*args,**kwargs):
+            with app.state.identity_store.sync_session() as db:
+                resume=db.get(Resume,resume_id)
+                db.get(Candidate,resume.candidate_id).deleted_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+                db.commit()
+            return SimpleNamespace(text="Python 5 years",used_ocr=False,safe_error_code=None)
+
+    class Builder:
+        async def build(self,*args,**kwargs):
+            return ProfileBuild({"summary":None,"skills":["Python"],"experience":None,"education":None,"status":"partial","source":"rules"},"partial","rules")
+
+    handler=ResumeProfileJobHandler(app.state.identity_store.sync_session,DeletingEnhancer(),Builder())
+    profile_job=SimpleNamespace(
+        organization_id=organization_id,
+        payload={"organization_id":str(organization_id),"resume_id":str(resume_id)},
+        trace_id="delete-race",
+    )
+    asyncio.run(handler(profile_job))
+    with app.state.identity_store.sync_session() as db:
+        assert db.scalar(select(ResumeProfile).where(ResumeProfile.resume_id==resume_id)) is None
 
 def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_path):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path); asyncio.run(pipeline.parse_item(job))
@@ -99,7 +212,7 @@ def test_rule_score_atomically_enqueues_eligible_llm_without_finishing_item(tmp_
         assert aggregate.status=="llm_scoring" and aggregate.processed_count==0
         assert len(jobs)==1 and jobs[0].payload=={"organization_id":str(stored.organization_id),"screening_item_id":str(stored.id),"screening_result_id":str(db.scalar(select(ScreeningResult.id))),"application_id":str(stored.application_id),"config_id":str(db.scalar(select(LlmProviderConfig.id))),"config_version":3,"prompt_version_id":str(prompt.id)}
         assert "resume" not in str(jobs[0].payload).lower() and "jd" not in jobs[0].payload
-        assert prompt.version_number==2 and prompt.content["schema_version"]=="screening-evaluation-v2"
+        assert prompt.version_number==3 and prompt.content["schema_version"]=="screening-evaluation-v2"
         assert "recommendation" in prompt.content["system"] and "must not" in prompt.content["system"]
         assert all(value in prompt.content["system"] for value in ("core_capability (0-35)", "experience_depth (0-25)", "role_seniority (0-20)", "transferability (0-10)", "explicit_constraints (0-10)"))
         assert db.scalar(select(Application)).stage=="new"
@@ -185,9 +298,9 @@ def test_pipeline_cancellation_closes_stream_and_kills_parser(tmp_path):
 
 @pytest.mark.parametrize(("filename","mime","content","version"),[
     ("resume.txt","text/plain",b"Python","txt-v1"),
-    ("resume.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document",__import__("server.tests.test_screening",fromlist=["docx_bytes"]).docx_bytes("Python"),"docx-v1"),
-    ("resume.pdf","application/pdf",__import__("server.tests.test_screening",fromlist=["pdf_bytes"]).pdf_bytes(),"pdf-v3"),
-])
+    ("resume.docx","application/vnd.openxmlformats-officedocument.wordprocessingml.document",__import__("server.tests.test_screening",fromlist=["docx_bytes"]).docx_bytes("Python"),"docx-v2"),
+    ("resume.pdf","application/pdf",__import__("server.tests.test_screening",fromlist=["pdf_bytes"]).pdf_bytes(),"pdf-v4"),
+], ids=("txt", "docx", "pdf"))
 def test_pipeline_parses_each_approved_document_type(tmp_path,filename,mime,content,version):
     app,pipeline,storage,scanner,job,run,item=seeded_pipeline(tmp_path,content,filename,mime); asyncio.run(pipeline.parse_item(job))
     with app.state.identity_store.sync_session() as db: assert db.get(ScreeningItem,uuid.UUID(item["id"])).parser_version==version

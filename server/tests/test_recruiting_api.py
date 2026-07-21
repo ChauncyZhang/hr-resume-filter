@@ -669,10 +669,12 @@ def test_resume_access_is_scoped_to_an_authorized_application_for_the_target_res
         assert [row["id"] for row in listed.json()["data"]] == [ids["allowed_resume_id"]]
         assert listed.json()["data"][0]["profile"] == {
             "summary": "企业级 AI 平台负责人",
+            "summary_origin": "resume",
             "skills": ["Python", "RAG"],
             "experience": "负责 Agent 平台交付",
             "education": "浙江大学 计算机本科",
             "status": "ready",
+            "source": "rules",
         }
 
         preview = client.get(f"/api/v1/resumes/{ids['allowed_resume_id']}/preview")
@@ -1012,8 +1014,9 @@ def test_candidate_list_returns_selected_application_and_latest_screening_result
             "source": "upload",
             "human_conclusion": None,
             "version": 1,
-            "updated_at": base.replace(tzinfo=None).isoformat(),
-            "rule_score": 81,
+                "updated_at": base.replace(tzinfo=None).isoformat(),
+                "next_interview_round": None,
+                "rule_score": 81,
             "recommendation": "可沟通",
             "route_result": "review",
             "ai_score": 72,
@@ -1283,7 +1286,7 @@ def test_create_job_definition_atomically_creates_typed_versions(tmp_path, publi
     assert response.headers["etag"] == '"1"'
     data = response.json()["data"]
     assert data["job"]["status"] == expected_status
-    assert data["jd"] == {"id": data["jd"]["id"], "version_number": 1, "description": payload["description"], "location": payload["location"], "process_template": payload["process_template"], "llm_enabled": payload["llm_enabled"]}
+    assert data["jd"] == {"id": data["jd"]["id"], "version_number": 1, "description": payload["description"], "location": payload["location"], "process_template": payload["process_template"], "workflow_template_id": None, "llm_enabled": payload["llm_enabled"]}
     assert data["rules"] == {"id": data["rules"]["id"], "version_number": 1, "must_have": payload["must_have"], "nice_to_have": payload["nice_to_have"]}
     with app.state.identity_store.sync_session() as db:
         assert db.query(Job).count() == db.query(JobJdVersion).count() == db.query(ScreeningRuleVersion).count() == 1
@@ -1325,10 +1328,11 @@ def test_job_owner_options_and_definition_writes_enforce_active_tenant_hiring_ma
         assert options.status_code == 200
         assert options.json() == {
             "data": [
+                {"id": str(admin_id), "name": "recruiting_admin"},
                 {"id": str(eligible_id), "name": "可选负责人"},
                 {"id": str(replacement_id), "name": "第二负责人"},
             ],
-            "meta": {"count": 2},
+            "meta": {"count": 3},
         }
 
         invalid_ids = {
@@ -1347,7 +1351,7 @@ def test_job_owner_options_and_definition_writes_enforce_active_tenant_hiring_ma
 
         created = client.post(
             "/api/v1/job-definitions",
-            json=job_definition_payload(hiring_owner_id=str(eligible_id)),
+            json=job_definition_payload(hiring_owner_id=str(admin_id)),
             headers={**headers, "Idempotency-Key": "valid-owner"},
         )
         assert created.status_code == 201
@@ -1573,6 +1577,7 @@ def test_job_definition_normalizes_text_only_legacy_content(tmp_path) -> None:
         "description": "old shape",
         "location": "",
         "process_template": "默认招聘流程",
+        "workflow_template_id": None,
         "llm_enabled": False,
     }
     assert response.json()["data"]["rules"] == {

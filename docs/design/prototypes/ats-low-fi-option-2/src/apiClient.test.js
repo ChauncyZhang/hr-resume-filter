@@ -329,9 +329,11 @@ test("organization and account methods follow the fixed API contract", async () 
   const responses = [
     jsonResponse({ data: [{ id: "dep-1", name: "技术部" }] }),
     jsonResponse({ data: { id: "dep-2", name: "产品部" } }),
+    jsonResponse({ data: { id: "dep-2", name: "产品部", status: "active" } }),
+    jsonResponse({ data: { id: "dep-2", name: "平台部", status: "inactive" } }),
     jsonResponse({ data: [{ id: "user-1", display_name: "林岚" }] }),
     jsonResponse({ data: { user: { id: "user-2" }, invitation: { token: "once" } } }),
-    jsonResponse({ data: { email: "lin@example.test" } }),
+    jsonResponse({ data: { email: "lin@example.test", organization_slug: "acme" } }),
     new Response(null, { status: 204 }),
   ];
   const client = createApiClient({ fetchImpl: async (url, options) => {
@@ -341,20 +343,24 @@ test("organization and account methods follow the fixed API contract", async () 
 
   assert.deepEqual(await client.listDepartments(), [{ id: "dep-1", name: "技术部" }]);
   assert.deepEqual(await client.createDepartment({ name: "产品部", parent_id: null }), { id: "dep-2", name: "产品部" });
+  assert.deepEqual(await client.getDepartment("dep/2"), { id: "dep-2", name: "产品部", status: "active" });
+  assert.deepEqual(await client.updateDepartment("dep/2", { name: "平台部", status: "inactive" }), { id: "dep-2", name: "平台部", status: "inactive" });
   assert.deepEqual(await client.listUsers(), [{ id: "user-1", display_name: "林岚" }]);
   assert.deepEqual(await client.inviteUser({ display_name: "周宁", email: "zhou@example.test", department_id: "dep-1", role: "recruiter" }, { idempotencyKey: "invite-key" }), { user: { id: "user-2" }, invitation: { token: "once" } });
-  assert.deepEqual(await client.acceptInvitation({ token: "once", password: "a-secure-password" }), { email: "lin@example.test" });
+  assert.deepEqual(await client.acceptInvitation({ token: "once", password: "a-secure-password" }), { email: "lin@example.test", organization_slug: "acme" });
   assert.equal(await client.changePassword({ current_password: "old-password", new_password: "new-secure-password" }), null);
 
   assert.deepEqual(calls.map(({ url, options }) => [url, options.method]), [
     ["/api/v1/settings/departments", "GET"],
     ["/api/v1/settings/departments", "POST"],
+    ["/api/v1/settings/departments/dep%2F2", "GET"],
+    ["/api/v1/settings/departments/dep%2F2", "PATCH"],
     ["/api/v1/settings/users", "GET"],
     ["/api/v1/settings/users", "POST"],
     ["/api/v1/auth/invitations/accept", "POST"],
     ["/api/v1/me/password", "POST"],
   ]);
-  assert.equal(calls[3].options.headers.get("Idempotency-Key"), "invite-key");
-  assert.deepEqual(JSON.parse(calls[4].options.body), { token: "once", password: "a-secure-password" });
-  assert.deepEqual(JSON.parse(calls[5].options.body), { current_password: "old-password", new_password: "new-secure-password" });
+  assert.equal(calls[5].options.headers.get("Idempotency-Key"), "invite-key");
+  assert.deepEqual(JSON.parse(calls[6].options.body), { token: "once", password: "a-secure-password" });
+  assert.deepEqual(JSON.parse(calls[7].options.body), { current_password: "old-password", new_password: "new-secure-password" });
 });

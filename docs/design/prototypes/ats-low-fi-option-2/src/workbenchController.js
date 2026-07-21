@@ -171,6 +171,7 @@ function normalizeItem(item, jobNames, { allowUnknownJob = false } = {}) {
     company: "",
     position: jobNames.get(jobId) || "职位信息不可用",
     stage: STAGES[stage],
+    nextRound: safeString(item?.next_interview_round),
     source: safeString(item?.source, "未记录"),
     city: safeString(item?.location, "地点未填写"),
     lastActivity: displayDateTime(item?.updated_at),

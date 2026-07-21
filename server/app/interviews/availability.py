@@ -85,7 +85,7 @@ def privacy_safe_availability(rows: list[dict], participant_ids: list[UUID]) -> 
     safe_rows: list[dict] = []
     for participant_id in participant_ids:
         row = by_participant.get(str(participant_id))
-        if not row or row.get("status") != "confirmed" or not isinstance(row.get("busy"), list):
+        if not row or row.get("status") not in {"confirmed", "unknown"} or not isinstance(row.get("busy"), list):
             safe_rows.append({"participant_id": str(participant_id), "status": "unknown", "busy": []})
             continue
         busy: list[dict] = []
@@ -105,7 +105,7 @@ def privacy_safe_availability(rows: list[dict], participant_ids: list[UUID]) -> 
             busy.append({"starts_at": starts_at.isoformat(), "ends_at": ends_at.isoformat()})
         safe_rows.append({
             "participant_id": str(participant_id),
-            "status": "confirmed" if valid else "unknown",
+            "status": row["status"] if valid else "unknown",
             "busy": busy if valid else [],
         })
     return safe_rows

@@ -43,6 +43,7 @@ class JobOut(ApiModel):
     headcount: int
     priority: str
     hiring_owner_id: str | None
+    workflow_template_id: str | None
     owner_id: str
     status: str
     version: int
@@ -90,6 +91,7 @@ class JobDefinitionCommand(ApiModel):
     description: str = Field(min_length=1, max_length=MAX_JD_TEXT_CHARS)
     location: str = Field(max_length=200)
     process_template: str = Field(min_length=1, max_length=100)
+    workflow_template_id: UUID | None = None
     llm_enabled: bool
     must_have: list[RuleItem] = Field(max_length=MAX_RULE_TERMS)
     nice_to_have: list[RuleItem] = Field(max_length=MAX_RULE_TERMS)
@@ -116,6 +118,7 @@ class JobJdDefinitionOut(ApiModel):
     description: str
     location: str
     process_template: str
+    workflow_template_id: str | None
     llm_enabled: bool
 
 
@@ -155,6 +158,7 @@ class CandidateApplicationSummaryOut(ApiModel):
     human_conclusion: str | None
     version: int
     updated_at: str
+    next_interview_round: str | None
     rule_score: int | None
     recommendation: str | None
     route_result: Literal["review", "deferred"] | None
@@ -185,6 +189,7 @@ class ApplicationOut(ApiModel):
 
 class ApplicationHistoryOut(ApplicationOut):
     job_title: str
+    next_interview_round: str | None = None
     route_result: Literal["review", "deferred"] | None
     ai_score: int | None
     ai_recommendation: str | None
@@ -209,10 +214,12 @@ class NoteOut(ApiModel):
 
 class ResumeProfileOut(ApiModel):
     summary: str | None
+    summary_origin: Literal["resume", "generated"] | None = None
     skills: list[str]
     experience: str | None
     education: str | None
     status: Literal["ready", "partial", "unavailable"]
+    source: Literal["rules", "llm", "ocr_rules", "ocr_llm"] = "rules"
 
 
 class ResumeOut(ApiModel):
@@ -260,6 +267,7 @@ class WorkbenchCandidateOut(ApiModel):
     source: str
     stage: WorkbenchStage
     updated_at: datetime
+    next_interview_round: str | None = None
 
 
 class WorkbenchStageOut(ApiModel):

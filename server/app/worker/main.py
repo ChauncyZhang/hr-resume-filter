@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 
 from sqlalchemy import select
-from sqlalchemy.exc import DisconnectionError, OperationalError, StatementError, TimeoutError as SqlAlchemyTimeoutError
+from sqlalchemy.exc import DisconnectionError, OperationalError, SQLAlchemyError, StatementError, TimeoutError as SqlAlchemyTimeoutError
 
 from server.app.core.logging import configure_logging
 from server.app.core.probes import ReadinessProbe, check_readiness
@@ -97,16 +97,37 @@ def build_screening_handlers(settings,storage_client,bucket):
     from server.app.reports.storage import MinioExportStorage
     sessions=sessionmaker(create_engine(_sync_database_url(settings.database_url)),expire_on_commit=False)
     scanner=ClamAvScanner(settings.clamav_host,settings.clamav_port,connect_timeout=settings.clamav_connect_timeout_seconds,read_timeout=settings.clamav_read_timeout_seconds,total_timeout=settings.clamav_total_timeout_seconds)
-    pipeline=ScreeningPipeline(sessions,PipelineStorage(storage_client,bucket),scanner,settings)
+    pipeline_storage=PipelineStorage(storage_client,bucket)
     llm_key=settings.llm_config_encryption_key.get_secret_value()
     if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
     from server.app.llm.registry import DatabaseProviderCatalog
     deployed_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
     allowlist=DatabaseProviderCatalog(sessions,deployed_allowlist,allow_http=settings.environment!="production")
-    llm_pipeline=LlmScreeningPipeline(sessions,OpenAiCompatibleGateway(allowlist),ApiKeyCipher(llm_key.encode()))
+    cipher=ApiKeyCipher(llm_key.encode())
+    llm_gateway=OpenAiCompatibleGateway(allowlist)
+    from server.app.ocr.gateway import OcrGateway
+    from server.app.recruiting.profile_builder import ResumeProfileBuilder
+    from server.app.recruiting.profile_jobs import ResumeProfileJobHandler,enqueue_missing_resume_profiles
+    from server.app.screening.resume_enrichment import ResumeTextEnhancer
+    profile_builder=ResumeProfileBuilder(sessions,llm_gateway,cipher)
+    text_enhancer=ResumeTextEnhancer(sessions,pipeline_storage,OcrGateway(),cipher,settings)
+    profile_job=ResumeProfileJobHandler(sessions,text_enhancer,profile_builder)
+    pipeline=ScreeningPipeline(
+        sessions,
+        pipeline_storage,
+        scanner,
+        settings,
+        text_enhancer=text_enhancer,
+        profile_builder=profile_builder,
+    )
+    llm_pipeline=LlmScreeningPipeline(sessions,llm_gateway,cipher)
     llm_finalizer=LlmTerminalFinalizer(sessions)
     report_export=ReportExportJobHandler(sessions,MinioExportStorage(storage_client,bucket))
-    return {"screening.parse_item":pipeline.parse_item,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"screening.llm_finalize_terminal":llm_finalizer,"reports.export":report_export}
+    try:
+        enqueue_missing_resume_profiles(sessions)
+    except SQLAlchemyError as error:
+        logger.warning("resume_profile_backfill_enqueue_failed",extra={"context":{"error_type":type(error).__name__}})
+    return {"screening.parse_item":pipeline.parse_item,"screening.profile_resume":profile_job,"screening.score_item":pipeline.score_item,"screening.llm_score_item":llm_pipeline.evaluate_item,"screening.llm_finalize_terminal":llm_finalizer,"reports.export":report_export}
 
 
 def build_governance_handlers(settings: Settings, governance: GovernanceSettings):

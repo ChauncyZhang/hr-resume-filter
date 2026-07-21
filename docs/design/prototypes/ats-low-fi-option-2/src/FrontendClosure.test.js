@@ -8,6 +8,7 @@ const prototypeRoot = fileURLToPath(new URL("../", import.meta.url));
 const departments = [{ id: "00000000-0000-4000-8000-000000000201", name: "技术部", parent_id: null, member_count: 6, job_count: 3 }];
 const users = [{ id: "user-1", display_name: "Admin", email: "admin@example.test", department_id: departments[0].id, department_name: "技术部", roles: ["recruiting_admin"], status: "active" }];
 const notificationJobId = "10000000-0000-4000-8000-000000000001";
+const standardWorkflowTemplate = { id: "50000000-0000-4000-8000-000000000001", name: "标准社招流程", rounds: ["一面"], status: "active", version: 1 };
 
 function notificationCandidate(stage, index, name) {
   return {
@@ -67,6 +68,12 @@ after(async () => {
 
 async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = false, roles = ["recruiting_admin"], workbench = null, onRequest } = {}) {
   const context = await browser.newContext({ viewport });
+  let departmentDetail = {
+    ...departments[0],
+    status: "active",
+    members: [{ id: users[0].id, name: users[0].display_name, roles: users[0].roles, status: "active" }],
+    jobs: [{ id: "job-1", title: "AI 工程师", status: "open" }],
+  };
   await context.route("**/api/v1/**", async (route) => {
     const request = route.request();
     const pathname = new URL(request.url()).pathname.replace(/\/$/, "");
@@ -80,10 +87,15 @@ async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = f
       if (request.method() === "POST") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { id: "dep-new", ...request.postDataJSON(), member_count: 0, job_count: 0 } }) });
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: departments }) });
     }
+    if (pathname === `/api/v1/settings/departments/${departments[0].id}`) {
+      if (request.method() === "PATCH") departmentDetail = { ...departmentDetail, ...request.postDataJSON() };
+      return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: departmentDetail }) });
+    }
     if (pathname === "/api/v1/settings/users") {
       if (request.method() === "POST") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { user: { id: "user-2", ...request.postDataJSON(), department_name: "技术部", roles: [request.postDataJSON().role], status: "invited" }, invitation: { token: "invite-once", expires_at: "2026-07-18T08:00:00Z" } } }) });
       return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: users }) });
     }
+    if (pathname === "/api/v1/settings/workflow-templates") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [standardWorkflowTemplate] }) });
     if (pathname === "/api/v1/jobs") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], meta: { departments: [], owners: [], status_counts: {}, next_cursor: null } }) });
     if (pathname === "/api/v1/workbench" && workbench) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: workbench }) });
     if (pathname === "/api/v1/auth/invitations/accept") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { email: "invitee@example.test" } }) });
@@ -134,6 +146,29 @@ test("organization settings load real data, restrict invite roles, and show the 
     assert.match(await drawer.getByText(/48 小时/).textContent(), /48 小时/);
     assert.equal(inviteRequest.headers()["idempotency-key"].length > 0, true);
     assert.deepEqual(inviteRequest.postDataJSON(), { display_name: "周宁", email: "zhou@example.test", department_id: departments[0].id, role: "recruiter" });
+  } finally { await context.close(); }
+});
+
+test("department cards open management details and support rename and reversible deactivation", { timeout: 60_000 }, async () => {
+  const updates = [];
+  const { context, page } = await openPage({
+    onRequest(pathname, request) {
+      if (pathname === `/api/v1/settings/departments/${departments[0].id}` && request.method() === "PATCH") updates.push(request.postDataJSON());
+    },
+  });
+  try {
+    await page.goto(`${baseUrl}settings/organization/departments`);
+    await page.getByRole("button", { name: /技术部.*6 名成员.*3 个职位/ }).click();
+    const drawer = page.getByRole("dialog", { name: "技术部", exact: true });
+    await drawer.getByText("Admin", { exact: true }).waitFor();
+    assert.match(await drawer.textContent(), /AI 工程师/);
+    await drawer.getByLabel("部门名称", { exact: true }).fill("平台部");
+    await drawer.getByRole("button", { name: "保存名称", exact: true }).click();
+    const renamedDrawer = page.getByRole("dialog", { name: "平台部", exact: true });
+    await renamedDrawer.getByRole("button", { name: "停用部门", exact: true }).click();
+    await renamedDrawer.getByText("该部门已停用，历史成员和职位仍保留。", { exact: true }).waitFor();
+    assert.deepEqual(updates, [{ name: "平台部" }, { status: "inactive" }]);
+    await renamedDrawer.getByRole("button", { name: "重新启用", exact: true }).waitFor();
   } finally { await context.close(); }
 });
 
@@ -193,9 +228,9 @@ test("new jobs default to the standard process and manage departments navigates 
     assert.deepEqual(await departmentSelect.locator("option").allTextContents(), ["未分配部门", "技术部"]);
     const process = page.getByLabel("流程模板", { exact: true });
     assert.equal(await process.evaluate((element) => element.tagName), "SELECT");
-    assert.equal(await process.inputValue(), "标准社招流程");
-    assert.match(await page.getByText("阶段摘要", { exact: true }).locator("..").textContent(), /新简历.*待复核.*面试.*待决策/s);
-    assert.match(await page.getByText("AI 简历评估", { exact: true }).locator("..").textContent(), /LLM 直接生成最终分、结论、理由和路由结果/);
+    assert.equal(await process.inputValue(), standardWorkflowTemplate.id);
+    assert.match(await page.getByText("阶段摘要", { exact: true }).locator("..").textContent(), /新简历.*用人经理评审.*一面.*待决策/s);
+    assert.match(await page.getByText("AI 简历评估", { exact: true }).locator("..").textContent(), /LLM 生成评分、结论与依据/);
     await page.getByLabel("职位名称", { exact: true }).fill("平台工程师");
     await page.getByRole("button", { name: /管理部门/ }).click();
     await page.getByRole("heading", { name: "组织与权限", exact: true }).waitFor();

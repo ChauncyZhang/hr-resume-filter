@@ -15,21 +15,23 @@ from sqlalchemy.orm import aliased
 from server.app.governance.retention import recalculate_candidate_retention
 from server.app.governance.audit import AuditValidationError, _validate_metadata
 from server.app.identity.api import problem, session_token
-from server.app.identity.models import AuditLog, Department, Job, JobCollaborator, User, UserRole, UserStatus
+from server.app.identity.models import AuditLog, Department, Job, JobCollaborator, User, UserRole, UserStatus, WorkflowTemplate
 from server.app.identity.policy import Principal
 from server.app.identity.service import InvalidSession
 from server.app.recruiting.cursor import CursorCodec, InvalidCursor
 from server.app.recruiting.authorization import RecruitingAction, RecruitingAuthorizationService
 from server.app.recruiting.models import (
     Application, ApplicationReviewTask, ApplicationStageEvent, Candidate, CandidateContact, CandidateEvent, CandidateNote,
-    DownloadTicket, JobJdVersion, Resume, ScreeningRuleVersion,
+    DownloadTicket, JobJdVersion, Resume, ResumeProfile, ScreeningRuleVersion,
 )
 from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.app.llm.models import LlmScreeningEvaluation
+from server.app.interviews.models import Interview
 from server.app.recruiting.tasks import LLM_TERMINAL_SAFE_ERROR_CODES, normalize_llm_terminal_safe_error_code
 from server.app.screening.rules import RuleSnapshotError,normalize_rule_content
 from server.app.recruiting.security import ContactCipher
 from server.app.recruiting.http import content_disposition
+from server.app.recruiting.workflow import next_interview_round
 from server.app.recruiting.storage import MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, StorageObjectTooLarge, StorageReadFailed
 from server.app.recruiting.resume_profile import extract_resume_profile
 from server.app.recruiting.schemas import (
@@ -247,7 +249,7 @@ def _load_candidate_application(db, principal: Principal, candidate_id: UUID, ap
 
 
 def _job_data(job: Job) -> dict[str, Any]:
-    return {"id": str(job.id), "title": job.title, "department_id": str(job.department_id) if job.department_id else None, "headcount": job.headcount, "priority": job.priority, "hiring_owner_id": str(job.hiring_owner_id) if job.hiring_owner_id else None, "owner_id": str(job.owner_id), "status": job.status, "version": job.version, "updated_at": job.updated_at.isoformat()}
+    return {"id": str(job.id), "title": job.title, "department_id": str(job.department_id) if job.department_id else None, "headcount": job.headcount, "priority": job.priority, "hiring_owner_id": str(job.hiring_owner_id) if job.hiring_owner_id else None, "workflow_template_id": str(job.workflow_template_id) if job.workflow_template_id else None, "owner_id": str(job.owner_id), "status": job.status, "version": job.version, "updated_at": job.updated_at.isoformat()}
 
 
 def _job_jd_definition(jd: JobJdVersion) -> dict[str, Any]:
@@ -258,11 +260,12 @@ def _job_jd_definition(jd: JobJdVersion) -> dict[str, Any]:
                 "description": content["text"],
                 "location": "",
                 "process_template": "默认招聘流程",
+                "workflow_template_id": None,
                 "llm_enabled": False,
             }
         else:
             content = {}
-    return {"id": str(jd.id), "version_number": jd.version_number, **{key: content.get(key) for key in ("description", "location", "process_template", "llm_enabled")}}
+    return {"id": str(jd.id), "version_number": jd.version_number, **{key: content.get(key) for key in ("description", "location", "process_template", "workflow_template_id", "llm_enabled")}}
 
 
 def _screening_rules_definition(rules: ScreeningRuleVersion) -> dict[str, Any]:
@@ -273,7 +276,7 @@ def _screening_rules_definition(rules: ScreeningRuleVersion) -> dict[str, Any]:
     return {"id": str(rules.id), "version_number": rules.version_number, **{key: content.get(key) for key in ("must_have", "nice_to_have")}}
 
 
-def _workbench_candidate_data(row) -> dict[str, Any]:
+def _workbench_candidate_data(row, next_interview_round: str | None = None) -> dict[str, Any]:
     return {
         "application_id": str(row.application_id),
         "candidate_id": str(row.candidate_id),
@@ -284,6 +287,7 @@ def _workbench_candidate_data(row) -> dict[str, Any]:
         "source": row.source,
         "stage": row.stage,
         "updated_at": row.updated_at,
+        "next_interview_round": next_interview_round,
     }
 
 
@@ -412,6 +416,46 @@ def _screening_projections_for_applications(db,organization_id:UUID,application_
     return projections
 
 
+def _next_interview_rounds(
+    db, organization_id: UUID, application_ids: list[UUID]
+) -> dict[UUID, str | None]:
+    if not application_ids:
+        return {}
+    template_rows = db.execute(select(
+        Application.id,
+        WorkflowTemplate.rounds,
+    ).join(
+        Job,
+        and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id),
+    ).outerjoin(
+        WorkflowTemplate,
+        and_(
+            WorkflowTemplate.organization_id == Job.organization_id,
+            WorkflowTemplate.id == Job.workflow_template_id,
+        ),
+    ).where(
+        Application.organization_id == organization_id,
+        Application.id.in_(application_ids),
+    )).all()
+    completed_rows = db.execute(select(
+        Interview.application_id,
+        Interview.round_name,
+    ).where(
+        Interview.organization_id == organization_id,
+        Interview.application_id.in_(application_ids),
+        Interview.status == "feedback_completed",
+    )).all()
+    completed_by_application: dict[UUID, set[str]] = {}
+    for application_id, round_name in completed_rows:
+        completed_by_application.setdefault(application_id, set()).add(round_name)
+    result: dict[UUID, str | None] = {}
+    for application_id, rounds in template_rows:
+        result[application_id] = next_interview_round(
+            rounds, completed_by_application.get(application_id, set())
+        )
+    return result
+
+
 def _candidate_application_summaries(db, organization_id: UUID, application_ids: list[UUID]) -> dict[UUID, dict[str, Any]]:
     if not application_ids:
         return {}
@@ -438,6 +482,7 @@ def _candidate_application_summaries(db, organization_id: UUID, application_ids:
         Application.id.in_(application_ids),
     )).all()
     projections=_screening_projections_for_applications(db,organization_id,application_ids)
+    next_rounds = _next_interview_rounds(db, organization_id, application_ids)
     return {
         application.id: {
             "id": str(application.id),
@@ -451,6 +496,7 @@ def _candidate_application_summaries(db, organization_id: UUID, application_ids:
             "human_conclusion": application.human_conclusion,
             "version": application.version,
             "updated_at": application.updated_at.isoformat(),
+            "next_interview_round": next_rounds.get(application.id),
             "rule_score": rule_score,
             "recommendation": recommendation,
             **projections.get(application.id,{"route_result":None,"ai_score":None,"ai_recommendation":None,"llm_status":None,"llm_error_code":None,"llm_evaluation":None}),
@@ -491,19 +537,37 @@ def _eligible_hiring_manager(db, organization_id: UUID, user_id: UUID | None) ->
         User.organization_id == organization_id,
         User.id == user_id,
         User.status == UserStatus.ACTIVE,
-        exists().where(UserRole.user_id == User.id, UserRole.role == "hiring_manager"),
+        exists().where(
+            UserRole.user_id == User.id,
+            UserRole.role.in_(("hiring_manager", "recruiting_admin")),
+        ),
     ))))
 
 
-def _department_is_valid(db, organization_id: UUID, department_id: UUID | None) -> bool:
+def _department_is_valid(
+    db,
+    organization_id: UUID,
+    department_id: UUID | None,
+    *,
+    allow_inactive_id: UUID | None = None,
+) -> bool:
     return department_id is None or db.scalar(
         select(
             exists().where(
                 Department.organization_id == organization_id,
                 Department.id == department_id,
+                or_(Department.status == "active", Department.id == allow_inactive_id),
             )
         )
     )
+
+
+def _workflow_template_is_valid(db, organization_id: UUID, template_id: UUID | None) -> bool:
+    return template_id is None or bool(db.scalar(select(exists().where(
+        WorkflowTemplate.organization_id == organization_id,
+        WorkflowTemplate.id == template_id,
+        WorkflowTemplate.status == "active",
+    ))))
 
 
 def _application_data(item: Application) -> dict[str, Any]:
@@ -534,6 +598,10 @@ def create_job_definition(payload: JobDefinitionCommand, request: Request, idemp
             return problem(
                 request, 422, "department_invalid", "The department is invalid."
             )
+        if not _workflow_template_is_valid(
+            db, principal.organization_id, command["workflow_template_id"]
+        ):
+            return problem(request, 422, "workflow_template_invalid", "The workflow template is invalid.")
         if not _eligible_hiring_manager(db, principal.organization_id, command["hiring_owner_id"]):
             return problem(request, 422, "hiring_owner_invalid", "The hiring owner is invalid.")
         try:
@@ -584,8 +652,20 @@ def replace_job_definition(job_id: UUID, payload: JobDefinitionCommand, request:
             return value
     command = payload.model_dump()
     with request.app.state.identity_store.sync_session() as db:
-        if _load_job(db, principal, job_id, RecruitingAction.MANAGE_JOB) is None:
+        job = _load_job(db, principal, job_id, RecruitingAction.MANAGE_JOB)
+        if job is None:
             return _denied(request)
+        if not _department_is_valid(
+            db,
+            principal.organization_id,
+            command["department_id"],
+            allow_inactive_id=job.department_id,
+        ):
+            return problem(request, 422, "department_invalid", "The department is invalid.")
+        if not _workflow_template_is_valid(
+            db, principal.organization_id, command["workflow_template_id"]
+        ):
+            return problem(request, 422, "workflow_template_invalid", "The workflow template is invalid.")
         if not _eligible_hiring_manager(db, principal.organization_id, command["hiring_owner_id"]):
             return problem(request, 422, "hiring_owner_invalid", "The hiring owner is invalid.")
         try:
@@ -681,12 +761,17 @@ def get_workbench(request: Request, response: Response):
                 AUTH.job_predicate(principal, RecruitingAction.READ, Job),
             ).order_by(Application.updated_at.desc(), Application.id.desc())).all()
 
+            next_rounds = _next_interview_rounds(
+                db,
+                principal.organization_id,
+                [row.application_id for row in application_rows],
+            )
             for row in application_rows:
                 job = jobs_by_id[row.job_id]
                 stage = job["stages"][row.stage]
                 stage["count"] += 1
                 job["active_count"] += 1
-                item = _workbench_candidate_data(row)
+                item = _workbench_candidate_data(row, next_rounds.get(row.application_id))
                 if len(stage["items"]) < 5:
                     stage["items"].append(item)
                 task_action = WORKBENCH_TASK_ACTIONS.get(row.stage)
@@ -750,7 +835,10 @@ def list_job_owner_options(request: Request):
         rows = db.execute(select(User.id, User.display_name).where(
             User.organization_id == principal.organization_id,
             User.status == UserStatus.ACTIVE,
-            exists().where(UserRole.user_id == User.id, UserRole.role == "hiring_manager"),
+            exists().where(
+                UserRole.user_id == User.id,
+                UserRole.role.in_(("hiring_manager", "recruiting_admin")),
+            ),
         ).order_by(User.display_name.asc(), User.id.asc())).all()
         return {
             "data": [{"id": str(user_id), "name": display_name} for user_id, display_name in rows],
@@ -1298,7 +1386,28 @@ def resumes(candidate_id: UUID, request: Request):
             Resume.candidate_id == candidate_id,
             _resume_application_scope(principal, RecruitingAction.READ),
         ).order_by(Resume.version_number)).all()
-        return {"data": [{"id": str(row.id), "candidate_id": str(row.candidate_id), "version_number": row.version_number, "created_at": row.created_at.isoformat(), "profile": extract_resume_profile(row.parsed_text or "")} for row in rows], "meta": {"count": len(rows)}}
+        persisted = {
+            profile.resume_id: profile
+            for profile in db.scalars(select(ResumeProfile).where(
+                ResumeProfile.organization_id == principal.organization_id,
+                ResumeProfile.resume_id.in_([row.id for row in rows]),
+            )).all()
+        } if rows else {}
+        data = []
+        for row in rows:
+            stored = persisted.get(row.id)
+            profile = dict(stored.data) if stored is not None else extract_resume_profile(row.parsed_text or "", include_metadata=True)
+            profile = {
+                "summary": profile.get("summary"),
+                "summary_origin": profile.get("summary_origin"),
+                "skills": list(profile.get("skills") or []),
+                "experience": profile.get("experience"),
+                "education": profile.get("education"),
+                "status": stored.status if stored is not None else profile.get("status", "unavailable"),
+                "source": stored.source if stored is not None else "rules",
+            }
+            data.append({"id": str(row.id), "candidate_id": str(row.candidate_id), "version_number": row.version_number, "created_at": row.created_at.isoformat(), "profile": profile})
+        return {"data": data, "meta": {"count": len(rows)}}
 
 
 def _load_resume(db, principal: Principal, resume_id: UUID, action: RecruitingAction):
@@ -1431,9 +1540,11 @@ def applications(candidate_id: UUID, request: Request):
     with request.app.state.identity_store.sync_session() as db:
         if _load_candidate(db, principal, candidate_id) is None: return _denied(request)
         rows = db.execute(select(Application, Job.title).join(Job, and_(Job.organization_id == Application.organization_id, Job.id == Application.job_id)).where(Application.organization_id == principal.organization_id, Application.candidate_id == candidate_id, _job_scope(principal)).order_by(Application.created_at.desc())).all()
-        projections=_screening_projections_for_applications(db,principal.organization_id,[application.id for application,_ in rows])
+        application_ids = [application.id for application, _ in rows]
+        projections=_screening_projections_for_applications(db,principal.organization_id,application_ids)
+        next_rounds = _next_interview_rounds(db, principal.organization_id, application_ids)
         empty={"route_result":None,"ai_score":None,"ai_recommendation":None,"llm_status":None,"llm_error_code":None,"llm_evaluation":None}
-        return {"data": [{**_application_data(application), "job_title": job_title,**projections.get(application.id,empty)} for application, job_title in rows], "meta": {"count": len(rows)}}
+        return {"data": [{**_application_data(application), "job_title": job_title, "next_interview_round": next_rounds.get(application.id), **projections.get(application.id,empty)} for application, job_title in rows], "meta": {"count": len(rows)}}
 
 
 @router.post("/jobs/{job_id}/applications", status_code=201, response_model=ApplicationResource)

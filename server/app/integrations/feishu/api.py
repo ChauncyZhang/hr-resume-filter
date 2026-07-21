@@ -276,11 +276,19 @@ def oauth_callback(request: Request, code: str = Query(min_length=1, max_length=
                     user_id = user.id
                 else:
                     normalized_email = identity.email.strip().casefold() if identity.email else None
-                    invited = db.scalar(select(User).where(User.organization_id == organization_id, User.normalized_email == normalized_email, User.status == UserStatus.INVITED).with_for_update()) if normalized_email else None
-                    if invited is None:
+                    eligible = db.scalar(
+                        select(User)
+                        .where(
+                            User.organization_id == organization_id,
+                            User.normalized_email == normalized_email,
+                            User.status.in_([UserStatus.INVITED, UserStatus.ACTIVE]),
+                        )
+                        .with_for_update()
+                    ) if normalized_email else None
+                    if eligible is None:
                         return _app_redirect(error="feishu_account_not_invited_or_bound")
-                    invited.status = UserStatus.ACTIVE
-                    user_id = invited.id
+                    eligible.status = UserStatus.ACTIVE
+                    user_id = eligible.id
             if existing is not None and existing.user_id != user_id:
                 return problem(request, 409, "feishu_identity_already_bound", "The Feishu identity is already linked.")
             own_binding = db.scalar(select(FeishuIdentityBinding).where(FeishuIdentityBinding.organization_id == organization_id, FeishuIdentityBinding.user_id == user_id).with_for_update())

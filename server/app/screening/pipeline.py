@@ -5,7 +5,9 @@ from sqlalchemy import and_,func,select
 from server.app.queue.repository import QueueRepository
 from server.app.queue.service import PermanentJobError,RetryableJobError
 from server.app.governance.retention import recalculate_candidate_retention
-from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ScreeningRuleVersion
+from server.app.recruiting.models import Application,Candidate,FileObject,JobJdVersion,Resume,ResumeProfile,ScreeningRuleVersion
+from server.app.recruiting.profile_builder import PROFILE_VERSION,ProfileBuild,ResumeProfileBuilder
+from server.app.recruiting.resume_profile import extract_resume_profile
 from server.app.screening.actions import CandidateTombstoned,lock_candidate_screening_item
 from server.app.screening.models import ScreeningItem,ScreeningResult,ScreeningRun
 from server.app.screening.progress import aggregate_run
@@ -17,11 +19,13 @@ from server.app.screening.storage import StorageWriteFailed
 from server.app.llm.models import LlmProviderConfig,PromptVersion
 from server.app.llm.screening import SCREENING_SYSTEM_PROMPT
 from server.app.screening.routing import route_llm_screening_terminal
+from server.app.screening.document_quality import assess_text_quality
+from server.app.screening.resume_enrichment import EnrichedResumeText
 
 _RETRYABLE={"scanner_unavailable","scanner_error","storage_unavailable"}
 def _uuid(item_id,name): return uuid.uuid5(uuid.UUID(str(item_id)),name)
 _PROMPT_CONTENT={"system":SCREENING_SYSTEM_PROMPT,"schema_version":"screening-evaluation-v2"}
-_PROMPT_VERSION=2
+_PROMPT_VERSION=3
 def _ensure_screening_prompt(db,organization_id,created_by,*,content=None,version_number=_PROMPT_VERSION):
     prompt_content=dict(content or _PROMPT_CONTENT); prompt_hash=hashlib.sha256(json.dumps(prompt_content,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
     prompt_id=uuid.uuid5(uuid.UUID(str(organization_id)),f"screening-evaluation:{version_number}")
@@ -33,7 +37,11 @@ def _ensure_screening_prompt(db,organization_id,created_by,*,content=None,versio
     return prompt
 
 class ScreeningPipeline:
-    def __init__(self,sessions,storage,scanner,settings,parser=None): self.sessions,self.storage,self.scanner,self.settings=sessions,storage,scanner,settings; self.parser=parser or IsolatedParser(settings.parser_hard_timeout_seconds)
+    def __init__(self,sessions,storage,scanner,settings,parser=None,text_enhancer=None,profile_builder:ResumeProfileBuilder|None=None):
+        self.sessions,self.storage,self.scanner,self.settings=sessions,storage,scanner,settings
+        self.parser=parser or IsolatedParser(settings.parser_hard_timeout_seconds)
+        self.text_enhancer=text_enhancer
+        self.profile_builder=profile_builder
     def _limits(self):
         s=self.settings; return ParserLimits(s.parser_max_source_bytes,s.parser_max_text_chars,s.parser_pdf_max_pages,s.parser_docx_max_entries,s.parser_docx_max_uncompressed_bytes,s.parser_docx_max_compression_ratio)
     async def parse_item(self,job):
@@ -85,6 +93,36 @@ class ScreeningPipeline:
         except Exception: return await self._retry_or_finish(job,organization_id,item_id,"storage_unavailable","parse")
         finally:
             if stream is not None: stream.close()
+        if self.text_enhancer is not None:
+            enriched=await self.text_enhancer.enhance(
+                organization_id,
+                storage_key=key,
+                filename=filename,
+                mime_type=mime,
+                native_text=parsed.text,
+            )
+        else:
+            assessment=assess_text_quality(parsed.text)
+            enriched=EnrichedResumeText(parsed.text,assessment,False)
+        with self.sessions() as db:
+            run_context=db.scalar(select(ScreeningRun).where(ScreeningRun.organization_id==organization_id,ScreeningRun.id==item.run_id))
+            if run_context is None: raise PermanentJobError("screening_item_missing")
+            job_id=run_context.job_id
+        candidate_name=(PurePath(filename).stem[:200] or "Candidate")
+        if self.profile_builder is not None:
+            profile=await self.profile_builder.build(
+                organization_id,
+                job_id=job_id,
+                resume_text=enriched.text,
+                candidate_name=candidate_name,
+                used_ocr=enriched.used_ocr,
+                trace_id=getattr(job,"trace_id",None),
+            )
+        else:
+            profile_data=extract_resume_profile(enriched.text,include_metadata=True)
+            profile_source="ocr_rules" if enriched.used_ocr else "rules"
+            profile_data["source"]=profile_source
+            profile=ProfileBuild(profile_data,str(profile_data["status"]),profile_source)
         with self.sessions() as db:
             try: candidate,item,blocked=lock_candidate_screening_item(db,organization_id,item_id,candidate_id,allow_unassociated=True,allow_missing_candidate=True,allow_blocked=True)
             except CandidateTombstoned: raise PermanentJobError("screening_item_missing") from None
@@ -94,14 +132,26 @@ class ScreeningPipeline:
                 item.status="cancelled"; item.safe_error_code="candidate_unavailable"; item.finished_at=item.finished_at or datetime.now(timezone.utc)
                 self._aggregate(db,run); db.commit(); return
             resume_id,application_id=_uuid(item.id,"resume"),_uuid(item.id,"application")
-            candidate=candidate or Candidate(id=candidate_id,organization_id=organization_id,display_name=(PurePath(filename).stem[:200] or "Candidate"),owner_id=run.created_by)
+            candidate=candidate or Candidate(id=candidate_id,organization_id=organization_id,display_name=candidate_name,owner_id=run.created_by)
             if candidate not in db: db.add(candidate)
-            resume=db.get(Resume,resume_id) or Resume(id=resume_id,organization_id=organization_id,candidate_id=candidate_id,file_object_id=item.file_object_id,version_number=1,parsed_text=parsed.text)
+            resume=db.get(Resume,resume_id) or Resume(id=resume_id,organization_id=organization_id,candidate_id=candidate_id,file_object_id=item.file_object_id,version_number=1,parsed_text=enriched.text)
             if resume not in db: db.add(resume)
+            resume_profile=db.scalar(select(ResumeProfile).where(ResumeProfile.organization_id==organization_id,ResumeProfile.resume_id==resume_id))
+            if resume_profile is None:
+                db.add(ResumeProfile(
+                    id=_uuid(item.id,"resume-profile"),
+                    organization_id=organization_id,
+                    resume_id=resume_id,
+                    data=profile.data,
+                    status=profile.status,
+                    source=profile.source,
+                    profile_version=PROFILE_VERSION,
+                    safe_error_code=profile.safe_error_code or enriched.safe_error_code,
+                ))
             application=db.get(Application,application_id) or Application(id=application_id,organization_id=organization_id,candidate_id=candidate_id,job_id=run.job_id,resume_id=resume_id,owner_id=run.created_by,stage="new",source="screening")
             if application not in db:
                 db.add(application); db.flush(); recalculate_candidate_retention(db,organization_id,candidate_id)
-            item.candidate_id=candidate_id; item.resume_id=resume_id; item.application_id=application_id; item.status="parsed"; item.parser_version=parsed.parser_version; item.parse_quality=parsed.quality; item.safe_error_code=None
+            item.candidate_id=candidate_id; item.resume_id=resume_id; item.application_id=application_id; item.status="parsed"; item.parser_version=parsed.parser_version; item.parse_quality=enriched.assessment.quality; item.safe_error_code=None
             QueueRepository(db).enqueue(organization_id,"screening.score_item",{"organization_id":str(organization_id),"screening_item_id":str(item.id),"jd_version_id":str(run.jd_version_id),"rule_version_id":str(run.rule_version_id),"rule_engine_version":ENGINE_VERSION},dedupe_key=f"score:{item.id}",trace_id=getattr(job,"trace_id",None),max_attempts=3); run.status="rule_scoring"; db.commit()
     async def score_item(self,job):
         organization_id=uuid.UUID(str(job.payload["organization_id"])); item_id=uuid.UUID(str(job.payload["screening_item_id"]))

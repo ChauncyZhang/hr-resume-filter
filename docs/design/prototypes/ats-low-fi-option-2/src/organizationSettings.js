@@ -23,8 +23,27 @@ function normalizeDepartment(value) {
     id: safeString(value?.id),
     name: safeString(value?.name),
     parentId: safeString(value?.parent_id) || null,
+    status: value?.status === "inactive" ? "inactive" : "active",
     memberCount: safeCount(value?.member_count),
     jobCount: safeCount(value?.job_count),
+  };
+}
+
+function normalizeDepartmentDetail(value) {
+  const department = normalizeDepartment(value);
+  return {
+    ...department,
+    members: Array.isArray(value?.members) ? value.members.map((member) => ({
+      id: safeString(member?.id),
+      name: safeString(member?.name),
+      roles: Array.isArray(member?.roles) ? member.roles.map((role) => ROLE_LABELS.get(role) || safeString(role)).filter(Boolean) : [],
+      status: member?.status === "active" ? "启用" : member?.status === "invited" ? "待激活" : "停用",
+    })).filter((member) => member.id) : [],
+    jobs: Array.isArray(value?.jobs) ? value.jobs.map((job) => ({
+      id: safeString(job?.id),
+      name: safeString(job?.title),
+      status: safeString(job?.status),
+    })).filter((job) => job.id) : [],
   };
 }
 
@@ -51,7 +70,7 @@ export function getInviteRoleOptions(currentRole) {
 }
 
 export function createOrganizationSettingsController({ client = apiClient, createIdempotencyKey = () => globalThis.crypto.randomUUID() } = {}) {
-  let state = Object.freeze({ status: "idle", users: [], departments: [], error: "", actionStatus: "idle", actionError: "", invitation: null });
+  let state = Object.freeze({ status: "idle", users: [], departments: [], error: "", actionStatus: "idle", actionError: "", invitation: null, departmentDetailStatus: "idle", departmentDetail: null });
   const listeners = new Set();
   const setState = (next) => {
     state = Object.freeze(next);
@@ -100,6 +119,41 @@ export function createOrganizationSettingsController({ client = apiClient, creat
         throw error;
       }
     },
+    async loadDepartment(id) {
+      patchState({ departmentDetailStatus: "loading", departmentDetail: null, actionError: "" });
+      try {
+        const departmentDetail = normalizeDepartmentDetail(await client.getDepartment(id));
+        patchState({ departmentDetailStatus: "ready", departmentDetail });
+        return departmentDetail;
+      } catch (error) {
+        patchState({ departmentDetailStatus: "error", departmentDetail: null, actionError: "部门详情加载失败，请稍后重试。" });
+        throw error;
+      }
+    },
+    async updateDepartment(id, changes) {
+      patchState({ actionStatus: "saving", actionError: "" });
+      try {
+        const departmentDetail = normalizeDepartmentDetail(await client.updateDepartment(id, changes));
+        patchState({
+          actionStatus: "success",
+          departmentDetailStatus: "ready",
+          departmentDetail,
+          departments: state.departments.map((department) => department.id === departmentDetail.id ? {
+            id: departmentDetail.id,
+            name: departmentDetail.name,
+            parentId: departmentDetail.parentId,
+            status: departmentDetail.status,
+            memberCount: departmentDetail.memberCount,
+            jobCount: departmentDetail.jobCount,
+          } : department),
+        });
+        return departmentDetail;
+      } catch (error) {
+        patchState({ actionStatus: "error", actionError: error?.kind === "unavailable" ? "部门暂时无法更新，请稍后重试。" : "部门更新失败，请核对名称后重试。" });
+        throw error;
+      }
+    },
+    clearDepartment() { patchState({ departmentDetailStatus: "idle", departmentDetail: null, actionError: "", actionStatus: "idle" }); },
     dismissInvitation() { patchState({ invitation: null, actionStatus: "idle", actionError: "" }); },
   };
 }

@@ -40,6 +40,7 @@ class Organization(Timestamped, Base):
 class Department(Timestamped, Base):
     __tablename__ = "departments"
     __table_args__ = (
+        CheckConstraint("status IN ('active','inactive')", name="ck_departments_status"),
         UniqueConstraint(
             "organization_id", "parent_id", "name", postgresql_nulls_not_distinct=True
         ),
@@ -52,6 +53,24 @@ class Department(Timestamped, Base):
     organization_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     parent_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     name: Mapped[str] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(String(16), default="active")
+
+
+class WorkflowTemplate(Timestamped, Base):
+    __tablename__ = "workflow_templates"
+    __table_args__ = (
+        CheckConstraint("status IN ('active','inactive')", name="ck_workflow_templates_status"),
+        CheckConstraint("version >= 1", name="ck_workflow_templates_version"),
+        UniqueConstraint("organization_id", "id"),
+        UniqueConstraint("organization_id", "name"),
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    name: Mapped[str] = mapped_column(String(200))
+    rounds: Mapped[list[str]] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(16), default="active")
+    version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class User(Timestamped, Base):
@@ -144,6 +163,7 @@ class Job(Timestamped, Base):
     headcount: Mapped[int] = mapped_column(Integer, default=1)
     priority: Mapped[str] = mapped_column(String(16), default="normal")
     hiring_owner_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    workflow_template_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
     owner_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     status: Mapped[str] = mapped_column(String(32), default="draft")
     version: Mapped[int] = mapped_column(Integer, default=1)
@@ -160,6 +180,10 @@ class Job(Timestamped, Base):
         ForeignKeyConstraint(
             ["organization_id", "hiring_owner_id"],
             ["users.organization_id", "users.id"],
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "workflow_template_id"],
+            ["workflow_templates.organization_id", "workflow_templates.id"],
         ),
     )
 

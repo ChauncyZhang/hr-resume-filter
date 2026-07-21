@@ -214,10 +214,11 @@ def test_workbench_contract_filters_terminal_rows_and_caps_newest_items(tmp_path
         "display_name",
         "current_title",
         "location",
-        "source",
-        "stage",
-        "updated_at",
-    }
+            "source",
+            "stage",
+            "updated_at",
+            "next_interview_round",
+        }
     assert "must not be returned" not in response.text
     assert "Candidate 50" not in response.text
     assert body["data"]["interviews"] == {
@@ -289,7 +290,7 @@ def test_workbench_review_tasks_are_persisted_open_and_principal_assigned(tmp_pa
     assert review["items"]==[{
         "application_id":str(assigned.id),"candidate_id":str(assigned.candidate_id),"job_id":str(job.id),
         "display_name":"Candidate 1","current_title":"Title 1","location":"Location 1","source":"source-1",
-        "stage":"review","updated_at":(base+timedelta(hours=3)).replace(tzinfo=None).isoformat(),"task_id":str(tasks[0].id),
+        "stage":"review","updated_at":(base+timedelta(hours=3)).replace(tzinfo=None).isoformat(),"next_interview_round":None,"task_id":str(tasks[0].id),
         "ai_status":"failed","config_warning":False,
         "candidate_link":f"/candidates/{assigned.candidate_id}?tab=evidence&application={assigned.id}&job={job.id}",
     }]
@@ -427,7 +428,9 @@ def test_workbench_query_count_is_bounded(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 200
     selects = [statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]
-    assert len(selects) <= 3
+    # The workbench uses three base queries plus two bounded batch queries for
+    # workflow templates and completed interview rounds.
+    assert len(selects) <= 5
 
 
 def test_workbench_openapi_enforces_bounded_non_sensitive_contract(tmp_path) -> None:

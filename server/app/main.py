@@ -150,10 +150,13 @@ def create_app(
     llm_key=settings.llm_config_encryption_key.get_secret_value()
     if llm_key=="change-me": llm_key="QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
     app.state.llm_key_cipher=ApiKeyCipher(llm_key.encode())
+    app.state.ocr_key_cipher=app.state.llm_key_cipher
     from server.app.llm.registry import DatabaseProviderCatalog
     deployed_llm_allowlist=ProviderAllowlist(settings.llm_provider_allowlist,allow_http=settings.environment!="production")
     app.state.llm_allowlist=DatabaseProviderCatalog(app.state.identity_store.sync_session,deployed_llm_allowlist,allow_http=settings.environment!="production")
     app.state.llm_gateway=OpenAiCompatibleGateway(app.state.llm_allowlist)
+    from server.app.ocr.gateway import OcrGateway
+    app.state.ocr_gateway=OcrGateway()
     from server.app.integrations.feishu.provider import HttpFeishuProvider
     from server.app.integrations.feishu.service import FeishuSecretCipher
     feishu_key = settings.feishu_config_encryption_key.get_secret_value()
@@ -175,6 +178,8 @@ def create_app(
     app.include_router(screening_router)
     from server.app.llm.api import router as llm_router
     app.include_router(llm_router)
+    from server.app.ocr.api import router as ocr_router
+    app.include_router(ocr_router)
     from server.app.interviews.api import router as interview_router
     app.include_router(interview_router)
     app.include_router(talent_router)

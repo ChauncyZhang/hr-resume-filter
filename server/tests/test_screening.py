@@ -47,6 +47,7 @@ def test_rule_weights_are_exactly_75_15_10(jd: str, resume: str, score: int, rec
     assert result.score == score
     assert result.recommendation == recommendation
 
+
 def test_rule_snapshot_overrides_are_immutable_validated_and_change_results() -> None:
     first=RuleSnapshot.from_content("required: Python",{"required_terms":["Python"],"bonus_terms":["Docker"]})
     second=RuleSnapshot.from_content("required: Python",{"required_terms":["Rust"],"bonus_terms":[]})
@@ -68,6 +69,14 @@ def docx_bytes(text: str) -> bytes:
     stream = io.BytesIO(); document = Document(); document.add_paragraph(text); document.save(stream); return stream.getvalue()
 
 
+def table_docx_bytes() -> bytes:
+    from docx import Document
+    stream = io.BytesIO(); document = Document(); table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "个人总结"; table.cell(0, 1).text = "负责企业级 AI 平台交付"
+    table.cell(1, 0).text = "教育经历"; table.cell(1, 1).text = "2018-2022 某大学 本科"
+    document.save(stream); return stream.getvalue()
+
+
 def pdf_bytes(*, pages: int = 1, encrypted: bool = False) -> bytes:
     from pypdf import PdfWriter
     stream = io.BytesIO(); writer = PdfWriter()
@@ -81,8 +90,19 @@ def test_parser_happy_paths_use_stable_versions_and_quality() -> None:
     docx = parse_document(io.BytesIO(docx_bytes("Python 后端")), extension=".docx", mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     pdf = parse_document(io.BytesIO(pdf_bytes()), extension=".pdf", mime_type="application/pdf")
     assert txt.text == "中文 Python 5年" and txt.parser_version == "txt-v1" and txt.quality == "good"
-    assert "Python 后端" in docx.text and docx.parser_version == "docx-v1"
-    assert pdf.parser_version == "pdf-v3" and pdf.quality == "empty"
+    assert "Python 后端" in docx.text and docx.parser_version == "docx-v2"
+    assert pdf.parser_version == "pdf-v4" and pdf.quality == "empty"
+
+
+def test_docx_parser_reads_table_content_in_document_order() -> None:
+    parsed = parse_document(
+        io.BytesIO(table_docx_bytes()),
+        extension=".docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    assert parsed.parser_version == "docx-v2"
+    assert parsed.text.splitlines() == ["个人总结", "负责企业级 AI 平台交付", "教育经历", "2018-2022 某大学 本科"]
 
 
 def test_pdf_parser_removes_repeated_standalone_obfuscation_markers(monkeypatch) -> None:
@@ -107,7 +127,7 @@ def test_pdf_parser_removes_repeated_standalone_obfuscation_markers(monkeypatch)
 
     parsed = parse_document(io.BytesIO(b"%PDF-test"), extension=".pdf", mime_type="application/pdf")
 
-    assert parsed.parser_version == "pdf-v3"
+    assert parsed.parser_version == "pdf-v4"
     assert marker not in parsed.text
     assert single_identifier in parsed.text
 
@@ -145,6 +165,44 @@ def test_pdf_parser_reconstructs_two_column_reading_order(monkeypatch) -> None:
     assert parsed.text.index("个人优势") < parsed.text.index("熟练全盘账务处理。")
     assert parsed.text.index("工作经历") < parsed.text.index("某科技公司 财务经理 2018.08-至今")
     assert parsed.text.index("教育经历") < parsed.text.index("四川大学 大专 会计 1996-1998")
+
+
+def test_pdf_parser_uses_plain_order_when_coordinates_are_anomalous(monkeypatch) -> None:
+    class MediaBox:
+        width = 600
+        height = 840
+
+    class Page:
+        mediabox = MediaBox()
+
+        def extract_text(self, visitor_text=None) -> str:
+            if visitor_text is not None:
+                fragments = (
+                    ("2024年09月", 0, 0),
+                    ("2022年09月", 0, 0),
+                    ("2020年09月", 0, 0),
+                    ("个人总结", 40, 180),
+                    ("具备 Agent 工程经验。", 40, 205),
+                    ("教育经历", 40, 900),
+                    ("2022年09月-2024年06月 某大学 硕士", 680, 930),
+                )
+                for text, x, y in fragments:
+                    visitor_text(text, [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, x, y], None, 13)
+            return "个人总结\n具备 Agent 工程经验。\n教育经历\n2022年09月-2024年06月 某大学 硕士"
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page()]
+
+        def __init__(self, _stream, strict: bool) -> None:
+            assert strict is True
+
+    monkeypatch.setattr("pypdf.PdfReader", Reader)
+
+    parsed = parse_document(io.BytesIO(b"%PDF-test"), extension=".pdf", mime_type="application/pdf")
+
+    assert parsed.text.splitlines()[0] == "个人总结"
+    assert "2024年09月2022年09月" not in parsed.text
 
 
 @pytest.mark.parametrize(("extension", "mime", "data", "code"), [

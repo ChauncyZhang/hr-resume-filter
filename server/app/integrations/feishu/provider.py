@@ -278,14 +278,52 @@ class HttpFeishuProvider:
     def batch_freebusy(self, credentials: FeishuCredentials, request: FreeBusyRequest) -> tuple[BusyWindow, ...]:
         if len(request.user_ids) > MAX_FREEBUSY_USERS or request.time_max - request.time_min > MAX_FREEBUSY_RANGE:
             raise ValueError("freebusy provider request exceeds Feishu limits")
-        payload = self._json("POST", f"{OPEN_API_BASE}/calendar/v4/freebusy/batch?user_id_type=open_id", headers=self._headers(credentials), json={"time_min": request.time_min.isoformat(), "time_max": request.time_max.isoformat(), "user_ids": list(request.user_ids), "only_busy": True})
-        rows = payload.get("data", {}).get("freebusy_list", [])
+        payload = self._json(
+            "POST",
+            f"{OPEN_API_BASE}/calendar/v4/freebusy/batch?user_id_type=open_id",
+            headers=self._headers(credentials),
+            json={
+                "time_min": request.time_min.isoformat(),
+                "time_max": request.time_max.isoformat(),
+                "user_ids": list(request.user_ids),
+                "include_external_calendar": True,
+                "only_busy": True,
+                "need_rsvp_status": True,
+            },
+        )
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise FeishuProviderError("feishu_response_invalid", retryable=False)
+        if "freebusy_lists" in data:
+            rows = data["freebusy_lists"]
+            items_key = "freebusy_items"
+        elif "freebusy_list" in data:
+            rows = data["freebusy_list"]
+            items_key = "freebusy"
+        else:
+            raise FeishuProviderError("feishu_response_invalid", retryable=False)
+        if not isinstance(rows, list):
+            raise FeishuProviderError("feishu_response_invalid", retryable=False)
         windows: list[BusyWindow] = []
-        for row in rows if isinstance(rows, list) else []:
-            user_id = row.get("user_id") if isinstance(row, dict) else None
-            for item in row.get("freebusy", []) if isinstance(row, dict) else []:
-                if isinstance(user_id, str) and isinstance(item, dict):
-                    windows.append(BusyWindow(user_id, datetime.fromisoformat(item["start_time"]), datetime.fromisoformat(item["end_time"])))
+        try:
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("user_id"), str):
+                    raise ValueError
+                items = row.get(items_key)
+                if not isinstance(items, list):
+                    raise ValueError
+                for item in items:
+                    if not isinstance(item, dict):
+                        raise ValueError
+                    if item.get("rsvp_status") in {"decline", "declined"}:
+                        continue
+                    starts_at = datetime.fromisoformat(str(item["start_time"]).replace("Z", "+00:00"))
+                    ends_at = datetime.fromisoformat(str(item["end_time"]).replace("Z", "+00:00"))
+                    if starts_at.tzinfo is None or ends_at.tzinfo is None or ends_at <= starts_at:
+                        raise ValueError
+                    windows.append(BusyWindow(row["user_id"], starts_at, ends_at))
+        except (KeyError, TypeError, ValueError):
+            raise FeishuProviderError("feishu_response_invalid", retryable=False) from None
         return tuple(windows)
 
     def create_event(self, credentials: FeishuCredentials, request: CalendarEventRequest, *, idempotency_key: str) -> CalendarEvent:

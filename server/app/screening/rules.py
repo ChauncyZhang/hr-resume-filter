@@ -8,7 +8,7 @@ MAX_RULE_TERMS = 50
 MAX_RULE_TERM_CHARS = 100
 TYPED_RULE_KEYS = frozenset({"must_have", "nice_to_have"})
 LEGACY_RULE_KEYS = frozenset({"required_terms", "bonus_terms"})
-_TYPED_JD_KEYS = frozenset({"description", "location", "process_template", "llm_enabled"})
+_TYPED_JD_KEYS = frozenset({"description", "location", "process_template", "workflow_template_id", "llm_enabled"})
 
 
 def normalize_rule_content(content: object) -> dict[str,list[str]]:

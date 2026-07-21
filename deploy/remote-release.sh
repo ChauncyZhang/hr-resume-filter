@@ -203,8 +203,6 @@ if ! verify_release_runtime "$release_dir"; then
     exit 1
 fi
 
-ln -sfn "$release_dir" "$app_root/current.new"
-mv -Tf "$app_root/current.new" "$app_root/current"
 frontend_image_id=$(docker image inspect --format '{{.Id}}' "$frontend_image")
 {
     printf 'release=%s\n' "$release"
@@ -220,6 +218,8 @@ frontend_image_id=$(docker image inspect --format '{{.Id}}' "$frontend_image")
     printf 'previous_release=%s\n' "$previous_release"
     printf 'deployed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$release_dir/deploy/release-info.txt"
+ln -sfn "$release_dir" "$app_root/current.new"
+mv -Tf "$app_root/current.new" "$app_root/current"
 
 rm -f "$staging/source.tar.gz" "$staging/frontend-image.tar" "$staging/app-image.tar"
 rmdir "$staging" 2>/dev/null || true

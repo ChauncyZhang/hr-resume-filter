@@ -26,6 +26,11 @@ class CandidateUnavailable(InvalidStateTransition): pass
 def _job_definition_contents(command):
     try:
         jd_content={key:command[key] for key in ("description","location","process_template","llm_enabled")}
+        jd_content["workflow_template_id"] = (
+            str(command["workflow_template_id"])
+            if command.get("workflow_template_id") is not None
+            else None
+        )
         rule_content={key:command[key] for key in ("must_have","nice_to_have")}
     except (KeyError,TypeError) as error:
         raise RuleSnapshotError from error
@@ -322,6 +327,7 @@ def create_job_definition_record(db, organization_id, actor_user_id, command, *,
         owner_id=actor_user_id,
         status="open" if command["publish"] else "draft",
         **{key: command[key] for key in ("title", "department_id", "headcount", "priority", "hiring_owner_id")},
+        workflow_template_id=command["workflow_template_id"],
     )
     db.add(job)
     db.flush()
@@ -366,6 +372,7 @@ def replace_job_definition_record(db, organization_id, job_id, actor_user_id, co
     source_status = job.status
     for key in ("title", "department_id", "headcount", "priority", "hiring_owner_id"):
         setattr(job, key, command[key])
+    job.workflow_template_id = command["workflow_template_id"]
     db.execute(delete(JobCollaborator).where(
         JobCollaborator.organization_id == organization_id,
         JobCollaborator.job_id == job_id,

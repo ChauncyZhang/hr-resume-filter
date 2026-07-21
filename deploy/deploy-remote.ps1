@@ -154,17 +154,22 @@ try {
     if ($Scope -eq "all") {
         Invoke-Native docker save -o $appArchive $appImage
     }
-    Invoke-Native tar -czf $sourceArchive `
-        --exclude=.git `
-        --exclude=.worktrees `
-        --exclude=.tmp `
-        --exclude=.pytest_cache `
-        --exclude=.superpowers `
-        --exclude=node_modules `
-        --exclude=dist `
-        "--exclude=.venv*" `
-        --exclude=__pycache__ `
-        -C $repositoryRoot .
+    Push-Location $localStaging
+    try {
+        Invoke-Native tar -czf "source.tar.gz" `
+            --exclude=.git `
+            --exclude=.worktrees `
+            --exclude=.tmp `
+            --exclude=.pytest_cache `
+            --exclude=.superpowers `
+            --exclude=node_modules `
+            --exclude=dist `
+            "--exclude=.venv*" `
+            --exclude=__pycache__ `
+            -C $repositoryRoot .
+    } finally {
+        Pop-Location
+    }
 
     $sourceSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceArchive).Hash.ToLowerInvariant()
     Invoke-Native ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost "mkdir -p '$remoteStaging'"

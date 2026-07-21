@@ -206,7 +206,7 @@ test("checks conflicts, transitions, downloads calendar, and lists my tasks", as
   const downloaded = await controller.downloadCalendar(INTERVIEW_ID, { signal });
   const tasks = await controller.listMyTasks({ signal });
 
-  assert.deepEqual(conflicts, { hard: [INTERVIEW_ID], soft: [] });
+  assert.deepEqual(conflicts, { hard: [INTERVIEW_ID], soft: [], calendarHard: [], calendarSoft: [], unconfirmed: [] });
   assert.equal(transitioned.status, "已确认");
   assert.equal(downloaded, calendar);
   assert.equal(tasks[0].interviewId, INTERVIEW_ID);
@@ -313,7 +313,7 @@ test("checks a new schedule through the application-scoped conflict endpoint", a
     participantIds: [USER_ID],
   });
 
-  assert.deepEqual(result, { hard: [], soft: [INTERVIEW_ID] });
+  assert.deepEqual(result, { hard: [], soft: [INTERVIEW_ID], calendarHard: [], calendarSoft: [], unconfirmed: [] });
   assert.deepEqual(calls, [{
     kind: "request",
     path: "/api/v1/interview-conflicts",

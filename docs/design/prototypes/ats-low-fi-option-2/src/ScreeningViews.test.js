@@ -498,6 +498,8 @@ test("server candidate detail exposes the connected interview path and reports c
   assert.deepEqual(candidateHelpers.candidateWorkflowActions("待安排", "HR 招聘专员"), []);
   assert.equal(candidateHelpers.candidateNextStep("面试中"), "等待面试官提交反馈");
   assert.equal(candidateHelpers.canScheduleCandidateInterview("待安排", "HR 招聘专员", true), true);
+  assert.equal(candidateHelpers.canScheduleCandidateInterview("待决策", "HR 招聘专员", true), true);
   assert.equal(candidateHelpers.canScheduleCandidateInterview("待复核", "HR 招聘专员", true), false);
   assert.equal(candidateHelpers.canScheduleCandidateInterview("待安排", "用人经理", true), false);
+  assert.equal(candidateHelpers.canScheduleCandidateInterview("已通过", "HR 招聘专员", true), false);
 });

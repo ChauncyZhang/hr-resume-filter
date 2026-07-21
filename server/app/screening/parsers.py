@@ -1,4 +1,6 @@
 import io
+import math
+import re
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -6,6 +8,7 @@ from typing import BinaryIO
 
 from server.app.queue.service import normalize_safe_code
 from server.app.resume_text import is_obfuscation_marker, normalize_resume_line, sanitize_resume_text
+from server.app.screening.structured_pdf import StructuredPdfError, extract_structured_pdf
 
 @dataclass(frozen=True)
 class ParserLimits:
@@ -82,6 +85,26 @@ def _pdf_page_text(page) -> str:
             fragments.append({"text": value, "x": float(tm[4]), "y": float(tm[5]), "order": len(fragments)})
 
     fallback = page.extract_text(visitor_text=visitor) or ""
+    plain_text = sanitize_resume_text(fallback)
+    page_box = getattr(page, "mediabox", None)
+    page_width = float(getattr(page_box, "width", 600) or 600)
+    page_height = float(getattr(page_box, "height", 800) or 800)
+    outside = sum(
+        float(fragment["x"]) < -12
+        or float(fragment["x"]) > page_width * 1.08
+        or float(fragment["y"]) < -12
+        or float(fragment["y"]) > page_height * 1.08
+        for fragment in fragments
+    )
+    origin_dates = sum(
+        abs(float(fragment["x"])) <= 2
+        and abs(float(fragment["y"])) <= 2
+        and re.search(r"(?:19|20)\d{2}\s*年?\s*\d{0,2}", str(fragment["text"])) is not None
+        for fragment in fragments
+    )
+    if fragments and (outside >= max(2, math.ceil(len(fragments) * 0.12)) or origin_dates >= 3):
+        return plain_text
+
     marker_counts = Counter(str(fragment["text"]) for fragment in fragments if is_obfuscation_marker(str(fragment["text"])))
     repeated_markers = {value for value, count in marker_counts.items() if count >= 2}
     fragments = [fragment for fragment in fragments if str(fragment["text"]) not in repeated_markers]
@@ -107,7 +130,6 @@ def _pdf_page_text(page) -> str:
     starts = sorted({round(float(row["x"]), 1) for row in ordered_rows if float(row["x"]) >= 0})
     split: float | None = None
     widest_gap = 0.0
-    page_width = float(getattr(getattr(page, "mediabox", None), "width", 600))
     minimum_gap = page_width * 0.18
     for left, right in zip(starts, starts[1:]):
         gap = right - left
@@ -123,25 +145,82 @@ def _pdf_page_text(page) -> str:
     ))
     return sanitize_resume_text("\n".join(str(row["text"]) for row in ordered_rows if row["text"]))
 
+def _pdf_fallback(reader, limits: ParserLimits) -> ParsedDocument:
+    text = _bounded(sanitize_resume_text("\n".join(_pdf_page_text(page) for page in reader.pages)), limits)
+    return ParsedDocument(text, "pdf-v4", "good" if text.strip() else "empty")
+
+
 def _pdf(data: bytes, limits: ParserLimits) -> ParsedDocument:
     from pypdf import PdfReader
+    reader = None
     try:
         reader = PdfReader(io.BytesIO(data), strict=True)
         if reader.is_encrypted: raise ParserError("pdf_encrypted")
         if len(reader.pages) > limits.pdf_max_pages: raise ParserError("pdf_page_limit")
-        text = _bounded(sanitize_resume_text("\n".join(_pdf_page_text(page) for page in reader.pages)), limits)
     except ParserError: raise
-    except Exception: raise ParserError("pdf_malformed") from None
-    return ParsedDocument(text, "pdf-v3", "good" if text.strip() else "empty")
+    except Exception:
+        reader = None
+
+    try:
+        structured = extract_structured_pdf(
+            data,
+            max_source_bytes=limits.max_source_bytes,
+            max_text_chars=limits.max_text_chars,
+            max_pages=limits.pdf_max_pages,
+        )
+        structured = _bounded(sanitize_resume_text(structured), limits)
+        if structured.strip():
+            return ParsedDocument(structured, "pdf-pymupdf4llm-v1", "good")
+    except StructuredPdfError as error:
+        if error.safe_code in {"pdf_encrypted", "pdf_page_limit"}:
+            raise ParserError(error.safe_code) from None
+    except Exception:
+        pass
+    if reader is None:
+        raise ParserError("pdf_malformed")
+    try:
+        return _pdf_fallback(reader, limits)
+    except ParserError:
+        raise
+    except Exception:
+        raise ParserError("pdf_malformed") from None
+
+
+def _docx_blocks(document) -> list[str]:
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+
+    values: list[str] = []
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            value = normalize_resume_line(Paragraph(child, document).text)
+            if value:
+                values.append(value)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, document)
+            seen_cells: set[object] = set()
+            for row in table.rows:
+                for cell in row.cells:
+                    cell_key = cell._tc
+                    if cell_key in seen_cells:
+                        continue
+                    seen_cells.add(cell_key)
+                    for paragraph in cell.paragraphs:
+                        value = normalize_resume_line(paragraph.text)
+                        if value:
+                            values.append(value)
+    return values
 
 def _docx(data: bytes, limits: ParserLimits) -> ParsedDocument:
     try:
         _docx_preflight(data,limits)
         from docx import Document
-        document = Document(io.BytesIO(data)); text = _bounded("\n".join(paragraph.text for paragraph in document.paragraphs), limits)
+        document = Document(io.BytesIO(data)); text = _bounded(sanitize_resume_text("\n".join(_docx_blocks(document))), limits)
     except ParserError: raise
     except (zipfile.BadZipFile, KeyError, ValueError): raise ParserError("docx_malformed") from None
-    return ParsedDocument(text, "docx-v1", "good" if text.strip() else "empty")
+    return ParsedDocument(text, "docx-v2", "good" if text.strip() else "empty")
 
 def _txt(data: bytes, limits: ParserLimits) -> ParsedDocument:
     if b"\x00" in data or (data and sum(byte < 9 or 13 < byte < 32 for byte in data) / len(data) > .02): raise ParserError("binary_text_rejected")

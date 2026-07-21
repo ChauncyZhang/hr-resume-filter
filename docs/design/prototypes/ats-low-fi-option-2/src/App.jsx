@@ -1064,7 +1064,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
               </div>}
               {canPerformAction(currentRole, "安排面试") && <div className="rail-group">
                 <div className="rail-group-title"><span className="status-dot orange" />待安排面试（{workbenchTasks.interviewPending.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待安排" }))}>查看全部</button></div>
-                {workbenchTasks.interviewPending.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
+                {workbenchTasks.interviewPending.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openScheduleInterview(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.nextRound ? `安排${candidate.nextRound}` : "安排面试"}</small></button>)}
                 {workbenchTasks.interviewPending.count === 0 && <p>暂无待安排面试</p>}
               </div>}
               {canPerformAction(currentRole, "确认录用决策") && <div className="rail-group compact">
@@ -1106,6 +1106,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
             onDraftChange={(draft) => writeJobCreateDraft(window.sessionStorage, jobDraftUserId, draft)}
             onDraftClear={() => clearJobCreateDraft(window.sessionStorage, jobDraftUserId)}
             onManageDepartments={() => navigate(settingsPath("组织与权限", "部门", location.pathname + location.search))}
+            onManageTemplates={() => navigate(settingsPath("流程与评价模板", "招聘流程", location.pathname + location.search))}
             pageActionHost={pageActionHost}
             onCreateJob={canPerformAction(currentRole, "新建职位") ? openJobForm : null}
           />

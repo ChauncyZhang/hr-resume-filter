@@ -154,6 +154,7 @@ function normalizeDefinition(resource, funnel) {
     jd: safeString(jd?.description),
     location: safeString(jd?.location),
     process: safeString(jd?.process_template),
+    workflowTemplateId: safeUuid(jd?.workflow_template_id),
     llmEnabled: jd?.llm_enabled === true,
     mustHave: safeArray(rules?.must_have).filter((item) => typeof item === "string"),
     niceToHave: safeArray(rules?.nice_to_have).filter((item) => typeof item === "string"),
@@ -228,6 +229,7 @@ function definitionCommand(values, job, publish) {
     description: safeString(values?.jd).trim(),
     location: safeString(values?.location).trim(),
     process_template: safeString(values?.process).trim(),
+    workflow_template_id: safeUuid(values?.workflowTemplateId) || null,
     llm_enabled: values?.llmEnabled === true,
     must_have: normalizeRules(values?.mustHave),
     nice_to_have: normalizeRules(values?.niceToHave),
@@ -237,7 +239,13 @@ function definitionCommand(values, job, publish) {
 
 export function createJobController({ client = apiClient, idempotencyKey = () => globalThis.crypto.randomUUID() } = {}) {
   async function listDepartments({ signal } = {}) {
-    return normalizeFacets(await client.listDepartments({ signal }));
+    return safeArray(await client.listDepartments({ signal }))
+      .map((item) => ({
+        id: safeString(item?.id).trim(),
+        name: safeString(item?.name).trim(),
+        status: item?.status === "inactive" ? "inactive" : "active",
+      }))
+      .filter((item) => item.id && item.name);
   }
 
   async function listHiringManagers({ signal } = {}) {

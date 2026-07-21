@@ -73,7 +73,9 @@ def test_invited_user_cannot_login_and_public_accept_requires_only_allowed_origi
     assert denied_login.status_code == 401
     assert disallowed_origin.status_code == 403
     assert accepted.status_code == 200
-    assert accepted.json() == {"data": {"email": "invited@example.test"}}
+    assert accepted.json() == {
+        "data": {"email": "invited@example.test", "organization_slug": "acme"}
+    }
 
     with app.state.identity_store.sync_session() as db:
         user = db.query(User).filter_by(normalized_email="invited@example.test").one()

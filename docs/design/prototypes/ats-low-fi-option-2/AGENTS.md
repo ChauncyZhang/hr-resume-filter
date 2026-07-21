@@ -19,3 +19,6 @@ Durable product rules from HR usability review:
 - Keep each page-level primary action in the shared topbar action slot; do not position equivalent actions inside page-specific content headers.
 - Board and list density changes must preserve visible, clickable candidate records; never hide operational data to make stage columns fit.
 - Binary settings controls must keep compact checkbox or toggle dimensions and align with their labels and related actions; generic text-input sizing must never stretch them.
+- Role hierarchy must be reflected in assignment selectors: recruiting administrators can be selected anywhere a hiring manager or interviewer is eligible to act.
+- Organization entities use reversible lifecycle management. A disabled department remains visible for historical records but cannot receive new members or jobs until re-enabled.
+- Interview workflow templates provide the recommended next round, not a hard ceiling. After configured rounds are complete, authorized HR users must still be able to add another interview; scheduling that interview automatically returns the application from decision to interviewing.

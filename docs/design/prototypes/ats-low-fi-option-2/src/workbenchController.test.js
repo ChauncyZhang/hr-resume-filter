@@ -51,7 +51,7 @@ function response(changes = {}) {
           new: { count: 0, items: [] },
           review: { count: 1, items: [item()] },
           contact: { count: 0, items: [] },
-          interview_pending: { count: 7, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444" })] },
+          interview_pending: { count: 7, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444", next_interview_round: "二面" })] },
           interviewing: { count: 0, items: [] },
           decision: { count: 0, items: [] },
           passed: { count: 1, items: [item({ stage: "passed", application_id: "55555555-5555-4555-8555-555555555555" })] },
@@ -59,7 +59,7 @@ function response(changes = {}) {
       }],
       tasks: {
         review: { count: 1, items: [reviewTask()] },
-        interview_pending: { count: 7, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444" })] },
+        interview_pending: { count: 7, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444", next_interview_round: "二面" })] },
         decision: { count: 0, items: [] },
         passed: { count: 1, items: [item({ stage: "passed", application_id: "55555555-5555-4555-8555-555555555555" })] },
       },
@@ -99,6 +99,7 @@ test("load requests the scoped workbench once and maps stages and candidate navi
     company: "",
     position: "AI 工程师",
     stage: "待复核",
+    nextRound: "",
     source: "upload",
     city: "北京",
     lastActivity: new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date("2026-07-13T03:05:00Z")),
@@ -116,6 +117,7 @@ test("load requests the scoped workbench once and maps stages and candidate navi
   });
   assert.equal(result.tasks.passed.count, 1);
   assert.equal(result.tasks.interviewPending.items[0].position, "AI 工程师");
+  assert.equal(result.tasks.interviewPending.items[0].nextRound, "二面");
   assert.deepEqual(result.interviews, { available: false, upcoming: [], pendingFeedback: [] });
 });
 
@@ -215,6 +217,7 @@ test("review tasks keep their persisted contract independently of visible jobs a
     company: "",
     position: "职位信息不可用",
     stage: "待复核",
+    nextRound: "",
     source: "upload",
     city: "北京",
     lastActivity: new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date("2026-07-13T03:05:00Z")),

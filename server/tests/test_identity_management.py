@@ -143,6 +143,7 @@ def test_admin_roles_create_and_list_tenant_departments(management_app, role: st
         "id": department["id"],
         "name": "Engineering",
         "parent_id": None,
+        "status": "active",
         "member_count": 0,
         "job_count": 0,
     }
@@ -187,6 +188,104 @@ def test_admin_roles_create_and_list_tenant_departments(management_app, role: st
         assert audit.organization_id == actor.organization_id
         assert audit.category == "system"
         assert audit.metadata_json == {}
+
+
+def test_admin_can_view_rename_disable_and_reenable_department(management_app) -> None:
+    app, client, _ = management_app
+    actor = seed_user(app, role="recruiting_admin", email="admin@example.test")
+    with app.state.identity_store.sync_session() as db:
+        department = Department(organization_id=actor.organization_id, name="Engineering")
+        db.add(department)
+        db.flush()
+        member = User(
+            organization_id=actor.organization_id,
+            department_id=department.id,
+            email="member@example.test",
+            normalized_email="member@example.test",
+            display_name="Member",
+            password_hash=PasswordService().hash("member password value"),
+        )
+        member.roles.append(UserRole(role="hiring_manager"))
+        db.add(member)
+        db.add(Job(
+            organization_id=actor.organization_id,
+            department_id=department.id,
+            title="Backend Engineer",
+            owner_id=actor.user_id,
+            status="open",
+        ))
+        db.commit()
+        department_id = department.id
+
+    headers = login(client, "admin@example.test")
+    detail = client.get(f"/api/v1/settings/departments/{department_id}", headers=headers)
+    assert detail.status_code == 200
+    assert detail.json()["data"] == {
+        "id": str(department_id),
+        "name": "Engineering",
+        "parent_id": None,
+        "status": "active",
+        "member_count": 1,
+        "job_count": 1,
+        "members": [{
+            "id": detail.json()["data"]["members"][0]["id"],
+            "name": "Member",
+            "roles": ["hiring_manager"],
+            "status": "active",
+        }],
+        "jobs": [{
+            "id": detail.json()["data"]["jobs"][0]["id"],
+            "title": "Backend Engineer",
+            "status": "open",
+        }],
+    }
+
+    disabled = client.patch(
+        f"/api/v1/settings/departments/{department_id}",
+        json={"name": "Platform", "status": "inactive"},
+        headers=headers,
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["data"]["name"] == "Platform"
+    assert disabled.json()["data"]["status"] == "inactive"
+
+    rejected_invite = client.post(
+        "/api/v1/settings/users",
+        json={
+            "display_name": "New Member",
+            "email": "new-member@example.test",
+            "department_id": str(department_id),
+            "role": "hiring_manager",
+        },
+        headers=headers,
+    )
+    assert rejected_invite.status_code == 422
+    assert rejected_invite.json()["code"] == "department_invalid"
+
+    rejected_job = client.post(
+        "/api/v1/jobs",
+        json={
+            "title": "Inactive Department Job",
+            "department_id": str(department_id),
+            "headcount": 1,
+            "priority": "normal",
+            "hiring_owner_id": None,
+        },
+        headers=headers,
+    )
+    assert rejected_job.status_code == 422
+    assert rejected_job.json()["code"] == "department_invalid"
+
+    enabled = client.patch(
+        f"/api/v1/settings/departments/{department_id}",
+        json={"status": "active"},
+        headers=headers,
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["data"]["status"] == "active"
+    with app.state.identity_store.sync_session() as db:
+        audit = db.query(AuditLog).filter_by(event_type="organization.department_updated").all()
+        assert [row.metadata_json["status"] for row in audit] == ["inactive", "active"]
 
 
 def test_department_duplicate_and_invalid_parent_have_stable_errors(management_app) -> None:

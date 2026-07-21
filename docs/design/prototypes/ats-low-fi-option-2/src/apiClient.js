@@ -165,6 +165,14 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
       const response = await request("/api/v1/settings/departments", { method: "POST", body });
       return response?.data ?? null;
     },
+    async getDepartment(id) {
+      const response = await request(`/api/v1/settings/departments/${encodeURIComponent(id)}`);
+      return response?.data ?? null;
+    },
+    async updateDepartment(id, body) {
+      const response = await request(`/api/v1/settings/departments/${encodeURIComponent(id)}`, { method: "PATCH", body });
+      return response?.data ?? null;
+    },
     async listUsers() {
       const response = await request("/api/v1/settings/users");
       return Array.isArray(response?.data) ? response.data : [];

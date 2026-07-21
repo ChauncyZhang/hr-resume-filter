@@ -39,6 +39,7 @@ test("candidate list safely encodes supported filters and normalizes server rows
             owner_id: "owner-1",
             owner_name: "张小北",
             stage: "deferred",
+            next_interview_round: "技术二面",
             source: "本地上传",
             updated_at: "2026-07-13T10:00:00+00:00",
             rule_score: 81,
@@ -84,6 +85,7 @@ test("candidate list safely encodes supported filters and normalizes server rows
     company: "",
     position: "平台 & AI",
     stage: "AI 初筛暂缓",
+    nextRound: "技术二面",
     score: 76,
     recommendation: "暂缓",
     source: "本地上传",
@@ -215,6 +217,8 @@ test("candidate review loads the exact selected application when the same candid
           experience: "5 年大模型应用研发经验",
           education: "浙江大学 · 计算机本科",
           status: "ready",
+          source: "llm",
+          summary_origin: "generated",
         } },
       ]);
       if (path === `/api/v1/candidates/${candidateId}/notes?application_id=application-1`) return response([
@@ -261,6 +265,9 @@ test("candidate review loads the exact selected application when the same candid
   assert.deepEqual(review.questions, ["请说明最大项目规模"]);
   assert.deepEqual(review.historicalRule, { score: 81, recommendation: "可沟通" });
   assert.equal(review.summary, "负责企业级 RAG 和 Agent 平台交付。");
+  assert.equal(review.summaryOrigin, "generated");
+  assert.equal(review.profileStatus, "ready");
+  assert.equal(review.profileSource, "llm");
   assert.deepEqual(review.skills, ["Python", "RAG", "Agent"]);
   assert.equal(review.experience, "5 年大模型应用研发经验");
   assert.equal(review.education, "浙江大学 · 计算机本科");
@@ -269,6 +276,31 @@ test("candidate review loads the exact selected application when the same candid
     ["application-older", "AI 工程师", "已淘汰"],
     ["application-1", "AI 工程师", "待复核"],
   ]);
+});
+
+test("candidate profile never uses JD screening reason as the personal summary", () => {
+  const review = normalizeCandidateReview({
+    candidate: { id: candidateId, display_name: "候选人" },
+    applications: [{ id: "application-1", candidate_id: candidateId, job_id: jobId, resume_id: "resume-1", stage: "review" }],
+    resumes: [{ id: "resume-1", profile: { summary: null, status: "unavailable", source: "rules" } }],
+    notes: [],
+    timeline: [],
+    context: {
+      candidateId,
+      applicationId: "application-1",
+      jobId,
+      actor: {},
+      evidence: {
+        llmReason: "该候选人与当前 AI 工程师 JD 高度匹配。",
+        matched: "Python、RAG",
+      },
+    },
+  });
+
+  assert.equal(review.summary, "简历中未识别到明确的个人简介。");
+  assert.equal(review.profileStatus, "unavailable");
+  assert.deepEqual(review.skills, []);
+  assert.notEqual(review.summary, review.llmReason);
 });
 
 test("candidate review preserves ScreeningViews LLM evidence when opened from a screening result", () => {
