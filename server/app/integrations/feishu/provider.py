@@ -68,12 +68,14 @@ class CalendarEventRequest:
     timezone: str
     description: str
     location: str
+    attendee_open_ids: tuple[str, ...]
     attendee_emails: tuple[str, ...]
 
 
 @dataclass(frozen=True)
 class CalendarEvent:
     event_id: str
+    attendee_open_ids: tuple[str, ...]
     attendee_emails: tuple[str, ...]
     cancelled: bool = False
 
@@ -142,7 +144,11 @@ class FakeFeishuProvider:
         self._check()
         if idempotency_key in self._idempotency:
             return self._idempotency[idempotency_key]  # type: ignore[return-value]
-        event = CalendarEvent(f"evt_{uuid4().hex}", request.attendee_emails)
+        event = CalendarEvent(
+            f"evt_{uuid4().hex}",
+            request.attendee_open_ids,
+            request.attendee_emails,
+        )
         self.events[event.event_id] = event
         self._idempotency[idempotency_key] = event
         return event
@@ -153,7 +159,11 @@ class FakeFeishuProvider:
             return self._idempotency[idempotency_key]  # type: ignore[return-value]
         if event_id not in self.events:
             raise FeishuProviderError("feishu_event_not_found", retryable=False)
-        event = CalendarEvent(event_id, request.attendee_emails)
+        event = CalendarEvent(
+            event_id,
+            request.attendee_open_ids,
+            request.attendee_emails,
+        )
         self.events[event_id] = event
         self._idempotency[idempotency_key] = event
         return event
@@ -240,10 +250,30 @@ class HttpFeishuProvider:
             "location": {"name": request.location[:512]},
         }
 
-    def _add_attendees(self, credentials: FeishuCredentials, event_id: str, emails: tuple[str, ...]) -> None:
-        if not emails:
+    def _add_attendees(
+        self,
+        credentials: FeishuCredentials,
+        event_id: str,
+        open_ids: tuple[str, ...],
+        emails: tuple[str, ...],
+    ) -> None:
+        attendees = [
+            {"type": "user", "user_id": open_id}
+            for open_id in open_ids
+        ]
+        attendees.extend(
+            {"type": "third_party", "third_party_email": email}
+            for email in emails
+        )
+        if not attendees:
             return
-        self._json("POST", f"{OPEN_API_BASE}/calendar/v4/calendars/{credentials.calendar_id}/events/{event_id}/attendees", headers=self._headers(credentials), json={"attendees": [{"type": "third_party", "third_party_email": email} for email in emails]})
+        self._json(
+            "POST",
+            f"{OPEN_API_BASE}/calendar/v4/calendars/{credentials.calendar_id}/events/{event_id}/attendees",
+            params={"user_id_type": "open_id"},
+            headers=self._headers(credentials),
+            json={"attendees": attendees, "need_notification": True},
+        )
 
     def batch_freebusy(self, credentials: FeishuCredentials, request: FreeBusyRequest) -> tuple[BusyWindow, ...]:
         if len(request.user_ids) > MAX_FREEBUSY_USERS or request.time_max - request.time_min > MAX_FREEBUSY_RANGE:
@@ -263,14 +293,32 @@ class HttpFeishuProvider:
         event_id = payload.get("data", {}).get("event", {}).get("event_id")
         if not isinstance(event_id, str) or not event_id:
             raise FeishuProviderError("feishu_response_invalid", retryable=False)
-        self._add_attendees(credentials, event_id, request.attendee_emails)
-        return CalendarEvent(event_id, request.attendee_emails)
+        self._add_attendees(
+            credentials,
+            event_id,
+            request.attendee_open_ids,
+            request.attendee_emails,
+        )
+        return CalendarEvent(
+            event_id,
+            request.attendee_open_ids,
+            request.attendee_emails,
+        )
 
     def update_event(self, credentials: FeishuCredentials, event_id: str, request: CalendarEventRequest, *, idempotency_key: str) -> CalendarEvent:
         self._json("PATCH", f"{OPEN_API_BASE}/calendar/v4/calendars/{credentials.calendar_id}/events/{event_id}", headers=self._headers(credentials), json=self._event_body(request))
         # Attendee reconciliation is deliberately additive in the skeleton; ATS remains authoritative and retries are idempotent at the outbox boundary.
-        self._add_attendees(credentials, event_id, request.attendee_emails)
-        return CalendarEvent(event_id, request.attendee_emails)
+        self._add_attendees(
+            credentials,
+            event_id,
+            request.attendee_open_ids,
+            request.attendee_emails,
+        )
+        return CalendarEvent(
+            event_id,
+            request.attendee_open_ids,
+            request.attendee_emails,
+        )
 
     def cancel_event(self, credentials: FeishuCredentials, event_id: str, *, idempotency_key: str) -> None:
         self._json("DELETE", f"{OPEN_API_BASE}/calendar/v4/calendars/{credentials.calendar_id}/events/{event_id}", headers=self._headers(credentials))

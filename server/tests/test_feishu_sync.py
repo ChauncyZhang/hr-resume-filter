@@ -1,16 +1,30 @@
 import asyncio
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from uuid import UUID
 
-from server.app.integrations.feishu.models import FeishuInterviewSync
+from server.app.identity.models import User
+from server.app.integrations.feishu.models import FeishuIdentityBinding, FeishuInterviewSync
 from server.app.integrations.feishu.provider import FakeFeishuProvider
 from server.app.integrations.feishu.worker import FeishuCalendarOutboxHandler
 from server.app.interviews.models import Interview
 from server.app.queue.models import OutboxEvent
-from server.tests.test_interview_api import create_interview, make_app, seed_application
+from server.tests.test_interview_api import (
+    create_interview,
+    interview_payload,
+    make_app,
+    seed_application,
+)
 from server.tests.test_recruiting_api import login
+
+
+def _future_payload(seed):
+    return interview_payload(
+        seed,
+        starts_at=datetime(2030, 7, 20, 8, 0, tzinfo=timezone.utc),
+    )
 
 
 def test_interview_create_queues_enabled_feishu_sync_with_durable_idempotency(tmp_path) -> None:
@@ -30,7 +44,12 @@ def test_interview_create_queues_enabled_feishu_sync_with_durable_idempotency(tm
             },
         )
         assert configured.status_code == 200
-        created, _ = create_interview(client, seed, key="feishu-sync-create")
+        created, _ = create_interview(
+            client,
+            seed,
+            key="feishu-sync-create",
+            payload=_future_payload(seed),
+        )
         assert created.status_code == 201
         interview_id = UUID(created.json()["data"]["id"])
 
@@ -52,7 +71,12 @@ def test_interview_create_degrades_to_disabled_sync_without_outbox(tmp_path) -> 
     app = make_app(tmp_path)
     seed = seed_application(app)
     with TestClient(app) as client:
-        created, _ = create_interview(client, seed, key="feishu-disabled-create")
+        created, _ = create_interview(
+            client,
+            seed,
+            key="feishu-disabled-create",
+            payload=_future_payload(seed),
+        )
         interview_id = UUID(created.json()["data"]["id"])
 
     with app.state.identity_store.sync_session() as db:
@@ -65,6 +89,18 @@ def test_outbox_handler_creates_event_and_persists_retry_safe_sync_status(tmp_pa
     app = make_app(tmp_path)
     app.state.feishu_provider = FakeFeishuProvider()
     seed = seed_application(app)
+    with app.state.identity_store.sync_session() as db:
+        interviewer = db.get(User, seed["interviewer_id"])
+        db.add(
+            FeishuIdentityBinding(
+                organization_id=interviewer.organization_id,
+                user_id=interviewer.id,
+                union_id="on_interviewer",
+                open_id="ou_interviewer",
+                tenant_key="tenant",
+            )
+        )
+        db.commit()
     with TestClient(app) as client:
         headers = login(client, "interview-admin@example.test")
         client.put(
@@ -78,7 +114,12 @@ def test_outbox_handler_creates_event_and_persists_retry_safe_sync_status(tmp_pa
                 "enabled": True,
             },
         )
-        created, _ = create_interview(client, seed, key="feishu-handler-create")
+        created, _ = create_interview(
+            client,
+            seed,
+            key="feishu-handler-create",
+            payload=_future_payload(seed),
+        )
         interview_id = UUID(created.json()["data"]["id"])
     with app.state.identity_store.sync_session() as db:
         event = db.scalar(select(OutboxEvent).where(OutboxEvent.aggregate_id == interview_id))
@@ -96,7 +137,9 @@ def test_outbox_handler_creates_event_and_persists_retry_safe_sync_status(tmp_pa
         assert sync.sync_status == "synced"
         assert sync.attempts == 1
         assert sync.external_event_id in app.state.feishu_provider.events
-        assert app.state.feishu_provider.events[sync.external_event_id].attendee_emails
+        event = app.state.feishu_provider.events[sync.external_event_id]
+        assert event.attendee_open_ids == ("ou_interviewer",)
+        assert event.attendee_emails == ("interview-admin@example.test",)
 
 
 def test_verified_provider_change_only_marks_pending_confirmation(tmp_path) -> None:
@@ -116,7 +159,12 @@ def test_verified_provider_change_only_marks_pending_confirmation(tmp_path) -> N
                 "enabled": True,
             },
         )
-        created, _ = create_interview(client, seed, key="feishu-provider-change")
+        created, _ = create_interview(
+            client,
+            seed,
+            key="feishu-provider-change",
+            payload=_future_payload(seed),
+        )
         interview_id = UUID(created.json()["data"]["id"])
         with app.state.identity_store.sync_session() as db:
             interview = db.get(Interview, interview_id)

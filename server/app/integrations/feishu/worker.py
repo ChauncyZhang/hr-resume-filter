@@ -5,10 +5,14 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from server.app.identity.models import Job
-from server.app.integrations.feishu.models import FeishuInterviewSync, FeishuOrganizationConfig
+from server.app.identity.models import Job, User
+from server.app.integrations.feishu.models import (
+    FeishuIdentityBinding,
+    FeishuInterviewSync,
+    FeishuOrganizationConfig,
+)
 from server.app.integrations.feishu.provider import CalendarEventRequest, FeishuCredentials, FeishuProviderError
-from server.app.interviews.models import Interview
+from server.app.interviews.models import Interview, InterviewParticipant
 from server.app.queue.service import PermanentJobError, RetryableJobError
 from server.app.recruiting.models import Application, Candidate
 
@@ -50,11 +54,44 @@ class FeishuCalendarOutboxHandler:
             action = sync.desired_action
             external_event_id = sync.external_event_id
             credentials = FeishuCredentials(config.app_id, self._cipher.decrypt(config.encrypted_app_secret), config.redirect_uri, config.calendar_id)
-            emails = tuple(dict.fromkeys(
-                contact.get("email")
-                for contact in [interview.calendar_organizer, *interview.calendar_attendees]
-                if isinstance(contact, dict) and isinstance(contact.get("email"), str) and contact.get("email")
-            ))
+            participant_ids = list(
+                db.scalars(
+                    select(InterviewParticipant.user_id).where(
+                        InterviewParticipant.organization_id == organization_id,
+                        InterviewParticipant.interview_id == interview_id,
+                    )
+                )
+            )
+            attendee_user_ids = tuple(
+                dict.fromkeys([interview.created_by, *participant_ids])
+            )
+            users = {
+                user.id: user
+                for user in db.scalars(
+                    select(User).where(
+                        User.organization_id == organization_id,
+                        User.id.in_(attendee_user_ids),
+                    )
+                )
+            }
+            bindings = {
+                binding.user_id: binding
+                for binding in db.scalars(
+                    select(FeishuIdentityBinding).where(
+                        FeishuIdentityBinding.organization_id == organization_id,
+                        FeishuIdentityBinding.user_id.in_(attendee_user_ids),
+                    )
+                )
+            }
+            open_ids: list[str] = []
+            emails: list[str] = []
+            for user_id in attendee_user_ids:
+                binding = bindings.get(user_id)
+                user = users.get(user_id)
+                if binding is not None and binding.open_id:
+                    open_ids.append(binding.open_id)
+                elif user is not None and user.email:
+                    emails.append(user.email)
             request = CalendarEventRequest(
                 interview_id=interview.id,
                 summary=f"{job.title} - {candidate.display_name} - {interview.round_name}",
@@ -63,7 +100,8 @@ class FeishuCalendarOutboxHandler:
                 timezone=interview.timezone,
                 description=f"ATS interview {interview.id}",
                 location=interview.location or interview.meeting_url or "",
-                attendee_emails=emails,
+                attendee_open_ids=tuple(dict.fromkeys(open_ids)),
+                attendee_emails=tuple(dict.fromkeys(emails)),
             )
             sync.sync_status = "syncing"
             sync.attempts += 1

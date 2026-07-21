@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import json
 from uuid import uuid4
 
+import httpx
 import pytest
 
 from server.app.integrations.feishu.provider import (
@@ -8,6 +10,7 @@ from server.app.integrations.feishu.provider import (
     CalendarEventRequest,
     FakeFeishuProvider,
     FeishuCredentials,
+    HttpFeishuProvider,
     OAuthIdentity,
     chunk_freebusy_requests,
 )
@@ -90,12 +93,14 @@ def test_fake_provider_contract_is_idempotent_and_records_attendees() -> None:
         timezone="Asia/Shanghai",
         description="Interview",
         location="Room 1",
+        attendee_open_ids=("ou_one",),
         attendee_emails=("one@example.test", "two@example.test"),
     )
 
     first = provider.create_event(credentials, request, idempotency_key="event-key")
     second = provider.create_event(credentials, request, idempotency_key="event-key")
     assert first == second
+    assert first.attendee_open_ids == request.attendee_open_ids
     assert first.attendee_emails == request.attendee_emails
 
     updated = provider.update_event(
@@ -108,6 +113,50 @@ def test_fake_provider_contract_is_idempotent_and_records_attendees() -> None:
     provider.cancel_event(credentials, first.event_id, idempotency_key="cancel-key")
     provider.cancel_event(credentials, first.event_id, idempotency_key="cancel-key")
     assert provider.events[first.event_id].cancelled is True
+
+
+def test_http_provider_adds_bound_users_as_internal_attendees() -> None:
+    attendee_requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token"})
+        if request.url.path.endswith("/events"):
+            return httpx.Response(200, json={"code": 0, "data": {"event": {"event_id": "evt_1"}}})
+        if request.url.path.endswith("/attendees"):
+            attendee_requests.append(request)
+            return httpx.Response(200, json={"code": 0, "data": {"attendees": []}})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    provider = HttpFeishuProvider(httpx.Client(transport=httpx.MockTransport(handler)))
+    request = CalendarEventRequest(
+        interview_id=uuid4(),
+        summary="Backend interview",
+        starts_at=datetime(2026, 7, 20, 1, tzinfo=timezone.utc),
+        ends_at=datetime(2026, 7, 20, 2, tzinfo=timezone.utc),
+        timezone="Asia/Shanghai",
+        description="Interview",
+        location="Room 1",
+        attendee_open_ids=("ou_bound",),
+        attendee_emails=("external@example.test",),
+    )
+
+    provider.create_event(
+        FeishuCredentials("cli", "secret", "https://example.test/callback"),
+        request,
+        idempotency_key="event-key",
+    )
+
+    assert len(attendee_requests) == 1
+    attendee_request = attendee_requests[0]
+    assert attendee_request.url.params["user_id_type"] == "open_id"
+    assert json.loads(attendee_request.content) == {
+        "attendees": [
+            {"type": "user", "user_id": "ou_bound"},
+            {"type": "third_party", "third_party_email": "external@example.test"},
+        ],
+        "need_notification": True,
+    }
 
 
 def test_fake_provider_does_not_make_network_calls_and_exposes_oauth_identity() -> None:
