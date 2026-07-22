@@ -12,6 +12,11 @@ class OcrConfigUpdate(ApiModel):
     enabled: bool = False
     api_key: str | None = Field(default=None, min_length=1, max_length=4096)
 
+    @field_validator("provider_id", mode="before")
+    @classmethod
+    def normalize_provider_id(cls, value: str) -> str:
+        return value.strip().lower() if isinstance(value, str) else value
+
     @field_validator("base_url")
     @classmethod
     def normalize_base_url(cls, value: str) -> str:

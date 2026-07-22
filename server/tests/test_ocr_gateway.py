@@ -1,12 +1,13 @@
 import asyncio
 import json
+import struct
 
 import pytest
 
 from server.app.llm.gateway import TransportResponse
 from server.app.llm.policy import ProviderPolicyError
 from server.app.ocr.gateway import (
-    FIXED_TINY_PNG,
+    FIXED_PROBE_PNG,
     MAX_IMAGE_BYTES,
     OcrGateway,
     OcrGatewayError,
@@ -48,6 +49,11 @@ def test_gateway_dns_pins_https_and_disables_thinking_for_fixed_probe():
     assert all(value not in body.decode() for value in ("resume", "简历", "candidate", "13800000000"))
 
 
+def test_fixed_probe_image_meets_provider_dimension_requirements():
+    width, height = struct.unpack(">II", FIXED_PROBE_PNG[16:24])
+    assert width > 10 and height > 10
+
+
 @pytest.mark.parametrize(
     "base_url",
     [
@@ -86,7 +92,7 @@ def test_extract_images_preserves_page_order_and_bounds_inputs_and_outputs():
 
     result = asyncio.run(
         gateway.extract_images(
-            "vision", "https://vision.example/v1", "model", "key", [FIXED_TINY_PNG, jpeg]
+            "vision", "https://vision.example/v1", "model", "key", [FIXED_PROBE_PNG, jpeg]
         )
     )
 
@@ -116,7 +122,7 @@ def test_extract_images_preserves_page_order_and_bounds_inputs_and_outputs():
     with pytest.raises(OcrGatewayError, match="ocr_page_text_too_large"):
         asyncio.run(
             oversized.extract_images(
-                "vision", "https://vision.example/v1", "model", "key", [FIXED_TINY_PNG]
+                "vision", "https://vision.example/v1", "model", "key", [FIXED_PROBE_PNG]
             )
         )
 

@@ -11,8 +11,8 @@ from server.app.llm.policy import ProviderAllowlist, ProviderPolicyError
 
 THINKING_DISABLED = {"type": "disabled"}
 FIXED_PROBE_PROMPT = "Read this test image and reply with a short non-empty text. It contains no recruiting data."
-FIXED_TINY_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+FIXED_PROBE_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAAAoCAIAAAC5E2UfAAAACXBIWXMAAA7EAAAOxAGVKw4bAAAFiklEQVR4nO1YayilXRQ+Y4zrGEZyK1Ljc7+XGD+MRv5gRilSRFHkhylf4seU5JqSQopQhIhxz8zIdTDEJ1GuEYWJQS7DuIzb9+Rtdu+cc95zwdf+8e3n19lrr3ftvfaz9lprH9ENA1WIaG/g/w5GAGUwAiiDEUAZjADKYARQBiOAMhgBlMEIoAxGAGUwAiiDEUAZjADKYARQhnwCzs/PJycnP3z4MD09fXFxIanw48eP4eHhhoaGsbGx6+trIl9aWvqHh+XlZamfi6kRHBwcHB0dScpnZmbIt5eXl6Ojo1gaOyTGt7a2pBpcX1+X6uDZ2dnu7q6kfHt7m+8OB2zp8PBQ3pkpATkENDY2Pn/+XFNT087OTl1d3djY+PPnz3yFqqoqHR0dfX19W1tbNTU1FxcX4qe/v/+TJ0+e/YZIJDIxMenu7hZbIjQ0lFPAKtAh+lhoaGgIEth/xoOnpyf34eLiorW1NZaA5MWLF1BDHEBeVFTEaUKCz7W1tbnh+/fvpfpYUFAQHR3Nl2RkZMDrR48ePX36NC8vjxOurKy8fPlSdAs3N7f5+XmFDlgeZBFQX18P9woLCxFoGP769Qs7U1FRIYfY19eHQ6+uruaG379/f/XqlY+PDzcEAXzHjo+Pg4KCwIHQcnV1dVpaWnwJR8D+/r5UfW9v75CQEIQkNywuLsaJb2xsEIXNzU18jtgXWhEUlpSU6Onp8fdZXl4OO/ARV6qtrU1VVfXjx4+Q+/n5BQYG4lqsrq6+fv2axME9IUjAycmJqalpamqqmDwuLg7BfnV1hd8ODg5JSUn82YmJCUQcdwnECAA6OjpwIkJXWFkCoIz7R4ZIF15eXv39/UQilwBcPsQyri9/nwEBAe/evSPDt2/fxsfHgwwwQUw1Nzc/fvyYO4R7QpAAXGepziNqIEfiRqrFj7m5OSELkgTk5+cjVwjpK0uAr6+vk5MTCo+QQbkEcIiMjOTvs7Ozk19mXF1dEWTIAXAZOYATZmZmOjo6yjarIAQJKCsrk5ousBXkJcTywMAA3Ds9PRWyAAJwRf6+RWJiItKFpaUlqqWQvhABzs7ObjykpaVxszCFKSgYGRmFh4ejFIvVzLsRQIAAT0lJQRnA0RNhdnY2KDE0NPzPa0BFRQWWkZSDAOT99vZ2XHa49/PnTyELIMDKyir6N9zd3eFMa2urkL4QAaWlpdU8jIyM8HXQXEEhODhYQ0PDw8Pj27dvZOo+BIyPj4NsCwsLdFl8OVZPT0+3sbEJCwuTbVZBCBKAlbB7yf5sYWEBcvjJpaCpqSn+LKIGlfbTp0830lIQrgLOSGhFpVLQzs4O1/MQoPDo6OpiCSK5MwE5OTmIlaysLKH7jVIMyzgK2ZYVgSABWNvMzCw5OVlMHhUVhcTC/ba3t4+NjeXPfv36FTvDi+FGGgGVlZWwKbSiUgTg9NGPidXzN2/exMTEkOHdCKitrTUwMJidneXr4B6gMcWLgRsizpAGent7ZVtWBLLa0KamJtR6BAI6opvbBxfiC68BEvVfvnzBKeTm5uKxdnP7pEKWR4vGzUoSgDSNyBJaTogA5PqlPwH/UQ+RH3Db9vb2yGbweUtLC/n8bgQgVUZERIzygL4TzS66O3TknA6aVzhClr4P5DzE0BKgFOOUEbl4mOB8uaaYoKamBqGBsgw1eIvTJ524JAHoLqCDx53UtYQIkATyD2bX1tZwWNiVubk56jBqAKnPHO5GAE5W5U8kJCRA3tPTg6fiX7fA0wGdqGyzCkL+XxFoLRB0SOuo+9yLTAxIVghSPFxRDx9kT0oBfHd1dSH1CXWrDwh4itI4ODiIZPBQNtmfcZTBCKAMRgBlMAIogxFAGYwAymAEUAYjgDIYAZTBCKAMRgBlMAIogxFAGf8CeS+EHSYOa04AAAAASUVORK5CYII="
 )
 MAX_IMAGES = 20
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
@@ -144,7 +144,7 @@ class OcrGateway:
 
     async def test_connection(self, provider_id: str, base_url: str, model: str, api_key: str) -> int:
         started = time.monotonic()
-        text = await self._request(provider_id, base_url, model, api_key, FIXED_TINY_PNG, FIXED_PROBE_PROMPT)
+        text = await self._request(provider_id, base_url, model, api_key, FIXED_PROBE_PNG, FIXED_PROBE_PROMPT)
         if not text or len(text) > 1_000:
             raise OcrGatewayError("provider_response_invalid")
         return max(0, int((time.monotonic() - started) * 1000))

@@ -155,3 +155,23 @@ def test_ocr_config_requires_key_when_enabled_and_rejects_bad_url(tmp_path):
             headers={**system, "If-Match": '"0"', "Idempotency-Key": "unsafe"},
         )
         assert unsafe.status_code == 422 and unsafe.json()["code"] == "provider_address_forbidden"
+
+
+def test_ocr_config_normalizes_mixed_case_provider_id(tmp_path):
+    app = ocr_app(tmp_path)
+    with TestClient(app) as client:
+        system = login(client, "system@example.test")
+        saved = client.put(
+            "/api/v1/settings/ocr",
+            json={
+                "provider_id": " Ali ",
+                "base_url": "https://vision.example/v1",
+                "model": "qwen3.5-ocr",
+                "enabled": True,
+                "api_key": "sk-private",
+            },
+            headers={**system, "If-Match": '"0"', "Idempotency-Key": "normalize-provider"},
+        )
+
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["data"]["provider_id"] == "ali"

@@ -62,6 +62,19 @@ test("saves the complete contract with concurrency and idempotency headers", asy
   assert.equal(controller.getState().dirty, false);
 });
 
+test("normalizes a mixed-case Provider identifier before saving", async () => {
+  const client = createClient((path, options) => options.method === "PUT"
+    ? { data: { ...config, provider_id: "ali", version: 5 } }
+    : { data: config });
+  const controller = createOcrSettingsController({ client, createIdempotencyKey: () => "ocr-normalize-provider" });
+  await controller.load();
+  controller.updateDraft({ provider_id: " Ali " });
+
+  await controller.save();
+
+  assert.equal(client.calls[1].options.body.provider_id, "ali");
+});
+
 test("retains the saved key by omitting api_key and discard restores all fields", async () => {
   const client = createClient((path, options) => options.method === "PUT" ? { data: { ...config, enabled: false } } : { data: config });
   const controller = createOcrSettingsController({ client, createIdempotencyKey: () => "save-key" });
@@ -101,6 +114,14 @@ test("test and save failures expose only safe mapped messages", async () => {
 
   assert.equal(controller.getState().error, getOcrSettingsErrorMessage({ code: "persistence_failed" }));
   assert.equal(controller.getState().error.includes("database"), false);
+  assert.equal(
+    getOcrSettingsErrorMessage({ code: "provider_auth_failed" }),
+    "OCR 服务拒绝了 API Key，请检查 Key、地域和模型访问权限。",
+  );
+  assert.equal(
+    getOcrSettingsErrorMessage({ code: "provider_request_rejected" }),
+    "OCR 服务拒绝了测试请求，请检查模型是否支持图片识别。",
+  );
 });
 
 test("test is blocked for dirty, unconfigured, or keyless saved settings", () => {
@@ -122,6 +143,7 @@ test("AI Settings renders flat LLM and OCR sections with combined navigation pro
   assert.match(source, /onDirtyChange\?\.\(llmDirty \|\| ocrDirty\)/);
   assert.match(source, /window\.addEventListener\("beforeunload"/);
   assert.match(source, /招聘管理员仅可查看安全配置状态/);
+  assert.match(source, /仅支持小写字母、数字、下划线和连字符/);
   assert.match(styles, /\.ai-settings-block \+ \.ai-settings-block/);
   assert.doesNotMatch(source, /className="settings-section ocr-settings"/);
 });

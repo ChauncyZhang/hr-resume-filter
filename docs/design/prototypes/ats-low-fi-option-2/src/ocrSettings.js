@@ -10,7 +10,14 @@ const ERROR_MESSAGES = {
   persistence_failed: "OCR 设置暂时无法保存，请稍后重试。",
   precondition_required: "配置版本已失效，请刷新后重试。",
   provider_address_forbidden: "Base URL 不能使用内网、回环或保留地址。",
+  provider_auth_failed: "OCR 服务拒绝了 API Key，请检查 Key、地域和模型访问权限。",
+  provider_model_not_found: "OCR 模型或服务不存在，请检查模型名称和 Base URL。",
   provider_port_forbidden: "Base URL 只能使用服务端允许的 HTTPS 端口。",
+  provider_quota_or_rate_limited: "OCR 服务额度不足或请求过于频繁，请检查服务商额度后重试。",
+  provider_request_rejected: "OCR 服务拒绝了测试请求，请检查模型是否支持图片识别。",
+  provider_response_invalid: "OCR 服务返回了无法识别的响应，请检查接口兼容性。",
+  provider_response_too_large: "OCR 服务返回内容过大，请调整模型或服务配置。",
+  provider_unavailable: "OCR 服务当前无法连接，请稍后重试。",
   provider_url_forbidden: "Base URL 格式不安全，请填写标准 HTTPS 地址。",
   resource_not_found: "当前账号无权访问此设置。",
   service_unavailable: "OCR 服务暂时不可用，请稍后重试。",
@@ -143,7 +150,7 @@ export function createOcrSettingsController({
     if (!state.config || ["saving", "testing"].includes(state.status)) return false;
     const requestId = ++requestSequence;
     const body = {
-      provider_id: state.draft.provider_id.trim(),
+      provider_id: state.draft.provider_id.trim().toLowerCase(),
       base_url: state.draft.base_url.trim(),
       model: state.draft.model.trim(),
       enabled: state.draft.enabled,
