@@ -121,6 +121,63 @@ test("dedicated deployment hides the organization field and submits its configur
   }
 });
 
+test("successful password login replaces a stale settings route with the role default workbench", { timeout: 60_000 }, async () => {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  let authenticated = false;
+  const emptyGroup = { count: 0, items: [] };
+  await context.route("**/api/v1/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname.replace(/\/$/, "");
+    if (pathname === "/api/v1/me") {
+      await route.fulfill(authenticated ? {
+        status: 200,
+        contentType: "application/json",
+        headers: { "x-csrf-token": "post-login-csrf" },
+        body: JSON.stringify({ data: { id: "user-1", display_name: "Admin", roles: ["recruiting_admin"] } }),
+      } : { status: 401, contentType: "application/problem+json", body: JSON.stringify({ status: 401 }) });
+      return;
+    }
+    if (pathname === "/api/v1/auth/config") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { default_organization: { slug: "acme", name: "Acme" } } }) });
+      return;
+    }
+    if (pathname === "/api/v1/auth/login") {
+      authenticated = true;
+      await route.fulfill({ status: 204, body: "" });
+      return;
+    }
+    if (pathname === "/api/v1/workbench") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          data: {
+            generated_at: "2026-07-22T05:00:00Z",
+            jobs: [],
+            tasks: { review: emptyGroup, interview_pending: emptyGroup, decision: emptyGroup, passed: emptyGroup },
+            notifications: { review: emptyGroup, interview_pending: emptyGroup, decision: emptyGroup, passed: emptyGroup },
+            interviews: { available: false, upcoming: [], pending_feedback: [] },
+          },
+        }),
+      });
+      return;
+    }
+    await route.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ status: 503 }) });
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto(new URL("/settings/ai", baseUrl).toString(), { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "登录工作台", exact: true }).waitFor();
+    await page.locator('input[name="email"]').fill("hr@example.test");
+    await page.locator('input[name="password"]').fill("secret");
+    await page.getByRole("button", { name: "登录", exact: true }).click();
+
+    await page.waitForURL((url) => url.pathname === "/workbench");
+    await page.getByRole("heading", { name: "工作台", exact: true }).waitFor();
+  } finally {
+    await context.close();
+  }
+});
+
 test("locked login shows the server countdown and switching accounts restores submit", { timeout: 60_000 }, async () => {
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   await context.route("**/api/v1/**", async (route) => {

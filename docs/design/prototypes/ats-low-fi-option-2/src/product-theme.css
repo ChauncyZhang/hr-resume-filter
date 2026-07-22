@@ -249,7 +249,7 @@ input::placeholder, textarea::placeholder { color: #9b9ba1; }
 .kanban {
   min-height: 300px;
   padding: 0;
-  grid-template-columns: repeat(7, minmax(180px, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 0;
   background: #fff;
   overflow-x: auto;
@@ -264,13 +264,11 @@ input::placeholder, textarea::placeholder { color: #9b9ba1; }
   text-align: left;
 }
 .stage:last-child { border-right: 0; }
-.stage:nth-child(1) { border-top: 3px solid var(--blue); }
-.stage:nth-child(2) { border-top: 3px solid #2c7ee8; }
-.stage:nth-child(3) { border-top: 3px solid var(--orange); }
-.stage:nth-child(4) { border-top: 3px solid var(--purple); }
-.stage:nth-child(5) { border-top: 3px solid #d6a100; }
-.stage:nth-child(6) { border-top: 3px solid #da7b00; }
-.stage:nth-child(7) { border-top: 3px solid var(--green); }
+.stage:nth-child(1) { border-top: 3px solid #2c7ee8; }
+.stage:nth-child(2) { border-top: 3px solid var(--purple); }
+.stage:nth-child(3) { border-top: 3px solid #d6a100; }
+.stage:nth-child(4) { border-top: 3px solid #da7b00; }
+.stage:nth-child(5) { border-top: 3px solid var(--green); }
 .stage > header { height: auto; padding: 0 4px; display: grid; justify-content: stretch; gap: 8px; }
 .stage > header strong { color: var(--ink-secondary); font-size: 13px; font-weight: 500; }
 .stage > header span { color: var(--ink); font-size: 24px; line-height: 1; font-weight: 600; }
@@ -357,7 +355,7 @@ input::placeholder, textarea::placeholder { color: #9b9ba1; }
   .global-search { width: 220px; }
   .organization-context { display: none; }
   .page-body.dashboard-body { grid-template-columns: minmax(0, 1fr) 320px; }
-  .kanban { overflow-x: auto; grid-template-columns: repeat(7, minmax(180px, 1fr)); }
+  .kanban { overflow-x: auto; grid-template-columns: repeat(5, minmax(160px, 1fr)); }
 }
 
 @media (max-width: 1050px) {
@@ -373,7 +371,8 @@ input::placeholder, textarea::placeholder { color: #9b9ba1; }
   .dashboard-metrics { padding: 0 16px 12px; gap: 10px; }
   .dashboard-metrics > button { min-height: 96px; padding: 13px; }
   .page-body.dashboard-body { padding: 0 16px 24px; grid-template-columns: 1fr; }
-  .kanban { overflow-x: auto; grid-template-columns: repeat(7, minmax(220px, 1fr)); }
+  .kanban { overflow-x: auto; grid-template-columns: repeat(5, minmax(200px, 1fr)); scroll-snap-type: x proximity; }
+  .stage { scroll-snap-align: start; }
   .dashboard-body .right-rail { grid-template-columns: 1fr 1fr; }
   .dashboard-body .right-rail .rail-section:first-child { min-height: 278px; }
   .job-page, .candidate-page, .interview-page, .talent-page, .report-page, .settings-page, .screening-page { padding: 14px 16px 24px; }
@@ -390,4 +389,5 @@ input::placeholder, textarea::placeholder { color: #9b9ba1; }
   .calendar-interview-item { grid-template-columns: 1fr; }
   .calendar-interview-meta { justify-content: flex-start; }
   .top-actions > .button.secondary { display: none; }
+  .kanban { grid-template-columns: repeat(5, clamp(260px, 78vw, 300px)); }
 }

@@ -142,6 +142,40 @@ test("notification bell opens actionable tasks and candidate navigation", { time
   } finally { await context.close(); }
 });
 
+test("workbench board shows the five actionable stages while list and totals keep their behavior", { timeout: 60_000 }, async () => {
+  const workbench = notificationWorkbench();
+  workbench.jobs[0].stages.new = { count: 1, items: [notificationCandidate("new", 3, "王晨")] };
+  workbench.jobs[0].stages.contact = { count: 1, items: [notificationCandidate("contact", 4, "赵敏")] };
+  workbench.jobs[0].active_count = 4;
+  const { context, page } = await openPage({ workbench });
+  try {
+    await page.goto(baseUrl);
+    const board = page.getByLabel("候选人招聘阶段", { exact: true });
+    await board.waitFor();
+    assert.deepEqual(await board.locator(".stage > header > strong").allTextContents(), [
+      "待用人经理评审",
+      "待安排面试",
+      "面试流程中",
+      "待用人经理录用决策",
+      "待录用确认",
+    ]);
+    assert.equal(await board.getByText("新简历", { exact: true }).count(), 0);
+    assert.equal(await board.getByText("待确认候选人意向", { exact: true }).count(), 0);
+    assert.equal(await board.locator(".candidate-card").count(), 2);
+    assert.match(await page.locator(".dashboard-efficiency").textContent(), /当前流程候选人4覆盖 4 个阶段/);
+
+    await page.getByRole("button", { name: "列表", exact: true }).click();
+    const list = page.locator(".list-view");
+    assert.equal(await list.locator(".list-row").count(), 4);
+    assert.equal(await list.getByText("新简历", { exact: true }).count(), 1);
+    assert.equal(await list.getByText("待确认候选人意向", { exact: true }).count(), 1);
+    assert.equal(await list.getByText("待用人经理评审", { exact: true }).count(), 1);
+    assert.equal(await list.getByText("待录用确认", { exact: true }).count(), 1);
+    await list.getByRole("button", { name: /陈曦/ }).click();
+    await page.waitForURL(/\/candidates\/30000000-0000-4000-8000-000000000001/);
+  } finally { await context.close(); }
+});
+
 test("organization settings load real data, restrict invite roles, and show the one-time invitation link", { timeout: 60_000 }, async () => {
   let inviteRequest;
   const { context, page } = await openPage({ onRequest(pathname, request) { if (pathname === "/api/v1/settings/users" && request.method() === "POST") inviteRequest = request; } });

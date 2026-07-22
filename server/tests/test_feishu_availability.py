@@ -80,6 +80,33 @@ def test_enabled_feishu_merges_external_busy_and_chunks_long_ranges(tmp_path) ->
     assert all(request.time_max - request.time_min <= timedelta(days=14) for request in provider.freebusy_requests)
 
 
+def test_bound_user_with_no_adjacent_week_events_remains_confirmed(tmp_path) -> None:
+    app = make_app(tmp_path)
+    seed = seed_application(app)
+    provider, adapter = configured_provider(app, seed)
+    app.state.interview_availability_provider = adapter
+
+    with TestClient(app) as client:
+        response = client.get("/api/v1/interview-availability", params={
+            "from": "2026-07-27T00:00:00+08:00",
+            "to": "2026-08-02T23:59:59+08:00",
+            "participant_ids": str(seed["interviewer_id"]),
+            "timezone": "Asia/Shanghai",
+            "buffer": 15,
+        }, headers=login(client, "interview-admin@example.test"))
+
+    assert response.status_code == 200
+    assert response.json()["data"]["participants"] == [{
+        "participant_id": str(seed["interviewer_id"]),
+        "status": "confirmed",
+        "busy": [],
+    }]
+    assert [(request.time_min.isoformat(), request.time_max.isoformat()) for request in provider.freebusy_requests] == [(
+        "2026-07-26T23:45:00+08:00",
+        "2026-08-03T00:14:59+08:00",
+    )]
+
+
 def test_enabled_feishu_reports_unbound_or_failed_calendar_as_unconfirmed(tmp_path) -> None:
     app = make_app(tmp_path)
     seed = seed_application(app)

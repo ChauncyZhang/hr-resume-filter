@@ -294,6 +294,8 @@ class HttpFeishuProvider:
         data = payload.get("data")
         if not isinstance(data, dict):
             raise FeishuProviderError("feishu_response_invalid", retryable=False)
+        if not data:
+            return ()
         if "freebusy_lists" in data:
             rows = data["freebusy_lists"]
             items_key = "freebusy_items"

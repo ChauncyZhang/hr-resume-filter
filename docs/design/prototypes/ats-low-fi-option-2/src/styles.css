@@ -468,15 +468,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .submitted-feedback-card > p strong { color: #233746; }
 .submitted-feedback-card .feedback-priorities { margin: 12px 0 0; }
 
-.kanban { grid-template-columns: repeat(7, minmax(112px, 1fr)); }
+.kanban { grid-template-columns: repeat(5, minmax(112px, 1fr)); }
 @media (max-width: 1180px) {
-  .kanban { overflow-x: auto; grid-template-columns: repeat(7, 150px); }
+  .kanban { overflow-x: auto; grid-template-columns: repeat(5, 160px); }
 }
 @media (max-width: 900px) {
-  .kanban { overflow-x: auto; grid-template-columns: repeat(7, 150px); }
+  .kanban { overflow-x: auto; grid-template-columns: repeat(5, 200px); }
 }
 @media (max-width: 600px) {
-  .kanban { grid-template-columns: repeat(7, minmax(78vw, 290px)); }
+  .kanban { grid-template-columns: repeat(5, clamp(260px, 78vw, 300px)); }
 }
 
 @media (min-width: 1440px) {

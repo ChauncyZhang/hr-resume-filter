@@ -334,8 +334,14 @@ test("load preserves abort errors", async () => {
 test("workbench shell keeps real tasks accessible across loading and narrow layouts", () => {
   const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
   const stylesSource = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+  const themeSource = readFileSync(new URL("./product-theme.css", import.meta.url), "utf8");
 
   assert.match(appSource, /className="page-body workbench-skeleton" role="status" aria-live="polite"/);
+  assert.match(appSource, /const workbenchBoardStageMeta = stageMeta\.filter\(\(stage\) => !\["新简历", "待沟通"\]\.includes\(stage\)\)/);
+  assert.match(appSource, /workbenchBoardStageMeta\.map\(\(stage\) => <section className="stage"/);
+  assert.match(appSource, /workbenchBoardStages\.map\(\(\[name, count, loadedCount, candidates\]\) =>/);
+  assert.match(appSource, /stages\.flat\(\)\.slice\(0, 10\)\.map\(\(candidate\) =>/);
+  assert.match(appSource, /const workbenchCandidateCount = visibleStageMeta\.reduce/);
   assert.match(appSource, /aria-pressed=\{activeWorkbenchJob\.id === job\.id\}/);
   assert.match(appSource, /navigate\(candidateListPath\(\{ jobId: activeWorkbenchJob\.id, stage: name \}\)\)/);
   assert.match(appSource, /candidateOrigin\?\.activeNav === "工作台" \? "返回工作台"/);
@@ -356,6 +362,8 @@ test("workbench shell keeps real tasks accessible across loading and narrow layo
   assert.match(appSource, /className="calendar-interview-round">\{record\.round\}/);
   assert.match(stylesSource, /\.calendar-interview-title strong\s*\{[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s);
   assert.match(stylesSource, /\.calendar-interview-meta\s*\{[^}]*flex-wrap:\s*wrap/s);
-  assert.match(stylesSource, /\.kanban\s*\{[^}]*grid-template-columns:\s*repeat\(7, minmax\(112px, 1fr\)\)/);
-  assert.match(stylesSource, /@media \(max-width: 1180px\)\s*\{[\s\S]*?\.kanban\s*\{[^}]*grid-template-columns:\s*repeat\(7, 150px\)/);
+  assert.match(stylesSource, /\.kanban\s*\{[^}]*grid-template-columns:\s*repeat\(5, minmax\(112px, 1fr\)\)/);
+  assert.match(themeSource, /\.kanban\s*\{[^}]*grid-template-columns:\s*repeat\(5, minmax\(0, 1fr\)\)/);
+  assert.match(themeSource, /@media \(max-width: 1280px\)\s*\{[\s\S]*?\.kanban\s*\{[^}]*grid-template-columns:\s*repeat\(5, minmax\(160px, 1fr\)\)/);
+  assert.match(themeSource, /@media \(max-width: 640px\)\s*\{[\s\S]*?\.kanban\s*\{[^}]*grid-template-columns:\s*repeat\(5, clamp\(260px, 78vw, 300px\)\)/);
 });

@@ -212,6 +212,37 @@ def test_http_provider_parses_current_batch_freebusy_response_shape() -> None:
     }
 
 
+def test_http_provider_accepts_successful_empty_next_week_freebusy_data() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/tenant_access_token/internal"):
+            return httpx.Response(200, json={"code": 0, "tenant_access_token": "tenant-token"})
+        if request.url.path.endswith("/freebusy/batch"):
+            requests.append(request)
+            return httpx.Response(200, json={"code": 0, "data": {}, "msg": "success"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    provider = HttpFeishuProvider(httpx.Client(transport=httpx.MockTransport(handler)))
+    starts_at = datetime.fromisoformat("2026-07-27T00:00:00+08:00")
+    ends_at = datetime.fromisoformat("2026-08-02T23:59:59+08:00")
+
+    windows = provider.batch_freebusy(
+        FeishuCredentials("cli", "secret", "https://example.test/callback"),
+        FreeBusyRequest(("ou_bound",), starts_at, ends_at),
+    )
+
+    assert windows == ()
+    assert json.loads(requests[0].content) == {
+        "time_min": "2026-07-27T00:00:00+08:00",
+        "time_max": "2026-08-02T23:59:59+08:00",
+        "user_ids": ["ou_bound"],
+        "include_external_calendar": True,
+        "only_busy": True,
+        "need_rsvp_status": True,
+    }
+
+
 def test_http_provider_keeps_legacy_batch_freebusy_response_compatible() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/tenant_access_token/internal"):

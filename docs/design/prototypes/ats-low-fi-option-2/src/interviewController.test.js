@@ -131,6 +131,17 @@ test("requests privacy-safe availability with range, participants, buffer, timez
   assert.equal(calls[0].path, `/api/v1/interview-availability?from=2026-07-13T00%3A00%3A00%2B08%3A00&to=2026-07-19T23%3A59%3A59%2B08%3A00&participant_ids=${USER_ID}&timezone=Asia%2FShanghai&buffer=15&exclude=${INTERVIEW_ID}`);
 });
 
+test("serializes the exact adjacent-week availability range in the selected timezone", async () => {
+  const { client, calls } = queuedClient([{ data: { participants: [] } }]);
+  const controller = createInterviewController({ client });
+
+  await controller.availability({
+    from: "2026-07-27", to: "2026-08-02", participantIds: [USER_ID], timezone: "Asia/Shanghai", buffer: 15,
+  });
+
+  assert.equal(calls[0].path, `/api/v1/interview-availability?from=2026-07-27T00%3A00%3A00%2B08%3A00&to=2026-08-02T23%3A59%3A59%2B08%3A00&participant_ids=${USER_ID}&timezone=Asia%2FShanghai&buffer=15`);
+});
+
 test("gets one interview and propagates abort errors unchanged", async () => {
   const abortError = new DOMException("aborted", "AbortError");
   const first = queuedClient([{ data: apiInterview({ status: "confirmed" }) }]);

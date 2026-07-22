@@ -51,7 +51,7 @@ import {
   writeJobCreateDraft,
 } from "./appRouter.js";
 import { apiClient } from "./apiClient.js";
-import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
+import { getSessionIdentity, getSessionMessage, mapServerRoles, sessionController } from "./session.js";
 import { normalizeScreeningTask, screeningController as defaultScreeningController } from "./screeningController.js";
 import { candidateController as defaultCandidateController } from "./candidateController.js";
 import { applicationStageLabel } from "./recruitingTerminology.js";
@@ -97,6 +97,8 @@ const stageMeta = [
   "已通过",
 ];
 
+const workbenchBoardStageMeta = stageMeta.filter((stage) => !["新简历", "待沟通"].includes(stage));
+
 const emptyStages = stageMeta.map(() => []);
 
 function IconButton({ label, children, className = "", onClick, disabled = false, buttonRef, ...buttonProps }) {
@@ -137,7 +139,7 @@ function WorkbenchSkeleton() {
         <section className="pipeline-panel">
           <header className="pipeline-header"><div className="skeleton-heading" aria-hidden="true"><span /><span /></div></header>
           <div className="kanban skeleton-kanban" aria-hidden="true">
-            {stageMeta.map((stage) => <section className="stage" key={stage}><header><span /></header><div className="stage-list"><span /><span /></div></section>)}
+            {workbenchBoardStageMeta.map((stage) => <section className="stage" key={stage}><header><span /></header><div className="stage-list"><span /><span /></div></section>)}
           </div>
         </section>
         <span className="workbench-loading-label">正在加载工作台</span>
@@ -172,9 +174,16 @@ function inviteTokenFromHash() {
 }
 
 export function App({ controller = sessionController, screeningController = defaultScreeningController, candidateController = defaultCandidateController, jobController = defaultJobController, workbenchController = defaultWorkbenchController, interviewController = defaultInterviewController, talentController = defaultTalentController, reportController = defaultReportController, accountClient = apiClient }) {
+  const navigate = useNavigate();
   const session = useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot);
   const [inviteToken, setInviteToken] = useState(inviteTokenFromHash);
   const [acceptedEmail, setAcceptedEmail] = useState("");
+  const handleLogin = useCallback(async (credentials) => {
+    const user = await controller.login(credentials);
+    const defaultNav = getDefaultNavItem(mapServerRoles(user?.roles));
+    navigate(routeForNav(defaultNav), { replace: true });
+    return user;
+  }, [controller, navigate]);
 
   useEffect(() => {
     void controller.bootstrap();
@@ -188,7 +197,7 @@ export function App({ controller = sessionController, screeningController = defa
   if (session.status === "bootstrapping") return <SessionLoadingView />;
   if (session.status === "anonymous") {
     if (inviteToken) return <InviteAcceptView token={inviteToken} client={accountClient} onAccepted={(email) => { window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`); setAcceptedEmail(email); setInviteToken(""); }} />;
-    return <LoginView error={session.error} retryAfterSeconds={session.retryAfterSeconds} submitting={session.submitting} initialEmail={acceptedEmail} onLogin={(credentials) => controller.login(credentials)} />;
+    return <LoginView error={session.error} retryAfterSeconds={session.retryAfterSeconds} submitting={session.submitting} initialEmail={acceptedEmail} onLogin={handleLogin} />;
   }
   if (session.status !== "authenticated") {
     const identity = getSessionIdentity(session.user, null);
@@ -295,6 +304,10 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   const activeWorkbenchJob = workbenchJobs.find((job) => job.id === activeWorkbenchJobId) || workbenchJobs[0] || null;
   const stages = activeWorkbenchJob ? stageMeta.map((stage) => activeWorkbenchJob.stages[stage]?.items || []) : emptyStages;
   const visibleStageMeta = stageMeta.map((name, index) => [name, activeWorkbenchJob?.stages[name]?.count || 0, stages[index].length]);
+  const workbenchBoardStages = workbenchBoardStageMeta.map((name) => {
+    const stageIndex = stageMeta.indexOf(name);
+    return [name, activeWorkbenchJob?.stages[name]?.count || 0, stages[stageIndex].length, stages[stageIndex]];
+  });
   const emptyTaskGroup = { count: 0, items: [] };
   const workbenchTasks = workbenchState.data?.tasks || { review: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup, passed: emptyTaskGroup };
   const workbenchNotifications = workbenchState.data?.notifications || { review: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup, passed: emptyTaskGroup };
@@ -1032,11 +1045,11 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
 
               {view === "board" ? (
                 <div className="kanban" aria-label="候选人招聘阶段">
-                  {visibleStageMeta.map(([name, count, loadedCount], index) => (
+                  {workbenchBoardStages.map(([name, count, loadedCount, candidates]) => (
                     <section className="stage" key={name}>
                       <header><strong>{applicationStageLabel(name)}</strong><span>{count}</span></header>
                       <div className="stage-list">
-                        {stages[index].slice(0, 5).map((candidate) => (
+                        {candidates.slice(0, 5).map((candidate) => (
                           <CandidateCard key={candidate.applicationId || candidate.id} candidate={candidate} onOpen={openCandidate} />
                         ))}
                       </div>
