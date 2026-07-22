@@ -1,0 +1,40 @@
+name: beyondcandidate
+
+services:
+  proxy:
+    image: beyondcandidate-frontend:bootstrap
+    ports: !override
+      - "0.0.0.0:443:8443"
+    environment:
+      NGINX_ENVSUBST_FILTER: "^SERVER_NAME"
+      SERVER_NAME: "hr.aurora-tek.cn"
+    volumes: !override
+      - ./nginx/production.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/snippets/security-headers.conf:/etc/nginx/snippets/security-headers.conf:ro
+      - /etc/beyondcandidate/tls/fullchain.pem:/etc/nginx/tls/tls.crt:ro
+      - /etc/beyondcandidate/tls/private.key:/etc/nginx/tls/tls.key:ro
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "-q", "--spider", "https://127.0.0.1:8443/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    image: beyondcandidate-server:bootstrap
+    build: !reset null
+
+  worker:
+    image: beyondcandidate-server:bootstrap
+    build: !reset null
+
+  postgres:
+    image: postgres:16.9-alpine
+
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+
+  minio-provision:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+
+  clamav:
+    image: clamav/clamav:1.4.3

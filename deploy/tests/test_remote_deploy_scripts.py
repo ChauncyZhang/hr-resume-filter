@@ -5,16 +5,11 @@ import subprocess
 ROOT = Path(__file__).parents[2]
 BASH = r"C:\Program Files\Git\bin\bash.exe"
 POWERSHELL = (ROOT / "deploy" / "deploy-remote.ps1").read_text(encoding="utf-8")
+BOOTSTRAP_POWERSHELL = (ROOT / "deploy" / "bootstrap-remote.ps1").read_text(encoding="utf-8")
 REMOTE_SHELL = (ROOT / "deploy" / "remote-release.sh").read_text(encoding="utf-8")
 REMOTE_ROLLBACK = (ROOT / "deploy" / "remote-rollback.sh").read_text(encoding="utf-8")
 PRODUCTION_SMOKE = (
-    ROOT
-    / "docs"
-    / "design"
-    / "prototypes"
-    / "ats-low-fi-option-2"
-    / "scripts"
-    / "production-browser-smoke.cjs"
+    ROOT / "deploy" / "production-browser-smoke.cjs"
 ).read_text(encoding="utf-8")
 SHARED_TEMPLATE = (
     ROOT / "deploy" / "tests" / "fixtures" / "shared-production.conf.template"
@@ -30,8 +25,9 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "--exclude=.tmp" in POWERSHELL
     assert "--exclude=.venv*" in POWERSHELL
     assert '--force-local' not in POWERSHELL
-    assert 'Push-Location $localStaging' in POWERSHELL
-    assert 'tar -czf "source.tar.gz"' in POWERSHELL
+    assert '$productRoot = (Resolve-Path (Join-Path $repositoryRoot "product")).Path' in POWERSHELL
+    assert 'Invoke-Native git -C $productRoot archive' in POWERSHELL
+    assert 'Copy-Item -LiteralPath (Join-Path $PSScriptRoot $privateFile)' in POWERSHELL
     assert 'Join-Path $tempRoot "beyondcandidate-deploy-"' in POWERSHELL
     assert "Local staging cleanup was skipped" in POWERSHELL
     assert "[Parameter(ValueFromRemainingArguments" not in POWERSHELL
@@ -42,6 +38,7 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "scp failed after 3 attempts" in POWERSHELL
     assert "Production browser smoke failed; requesting release rollback" in POWERSHELL
     assert "remote-rollback.sh" in POWERSHELL
+    assert "Invoke-Native npm.cmd ci --no-audit --no-fund" in POWERSHELL
 
 
 def test_container_test_gate_excludes_contracts_that_require_host_tools() -> None:
@@ -51,9 +48,22 @@ def test_container_test_gate_excludes_contracts_that_require_host_tools() -> Non
     assert "--ignore=server/tests/test_observability_topology.py" in POWERSHELL
 
 
+def test_first_machine_bootstrap_is_secret_safe_and_preserves_shared_website() -> None:
+    assert "RandomNumberGenerator" in BOOTSTRAP_POWERSHELL
+    assert "bootstrap-admin.json" in BOOTSTRAP_POWERSHELL
+    assert "SharedWebsiteContainer" in BOOTSTRAP_POWERSHELL
+    assert "docker inspect --format '{{.State.Running}}'" in BOOTSTRAP_POWERSHELL
+    assert "docker rm" not in BOOTSTRAP_POWERSHELL
+    assert "docker stop" not in BOOTSTRAP_POWERSHELL
+    assert "foreach ($upload in $uploads)" in BOOTSTRAP_POWERSHELL
+
+
 def test_remote_release_preserves_project_identity_and_rolls_back_services() -> None:
     assert "docker compose -p beyondcandidate" in REMOTE_SHELL
-    assert 'previous_release=$(readlink -f "$app_root/current")' in REMOTE_SHELL
+    assert 'previous_release=$(readlink -f "$app_root/current" 2>/dev/null || true)' in REMOTE_SHELL
+    assert 'configuration_root=$app_root/bootstrap' in REMOTE_SHELL
+    assert 'bootstrap_system_admin' in REMOTE_SHELL
+    assert 'docker network connect beyondcandidate_edge aurora-web' in REMOTE_SHELL
     assert "rollback_services" in REMOTE_SHELL
     assert "python -m alembic -c server/alembic.ini upgrade head" in REMOTE_SHELL
     assert "10-provision-app-role.sh" in REMOTE_SHELL

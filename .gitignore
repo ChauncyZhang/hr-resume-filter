@@ -13,3 +13,6 @@ dist/
 .tmp/
 *.spec
 .worktrees/
+node_modules/
+deploy/target.local.psd1
+deploy/bootstrap-output/

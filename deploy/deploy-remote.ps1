@@ -88,18 +88,23 @@ foreach ($command in @("git", "docker", "ssh", "scp", "tar")) {
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$prototypeRoot = Join-Path $repositoryRoot "docs\design\prototypes\ats-low-fi-option-2"
-$commit = (& git -C $repositoryRoot rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$') {
-    throw "Unable to resolve the release commit"
+$productRoot = (Resolve-Path (Join-Path $repositoryRoot "product")).Path
+$prototypeRoot = Join-Path $productRoot "frontend"
+$internalCommit = (& git -C $repositoryRoot rev-parse HEAD).Trim()
+$commit = (& git -C $productRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40}$' -or $internalCommit -notmatch '^[0-9a-f]{40}$') {
+    throw "Unable to resolve the internal or product release commit"
 }
 $shortCommit = $commit.Substring(0, 8)
+$shortInternalCommit = $internalCommit.Substring(0, 8)
 $dirtyLines = @(& git -C $repositoryRoot status --porcelain --untracked-files=normal)
 if ($LASTEXITCODE -ne 0) { throw "Unable to inspect repository status" }
-$isDirty = $dirtyLines.Count -gt 0
+$productDirtyLines = @(& git -C $productRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) { throw "Unable to inspect product submodule status" }
+$isDirty = $dirtyLines.Count -gt 0 -or $productDirtyLines.Count -gt 0
 
 $dirtySuffix = if ($isDirty) { "-dirty" } else { "" }
-$releaseId = "{0}-{1}{2}" -f [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss"), $shortCommit, $dirtySuffix
+$releaseId = "{0}-{1}-{2}{3}" -f [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss"), $shortCommit, $shortInternalCommit, $dirtySuffix
 $localStaging = Join-Path ([System.IO.Path]::GetTempPath()) "beyondcandidate-deploy-$releaseId"
 $remoteStaging = "/tmp/beyondcandidate-deploy-$releaseId"
 $frontendImage = "beyondcandidate-frontend:$releaseId"
@@ -107,9 +112,11 @@ $appImage = "beyondcandidate-server:$releaseId"
 $sourceArchive = Join-Path $localStaging "source.tar.gz"
 $frontendArchive = Join-Path $localStaging "frontend-image.tar"
 $appArchive = Join-Path $localStaging "app-image.tar"
+$releaseTree = Join-Path $localStaging "release-tree"
+$productArchive = Join-Path $localStaging "product.tar"
 
 Write-Host "[deploy] release=$releaseId scope=$Scope host=$RemoteHost"
-Write-Host "[deploy] commit=$commit dirty=$isDirty"
+Write-Host "[deploy] product_commit=$commit internal_commit=$internalCommit dirty=$isDirty"
 Invoke-SharedNginxReleaseGate $repositoryRoot
 if ($ValidateOnly) {
     Write-Host "[deploy] shared Nginx release gate passed; no build or remote change performed"
@@ -122,10 +129,17 @@ if ($isDirty -and -not $AllowDirty) {
 try {
     Invoke-Native docker info --format "{{.ServerVersion}}"
 
+    Push-Location $prototypeRoot
+    try {
+        Assert-Command "npm.cmd"
+        Invoke-Native npm.cmd ci --no-audit --no-fund
+    } finally {
+        Pop-Location
+    }
+
     if (-not $SkipTests) {
         Push-Location $prototypeRoot
         try {
-            Assert-Command "npm.cmd"
             Invoke-Native npm.cmd test
             Invoke-Native npm.cmd run build
         } finally {
@@ -134,7 +148,7 @@ try {
 
         if ($Scope -eq "all") {
             $testImage = "beyondcandidate-server-test:$releaseId"
-            Invoke-Native docker build --target test -t $testImage -f (Join-Path $repositoryRoot "server\Dockerfile") $repositoryRoot
+            Invoke-Native docker build --target test -t $testImage -f (Join-Path $productRoot "server\Dockerfile") $productRoot
             Invoke-Native docker run --rm $testImage python -m pytest server/tests `
                 --ignore=server/tests/test_backup_restore_contract.py `
                 --ignore=server/tests/test_observability_preflight.py `
@@ -144,9 +158,9 @@ try {
         }
     }
 
-    Invoke-Native docker build -f (Join-Path $repositoryRoot "deploy\nginx\Dockerfile") -t $frontendImage $prototypeRoot
+    Invoke-Native docker build -f (Join-Path $productRoot "deploy\nginx\Dockerfile") -t $frontendImage $productRoot
     if ($Scope -eq "all") {
-        Invoke-Native docker build --target runtime -f (Join-Path $repositoryRoot "server\Dockerfile") -t $appImage $repositoryRoot
+        Invoke-Native docker build --target runtime -f (Join-Path $productRoot "server\Dockerfile") -t $appImage $productRoot
     }
 
     New-Item -ItemType Directory -Force -Path $localStaging | Out-Null
@@ -154,22 +168,26 @@ try {
     if ($Scope -eq "all") {
         Invoke-Native docker save -o $appArchive $appImage
     }
-    Push-Location $localStaging
-    try {
-        Invoke-Native tar -czf "source.tar.gz" `
-            --exclude=.git `
-            --exclude=.worktrees `
-            --exclude=.tmp `
-            --exclude=.pytest_cache `
-            --exclude=.superpowers `
-            --exclude=node_modules `
-            --exclude=dist `
-            "--exclude=.venv*" `
-            --exclude=__pycache__ `
-            -C $repositoryRoot .
-    } finally {
-        Pop-Location
+    New-Item -ItemType Directory -Force -Path $releaseTree | Out-Null
+    if ($isDirty -and $AllowDirty) {
+        Invoke-Native tar -cf $productArchive `
+            --exclude=.git --exclude=.tmp --exclude=.pytest_cache `
+            --exclude=node_modules --exclude=dist "--exclude=.venv*" --exclude=__pycache__ `
+            -C $productRoot .
+    } else {
+        Invoke-Native git -C $productRoot archive --format=tar --output=$productArchive HEAD
     }
+    Invoke-Native tar -xf $productArchive -C $releaseTree
+    foreach ($privateFile in @(
+        "remote-release.sh",
+        "remote-rollback.sh",
+        "shared_nginx_release_validator.py",
+        "shared-nginx-smoke.sh"
+    )) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $privateFile) `
+            -Destination (Join-Path $releaseTree "deploy\$privateFile") -Force
+    }
+    Invoke-Native tar -czf $sourceArchive -C $releaseTree .
 
     $sourceSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceArchive).Hash.ToLowerInvariant()
     Invoke-Native ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost "mkdir -p '$remoteStaging'"
@@ -206,9 +224,11 @@ exec "$release_dir/deploy/remote-release.sh" "$release" "$scope" "$domain" "$app
     Push-Location $prototypeRoot
     try {
         $previousProductionUrl = $env:UX09_PRODUCTION_URL
+        $previousNodePath = $env:NODE_PATH
         try {
             $env:UX09_PRODUCTION_URL = "https://$Domain/"
-            Invoke-Native node scripts/production-browser-smoke.cjs
+            $env:NODE_PATH = Join-Path $prototypeRoot "node_modules"
+            Invoke-Native node (Join-Path $PSScriptRoot "production-browser-smoke.cjs")
         } catch {
             Write-Warning "Production browser smoke failed; requesting release rollback"
             & ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost `
@@ -219,6 +239,7 @@ exec "$release_dir/deploy/remote-release.sh" "$release" "$scope" "$domain" "$app
             throw
         } finally {
             $env:UX09_PRODUCTION_URL = $previousProductionUrl
+            $env:NODE_PATH = $previousNodePath
         }
     } finally {
         Pop-Location

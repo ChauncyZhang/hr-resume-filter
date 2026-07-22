@@ -1,4 +1,0 @@
-候选人 A
-5年 Python 后端开发经验，本科学历。
-熟悉 FastAPI、Docker、PostgreSQL 和 Redis。
-参与过招聘系统、权限系统和数据处理平台建设。

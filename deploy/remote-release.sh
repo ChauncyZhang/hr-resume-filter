@@ -14,11 +14,22 @@ staging=$5
 commit=$6
 source_sha=$7
 release_dir="$app_root/releases/$release"
-previous_release=$(readlink -f "$app_root/current")
-previous_env_file="$previous_release/deploy/.env"
+previous_release=$(readlink -f "$app_root/current" 2>/dev/null || true)
+initial_release=0
+if [ -n "$previous_release" ] && [ -d "$previous_release" ]; then
+    configuration_root=$previous_release/deploy
+    configuration_template=$previous_release/deploy/nginx/production.conf.template
+else
+    initial_release=1
+    previous_release=
+    configuration_root=$app_root/bootstrap
+    configuration_template=$app_root/bootstrap/production.conf.template
+fi
+previous_env_file="$configuration_root/.env"
 overlay="$release_dir/deploy/compose.server-https.yaml"
 env_file="$release_dir/deploy/.env"
 nginx_template="$release_dir/deploy/nginx/production.conf.template"
+bootstrap_admin="$app_root/bootstrap/bootstrap-admin.json"
 frontend_image="beyondcandidate-frontend:$release"
 app_image="beyondcandidate-server:$release"
 
@@ -26,6 +37,10 @@ case "$scope" in
     frontend|all) ;;
     *) printf 'unsupported release scope: %s\n' "$scope" >&2; exit 2 ;;
 esac
+if [ "$initial_release" -eq 1 ] && [ "$scope" != all ]; then
+    printf '%s\n' 'the first release must use scope=all' >&2
+    exit 2
+fi
 case "$release" in
     *[!A-Za-z0-9._-]*|'') printf '%s\n' 'invalid release id' >&2; exit 2 ;;
 esac
@@ -52,10 +67,9 @@ PY
 }
 
 test -d "$release_dir"
-test -d "$previous_release"
 test -f "$previous_env_file"
-test -f "$previous_release/deploy/compose.server-https.yaml"
-test -f "$previous_release/deploy/nginx/production.conf.template"
+test -f "$configuration_root/compose.server-https.yaml"
+test -f "$configuration_template"
 test -f "$staging/frontend-image.tar"
 aurora_web_smoke_marker=$(read_aurora_web_smoke_marker "$previous_env_file")
 if [ -z "$aurora_web_smoke_marker" ]; then
@@ -64,8 +78,8 @@ if [ -z "$aurora_web_smoke_marker" ]; then
 fi
 cp "$previous_env_file" "$env_file"
 chmod 600 "$env_file"
-cp "$previous_release/deploy/compose.server-https.yaml" "$overlay"
-cp "$previous_release/deploy/nginx/production.conf.template" "$nginx_template"
+cp "$configuration_root/compose.server-https.yaml" "$overlay"
+cp "$configuration_template" "$nginx_template"
 python3 "$release_dir/deploy/shared_nginx_release_validator.py" \
     --nginx-template "$nginx_template"
 
@@ -80,6 +94,11 @@ compose_at() {
 }
 
 rollback_services() {
+    if [ "$initial_release" -eq 1 ]; then
+        compose_at "$release_dir" stop proxy api worker >/dev/null 2>&1 || true
+        compose_at "$release_dir" rm -f proxy api worker >/dev/null 2>&1 || true
+        return 0
+    fi
     if [ "$scope" = all ]; then
         compose_at "$previous_release" up -d --no-build api worker proxy
     else
@@ -115,6 +134,11 @@ verify_release_runtime() {
 }
 
 restore_previous_and_verify() {
+    if [ "$initial_release" -eq 1 ]; then
+        rollback_services
+        printf '%s\n' 'initial release stopped; there is no previous release to restore' >&2
+        return 0
+    fi
     if ! rollback_services; then
         printf '%s\n' 'rollback service restoration failed' >&2
         return 1
@@ -123,6 +147,24 @@ restore_previous_and_verify() {
         printf '%s\n' 'rollback verification failed; previous release is not healthy' >&2
         return 1
     fi
+}
+
+ensure_shared_website_network() {
+    docker inspect aurora-web >/dev/null
+    if ! docker network inspect beyondcandidate_edge >/dev/null 2>&1; then
+        docker network create beyondcandidate_edge >/dev/null
+    fi
+    if ! docker inspect --format '{{json .NetworkSettings.Networks}}' aurora-web | grep -q 'beyondcandidate_edge'; then
+        docker network connect beyondcandidate_edge aurora-web
+    fi
+}
+
+bootstrap_system_admin() {
+    [ "$initial_release" -eq 1 ] || return 0
+    test -f "$bootstrap_admin"
+    compose_at "$release_dir" run --rm --no-deps \
+        -v "$bootstrap_admin:/run/secrets/bootstrap-admin.json:ro" api \
+        python -c 'import json, os; from server.app.identity.bootstrap import bootstrap_system_admin as create; from server.app.identity.store import IdentityStore; data=json.load(open("/run/secrets/bootstrap-admin.json", encoding="utf-8")); create(IdentityStore(os.environ["DATABASE_URL"]), data["organization_slug"], data["organization_name"], data["email"], data["display_name"], data["password"])'
 }
 
 docker load -i "$staging/frontend-image.tar"
@@ -147,6 +189,7 @@ test -f "$smoke_tool"
 
 if [ "$scope" = all ]; then
     compose_at "$release_dir" up -d postgres minio clamav
+    ensure_shared_website_network
     compose_at "$release_dir" up --no-deps minio-provision
     owner_url=$(python3 - "$env_file" <<'PY'
 import sys
@@ -190,7 +233,13 @@ PY
         restore_previous_and_verify || exit 1
         exit 1
     fi
+    if ! bootstrap_system_admin; then
+        printf '%s\n' 'initial administrator creation failed; rolling back services' >&2
+        restore_previous_and_verify || exit 1
+        exit 1
+    fi
 else
+    ensure_shared_website_network
     if ! compose_at "$release_dir" up -d --no-deps --force-recreate proxy; then
         restore_previous_and_verify || exit 1
         exit 1
@@ -220,6 +269,9 @@ frontend_image_id=$(docker image inspect --format '{{.Id}}' "$frontend_image")
 } > "$release_dir/deploy/release-info.txt"
 ln -sfn "$release_dir" "$app_root/current.new"
 mv -Tf "$app_root/current.new" "$app_root/current"
+if [ "$initial_release" -eq 1 ]; then
+    rm -rf "$app_root/bootstrap"
+fi
 
 rm -f "$staging/source.tar.gz" "$staging/frontend-image.tar" "$staging/app-image.tar"
 rmdir "$staging" 2>/dev/null || true
