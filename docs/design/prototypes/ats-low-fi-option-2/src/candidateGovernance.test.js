@@ -186,6 +186,7 @@ test("release is disabled when hold id/version is absent and dispose aborts late
 
 test("candidate detail wires governance states, destructive confirmation and role-gated hold actions", () => {
   const source = readFileSync(new URL("./CandidateViews.jsx", import.meta.url), "utf8");
+  const css = readFileSync(new URL("./product-theme-people.css", import.meta.url), "utf8");
   assert.match(source, /createCandidateGovernanceController/);
   assert.match(source, /canReadCandidateGovernance/);
   assert.match(source, /canRequestCandidateDeletion/);
@@ -196,11 +197,17 @@ test("candidate detail wires governance states, destructive confirmation and rol
   assert.match(source, /data-dialog-initial-focus/);
   assert.match(source, /onKeyDown=\{handleKeyDown\}/);
   assert.match(source, /\["requested", "approved", "executing", "failed"\]/);
-  assert.match(source, /requested: "待审批"/);
-  assert.match(source, /approved: "已批准"/);
-  assert.match(source, /executing: "执行中"/);
+  assert.match(source, /requested: "待系统管理员审批"/);
+  assert.match(source, /approved: "已批准，等待执行"/);
+  assert.match(source, /executing: "正在删除"/);
   assert.match(source, /completed: "已完成"/);
-  assert.match(source, /failed: "失败"/);
+  assert.match(source, /failed: "执行失败"/);
+  assert.match(source, /设置 → 审计与数据治理 → 删除请求审批/);
+  assert.match(source, /canRequest && !duplicateOpen/);
+  assert.doesNotMatch(source, /已有删除请求/);
+  assert.match(css, /grid-template-columns:[^;]*168px 76px/);
+  assert.match(css, /\.candidate-page \.candidate-stage-cell \{[^}]*padding-right: 8px/);
+  assert.match(css, /\.candidate-page \.candidate-score \{[^}]*padding-left: 4px/);
   assert.doesNotMatch(source, /queued|processing/);
   assert.doesNotMatch(source, /private_manifest|object_key|raw problem/i);
 });

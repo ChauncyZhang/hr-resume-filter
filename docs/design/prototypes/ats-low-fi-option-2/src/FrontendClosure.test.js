@@ -73,7 +73,7 @@ after(async () => {
   await vite?.close();
 });
 
-async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = false, roles = ["recruiting_admin"], workbench = null, onRequest } = {}) {
+async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = false, roles = ["recruiting_admin"], workbench = null, candidates = null, onRequest } = {}) {
   const context = await browser.newContext({ viewport });
   let departmentDetail = {
     ...departments[0],
@@ -104,6 +104,7 @@ async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = f
     }
     if (pathname === "/api/v1/settings/workflow-templates") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [standardWorkflowTemplate] }) });
     if (pathname === "/api/v1/jobs") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], meta: { departments: [], owners: [], status_counts: {}, next_cursor: null } }) });
+    if (pathname === "/api/v1/candidates" && candidates) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: candidates, meta: { limit: 50, next_cursor: null, owners: [] } }) });
     if (pathname === "/api/v1/workbench" && workbench) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: workbench }) });
     if (/^\/api\/v1\/notifications\/workbench\/[^/]+\/read$/.test(pathname) && request.method() === "PUT") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { application_id: pathname.split("/")[5], version: request.postDataJSON().version, read_at: "2026-07-22T01:00:00Z" } }) });
     if (pathname === "/api/v1/auth/invitations/accept") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { email: "invitee@example.test" } }) });
@@ -311,5 +312,38 @@ test("candidate deep links restore tabs and URL filters while browser history fo
     await page.goBack();
     await page.getByRole("heading", { name: "候选人", exact: true, level: 1 }).waitFor();
     assert.equal(new URL(page.url()).searchParams.get("stage"), "待复核");
+  } finally { await context.close(); }
+});
+
+test("candidate list keeps long stage labels separate from AI scores", { timeout: 60_000 }, async () => {
+  const candidates = [{
+    id: "30000000-0000-4000-8000-000000000099",
+    display_name: "周雨晴",
+    current_title: "高级算法工程师",
+    location: "深圳",
+    updated_at: "2026-07-22T03:00:00Z",
+    application: {
+      id: "20000000-0000-4000-8000-000000000099",
+      job_id: notificationJobId,
+      job_title: "AI 工程师",
+      owner_id: users[0].id,
+      owner_name: users[0].display_name,
+      stage: "review",
+      source: "本地上传",
+      updated_at: "2026-07-22T03:00:00Z",
+      ai_score: 78,
+      ai_recommendation: "建议评审",
+    },
+  }];
+  const { context, page } = await openPage({ viewport: { width: 1280, height: 800 }, candidates });
+  try {
+    await page.goto(`${baseUrl}candidates`);
+    const row = page.locator(".candidate-table-row").filter({ hasText: "周雨晴" });
+    await row.waitFor();
+    const stageBox = await row.locator(".candidate-stage").boundingBox();
+    const scoreBox = await row.locator(".candidate-score").boundingBox();
+    assert.ok(stageBox && scoreBox);
+    assert.ok(stageBox.x + stageBox.width + 12 <= scoreBox.x, `stage ends at ${stageBox.x + stageBox.width}, score starts at ${scoreBox.x}`);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth === document.documentElement.clientWidth), true);
   } finally { await context.close(); }
 });

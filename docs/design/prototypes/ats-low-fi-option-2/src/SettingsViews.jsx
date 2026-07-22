@@ -842,7 +842,7 @@ const deletionCountLabels = [
 ];
 
 function deletionStatusLabel(status) {
-  return ({ requested: "待审批", approved: "已批准", executing: "执行中", completed: "已完成", failed: "失败" })[status] || "未知";
+  return ({ requested: "待系统管理员审批", approved: "已批准，等待执行", executing: "正在删除", completed: "已完成", failed: "执行失败" })[status] || "未知";
 }
 
 function GovernanceState({ title, message, onRetry, denied = false }) {

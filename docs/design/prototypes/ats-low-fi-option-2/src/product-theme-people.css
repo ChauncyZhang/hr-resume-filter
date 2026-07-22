@@ -91,10 +91,11 @@
 .pool-table,
 .talent-table { scrollbar-color: #c9c9cf transparent; }
 
-.candidate-table-head,
-.candidate-table-row {
-  min-width: 1020px;
-  grid-template-columns: minmax(180px, 1.25fr) minmax(120px, .9fr) 142px 60px 86px 82px minmax(120px, .8fr) 88px;
+.candidate-page .candidate-table-head,
+.candidate-page .candidate-table-row {
+  min-width: 1100px;
+  grid-template-columns: minmax(180px, 1.25fr) minmax(120px, .9fr) 168px 76px 86px 82px minmax(120px, .8fr) 88px;
+  column-gap: 12px;
 }
 
 .talent-page .pool-table-head,
@@ -162,10 +163,22 @@
   font-weight: 500;
 }
 
-.candidate-stage { color: var(--blue-dark); background: var(--blue-soft); }
-.candidate-stage.terminal { color: var(--ink-secondary); background: #eeeeF1; }
-.candidate-score { color: var(--blue); font-size: 19px; font-weight: 650; }
+.candidate-page .candidate-stage-cell { min-width: 0; padding-right: 8px; }
+.candidate-page .candidate-stage { max-width: 100%; color: var(--blue-dark); background: var(--blue-soft); }
+.candidate-page .candidate-stage.terminal { color: var(--ink-secondary); background: #eeeeF1; }
+.candidate-page .candidate-score { min-width: 0; padding-left: 4px; justify-self: start; color: var(--blue); font-size: 19px; font-weight: 650; white-space: nowrap; }
 .next-cell { color: var(--blue); font-weight: 600; }
+
+.governance-process-note {
+  margin: 12px 0 0;
+  padding: 10px 11px;
+  border: 1px solid #d8e5f4;
+  border-radius: 6px;
+  color: var(--ink-secondary);
+  background: #f4f8fd;
+  font-size: 14px;
+  line-height: 1.6;
+}
 
 .candidate-bulk-bar {
   min-height: 50px;
