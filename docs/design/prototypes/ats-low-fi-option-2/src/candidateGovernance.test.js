@@ -52,6 +52,7 @@ test("normalizers expose only documented governance fields and all nine counts",
   assert.deepEqual(normalizeDeletionRequest(request), {
     id: requestId, status: "requested", version: 4, reasonCode: "administrator_request",
     requestedAt: "2026-07-15T01:00:00Z", approvedAt: null, safeErrorCode: null,
+    activeApplicationCount: null,
     impact: { schemaVersion: 1, candidateRef: candidateId, candidateVersion: 8, policyVersion: 3, counts: {
       contacts: 1, resumes: 2, applications: 3, screeningRecords: 4, interviews: 5,
       feedbackRecords: 6, talentMemberships: 7, resumeObjects: 8, temporaryExports: 9,

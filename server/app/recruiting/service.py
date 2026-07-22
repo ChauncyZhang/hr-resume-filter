@@ -74,10 +74,11 @@ class RecruitingService:
 
     def transition_application_state(self, source, target, *, reason_code=None, reason_text=None):
         allowed = set()
-        if source not in self.TERMINAL and source in self.APPLICATION_PATH:
-            index = self.APPLICATION_PATH.index(source)
-            if index + 1 < len(self.APPLICATION_PATH):
-                allowed.add(self.APPLICATION_PATH[index + 1])
+        if source not in self.TERMINAL:
+            if source in self.APPLICATION_PATH:
+                index = self.APPLICATION_PATH.index(source)
+                if index + 1 < len(self.APPLICATION_PATH):
+                    allowed.add(self.APPLICATION_PATH[index + 1])
             allowed.update({"rejected", "withdrawn"})
         if target not in allowed or (target == "rejected" and not (reason_code or (reason_text and reason_text.strip()))):
             raise InvalidStateTransition
@@ -176,6 +177,47 @@ def transition_application_record(db, organization_id, application_id, target, *
     ):
         raise ResourceVersionConflict
     return _apply_application_transition(db, application, target, actor_user_id=actor_user_id, trace_id=trace_id, reason_code=reason_code, reason_text=reason_text)
+
+
+def withdraw_candidate_applications_for_deletion(
+    db,
+    organization_id,
+    candidate_id,
+    *,
+    actor_user_id,
+    trace_id,
+):
+    from server.app.recruiting.models import Application
+    from server.app.recruiting.tasks import close_review_task
+
+    lock_active_candidate(db, organization_id, candidate_id)
+    applications = list(
+        db.scalars(
+            select(Application)
+            .where(
+                Application.organization_id == organization_id,
+                Application.candidate_id == candidate_id,
+                Application.stage.not_in(RecruitingService.TERMINAL),
+            )
+            .order_by(Application.id)
+            .with_for_update()
+        )
+    )
+    for application in applications:
+        _apply_application_transition(
+            db,
+            application,
+            "withdrawn",
+            actor_user_id=actor_user_id,
+            trace_id=trace_id,
+            reason_code="candidate_deletion_approved",
+        )
+        close_review_task(
+            db,
+            organization_id=organization_id,
+            application_id=application.id,
+        )
+    return len(applications)
 
 
 APPLICATION_WORKFLOW_ACTIONS = {

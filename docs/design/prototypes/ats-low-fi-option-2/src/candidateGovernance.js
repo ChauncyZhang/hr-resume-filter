@@ -64,6 +64,10 @@ export function normalizeDeletionRequest(value) {
     requestedAt: safeString(value?.requested_at),
     approvedAt: nullableString(value?.approved_at),
     safeErrorCode: nullableString(value?.safe_error_code),
+    activeApplicationCount: Number.isInteger(value?.active_application_count)
+      && value.active_application_count >= 0
+      ? value.active_application_count
+      : null,
     impact: {
       schemaVersion: Number.isInteger(impact.schema_version) ? impact.schema_version : 0,
       candidateRef: safeString(impact.candidate_ref),

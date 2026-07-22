@@ -67,6 +67,7 @@ EVENT_METADATA_ALLOWLIST: dict[str, dict[str, MetadataField]] = {
     },
     "governance.deletion_approved": {
         "request_version": _INT,
+        "terminated_active_application_count": _INT,
         "safe_error_code": _CODE,
     },
     "governance.legal_hold_placed": {

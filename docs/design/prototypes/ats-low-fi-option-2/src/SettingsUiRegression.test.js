@@ -61,6 +61,54 @@ async function openAuthenticatedPage(viewport) {
   return { context, page };
 }
 
+async function openDeletionApprovalPage() {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  let request = {
+    id: "3137e3e8-dcbd-4ea2-bab3-7e753b5b2952",
+    status: "requested",
+    version: 1,
+    reason_code: "administrator_request",
+    requested_at: "2026-07-22T05:42:40Z",
+    approved_at: null,
+    safe_error_code: null,
+    active_application_count: 1,
+    impact: {
+      schema_version: 1,
+      candidate_ref: "11111111-1111-4111-8111-111111111111",
+      candidate_version: 1,
+      policy_version: 1,
+      counts: { contacts: 0, resumes: 1, applications: 1, screening_records: 2, interviews: 0, feedback_records: 0, talent_memberships: 0, resume_objects: 1, temporary_exports: 0 },
+      backup_window_ends_at: "2026-10-20T05:42:40Z",
+    },
+  };
+  await context.route("**/api/v1/**", async (route) => {
+    const pathname = new URL(route.request().url()).pathname.replace(/\/$/, "");
+    if (pathname === "/api/v1/me") {
+      await route.fulfill({ status: 200, contentType: "application/json", headers: { "x-csrf-token": "approval-regression" }, body: JSON.stringify({ data: { id: "system-admin-1", display_name: "System Admin", roles: ["system_admin"] } }) });
+      return;
+    }
+    if (pathname === `/api/v1/deletion-requests/${request.id}/transitions` && route.request().method() === "POST") {
+      assert.deepEqual(route.request().postDataJSON(), { target_status: "approved", terminate_active_applications: true });
+      request = { ...request, status: "approved", version: 2, approved_at: "2026-07-22T06:00:00Z", active_application_count: 0 };
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: request }) });
+      return;
+    }
+    if (pathname === `/api/v1/deletion-requests/${request.id}`) {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: request }) });
+      return;
+    }
+    if (pathname === "/api/v1/deletion-requests") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [request], meta: { next_cursor: null, limit: 50 } }) });
+      return;
+    }
+    await route.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ status: 503 }) });
+  });
+  const page = await context.newPage();
+  await page.goto(`${baseUrl}settings/governance`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "删除请求审批", exact: true }).waitFor();
+  return { context, page, requestId: request.id };
+}
+
 async function assertNoHorizontalOverflow(page, label) {
   const widths = await page.evaluate(() => ({
     body: [document.body.clientWidth, document.body.scrollWidth],
@@ -250,6 +298,10 @@ test("audit controls align at desktop width and stack without overflow on narrow
       await page.getByRole("button", { name: "审计与数据治理", exact: true }).click();
       const toolbar = page.locator(".audit-toolbar.governance-filters");
       await toolbar.waitFor();
+      const approvalQueue = page.locator(".deletion-queue");
+      await approvalQueue.waitFor();
+      const [approvalBox, toolbarBox] = await Promise.all([approvalQueue.boundingBox(), toolbar.boundingBox()]);
+      assert.ok(approvalBox && toolbarBox && approvalBox.y < toolbarBox.y, `deletion approvals must appear before audit logs: ${JSON.stringify({ approvalBox, toolbarBox })}`);
       const controls = toolbar.locator("input, select, button");
       const boxes = await controls.evaluateAll((elements) => elements.map((element) => {
         const box = element.getBoundingClientRect();
@@ -270,6 +322,28 @@ test("audit controls align at desktop width and stack without overflow on narrow
     } finally {
       await context.close();
     }
+  }
+});
+
+test("successful deletion approval closes its drawers and cannot be approved twice", { timeout: 60_000 }, async () => {
+  const { context, page, requestId } = await openDeletionApprovalPage();
+  try {
+    await page.getByRole("button", { name: new RegExp(requestId) }).click();
+    const detail = page.getByRole("dialog", { name: "删除请求详情", exact: true });
+    await detail.waitFor();
+    await detail.getByRole("button", { name: "批准删除", exact: true }).click();
+    const confirmation = page.getByRole("dialog", { name: "确认终止申请并删除候选人", exact: true });
+    await confirmation.getByRole("button", { name: "终止 1 项申请并批准删除", exact: true }).click();
+    await detail.waitFor({ state: "detached" });
+    await confirmation.waitFor({ state: "detached" });
+
+    const approvedRow = page.getByRole("button", { name: new RegExp(`${requestId}.*已批准，等待执行`) });
+    await approvedRow.click();
+    const approvedDetail = page.getByRole("dialog", { name: "删除请求详情", exact: true });
+    await approvedDetail.waitFor();
+    assert.equal(await approvedDetail.getByRole("button", { name: "批准删除", exact: true }).count(), 0);
+  } finally {
+    await context.close();
   }
 });
 

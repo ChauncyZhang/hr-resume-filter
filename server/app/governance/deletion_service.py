@@ -25,7 +25,11 @@ from server.app.recruiting.models import (
     IdempotencyRecord,
     Resume,
 )
-from server.app.recruiting.service import IdempotencyConflict, RecruitingService
+from server.app.recruiting.service import (
+    IdempotencyConflict,
+    RecruitingService,
+    withdraw_candidate_applications_for_deletion,
+)
 from server.app.reports.models import ExportCandidateMembership, ExportRecord
 from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.app.talent.models import TalentPoolMembership
@@ -502,7 +506,9 @@ def build_private_manifest(
     return manifest, policy
 
 
-def safe_request_projection(row: DeletionRequest) -> dict[str, Any]:
+def safe_request_projection(
+    row: DeletionRequest, *, active_application_count: int | None = None
+) -> dict[str, Any]:
     backup_window_ends_at = datetime.fromisoformat(
         row.impact_manifest["backup_window_ends_at"].replace("Z", "+00:00")
     )
@@ -514,6 +520,7 @@ def safe_request_projection(row: DeletionRequest) -> dict[str, Any]:
         "requested_at": aware(row.requested_at),
         "approved_at": aware(row.approved_at) if row.approved_at else None,
         "safe_error_code": row.safe_error_code,
+        "active_application_count": active_application_count,
         "impact": impact_manifest_projection(
             row.impact_manifest,
             request_id=row.id,
@@ -612,16 +619,19 @@ def create_deletion_request_locked(
     return row
 
 
-def _has_active_application(db, row: DeletionRequest) -> bool:
-    return db.scalar(
-        select(func.count())
-        .select_from(Application)
-        .where(
-            Application.organization_id == row.organization_id,
-            Application.candidate_id == row.candidate_id,
-            Application.stage.not_in(RecruitingService.TERMINAL),
+def active_application_count(db, row: DeletionRequest) -> int:
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(Application)
+            .where(
+                Application.organization_id == row.organization_id,
+                Application.candidate_id == row.candidate_id,
+                Application.stage.not_in(RecruitingService.TERMINAL),
+            )
         )
-    ) > 0
+        or 0
+    )
 
 
 def _active_hold(db, row: DeletionRequest) -> LegalHold | None:
@@ -651,6 +661,7 @@ def approve_deletion_request_locked(
     row: DeletionRequest,
     principal,
     expected_version: int,
+    terminate_active_applications: bool = False,
     now: datetime,
     trace_id: str | None,
 ) -> ApprovalResult:
@@ -658,7 +669,7 @@ def approve_deletion_request_locked(
         raise DeletionDomainError("resource_version_conflict")
     if row.status not in {"requested", "failed"}:
         raise DeletionDomainError("invalid_deletion_state_transition")
-    has_active_application = _has_active_application(db, row)
+    active_applications = active_application_count(db, row)
     hold = _active_hold(db, row)
     current_manifest, _ = build_private_manifest(
         db, candidate, now=aware(row.requested_at)
@@ -692,7 +703,9 @@ def approve_deletion_request_locked(
     validate_approval(
         requester_id=row.requested_by,
         approver_id=principal.user_id,
-        has_active_application=has_active_application,
+        has_active_application=(
+            active_applications > 0 and not terminate_active_applications
+        ),
         has_active_hold=hold is not None,
         candidate_version=candidate.version,
         expected_candidate_version=(
@@ -709,6 +722,15 @@ def approve_deletion_request_locked(
         row.manifest_hash = current_hash
         row.candidate_version = candidate.version
         row.policy_version = current_manifest["policy_version"]
+    terminated_active_applications = 0
+    if terminate_active_applications and active_applications > 0:
+        terminated_active_applications = withdraw_candidate_applications_for_deletion(
+            db,
+            row.organization_id,
+            row.candidate_id,
+            actor_user_id=principal.user_id,
+            trace_id=trace_id,
+        )
     advance_deletion_status(row.status, "approved")
     row.status = "approved"
     row.approved_by = principal.user_id
@@ -736,7 +758,10 @@ def approve_deletion_request_locked(
         trace_id=trace_id,
         resource_type="deletion_request",
         resource_id=row.id,
-        metadata={"request_version": row.version},
+        metadata={
+            "request_version": row.version,
+            "terminated_active_application_count": terminated_active_applications,
+        },
     )
     db.flush()
     return ApprovalResult(row, True)

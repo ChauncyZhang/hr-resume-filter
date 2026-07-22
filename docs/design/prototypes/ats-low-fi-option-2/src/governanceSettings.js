@@ -20,7 +20,7 @@ const ERROR_MESSAGES = {
   service_unavailable: "服务暂时不可用，请稍后重试。",
   stale_manifest: "删除影响已变化，已加载最新影响，请重新确认。",
   self_approval_forbidden: "不能批准自己提交的删除请求，请由其他系统管理员审批。",
-  active_application_exists: "候选人仍有进行中的职位申请，请先结束相关申请后再审批。",
+  active_application_exists: "候选人仍有进行中的职位申请。请刷新详情，并使用“终止申请并批准删除”继续。",
   legal_hold_active: "候选人处于法律保留状态，请由招聘管理员确认并解除后再审批。",
   invalid_deletion_state_transition: "该删除请求状态已变化，已无法批准；请刷新请求后核对最新状态。",
 };
@@ -373,22 +373,27 @@ export function createGovernanceSettingsController({
     }
   }
 
-  function ensureApprovalIntent(selected) {
-    const signature = JSON.stringify({ id: selected.id, version: selected.version, target_status: "approved" });
+  function ensureApprovalIntent(selected, terminateActiveApplications) {
+    const signature = JSON.stringify({
+      id: selected.id,
+      version: selected.version,
+      target_status: "approved",
+      terminate_active_applications: terminateActiveApplications,
+    });
     if (!approvalIntent || approvalIntent.signature !== signature) approvalIntent = { signature, key: createIdempotencyKey() };
     if (!safeString(approvalIntent.key) || approvalIntent.key.length > 255) approvalIntent.key = createUniqueIdempotencyKey();
     return approvalIntent;
   }
 
-  async function approveDeletionRequest() {
+  async function approveDeletionRequest({ terminateActiveApplications = false } = {}) {
     const selected = state.deletionQueue.selected;
     if (!selected || !["requested", "failed"].includes(selected.status) || state.deletionQueue.approving) return false;
-    const operation = ensureApprovalIntent(selected);
+    const operation = ensureApprovalIntent(selected, terminateActiveApplications);
     const previousImpact = impactSignature(selected);
     const { generation, request } = startDeletionRequest();
     publish("deletionQueue", { approving: true, detailError: "", message: "", confirmationRequired: false });
     try {
-      const response = await client.request(`/api/v1/deletion-requests/${selected.id}/transitions`, { method: "POST", body: { target_status: "approved" }, ifMatch: `"${selected.version}"`, idempotencyKey: operation.key, signal: request.signal });
+      const response = await client.request(`/api/v1/deletion-requests/${selected.id}/transitions`, { method: "POST", body: { target_status: "approved", terminate_active_applications: terminateActiveApplications }, ifMatch: `"${selected.version}"`, idempotencyKey: operation.key, signal: request.signal });
       if (!isCurrentDeletion(generation)) return false;
       const approved = normalizeDeletionRequest(response?.data);
       if (!approved) throw new Error("invalid deletion request projection");

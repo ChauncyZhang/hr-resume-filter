@@ -68,7 +68,11 @@ class IsolatedOcrRenderer:
             raise OcrRenderingError("file_magic_mismatch")
 
         request = json.dumps({"limits": asdict(limits)}, separators=(",", ":")).encode("utf-8") + b"\n" + source
-        environment = {key: os.environ[key] for key in ("PATH", "PYTHONPATH") if key in os.environ}
+        environment = {
+            key: os.environ[key]
+            for key in ("PATH", "PYTHONPATH", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME")
+            if key in os.environ
+        }
         environment.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"})
         process = await asyncio.create_subprocess_exec(
             sys.executable,

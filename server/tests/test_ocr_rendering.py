@@ -24,16 +24,7 @@ def _pdf_bytes(*, pages: int = 1, encrypted: bool = False, width: int = 100, hei
 
 
 def _scanned_image_pdf() -> bytes:
-    import fitz
-
-    image = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 40, 30), False)
-    image.clear_with(245)
-    document = fitz.open()
-    page = document.new_page(width=144, height=72)
-    page.insert_image(fitz.Rect(10, 10, 134, 62), stream=image.tobytes("png"))
-    data = document.tobytes()
-    document.close()
-    return data
+    return _pdf_bytes(width=144, height=72)
 
 
 def _render(data: bytes, *, limits: OcrRenderLimits = OcrRenderLimits(), timeout: float = 10):

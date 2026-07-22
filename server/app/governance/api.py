@@ -27,6 +27,7 @@ from server.app.governance.authorization import (
 from server.app.governance.deletion_models import DeletionRequest, LegalHold
 from server.app.governance.deletion_service import (
     DeletionDomainError,
+    active_application_count,
     aware as aware_deletion,
     append_failure_audit,
     approve_deletion_request_locked,
@@ -780,7 +781,12 @@ def get_deletion_request(request_id: UUID, request: Request):
                 request, principal, "governance.deletion_request_read"
             )
         body = _serialized(
-            DeletionRequestResource, {"data": safe_request_projection(row)}
+            DeletionRequestResource,
+            {
+                "data": safe_request_projection(
+                    row, active_application_count=active_application_count(db, row)
+                )
+            },
         )
         try:
             _audit_read_success(
@@ -854,12 +860,20 @@ def transition_deletion_request(
                 row=row,
                 principal=principal,
                 expected_version=expected,
+                terminate_active_applications=payload.terminate_active_applications,
                 now=_current_time(request),
                 trace_id=request.state.trace_id,
             )
             resource = _serialized(
                 DeletionRequestResource,
-                {"data": safe_request_projection(result.request)},
+                {
+                    "data": safe_request_projection(
+                        result.request,
+                        active_application_count=active_application_count(
+                            db, result.request
+                        ),
+                    )
+                },
             )
             if result.enqueued:
                 status = 200

@@ -23,7 +23,7 @@ const deletionCounts = {
 const deletionRequest = {
   id: "22222222-2222-4222-8222-222222222222", status: "requested", version: 4,
   reason_code: "administrator_request", requested_at: "2026-07-15T01:00:00Z", approved_at: null,
-  safe_error_code: null, impact: { schema_version: 1, candidate_ref: "11111111-1111-4111-8111-111111111111", candidate_version: 8, policy_version: 3, counts: deletionCounts, backup_window_ends_at: "2026-08-15T01:00:00Z" },
+  safe_error_code: null, active_application_count: 0, impact: { schema_version: 1, candidate_ref: "11111111-1111-4111-8111-111111111111", candidate_version: 8, policy_version: 3, counts: deletionCounts, backup_window_ends_at: "2026-08-15T01:00:00Z" },
 };
 
 const policy = {
@@ -204,7 +204,7 @@ test("audit and retention independently expose denied and safe retryable error s
 test("deletion approval errors map real server codes to safe actionable guidance", () => {
   const expectedGuidance = new Map([
     ["self_approval_forbidden", /其他系统管理员审批/],
-    ["active_application_exists", /先结束相关申请/],
+    ["active_application_exists", /终止申请并批准删除/],
     ["legal_hold_active", /确认并解除/],
     ["invalid_deletion_state_transition", /刷新请求后核对最新状态/],
   ]);
@@ -704,6 +704,7 @@ test("deletion request normalization keeps only the safe detail projection", () 
   const normalized = normalizeDeletionRequest({ ...deletionRequest, object_key: "private", impact_manifest: { secret: true } });
   assert.equal(normalized.id, deletionRequest.id);
   assert.equal(normalized.impact.counts.temporaryExports, 9);
+  assert.equal(normalized.activeApplicationCount, 0);
   assert.equal(Object.hasOwn(normalized, "object_key"), false);
   assert.equal(Object.hasOwn(normalized, "impact_manifest"), false);
 });
@@ -742,14 +743,33 @@ test("approval posts exact transition contract and rotates key after success", a
   await controller.loadDeletionRequests();
   await controller.loadDeletionRequest(deletionRequest.id);
   assert.equal(await controller.approveDeletionRequest(), true);
+  assert.equal(controller.getState().deletionQueue.selected.status, "approved");
+  assert.equal(await controller.approveDeletionRequest(), false);
   await controller.loadDeletionRequest(deletionRequest.id);
   controller.getState().deletionQueue.selected.status = "failed";
   assert.equal(await controller.approveDeletionRequest(), true);
   const posts = client.calls.filter((call) => call.options.method === "POST");
   assert.deepEqual(posts.map((call) => call.path), Array(2).fill(`/api/v1/deletion-requests/${deletionRequest.id}/transitions`));
-  assert.deepEqual(posts.map((call) => call.options.body), Array(2).fill({ target_status: "approved" }));
+  assert.deepEqual(posts.map((call) => call.options.body), Array(2).fill({ target_status: "approved", terminate_active_applications: false }));
   assert.deepEqual(posts.map((call) => call.options.ifMatch), ['"4"', '"5"']);
   assert.deepEqual(posts.map((call) => call.options.idempotencyKey), ["approve-key-1", "approve-key-2"]);
+});
+
+test("approval explicitly authorizes terminating active applications", async () => {
+  const activeRequest = { ...deletionRequest, active_application_count: 2 };
+  const client = createClient((_path, options) => {
+    if (options.method === "POST") return { data: { ...activeRequest, status: "approved", version: 5, active_application_count: 0 } };
+    return { data: activeRequest };
+  });
+  const controller = createGovernanceSettingsController({ client, createIdempotencyKey: () => "terminate-key" });
+  await controller.loadDeletionRequest(activeRequest.id);
+  assert.equal(await controller.approveDeletionRequest({ terminateActiveApplications: true }), true);
+  const post = client.calls.find((call) => call.options.method === "POST");
+  assert.deepEqual(post.options.body, {
+    target_status: "approved",
+    terminate_active_applications: true,
+  });
+  assert.equal(post.options.idempotencyKey, "terminate-key");
 });
 
 test("stale manifest and version conflict refresh detail and require a new confirmation", async () => {

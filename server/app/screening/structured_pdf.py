@@ -17,7 +17,7 @@ def extract_structured_pdf(
     max_text_chars: int,
     max_pages: int,
     timeout_seconds: float = 5.0,
-    worker_module: str = "server.app.screening.pymupdf4llm_worker",
+    worker_module: str = "server.app.screening.pdfplumber_worker",
 ) -> str:
     """Run the layout parser in a disposable child so timeout still permits fallback."""
     if len(data) > max_source_bytes:
@@ -32,7 +32,7 @@ def extract_structured_pdf(
     ).encode("utf-8") + b"\n"
     environment = {
         key: os.environ[key]
-        for key in ("PATH", "PYTHONPATH")
+        for key in ("PATH", "PYTHONPATH", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME")
         if key in os.environ
     }
     environment.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONIOENCODING": "utf-8"})

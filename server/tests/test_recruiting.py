@@ -79,6 +79,7 @@ def test_application_state_machine_terminal_rules_and_rejection_reason():
     for source in normal[:-1]:
         assert svc.transition_application_state(source, "withdrawn") == "withdrawn"
         assert svc.transition_application_state(source, "rejected", reason_code="skills") == "rejected"
+    assert svc.transition_application_state("deferred", "withdrawn") == "withdrawn"
     with pytest.raises(InvalidStateTransition):
         svc.transition_application_state("new", "rejected")
     for terminal in ("hired", "rejected", "withdrawn"):

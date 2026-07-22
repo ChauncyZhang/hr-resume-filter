@@ -18,7 +18,16 @@ from server.app.main import create_app
 from server.app.queue.models import BackgroundJob
 from server.app.queue.payloads import DEFAULT_PAYLOAD_POLICIES, UnsafePayload
 from server.app.queue.repository import TERMINAL_CALLBACK_TYPES
-from server.app.recruiting.models import Application, Candidate, CandidateContact, FileObject, IdempotencyRecord, Resume
+from server.app.recruiting.models import (
+    Application,
+    ApplicationReviewTask,
+    ApplicationStageEvent,
+    Candidate,
+    CandidateContact,
+    FileObject,
+    IdempotencyRecord,
+    Resume,
+)
 from server.tests.test_recruiting_api import login, seed_user
 
 
@@ -78,10 +87,21 @@ def request_deletion(client, headers, candidate_id, key="request-1", reason="can
     )
 
 
-def approve(client, headers, request_id, version, key="approve-1"):
+def approve(
+    client,
+    headers,
+    request_id,
+    version,
+    key="approve-1",
+    *,
+    terminate_active_applications=False,
+):
     return client.post(
         f"/api/v1/deletion-requests/{request_id}/transitions",
-        json={"target_status": "approved"},
+        json={
+            "target_status": "approved",
+            "terminate_active_applications": terminate_active_applications,
+        },
         headers={**headers, "If-Match": f'"{version}"', "Idempotency-Key": key},
     )
 
@@ -299,7 +319,7 @@ def test_request_is_replay_safe_conflict_safe_and_public_projection_is_recursive
     data = first.json()["data"]
     assert set(data) == {
         "id", "status", "version", "reason_code", "requested_at", "approved_at",
-        "safe_error_code", "impact",
+        "safe_error_code", "active_application_count", "impact",
     }
     assert set(data["impact"]["counts"]) == {
         "contacts", "resumes", "applications", "screening_records", "interviews",
@@ -454,6 +474,122 @@ def test_approval_requires_current_preconditions_and_enqueues_once(tmp_path) -> 
             "deletion_request_id": request_id,
             "request_version": 2,
         }
+
+
+def test_active_applications_require_explicit_termination_and_are_withdrawn_atomically(
+    tmp_path,
+) -> None:
+    app = make_app(tmp_path)
+    requester_id = seed_user(app, "recruiter", "active-requester@deletion.test")
+    seed_user(app, "system_admin", "active-approver@deletion.test")
+    candidate_id = candidate_for(app, requester_id)
+    with app.state.identity_store.sync_session() as db:
+        candidate = db.get(Candidate, candidate_id)
+        file = FileObject(
+            organization_id=candidate.organization_id,
+            storage_key="private/active-deletion-resume",
+            original_filename="active.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            sha256="7" * 64,
+            uploaded_by=requester_id,
+        )
+        db.add(file)
+        db.flush()
+        resume = Resume(
+            organization_id=candidate.organization_id,
+            candidate_id=candidate.id,
+            file_object_id=file.id,
+            version_number=1,
+            parsed_text="active application resume",
+        )
+        job = Job(
+            organization_id=candidate.organization_id,
+            title="Active deletion job",
+            owner_id=requester_id,
+            status="open",
+        )
+        db.add_all([resume, job])
+        db.flush()
+        db.add(
+            JobCollaborator(
+                organization_id=candidate.organization_id,
+                job_id=job.id,
+                user_id=requester_id,
+                access_role="job_recruiter",
+            )
+        )
+        application = Application(
+            organization_id=candidate.organization_id,
+            candidate_id=candidate.id,
+            job_id=job.id,
+            resume_id=resume.id,
+            owner_id=requester_id,
+            stage="deferred",
+        )
+        db.add(application)
+        db.flush()
+        review_task = ApplicationReviewTask(
+            organization_id=candidate.organization_id,
+            application_id=application.id,
+            assignee_id=requester_id,
+            status="open",
+            ai_status="succeeded",
+        )
+        db.add(review_task)
+        db.commit()
+        application_id = application.id
+        review_task_id = review_task.id
+
+    with TestClient(app) as client:
+        requester = login(client, "active-requester@deletion.test")
+        created = request_deletion(client, requester, candidate_id)
+        request_id = created.json()["data"]["id"]
+        approver = login(client, "active-approver@deletion.test")
+        detail = client.get(f"/api/v1/deletion-requests/{request_id}", headers=approver)
+        blocked = approve(client, approver, request_id, 1, "blocked-active")
+        approved = approve(
+            client,
+            approver,
+            request_id,
+            1,
+            "terminate-active",
+            terminate_active_applications=True,
+        )
+
+    assert detail.status_code == 200
+    assert detail.json()["data"]["active_application_count"] == 1
+    assert_problem(blocked, 409, "active_application_exists")
+    assert approved.status_code == 200
+    assert approved.json()["data"]["status"] == "approved"
+    assert approved.json()["data"]["active_application_count"] == 0
+    with app.state.identity_store.sync_session() as db:
+        application = db.get(Application, application_id)
+        review_task = db.get(ApplicationReviewTask, review_task_id)
+        assert application.stage == "withdrawn"
+        assert review_task.status == "closed"
+        assert db.scalar(
+            select(func.count())
+            .select_from(ApplicationStageEvent)
+            .where(
+                ApplicationStageEvent.application_id == application_id,
+                ApplicationStageEvent.event_type == "application.stage_changed",
+            )
+        ) == 1
+        approval_audit = db.scalar(
+            select(AuditLog).where(
+                AuditLog.event_type == "governance.deletion_approved",
+                AuditLog.outcome == "success",
+            )
+        )
+        assert approval_audit.metadata_json[
+            "terminated_active_application_count"
+        ] == 1
+        assert db.scalar(
+            select(func.count())
+            .select_from(BackgroundJob)
+            .where(BackgroundJob.type == "governance.delete_candidate")
+        ) == 1
 
 
 def test_stale_manifest_refreshes_without_enqueue_and_increments_version(tmp_path) -> None:

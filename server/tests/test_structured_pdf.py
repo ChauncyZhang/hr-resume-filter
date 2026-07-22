@@ -1,4 +1,5 @@
 import io
+import re
 import socket
 import subprocess
 from types import SimpleNamespace
@@ -6,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from server.app.screening.parsers import ParserLimits, parse_document
-from server.app.screening.pymupdf4llm_worker import _disable_network, extract_markdown
+from server.app.screening.pdfplumber_worker import _disable_network, extract_layout_text
 from server.app.screening.structured_pdf import StructuredPdfError, extract_structured_pdf
 
 
@@ -20,33 +21,36 @@ def _pdf_bytes() -> bytes:
     return stream.getvalue()
 
 
-def test_worker_explicitly_disables_ocr(monkeypatch) -> None:
+def test_worker_extracts_layout_text_without_images_or_ocr(monkeypatch) -> None:
     calls: list[dict[str, object]] = []
 
+    class Reader:
+        is_encrypted = False
+        pages = [object()]
+
+    class Page:
+        def extract_text(self, **kwargs):
+            calls.append(kwargs)
+            return "# Profile\nPython  "
+
     class Document:
-        needs_pass = False
-        page_count = 1
+        pages = [Page()]
 
-        def close(self) -> None:
-            pass
+        def __enter__(self):
+            return self
 
-    monkeypatch.setitem(__import__("sys").modules, "pymupdf", SimpleNamespace(open=lambda **_kwargs: Document()))
+        def __exit__(self, *_args) -> None:
+            return None
+
+    monkeypatch.setattr("pypdf.PdfReader", lambda *_args, **_kwargs: Reader())
     monkeypatch.setitem(
         __import__("sys").modules,
-        "pymupdf4llm",
-        SimpleNamespace(to_markdown=lambda _document, **kwargs: calls.append(kwargs) or "# Profile\nPython"),
+        "pdfplumber",
+        SimpleNamespace(open=lambda *_args, **_kwargs: Document()),
     )
 
-    assert extract_markdown(b"%PDF-test", max_pages=2, max_text_chars=100) == "# Profile\nPython"
-    assert calls == [{
-        "use_ocr": False,
-        "force_ocr": False,
-        "write_images": False,
-        "embed_images": False,
-        "ignore_images": True,
-        "page_chunks": False,
-        "show_progress": False,
-    }]
+    assert extract_layout_text(b"%PDF-test", max_pages=2, max_text_chars=100) == "# Profile\nPython"
+    assert calls == [{"layout": True, "x_tolerance": 2, "y_tolerance": 3}]
 
 
 def test_worker_disables_network_in_its_own_process() -> None:
@@ -60,27 +64,37 @@ def test_worker_disables_network_in_its_own_process() -> None:
 
 
 def test_real_library_subprocess_handles_layout_and_clean_json_protocol() -> None:
-    import pymupdf
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-    document = pymupdf.open()
-    page = document.new_page(width=600, height=800)
-    page.insert_text((40, 45), "CANDIDATE PROFILE", fontsize=18)
-    page.insert_text((40, 90), "EXPERIENCE", fontsize=14)
-    page.insert_text((40, 115), "Platform Engineer", fontsize=11)
-    page.insert_text((330, 90), "EDUCATION", fontsize=14)
-    page.insert_text((330, 115), "Example University", fontsize=11)
-    rows = (("YEAR", "COMPANY", "ROLE"), ("2021-2025", "Example Tech", "AI Engineer"))
-    x_positions = (40, 190, 360)
-    for row_index, row in enumerate(rows):
-        y = 210 + row_index * 32
-        for column_index, value in enumerate(row):
-            page.insert_text((x_positions[column_index] + 6, y + 21), value, fontsize=10)
-    for x in (40, 190, 360, 540):
-        page.draw_line((x, 210), (x, 274))
-    for y in (210, 242, 274):
-        page.draw_line((40, y), (540, y))
-    source = document.tobytes()
-    document.close()
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=600, height=800)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)}),
+    })
+    content = DecodedStreamObject()
+    content.set_data(b"\n".join([
+        b"BT /F1 18 Tf 40 755 Td (CANDIDATE PROFILE) Tj ET",
+        b"BT /F1 14 Tf 40 710 Td (EXPERIENCE) Tj ET",
+        b"BT /F1 11 Tf 40 685 Td (Platform Engineer) Tj ET",
+        b"BT /F1 14 Tf 330 710 Td (EDUCATION) Tj ET",
+        b"BT /F1 11 Tf 330 685 Td (Example University) Tj ET",
+        b"BT /F1 10 Tf 40 590 Td (YEAR) Tj ET",
+        b"BT /F1 10 Tf 190 590 Td (COMPANY) Tj ET",
+        b"BT /F1 10 Tf 360 590 Td (ROLE) Tj ET",
+        b"BT /F1 10 Tf 40 558 Td (2021-2025) Tj ET",
+        b"BT /F1 10 Tf 190 558 Td (Example Tech) Tj ET",
+        b"BT /F1 10 Tf 360 558 Td (AI Engineer) Tj ET",
+    ]))
+    page[NameObject("/Contents")] = writer._add_object(content)
+    stream = io.BytesIO()
+    writer.write(stream)
+    source = stream.getvalue()
 
     markdown = extract_structured_pdf(
         source,
@@ -90,11 +104,12 @@ def test_real_library_subprocess_handles_layout_and_clean_json_protocol() -> Non
         timeout_seconds=15,
     )
 
-    assert markdown.strip()
-    assert markdown.index("CANDIDATE PROFILE") < markdown.index("EXPERIENCE")
-    assert "Platform Engineer" in markdown
-    assert "EDUCATION" in markdown and "Example University" in markdown
-    assert "2021-2025" in markdown and "Example Tech" in markdown and "AI Engineer" in markdown
+    normalized = re.sub(r"[ \t]+", " ", markdown)
+    assert normalized.strip()
+    assert normalized.index("CANDIDATE PROFILE") < normalized.index("EXPERIENCE")
+    assert "Platform Engineer" in normalized
+    assert "EDUCATION" in normalized and "Example University" in normalized
+    assert "2021-2025" in normalized and "Example Tech" in normalized and "AI Engineer" in normalized
 
 
 def test_pdf_prefers_layout_markdown_with_columns_and_table(monkeypatch) -> None:
@@ -114,7 +129,7 @@ def test_pdf_prefers_layout_markdown_with_columns_and_table(monkeypatch) -> None
 
     parsed = parse_document(io.BytesIO(_pdf_bytes()), extension=".pdf", mime_type="application/pdf")
 
-    assert parsed.parser_version == "pdf-pymupdf4llm-v1"
+    assert parsed.parser_version == "pdf-pdfplumber-v1"
     assert parsed.text.index("工作经历") < parsed.text.index("教育经历")
     assert "| 2021-2025 | 示例科技 | AI 工程师 |" in parsed.text
 
@@ -155,7 +170,7 @@ def test_pypdf_generic_failure_does_not_block_structured_success(monkeypatch) ->
 
     parsed = parse_document(io.BytesIO(b"%PDF-readable"), extension=".pdf", mime_type="application/pdf")
 
-    assert parsed.parser_version == "pdf-pymupdf4llm-v1"
+    assert parsed.parser_version == "pdf-pdfplumber-v1"
     assert "Structured profile" in parsed.text
 
 

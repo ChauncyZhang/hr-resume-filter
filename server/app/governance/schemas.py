@@ -81,6 +81,7 @@ class DeletionRequestCreate(StrictModel):
 
 class DeletionTransitionCreate(StrictModel):
     target_status: str = Field(pattern=r"^approved$")
+    terminate_active_applications: bool = False
 
 
 class LegalHoldCreate(StrictModel):
@@ -134,6 +135,7 @@ class DeletionRequestOut(StrictModel):
     requested_at: datetime
     approved_at: datetime | None
     safe_error_code: str | None
+    active_application_count: int | None = Field(default=None, ge=0)
     impact: DeletionImpactOut
 
 

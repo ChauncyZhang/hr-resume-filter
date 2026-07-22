@@ -170,7 +170,7 @@ def _pdf(data: bytes, limits: ParserLimits) -> ParsedDocument:
         )
         structured = _bounded(sanitize_resume_text(structured), limits)
         if structured.strip():
-            return ParsedDocument(structured, "pdf-pymupdf4llm-v1", "good")
+            return ParsedDocument(structured, "pdf-pdfplumber-v1", "good")
     except StructuredPdfError as error:
         if error.safe_code in {"pdf_encrypted", "pdf_page_limit"}:
             raise ParserError(error.safe_code) from None
