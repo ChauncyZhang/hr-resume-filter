@@ -33,8 +33,8 @@ test("saved schedule message describes downloadable invitation and pending notif
   assert.ok(helpersSource, "InterviewViews.jsx must expose the interview schedule helper block");
   const { getScheduleSavedMessage } = vm.runInNewContext(`(() => { ${helpersSource.replaceAll("export ", "")} return { getScheduleSavedMessage }; })()`);
 
-  assert.equal(getScheduleSavedMessage(null), "面试安排已保存；邀请文件可下载；通知待发送");
-  assert.equal(getScheduleSavedMessage({ id: "INT-1" }), "面试改期已保存；新的邀请文件可下载；通知待发送");
+  assert.equal(getScheduleSavedMessage(null), "面试安排已保存；邀请文件可下载；面试邀请尚未发送");
+  assert.equal(getScheduleSavedMessage({ id: "INT-1" }), "面试改期已保存；新的邀请文件可下载；面试邀请尚未发送");
   assert.match(source, /onNotify\(getScheduleSavedMessage\(record, Boolean\(finalConflict\?\.unconfirmed\?\.length\)\)\)/);
   assert.doesNotMatch(source, /通知已发送/);
 });

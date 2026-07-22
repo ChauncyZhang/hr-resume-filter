@@ -19,8 +19,8 @@ test("talent tags can be removed and reactivation is exposed as a direct action"
 test("the system deferred pool is selected by system key and exposes recovery evidence", () => {
   assert.match(source, /pool\.systemKey === "ai_screening_deferred"/);
   assert.match(source, /原岗位/);
-  assert.match(source, /最终分/);
-  assert.match(source, /暂缓时间/);
+  assert.match(source, /AI 匹配分/);
+  assert.match(source, /进入人才库时间/);
   assert.match(source, /主要缺口/);
   assert.match(source, /跟进负责人/);
   assert.doesNotMatch(source, /pool\.name === [^\n]*ai_screening_deferred/);
@@ -35,10 +35,10 @@ test("deferred rows refer once while ordinary pools keep reactivation", () => {
 });
 
 test("deferred talent rows expose table semantics and mobile field labels", () => {
-  assert.match(source, /className="talent-table" role="table" aria-label="AI 初筛暂缓人才"/);
+  assert.match(source, /className="talent-table" role="table" aria-label="AI 初筛未进入评审人才"/);
   assert.match(source, /className="talent-table-head" role="row"/);
   assert.equal((source.match(/role="columnheader"/g) || []).length >= 8, true);
-  for (const label of ["人才", "原岗位", "最终分", "暂缓时间", "主要缺口", "跟进负责人", "状态", "操作"]) {
+  for (const label of ["人才", "原岗位", "AI 匹配分", "进入人才库时间", "主要缺口", "跟进负责人", "状态", "操作"]) {
     assert.match(source, new RegExp(`role="cell" data-label="${label}"`));
   }
   const css = readFileSync(new URL("./product-theme-people.css", import.meta.url), "utf8");

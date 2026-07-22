@@ -67,6 +67,27 @@ test("GET /me 轮换 CSRF，后续请求支持幂等键与 If-Match", async () =
   assert.equal(headers.get("If-Match"), '"7"');
 });
 
+test("markNotificationRead sends the opaque application and event version with CSRF", async () => {
+  const calls = [];
+  const responses = [
+    jsonResponse({ data: { display_name: "林岚" } }, { headers: { "X-CSRF-Token": "notification-csrf" } }),
+    jsonResponse({ data: { application_id: "application/1", version: "a".repeat(64), read_at: "2026-07-22T01:00:00Z" } }),
+  ];
+  const client = createApiClient({ fetchImpl: async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  } });
+
+  await client.getMe();
+  const result = await client.markNotificationRead("application/1", "a".repeat(64));
+
+  assert.equal(calls[1].url, "/api/v1/notifications/workbench/application%2F1/read");
+  assert.equal(calls[1].options.method, "PUT");
+  assert.equal(calls[1].options.headers.get("X-CSRF-Token"), "notification-csrf");
+  assert.deepEqual(JSON.parse(calls[1].options.body), { version: "a".repeat(64) });
+  assert.equal(result.read_at, "2026-07-22T01:00:00Z");
+});
+
 test("成功的 /me 缺少响应头时保留已有 CSRF", async () => {
   const calls = [];
   const responses = [

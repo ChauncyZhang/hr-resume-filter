@@ -27,6 +27,7 @@ from server.app.recruiting.models import (
 from server.app.screening.models import ScreeningItem, ScreeningResult
 from server.app.llm.models import LlmScreeningEvaluation
 from server.app.interviews.models import Interview
+from server.app.notifications.service import read_versions, workbench_notification_version
 from server.app.recruiting.tasks import LLM_TERMINAL_SAFE_ERROR_CODES, normalize_llm_terminal_safe_error_code
 from server.app.screening.rules import RuleSnapshotError,normalize_rule_content
 from server.app.recruiting.security import ContactCipher
@@ -731,6 +732,7 @@ def get_workbench(request: Request, response: Response):
             jobs_by_id[job.id] = data
 
         tasks = {stage: {"count": 0, "items": []} for stage in WORKBENCH_TASK_STAGES}
+        notification_candidates = {stage: [] for stage in WORKBENCH_TASK_STAGES}
         if jobs_by_id:
             application_rows = db.execute(select(
                 Application.id.label("application_id"),
@@ -738,6 +740,7 @@ def get_workbench(request: Request, response: Response):
                 Application.job_id,
                 Application.source,
                 Application.stage,
+                Application.version.label("application_version"),
                 Application.updated_at,
                 Candidate.display_name,
                 Candidate.current_title,
@@ -787,12 +790,16 @@ def get_workbench(request: Request, response: Response):
                     task["count"] += 1
                     if len(task["items"]) < 5:
                         task["items"].append(item)
+                    notification_item = dict(item)
+                    notification_item["notification_version"] = workbench_notification_version(row)
+                    notification_candidates[row.stage].append(notification_item)
 
         review_rows=db.execute(select(
             ApplicationReviewTask.id.label("task_id"),
             ApplicationReviewTask.ai_status,
             Application.id.label("application_id"),Application.candidate_id,Application.job_id,
             Application.source,literal("review").label("stage"),Application.updated_at,Candidate.display_name,Candidate.current_title,Candidate.location,
+            Application.version.label("application_version"),
             Job.hiring_owner_id,
         ).join(Application,and_(Application.organization_id==ApplicationReviewTask.organization_id,Application.id==ApplicationReviewTask.application_id)).join(Candidate,and_(Candidate.organization_id==Application.organization_id,Candidate.id==Application.candidate_id)).join(Job,and_(Job.organization_id==Application.organization_id,Job.id==Application.job_id)).where(
             ApplicationReviewTask.organization_id==principal.organization_id,
@@ -813,12 +820,41 @@ def get_workbench(request: Request, response: Response):
                 "candidate_link":f"/candidates/{row.candidate_id}?tab=evidence&application={row.application_id}&job={row.job_id}",
             })
             review_task["items"].append(item)
+            notification_item=dict(item)
+            notification_item["notification_version"]=workbench_notification_version(
+                row,
+                stage="review",
+                task_id=row.task_id,
+                ai_status=row.ai_status,
+                config_warning=row.hiring_owner_id is None,
+            )
+            notification_candidates["review"].append(notification_item)
+
+        notification_application_ids = [
+            UUID(item["application_id"])
+            for candidates in notification_candidates.values()
+            for item in candidates
+        ]
+        receipt_versions = read_versions(
+            db,
+            principal.organization_id,
+            principal.user_id,
+            notification_application_ids,
+        )
+        notifications = {}
+        for stage, candidates in notification_candidates.items():
+            unread = [
+                item for item in candidates
+                if receipt_versions.get(UUID(item["application_id"])) != item["notification_version"]
+            ]
+            notifications[stage] = {"count": len(unread), "items": unread[:5]}
 
         return {
             "data": {
                 "generated_at": datetime.now(timezone.utc),
                 "jobs": jobs,
                 "tasks": tasks,
+                "notifications": notifications,
                 "interviews": {"available": False, "upcoming": [], "pending_feedback": []},
             },
         }

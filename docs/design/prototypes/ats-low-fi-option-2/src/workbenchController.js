@@ -93,6 +93,21 @@ function isReviewTaskGroup(group) {
     && group.items.every(isReviewTask);
 }
 
+function isNotification(item, expectedStage, review = false) {
+  return (review ? isReviewTask(item) : isCandidate(item, expectedStage))
+    && typeof item.notification_version === "string"
+    && /^[0-9a-f]{64}$/.test(item.notification_version);
+}
+
+function isNotificationGroup(group, stage, { review = false } = {}) {
+  return isObject(group)
+    && isCount(group.count)
+    && Array.isArray(group.items)
+    && group.items.length <= 5
+    && group.items.length <= group.count
+    && group.items.every((item) => isNotification(item, stage, review));
+}
+
 function isJob(job) {
   if (
     !isObject(job)
@@ -113,6 +128,7 @@ function isJob(job) {
 function validateEnvelope(response) {
   const payload = response?.data;
   const taskGroups = payload?.tasks;
+  const notifications = payload?.notifications;
   const interviews = payload?.interviews;
   if (
     !isObject(payload)
@@ -121,6 +137,7 @@ function validateEnvelope(response) {
     || payload.jobs.length > 20
     || !payload.jobs.every(isJob)
     || !isObject(taskGroups)
+    || !isObject(notifications)
     || !isObject(interviews)
     || interviews.available !== false
     || !Array.isArray(interviews.upcoming)
@@ -136,6 +153,10 @@ function validateEnvelope(response) {
     isStageGroup(taskGroups[stage], stage, jobIds)
     && taskGroups[stage].count === payload.jobs.reduce((total, job) => total + job.stages[stage].count, 0)
     ))
+    || !isNotificationGroup(notifications.review, "review", { review: true })
+    || !isNotificationGroup(notifications.interview_pending, "interview_pending")
+    || !isNotificationGroup(notifications.decision, "decision")
+    || !isNotificationGroup(notifications.passed, "passed")
   ) throw invalidResponse();
   return payload;
 }
@@ -213,6 +234,30 @@ function normalizeReviewTaskGroup(group, jobNames) {
   };
 }
 
+function withNotificationVersion(candidate, item) {
+  return candidate ? { ...candidate, notificationVersion: item.notification_version } : null;
+}
+
+function normalizeNotificationTaskGroup(group, apiStage, jobNames) {
+  return {
+    count: safeCount(group?.count),
+    items: safeArray(group?.items)
+      .map((item) => withNotificationVersion(normalizeItem(item, jobNames), item))
+      .filter((item) => item?.stage === STAGES[apiStage]),
+  };
+}
+
+function normalizeReviewNotificationGroup(group, jobNames) {
+  const normalized = normalizeReviewTaskGroup(group, jobNames);
+  return {
+    count: normalized.count,
+    items: normalized.items.map((item, index) => ({
+      ...item,
+      notificationVersion: group.items[index].notification_version,
+    })),
+  };
+}
+
 function normalizeWorkbench(payload) {
   const rawJobs = safeArray(payload?.jobs).filter((job) => safeString(job?.id) && safeString(job?.title));
   const jobNames = new Map(rawJobs.map((job) => [job.id, job.title]));
@@ -228,6 +273,7 @@ function normalizeWorkbench(payload) {
     ])),
   }));
   const tasks = payload?.tasks || {};
+  const notifications = payload?.notifications || {};
   const interviews = payload?.interviews || {};
   const interviewsAvailable = interviews.available === true;
   return {
@@ -238,6 +284,12 @@ function normalizeWorkbench(payload) {
       interviewPending: normalizeTaskGroup(tasks.interview_pending, "interview_pending", jobNames),
       decision: normalizeTaskGroup(tasks.decision, "decision", jobNames),
       passed: normalizeTaskGroup(tasks.passed, "passed", jobNames),
+    },
+    notifications: {
+      review: normalizeReviewNotificationGroup(notifications.review, jobNames),
+      interviewPending: normalizeNotificationTaskGroup(notifications.interview_pending, "interview_pending", jobNames),
+      decision: normalizeNotificationTaskGroup(notifications.decision, "decision", jobNames),
+      passed: normalizeNotificationTaskGroup(notifications.passed, "passed", jobNames),
     },
     interviews: {
       available: interviewsAvailable,
@@ -252,6 +304,9 @@ export function createWorkbenchController({ client = apiClient } = {}) {
     async load({ signal } = {}) {
       const response = await client.request("/api/v1/workbench", signal ? { signal } : {});
       return normalizeWorkbench(validateEnvelope(response));
+    },
+    async markNotificationRead(candidate) {
+      return client.markNotificationRead(candidate.applicationId, candidate.notificationVersion);
     },
   };
 }

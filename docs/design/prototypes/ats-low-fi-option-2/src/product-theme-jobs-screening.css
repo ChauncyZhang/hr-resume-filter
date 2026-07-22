@@ -547,7 +547,7 @@ body .detail-candidate-table {
 
 body .detail-candidate-head,
 body .detail-candidate-table > button {
-  grid-template-columns: minmax(220px, 1.4fr) 105px 72px 118px 95px 25px;
+  grid-template-columns: minmax(220px, 1.4fr) 145px 72px 118px 105px 25px;
 }
 
 body .detail-candidate-head {
@@ -901,8 +901,8 @@ body .result-status-tabs {
 
 body .screening-table-head,
 body .screening-row {
-  min-width: 1240px;
-  grid-template-columns: 116px minmax(170px, 1.05fr) 92px 110px 64px minmax(250px, 1.45fr) minmax(230px, 1.25fr) 96px;
+  min-width: 1340px;
+  grid-template-columns: 148px minmax(170px, 1.05fr) 92px 176px 64px minmax(250px, 1.45fr) minmax(230px, 1.25fr) 96px;
   gap: 12px;
 }
 
@@ -928,6 +928,8 @@ body .screening-route,
 body .screening-candidate-file strong,
 body .recommendation-cell {
   font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 body .screening-route {

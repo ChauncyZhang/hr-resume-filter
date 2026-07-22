@@ -21,6 +21,11 @@ from server.app.identity.security import PasswordService, hash_token, tokens_mat
 from server.app.identity.store import IdentityStore
 
 
+_SESSION_IDLE_TIMEOUT = timedelta(hours=2)
+_SESSION_ABSOLUTE_TIMEOUT = timedelta(hours=12)
+_SESSION_RENEWAL_INTERVAL = timedelta(minutes=30)
+
+
 class Clock:
     def current_time(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -139,8 +144,8 @@ class IdentityService:
                 user_id=user.id,
                 token_hash=hash_token(session_token),
                 csrf_token_hash=hash_token(csrf),
-                idle_expires_at=now + timedelta(minutes=30),
-                absolute_expires_at=now + timedelta(hours=12),
+                idle_expires_at=now + _SESSION_IDLE_TIMEOUT,
+                absolute_expires_at=now + _SESSION_ABSOLUTE_TIMEOUT,
                 authorization_version=user.authorization_version,
             )
             db.add(record)
@@ -160,8 +165,8 @@ class IdentityService:
                 user_id=user.id,
                 token_hash=hash_token(session_token),
                 csrf_token_hash=hash_token(csrf),
-                idle_expires_at=now + timedelta(minutes=30),
-                absolute_expires_at=now + timedelta(hours=12),
+                idle_expires_at=now + _SESSION_IDLE_TIMEOUT,
+                absolute_expires_at=now + _SESSION_ABSOLUTE_TIMEOUT,
                 authorization_version=user.authorization_version,
             ))
             self._audit(db, event, "success", organization_id=user.organization_id, user_id=user.id, trace_id=trace_id, network=network)
@@ -180,7 +185,6 @@ class IdentityService:
                 selectinload(UserSession.user).selectinload(User.organization),
             )
             .where(UserSession.token_hash == hash_token(token))
-            .with_for_update(of=UserSession)
         )
         if record is None:
             raise InvalidSession
@@ -190,19 +194,47 @@ class IdentityService:
         if reason is None:
             return record
         now = self.clock.current_time()
-        record.revoked_at = now
-        record.revocation_reason = reason
-        self._audit(
-            db,
-            "session.invalidated",
-            "revoked",
-            organization_id=record.organization_id,
-            user_id=record.user_id,
-            trace_id=trace_id,
-            network=network,
+        revoked = db.execute(
+            update(UserSession)
+            .where(UserSession.id == record.id, UserSession.revoked_at.is_(None))
+            .values(revoked_at=now, revocation_reason=reason)
+            .execution_options(synchronize_session=False)
         )
-        db.commit()
+        if revoked.rowcount:
+            self._audit(
+                db,
+                "session.invalidated",
+                "revoked",
+                organization_id=record.organization_id,
+                user_id=record.user_id,
+                trace_id=trace_id,
+                network=network,
+            )
+            db.commit()
+        else:
+            db.rollback()
         raise InvalidSession
+
+    def _renew_session_if_due(self, db, record: UserSession) -> bool:
+        now = self.clock.current_time()
+        absolute = self._aware(record.absolute_expires_at)
+        target = min(now + _SESSION_IDLE_TIMEOUT, absolute)
+        current = self._aware(record.idle_expires_at)
+        if target <= current:
+            return False
+        if target < absolute and target - current < _SESSION_RENEWAL_INTERVAL:
+            return False
+        renewed = db.execute(
+            update(UserSession)
+            .where(
+                UserSession.id == record.id,
+                UserSession.revoked_at.is_(None),
+                UserSession.idle_expires_at == record.idle_expires_at,
+            )
+            .values(idle_expires_at=target)
+            .execution_options(synchronize_session=False)
+        )
+        return bool(renewed.rowcount)
 
     def _session_invalid_reason(self, record: UserSession) -> str | None:
         now = self.clock.current_time()
@@ -219,10 +251,9 @@ class IdentityService:
     def me(self, token: str):
         with self.store.sync_session() as db:
             record = self._resolve_session(db, token)
-            now = self.clock.current_time()
             csrf = self.tokens.new_token()
             record.csrf_token_hash = hash_token(csrf)
-            record.idle_expires_at = min(now + timedelta(minutes=30), self._aware(record.absolute_expires_at))
+            self._renew_session_if_due(db, record)
             user = record.user
             department = (
                 db.scalar(
@@ -349,6 +380,8 @@ class IdentityService:
 
         with self.store.sync_session() as db:
             record = self._resolve_session(db, token)
+            if self._renew_session_if_due(db, record):
+                db.commit()
             return Principal(
                 user_id=record.user_id,
                 organization_id=record.organization_id,
@@ -372,7 +405,10 @@ class IdentityService:
                 record = self._resolve_session(db, token, trace_id=trace_id, network=network)
             except InvalidSession:
                 return False
-            return tokens_match(record.csrf_token_hash, csrf)
+            valid = tokens_match(record.csrf_token_hash, csrf)
+            if valid and self._renew_session_if_due(db, record):
+                db.commit()
+            return valid
 
     def audit_denial(self, event: str, *, token: str | None, trace_id: str, network: str | None) -> bool:
         if not token:

@@ -99,9 +99,9 @@ test("screening renders the controller automatic outcome instead of the historic
     recommendation: "建议评审",
     routeResult: "review",
     routeLabel: "已转交用人经理",
-  }), { score: 72, recommendation: "建议评审", routeLabel: "已转交用人经理" });
-  assert.equal(helpers.screeningRouteLabel({ routeResult: "review" }), "已转交用人经理");
-  assert.equal(helpers.screeningRouteLabel({ routeResult: "deferred" }), "已暂缓");
+  }), { score: 72, recommendation: "进入评审", routeLabel: "已进入用人经理评审" });
+  assert.equal(helpers.screeningRouteLabel({ routeResult: "review" }), "已进入用人经理评审");
+  assert.equal(helpers.screeningRouteLabel({ routeResult: "deferred" }), "暂不进入评审");
 });
 
 test("screening final AI failure stays neutral and retains manager handoff", () => {
@@ -111,7 +111,7 @@ test("screening final AI failure stays neutral and retains manager handoff", () 
     recommendation: "AI评分不可用",
     routeResult: "review",
     routeLabel: "已转交用人经理",
-  }), { score: null, recommendation: "AI评分不可用", routeLabel: "已转交用人经理" });
+  }), { score: null, recommendation: "AI评分失败 · 已保护性转交评审", routeLabel: "已进入用人经理评审" });
   assert.doesNotMatch(JSON.stringify(helpers.screeningDisplayOutcome({ status: "failed", score: null })), /候选人失败/);
 });
 
@@ -140,9 +140,9 @@ test("screening summary uses the four server counters without recomputing rows",
   }, [{ id: "item-1", status: "failed", route_result: "deferred" }]);
 
   assert.deepEqual(helpers.screeningSummaryCounts(task), [
-    { label: "已转交用人经理", value: 8 },
-    { label: "已暂缓", value: 3 },
-    { label: "AI评分不可用", value: 2 },
+    { label: "已进入用人经理评审", value: 8 },
+    { label: "暂不进入评审", value: 3 },
+    { label: "AI 评分失败并保护性转交", value: 2 },
     { label: "文件处理失败", value: 1 },
   ]);
   assert.equal(task.managerReviewCount, 8);
@@ -177,9 +177,9 @@ test("ScreeningTaskView renders all four server counters instead of recomputing 
     onNotify() {},
   }));
 
-  assert.match(html, /<strong>8<\/strong><span>已转交用人经理<\/span>/);
-  assert.match(html, /<strong>3<\/strong><span>已暂缓<\/span>/);
-  assert.match(html, /<strong>2<\/strong><span>AI评分不可用<\/span>/);
+  assert.match(html, /<strong>8<\/strong><span>已进入用人经理评审<\/span>/);
+  assert.match(html, /<strong>3<\/strong><span>暂不进入评审<\/span>/);
+  assert.match(html, /<strong>2<\/strong><span>AI 评分失败并保护性转交<\/span>/);
   assert.match(html, /<strong>1<\/strong><span>文件处理失败<\/span>/);
 });
 
@@ -250,9 +250,9 @@ test("technical screening failures render no contradictory route, LLM conclusion
 
   assert.ok(row);
   assert.match(row, /aria-label="流转结果：未流转"[^>]*>未流转<\/span>/);
-  assert.match(row, /aria-label="LLM结论：未进入AI评分"[^>]*>未进入AI评分<\/span>/);
-  assert.match(row, /aria-label="最终分：—"/);
-  assert.doesNotMatch(row, /已转交用人经理|AI评分不可用|强烈推荐|矛盾维度证据|矛盾优势|矛盾风险/);
+  assert.match(row, /aria-label="AI 流转结论：未进入AI评分"[^>]*>未进入AI评分<\/span>/);
+  assert.match(row, /aria-label="AI 匹配分：—"/);
+  assert.doesNotMatch(row, /已进入用人经理评审|AI评分失败|强烈推荐|矛盾维度证据|矛盾优势|矛盾风险/);
   assert.match(row, /文件解析失败/);
 });
 
@@ -308,16 +308,16 @@ test("ScreeningTaskView renders final LLM and technical failures with distinct r
   const technicalFailureRow = rows.find((row) => row.includes("解析失败.pdf"));
 
   assert.ok(llmFailureRow);
-  assert.match(llmFailureRow, /aria-label="流转结果：已转交用人经理"[^>]*>已转交用人经理<\/span>/);
-  assert.match(llmFailureRow, /aria-label="LLM结论：AI评分不可用"[^>]*>AI评分不可用<\/span>/);
-  assert.match(llmFailureRow, /aria-label="最终分：—"/);
+  assert.match(llmFailureRow, /aria-label="流转结果：已进入用人经理评审"[^>]*>已进入用人经理评审<\/span>/);
+  assert.match(llmFailureRow, /aria-label="AI 流转结论：AI评分失败 · 已保护性转交评审"[^>]*>AI评分失败 · 已保护性转交评审<\/span>/);
+  assert.match(llmFailureRow, /aria-label="AI 匹配分：—"/);
   assert.doesNotMatch(llmFailureRow, /陈旧推荐|陈旧AI证据|陈旧AI优势/);
 
   assert.ok(technicalFailureRow);
   assert.match(technicalFailureRow, /aria-label="流转结果：未流转"[^>]*>未流转<\/span>/);
-  assert.match(technicalFailureRow, /aria-label="LLM结论：未进入AI评分"[^>]*>未进入AI评分<\/span>/);
-  assert.match(technicalFailureRow, /aria-label="最终分：—"/);
-  assert.doesNotMatch(technicalFailureRow, /已转交用人经理|AI评分不可用|陈旧技术推荐|陈旧技术AI证据|陈旧技术AI优势/);
+  assert.match(technicalFailureRow, /aria-label="AI 流转结论：未进入AI评分"[^>]*>未进入AI评分<\/span>/);
+  assert.match(technicalFailureRow, /aria-label="AI 匹配分：—"/);
+  assert.doesNotMatch(technicalFailureRow, /已进入用人经理评审|AI评分失败|陈旧技术推荐|陈旧技术AI证据|陈旧技术AI优势/);
 });
 
 test("screening result grid exposes table semantics and understandable mobile field labels", () => {
@@ -363,11 +363,11 @@ test("screening result grid exposes table semantics and understandable mobile fi
   assert.match(html, /role="table"[^>]*aria-labelledby="screening-results-title"/);
   assert.equal((html.match(/role="columnheader"/g) || []).length, 8);
   assert.equal((html.match(/role="cell"/g) || []).length, 8);
-  for (const label of ["流转结果", "候选人/文件", "处理状态", "LLM结论", "最终分", "维度评分", "主要优势与风险", "查看候选人"]) {
+  for (const label of ["流转结果", "候选人/文件", "处理状态", "AI 流转结论", "AI 匹配分", "维度评分", "主要优势与风险", "查看候选人"]) {
     assert.match(html, new RegExp(`data-label="${label}"`));
   }
-  assert.match(html, /aria-label="LLM结论：建议评审"/);
-  assert.match(html, /aria-label="最终分：72"/);
+  assert.match(html, /aria-label="AI 流转结论：进入评审"/);
+  assert.match(html, /aria-label="AI 匹配分：72"/);
 
   const css = readFileSync(new URL("./product-theme-jobs-screening.css", import.meta.url), "utf8");
   assert.match(css, /content:\s*attr\(data-label\)/);
@@ -375,7 +375,7 @@ test("screening result grid exposes table semantics and understandable mobile fi
 
 test("screening source has the eight automatic columns and no removed manual path", () => {
   const source = readFileSync(new URL("./ScreeningViews.jsx", import.meta.url), "utf8");
-  for (const heading of ["流转结果", "候选人/文件", "处理状态", "LLM结论", "最终分", "维度评分", "主要优势与风险", "查看候选人"]) assert.match(source, new RegExp(heading));
+  for (const heading of ["流转结果", "候选人/文件", "处理状态", "AI 流转结论", "AI 匹配分", "维度评分", "主要优势与风险", "查看候选人"]) assert.match(source, new RegExp(heading));
   const removed = ["待" + "HR审核", "HR初筛" + "进度", "待提交" + "用人经理", "advance" + "_to_review"];
   for (const text of removed) assert.equal(source.includes(text), false);
 });
@@ -387,7 +387,7 @@ test("screening import and demo flow contains only LLM automatic scoring and rou
   for (const text of removed) assert.equal(source.includes(text), false);
   assert.match(source, /LLM 自动评分/);
   assert.match(source, /自动路由/);
-  assert.match(source, /不淘汰候选人/);
+  assert.match(source, /保护性转交评审/);
 });
 
 test("job configuration describes LLM as the only scoring and routing source", () => {
@@ -458,7 +458,7 @@ test("server candidate context keeps identity separate from automatic screening 
       score: 78,
       recommendation: "建议评审",
       routeResult: "review",
-      routeLabel: "已转交用人经理",
+      routeLabel: "已进入用人经理评审",
       dimensions: [{ label: "技能经验", score: 82, evidence: ["Python"], gaps: ["Kubernetes"] }],
       strengths: ["经验匹配"],
       risks: ["规模待确认"],
@@ -496,7 +496,7 @@ test("server candidate detail exposes the connected interview path and reports c
   assert.deepEqual(candidateHelpers.candidateStageFilterOptions(), ["新简历", "待复核", "AI 初筛暂缓", "待沟通", "待安排", "面试中", "待决策", "已通过", "已录用", "已淘汰", "已撤回"]);
   assert.deepEqual(candidateHelpers.candidateWorkflowActions("待决策", "用人经理").map((item) => item.id), ["hiring_approved", "hiring_rejected"]);
   assert.deepEqual(candidateHelpers.candidateWorkflowActions("待安排", "HR 招聘专员"), []);
-  assert.equal(candidateHelpers.candidateNextStep("面试中"), "等待面试官提交反馈");
+  assert.equal(candidateHelpers.candidateNextStep("面试中"), "完成当前面试与面试官反馈");
   assert.equal(candidateHelpers.canScheduleCandidateInterview("待安排", "HR 招聘专员", true), true);
   assert.equal(candidateHelpers.canScheduleCandidateInterview("待决策", "HR 招聘专员", true), true);
   assert.equal(candidateHelpers.canScheduleCandidateInterview("待复核", "HR 招聘专员", true), false);

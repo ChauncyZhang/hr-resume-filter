@@ -188,6 +188,13 @@ export function createApiClient({ fetchImpl = globalThis.fetch } = {}) {
     async changePassword(body) {
       return request("/api/v1/me/password", { method: "POST", body });
     },
+    async markNotificationRead(applicationId, version) {
+      const response = await request(`/api/v1/notifications/workbench/${encodeURIComponent(applicationId)}/read`, {
+        method: "PUT",
+        body: { version },
+      });
+      return response?.data ?? null;
+    },
     async getFeishuConfig() { const response = await request("/api/v1/settings/integrations/feishu"); return response?.data ?? null; },
     async saveFeishuConfig(body) { const response = await request("/api/v1/settings/integrations/feishu", { method: "PUT", body }); return response?.data ?? null; },
     async testFeishuConnection() { const response = await request("/api/v1/settings/integrations/feishu/test", { method: "POST" }); return response?.data ?? null; },

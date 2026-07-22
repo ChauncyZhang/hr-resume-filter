@@ -15,7 +15,7 @@ export function getScheduleSavedMessage(record, availabilityUnconfirmed = false)
   const invitation = record ? "新的邀请文件可下载" : "邀请文件可下载";
   return availabilityUnconfirmed
     ? `${saved}；飞书忙闲暂未确认，请留意后续日历同步结果`
-    : `${saved}；${invitation}；通知待发送`;
+    : `${saved}；${invitation}；面试邀请尚未发送`;
 }
 
 export async function copyInterviewText(text, clipboard) {

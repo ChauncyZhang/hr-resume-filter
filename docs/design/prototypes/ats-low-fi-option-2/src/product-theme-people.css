@@ -91,6 +91,12 @@
 .pool-table,
 .talent-table { scrollbar-color: #c9c9cf transparent; }
 
+.candidate-table-head,
+.candidate-table-row {
+  min-width: 1020px;
+  grid-template-columns: minmax(180px, 1.25fr) minmax(120px, .9fr) 142px 60px 86px 82px minmax(120px, .8fr) 88px;
+}
+
 .talent-page .pool-table-head,
 .talent-page .pool-table-row {
   min-width: 920px;

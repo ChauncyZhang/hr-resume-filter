@@ -36,6 +36,10 @@ function reviewTask(changes = {}) {
   };
 }
 
+function notification(candidate) {
+  return { ...candidate, notification_version: "a".repeat(64) };
+}
+
 function response(changes = {}) {
   return {
     data: {
@@ -62,6 +66,12 @@ function response(changes = {}) {
         interview_pending: { count: 7, items: [item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444", next_interview_round: "二面" })] },
         decision: { count: 0, items: [] },
         passed: { count: 1, items: [item({ stage: "passed", application_id: "55555555-5555-4555-8555-555555555555" })] },
+      },
+      notifications: {
+        review: { count: 1, items: [notification(reviewTask())] },
+        interview_pending: { count: 1, items: [notification(item({ stage: "interview_pending", application_id: "44444444-4444-4444-8444-444444444444", next_interview_round: "二面" }))] },
+        decision: { count: 0, items: [] },
+        passed: { count: 1, items: [notification(item({ stage: "passed", application_id: "55555555-5555-4555-8555-555555555555" }))] },
       },
       interviews: { available: false, upcoming: [], pending_feedback: [] },
       ...changes,
@@ -118,7 +128,40 @@ test("load requests the scoped workbench once and maps stages and candidate navi
   assert.equal(result.tasks.passed.count, 1);
   assert.equal(result.tasks.interviewPending.items[0].position, "AI 工程师");
   assert.equal(result.tasks.interviewPending.items[0].nextRound, "二面");
+  assert.equal(result.notifications.review.items[0].notificationVersion, "a".repeat(64));
+  assert.equal(result.notifications.interviewPending.count, 1);
   assert.deepEqual(result.interviews, { available: false, upcoming: [], pendingFeedback: [] });
+});
+
+test("markNotificationRead uses the versioned idempotent notification endpoint", async () => {
+  const calls = [];
+  const client = { async markNotificationRead(applicationId, version) { calls.push({ applicationId, version }); return { read_at: "2026-07-22T01:00:00Z" }; } };
+  const candidate = { applicationId: APPLICATION_ID, notificationVersion: "a".repeat(64) };
+
+  const result = await createWorkbenchController({ client }).markNotificationRead(candidate);
+
+  assert.deepEqual(calls, [{ applicationId: APPLICATION_ID, version: "a".repeat(64) }]);
+  assert.deepEqual(result, { read_at: "2026-07-22T01:00:00Z" });
+});
+
+test("refresh restores server read state without removing the business task", async () => {
+  const client = { async request() {
+    return response({
+      notifications: {
+        review: { count: 0, items: [] },
+        interview_pending: { count: 0, items: [] },
+        decision: { count: 0, items: [] },
+        passed: { count: 0, items: [] },
+      },
+    });
+  } };
+
+  const result = await createWorkbenchController({ client }).load();
+
+  assert.equal(result.notifications.review.count, 0);
+  assert.equal(result.notifications.passed.count, 0);
+  assert.equal(result.tasks.review.count, 1);
+  assert.equal(result.tasks.passed.count, 1);
 });
 
 test("load applies safe display fallbacks to valid nullable workbench fields", async () => {

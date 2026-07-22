@@ -47,7 +47,7 @@ def _is_governance_path(path: str) -> bool:
 
 
 def _requires_no_store(path: str) -> bool:
-    return _is_governance_path(path) or path.startswith("/api/v1/auth/feishu") or path == "/api/v1/settings" or path.startswith(
+    return _is_governance_path(path) or path.startswith("/api/v1/notifications/") or path.startswith("/api/v1/auth/feishu") or path == "/api/v1/settings" or path.startswith(
         "/api/v1/settings/"
     )
 
@@ -182,6 +182,8 @@ def create_app(
     app.include_router(ocr_router)
     from server.app.interviews.api import router as interview_router
     app.include_router(interview_router)
+    from server.app.notifications.api import router as notification_router
+    app.include_router(notification_router)
     app.include_router(talent_router)
     app.include_router(reports_router)
     app.include_router(governance_router)

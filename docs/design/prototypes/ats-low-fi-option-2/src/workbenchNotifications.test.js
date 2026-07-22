@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { buildWorkbenchNotificationGroups, countWorkbenchNotifications } from "./workbenchNotifications.js";
+import { buildWorkbenchNotificationGroups, countWorkbenchNotifications, removeWorkbenchNotification } from "./workbenchNotifications.js";
 
-const candidate = { applicationId: "application-1", name: "李嘉明", position: "AI 工程师", city: "北京" };
+const candidate = { applicationId: "application-1", notificationVersion: "a".repeat(64), name: "李嘉明", position: "AI 工程师", city: "北京" };
 
 const tasks = {
   review: { count: 2, items: [candidate] },
@@ -39,6 +39,22 @@ test("notification groups ignore empty and malformed task counts", () => {
   assert.equal(countWorkbenchNotifications(groups), 1);
 });
 
+test("read notification disappears without changing the business task", () => {
+  const notifications = {
+    review: { count: 2, items: [candidate, { ...candidate, applicationId: "application-2", notificationVersion: "b".repeat(64) }] },
+    interviewPending: { count: 0, items: [] },
+    decision: { count: 0, items: [] },
+    passed: { count: 0, items: [] },
+  };
+  const businessTasks = structuredClone(notifications);
+
+  assert.deepEqual(removeWorkbenchNotification(notifications, candidate), {
+    ...notifications,
+    review: { count: 1, items: [{ ...candidate, applicationId: "application-2", notificationVersion: "b".repeat(64) }] },
+  });
+  assert.equal(businessTasks.review.count, 2);
+});
+
 test("notification menu is an operable accessible popover", () => {
   const source = readFileSync(new URL("./NotificationMenu.jsx", import.meta.url), "utf8");
   assert.match(source, /aria-expanded=\{open\}/);
@@ -50,7 +66,9 @@ test("notification menu is an operable accessible popover", () => {
 
 test("review notifications use the dedicated workbench review navigation", () => {
   const appSource = readFileSync(new URL("./App.jsx", import.meta.url), "utf8");
-  assert.match(appSource, /<NotificationMenu[^>]*onOpenCandidate=\{openWorkbenchTaskCandidate\}/);
+  assert.match(appSource, /<NotificationMenu[^>]*onOpenCandidate=\{openWorkbenchNotificationCandidate\}/);
+  assert.match(appSource, /workbenchController\.markNotificationRead\(candidate/);
+  assert.match(appSource, /removeWorkbenchNotification\(current\.data\.notifications, candidate\)/);
   assert.match(appSource, /candidate\.taskId \? openWorkbenchReviewCandidate\(candidate\) : openCandidate\(candidate\)/);
 });
 

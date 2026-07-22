@@ -34,6 +34,7 @@ function notificationWorkbench() {
     candidate_link: `/candidates/${review.candidate_id}?tab=evidence&application=${review.application_id}&job=${review.job_id}`,
   };
   const passed = notificationCandidate("passed", 2, "李嘉杨");
+  const notification = (item, version) => ({ ...item, notification_version: version.repeat(64) });
   const empty = { count: 0, items: [] };
   return {
     generated_at: "2026-07-17T04:00:00Z",
@@ -47,6 +48,12 @@ function notificationWorkbench() {
       stages: { new: empty, review: { count: 1, items: [review] }, contact: empty, interview_pending: empty, interviewing: empty, decision: empty, passed: { count: 1, items: [passed] } },
     }],
     tasks: { review: { count: 1, items: [reviewTask] }, interview_pending: empty, decision: empty, passed: { count: 1, items: [passed] } },
+    notifications: {
+      review: { count: 1, items: [notification(reviewTask, "a")] },
+      interview_pending: empty,
+      decision: empty,
+      passed: { count: 1, items: [notification(passed, "b")] },
+    },
     interviews: { available: false, upcoming: [], pending_feedback: [] },
   };
 }
@@ -98,6 +105,7 @@ async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = f
     if (pathname === "/api/v1/settings/workflow-templates") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [standardWorkflowTemplate] }) });
     if (pathname === "/api/v1/jobs") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: [], meta: { departments: [], owners: [], status_counts: {}, next_cursor: null } }) });
     if (pathname === "/api/v1/workbench" && workbench) return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: workbench }) });
+    if (/^\/api\/v1\/notifications\/workbench\/[^/]+\/read$/.test(pathname) && request.method() === "PUT") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { application_id: pathname.split("/")[5], version: request.postDataJSON().version, read_at: "2026-07-22T01:00:00Z" } }) });
     if (pathname === "/api/v1/auth/invitations/accept") return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ data: { email: "invitee@example.test" } }) });
     if (pathname === "/api/v1/me/password") return route.fulfill({ status: 204, body: "" });
     return route.fulfill({ status: 503, contentType: "application/problem+json", body: JSON.stringify({ status: 503 }) });
@@ -107,7 +115,13 @@ async function openPage({ viewport = { width: 1280, height: 800 }, anonymous = f
 }
 
 test("notification bell opens actionable tasks and candidate navigation", { timeout: 60_000 }, async () => {
-  const { context, page } = await openPage({ workbench: notificationWorkbench() });
+  let readRequest;
+  const { context, page } = await openPage({
+    workbench: notificationWorkbench(),
+    onRequest(pathname, request) {
+      if (/^\/api\/v1\/notifications\/workbench\/[^/]+\/read$/.test(pathname)) readRequest = request;
+    },
+  });
   try {
     await page.goto(baseUrl);
     const trigger = page.getByRole("button", { name: "查看 2 项待处理事项", exact: true });
@@ -122,6 +136,9 @@ test("notification bell opens actionable tasks and candidate navigation", { time
     await panel.getByRole("button", { name: /陈曦/ }).click();
     await page.waitForURL(/\/candidates\/30000000-0000-4000-8000-000000000001/);
     assert.equal(await panel.count(), 0);
+    assert.equal(readRequest.method(), "PUT");
+    assert.deepEqual(readRequest.postDataJSON(), { version: "a".repeat(64) });
+    assert.equal(readRequest.headers()["x-csrf-token"], "closure-csrf");
   } finally { await context.close(); }
 });
 
@@ -229,7 +246,7 @@ test("new jobs default to the standard process and manage departments navigates 
     const process = page.getByLabel("流程模板", { exact: true });
     assert.equal(await process.evaluate((element) => element.tagName), "SELECT");
     assert.equal(await process.inputValue(), standardWorkflowTemplate.id);
-    assert.match(await page.getByText("阶段摘要", { exact: true }).locator("..").textContent(), /新简历.*用人经理评审.*一面.*待决策/s);
+    assert.match(await page.getByText("阶段摘要", { exact: true }).locator("..").textContent(), /新简历.*用人经理评审.*一面.*用人经理录用决策/s);
     assert.match(await page.getByText("AI 简历评估", { exact: true }).locator("..").textContent(), /LLM 生成评分、结论与依据/);
     await page.getByLabel("职位名称", { exact: true }).fill("平台工程师");
     await page.getByRole("button", { name: /管理部门/ }).click();

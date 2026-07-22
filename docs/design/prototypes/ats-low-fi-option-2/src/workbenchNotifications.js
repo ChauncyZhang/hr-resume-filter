@@ -21,3 +21,16 @@ export function buildWorkbenchNotificationGroups(tasks, role) {
 export function countWorkbenchNotifications(groups) {
   return (groups || []).reduce((total, group) => total + (Number.isInteger(group?.count) ? group.count : 0), 0);
 }
+
+export function removeWorkbenchNotification(notifications, item) {
+  if (!notifications || !item?.applicationId || !item?.notificationVersion) return notifications;
+  return Object.fromEntries(Object.entries(notifications).map(([key, group]) => {
+    const items = Array.isArray(group?.items) ? group.items : [];
+    const remaining = items.filter((candidate) => !(
+      candidate.applicationId === item.applicationId
+      && candidate.notificationVersion === item.notificationVersion
+    ));
+    if (remaining.length === items.length) return [key, group];
+    return [key, { ...group, count: Math.max(0, group.count - 1), items: remaining }];
+  }));
+}

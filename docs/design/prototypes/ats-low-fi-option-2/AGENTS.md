@@ -22,3 +22,4 @@ Durable product rules from HR usability review:
 - Role hierarchy must be reflected in assignment selectors: recruiting administrators can be selected anywhere a hiring manager or interviewer is eligible to act.
 - Organization entities use reversible lifecycle management. A disabled department remains visible for historical records but cannot receive new members or jobs until re-enabled.
 - Interview workflow templates provide the recommended next round, not a hard ceiling. After configured rounds are complete, authorized HR users must still be able to add another interview; scheduling that interview automatically returns the application from decision to interviewing.
+- Keep process stages, actionable tasks, AI routing conclusions, and notification read state semantically separate. User-facing stage labels must identify the responsible actor or business outcome; internal API and database state values may remain stable behind a shared display mapping.

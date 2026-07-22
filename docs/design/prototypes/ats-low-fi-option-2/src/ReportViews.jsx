@@ -3,6 +3,7 @@ import { AlertTriangle, ArrowRight, BarChart3, CalendarRange, CheckCircle2, Chev
 import { canPerformAction } from "./roleCapabilities.js";
 import { createExportIntent, createLatestOperation, failedReportState, isTerminalExportFailure, loadingReportState } from "./reportWorkspaceState.js";
 import { PagePrimaryAction } from "./PagePrimaryAction.jsx";
+import { applicationStageLabel } from "./recruitingTerminology.js";
 import "./product-theme-admin.css";
 
 function NoPermission({ onNotify }) {
@@ -141,11 +142,11 @@ export function ReportWorkspace({ positions = [], currentRole, onDrillDown, onNo
       <div className="report-metrics"><MetricCard label="招聘申请" value={data.totalApplications} unit="份" note={selectedPosition ? selectedPosition.name : "全部有权限职位"} icon={UsersRound} /><MetricCard label="简历解析成功率" value={data.quality.parseSuccessRate} unit="%" note={`${data.quality.parseSucceeded}/${data.quality.parseTotal} 份解析成功`} icon={FileCheck2} /><MetricCard label="面试反馈完成率" value={data.interviews.feedbackCompletionRate} unit="%" note={`${data.interviews.feedbackCompleted}/${data.interviews.feedbackTotal} 份必需反馈`} icon={MessageSquareText} /><MetricCard label="平均反馈时效" value={data.interviews.averageFeedbackHours} unit="小时" note="从面试结束到提交反馈" icon={Clock3} /></div>
       <div className="report-grid">
         <div className="report-column">
-          <section className="report-panel funnel-panel"><header><div><h3>招聘漏斗</h3><p>当前阶段人数，点击后查看候选人</p></div><span>{filters.period}</span></header><div className="report-funnel">{data.stages.map((item) => <button type="button" key={item.apiStage} onClick={() => onDrillDown({ jobId: filters.jobId || "全部职位", stage: item.stage })} style={{ "--funnel-fill": `${Math.max(0, item.currentCount / maxStageCount * 100)}%` }}><span>{item.stage}</span><strong>{item.currentCount}</strong><small>{data.totalApplications ? `${Math.round(item.currentCount / data.totalApplications * 100)}%` : "0%"}</small><ArrowRight size={15} /></button>)}</div></section>
+          <section className="report-panel funnel-panel"><header><div><h3>招聘漏斗</h3><p>当前阶段人数，点击后查看候选人</p></div><span>{filters.period}</span></header><div className="report-funnel">{data.stages.map((item) => <button type="button" key={item.apiStage} onClick={() => onDrillDown({ jobId: filters.jobId || "全部职位", stage: item.stage })} style={{ "--funnel-fill": `${Math.max(0, item.currentCount / maxStageCount * 100)}%` }}><span>{applicationStageLabel(item.stage)}</span><strong>{item.currentCount}</strong><small>{data.totalApplications ? `${Math.round(item.currentCount / data.totalApplications * 100)}%` : "0%"}</small><ArrowRight size={15} /></button>)}</div></section>
           <ScreeningQualityPanel quality={data.quality} />
         </div>
         <div className="report-column">
-          <section className="report-panel duration-panel"><header><div><h3>阶段平均停留</h3><p>基于申请阶段事件计算</p></div></header><div className="duration-bars">{data.stages.map((item) => <div key={item.apiStage}><span>{item.stage}</span><div><i style={{ width: `${Math.min(100, item.averageDays / Math.max(1, ...data.stages.map((row) => row.averageDays)) * 100)}%` }} /></div><strong>{item.averageDays} 天</strong><small>当前 {item.currentCount} 人</small></div>)}</div></section>
+          <section className="report-panel duration-panel"><header><div><h3>阶段平均停留</h3><p>基于申请阶段事件计算</p></div></header><div className="duration-bars">{data.stages.map((item) => <div key={item.apiStage}><span>{applicationStageLabel(item.stage)}</span><div><i style={{ width: `${Math.min(100, item.averageDays / Math.max(1, ...data.stages.map((row) => row.averageDays)) * 100)}%` }} /></div><strong>{item.averageDays} 天</strong><small>当前 {item.currentCount} 人</small></div>)}</div></section>
           <section className="report-panel interview-report"><header><div><h3>面试效率</h3><p>面试场次、必需反馈和反馈时效</p></div></header><div><section><span>面试场次</span><strong>{data.interviews.count}</strong></section><section><span>完成反馈</span><strong>{data.interviews.feedbackCompleted}</strong></section><section><span>平均反馈时效</span><strong>{data.interviews.averageFeedbackHours}h</strong></section></div><p><CheckCircle2 size={15} />反馈完成率 {data.interviews.feedbackCompletionRate}%</p></section>
         </div>
       </div>

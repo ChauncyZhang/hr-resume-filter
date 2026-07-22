@@ -287,6 +287,31 @@ class WorkbenchReviewStageOut(ApiModel):
     items: list[WorkbenchReviewTaskOut] = Field(max_length=5)
 
 
+class WorkbenchNotificationOut(WorkbenchCandidateOut):
+    notification_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class WorkbenchReviewNotificationOut(WorkbenchReviewTaskOut):
+    notification_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class WorkbenchNotificationStageOut(ApiModel):
+    count: int = Field(ge=0)
+    items: list[WorkbenchNotificationOut] = Field(max_length=5)
+
+
+class WorkbenchReviewNotificationStageOut(ApiModel):
+    count: int = Field(ge=0)
+    items: list[WorkbenchReviewNotificationOut] = Field(max_length=5)
+
+
+class WorkbenchNotificationsOut(ApiModel):
+    review: WorkbenchReviewNotificationStageOut
+    interview_pending: WorkbenchNotificationStageOut
+    decision: WorkbenchNotificationStageOut
+    passed: WorkbenchNotificationStageOut
+
+
 class WorkbenchStagesOut(ApiModel):
     new: WorkbenchStageOut
     review: WorkbenchStageOut
@@ -324,6 +349,7 @@ class WorkbenchOut(ApiModel):
     generated_at: datetime
     jobs: list[WorkbenchJobOut] = Field(max_length=20)
     tasks: WorkbenchTasksOut
+    notifications: WorkbenchNotificationsOut
     interviews: WorkbenchInterviewsOut
 
 

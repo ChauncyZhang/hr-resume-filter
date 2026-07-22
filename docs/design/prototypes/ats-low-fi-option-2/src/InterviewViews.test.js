@@ -67,7 +67,7 @@ test("clearing a submitted draft removes only that interview draft", () => {
   clearInterviewFeedbackDraft("USER-001", "INT-001", storage);
 
   assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-001" }, storage), null);
-  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-002" }, storage).conclusion, "保留");
+  assert.equal(loadInterviewFeedbackDraft("USER-001", { id: "INT-002" }, storage).conclusion, "待补充评估");
 });
 
 test("a versioned server draft wins over a stale local draft", () => {

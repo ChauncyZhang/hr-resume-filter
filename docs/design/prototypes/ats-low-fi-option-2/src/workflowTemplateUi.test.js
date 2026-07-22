@@ -13,7 +13,7 @@ test("workflow template UI supports creating, adding, ordering, and deleting int
   assert.match(settingsSource, /moveRound\(index, -1\)/);
   assert.match(settingsSource, /moveRound\(index, 1\)/);
   assert.match(settingsSource, /rounds\.filter/);
-  assert.match(settingsSource, /完成后自动进入/);
+  assert.match(settingsSource, /完成后等待安排/);
 });
 
 test("job AI evaluation uses a compact switch isolated from generic input sizing", () => {

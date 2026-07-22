@@ -16,7 +16,7 @@ const API_TO_UI_STATUS = {
 const API_TO_UI_NOTIFICATION = { sent: "已发送", failed: "发送失败", not_sent: "待发送" };
 const UI_TO_API_RATING = { "需提升": 1, "一般": 2, "良好": 3, "优秀": 4 };
 const API_TO_UI_RATING = { 1: "需提升", 2: "一般", 3: "良好", 4: "优秀" };
-const UI_TO_API_CONCLUSION = { "强烈推荐": "strong_recommend", "推荐": "recommend", "保留": "hold", "不推荐": "no_hire" };
+const UI_TO_API_CONCLUSION = { "强烈推荐": "strong_recommend", "推荐": "recommend", "保留": "hold", "待补充评估": "hold", "不推荐": "no_hire" };
 const API_TO_UI_CONCLUSION = Object.fromEntries(Object.entries(UI_TO_API_CONCLUSION).map(([ui, api]) => [api, ui]));
 const UI_RATING_KEYS = {
   professional: "professional_ability",

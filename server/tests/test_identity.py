@@ -144,7 +144,7 @@ def test_passwords_use_argon2id_and_verify() -> None:
 
 
 def test_login_persists_only_hashes_and_sets_host_cookie(identity_app) -> None:
-    app, client, _ = identity_app
+    app, client, clock = identity_app
     seed_user(app)
     response = login(client)
     assert response.status_code == 200
@@ -160,6 +160,8 @@ def test_login_persists_only_hashes_and_sets_host_cookie(identity_app) -> None:
         assert stored.csrf_token_hash == hash_token(csrf)
         assert client.cookies["hr_session"] not in repr(stored)
         assert csrf not in repr(stored)
+        assert stored.idle_expires_at == clock.now.replace(tzinfo=None) + timedelta(hours=2)
+        assert stored.absolute_expires_at == clock.now.replace(tzinfo=None) + timedelta(hours=12)
 
 
 @pytest.mark.parametrize(
@@ -217,23 +219,94 @@ def test_me_rotates_csrf_refreshes_idle_but_not_absolute(identity_app) -> None:
         original = session.query(app.state.identity_store.SessionModel).one()
         absolute = original.absolute_expires_at
         idle = original.idle_expires_at
-    clock.advance(minutes=5)
+    clock.advance(minutes=31)
     response = get_me(client)
     assert response.status_code == 200
-    assert response.headers["X-CSRF-Token"] != old_csrf
+    new_csrf = response.headers["X-CSRF-Token"]
+    assert new_csrf != old_csrf
     assert response.json()["data"]["roles"] == ["recruiting_admin"]
     assert "session" not in response.text.casefold() and "password" not in response.text.casefold()
     with app.state.identity_store.sync_session() as session:
         refreshed = session.query(app.state.identity_store.SessionModel).one()
+        assert refreshed.csrf_token_hash == hash_token(new_csrf)
+        assert refreshed.idle_expires_at == clock.now.replace(tzinfo=None) + timedelta(hours=2)
         assert refreshed.idle_expires_at > idle
         assert refreshed.absolute_expires_at == absolute
+
+
+def test_principal_business_access_refreshes_idle_but_not_absolute(identity_app) -> None:
+    app, client, clock = identity_app
+    seed_user(app)
+    assert login(client).status_code == 200
+    token = client.cookies["hr_session"]
+    with app.state.identity_store.sync_session() as session:
+        original = session.query(app.state.identity_store.SessionModel).one()
+        absolute = original.absolute_expires_at
+
+    clock.advance(minutes=31)
+    principal = app.state.identity_service.principal(token)
+
+    assert principal.active
+    with app.state.identity_store.sync_session() as session:
+        refreshed = session.query(app.state.identity_store.SessionModel).one()
+        assert refreshed.idle_expires_at == clock.now.replace(tzinfo=None) + timedelta(hours=2)
+        assert refreshed.absolute_expires_at == absolute
+
+
+def test_valid_csrf_business_access_refreshes_idle_without_duplicate_write(identity_app) -> None:
+    app, client, clock = identity_app
+    seed_user(app)
+    response = login(client)
+    token = client.cookies["hr_session"]
+    csrf = response.headers["X-CSRF-Token"]
+    with app.state.identity_store.sync_session() as session:
+        absolute = session.query(app.state.identity_store.SessionModel).one().absolute_expires_at
+
+    clock.advance(minutes=31)
+    assert app.state.identity_service.validate_csrf(
+        token, csrf, trace_id="csrf-renewal", network="127.0.0.1"
+    )
+    with app.state.identity_store.sync_session() as session:
+        renewed = session.query(app.state.identity_store.SessionModel).one()
+        renewed_idle = renewed.idle_expires_at
+        assert renewed_idle == clock.now.replace(tzinfo=None) + timedelta(hours=2)
+        assert renewed.absolute_expires_at == absolute
+
+    clock.advance(minutes=1)
+    assert app.state.identity_service.validate_csrf(
+        token, csrf, trace_id="csrf-no-rewrite", network="127.0.0.1"
+    )
+    with app.state.identity_store.sync_session() as session:
+        unchanged = session.query(app.state.identity_store.SessionModel).one()
+        assert unchanged.idle_expires_at == renewed_idle
+        assert unchanged.absolute_expires_at == absolute
+
+
+def test_activity_renews_idle_to_absolute_when_final_extension_is_below_throttle(identity_app) -> None:
+    app, client, clock = identity_app
+    seed_user(app)
+    assert login(client).status_code == 200
+    token = client.cookies["hr_session"]
+    with app.state.identity_store.sync_session() as session:
+        stored = session.query(app.state.identity_store.SessionModel).one()
+        absolute = stored.absolute_expires_at
+        stored.idle_expires_at = absolute - timedelta(minutes=15)
+        session.commit()
+
+    clock.advance(hours=10)
+    assert app.state.identity_service.principal(token).active
+
+    with app.state.identity_store.sync_session() as session:
+        renewed = session.query(app.state.identity_store.SessionModel).one()
+        assert renewed.idle_expires_at == absolute
+        assert renewed.absolute_expires_at == absolute
 
 
 def test_idle_absolute_disable_and_authorization_version_revoke(identity_app) -> None:
     app, client, clock = identity_app
     user_id = seed_user(app)
     assert login(client).status_code == 200
-    clock.advance(minutes=31)
+    clock.advance(hours=2, seconds=1)
     assert get_me(client).status_code == 401
     assert login(client).status_code == 200
     with app.state.identity_store.sync_session() as session:
@@ -383,7 +456,7 @@ def test_state_changing_request_revokes_known_invalid_session_once(identity_app,
             session.get(User, user_id).status = UserStatus.DISABLED
         session.commit()
     if invalid_kind == "expired":
-        clock.advance(minutes=31)
+        clock.advance(hours=2, seconds=1)
 
     headers = {"Origin": "https://hr.example.test", "X-CSRF-Token": "wrong"}
     assert client.post("/api/v1/unknown-write", headers=headers).status_code == 403

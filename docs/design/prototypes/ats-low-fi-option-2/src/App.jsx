@@ -54,6 +54,7 @@ import { apiClient } from "./apiClient.js";
 import { getSessionIdentity, getSessionMessage, sessionController } from "./session.js";
 import { normalizeScreeningTask, screeningController as defaultScreeningController } from "./screeningController.js";
 import { candidateController as defaultCandidateController } from "./candidateController.js";
+import { applicationStageLabel } from "./recruitingTerminology.js";
 import { jobController as defaultJobController } from "./jobController.js";
 import { workbenchController as defaultWorkbenchController } from "./workbenchController.js";
 import { deriveCandidateInterviews, interviewController as defaultInterviewController, selectSchedulableCandidates } from "./interviewController.js";
@@ -73,7 +74,7 @@ import {
   succeedJobRequest,
 } from "./jobWorkspaceState.js";
 import { getRecentScreeningTaskStorageKey, LEGACY_RECENT_SCREENING_TASK_STORAGE_KEY, parseRecentScreeningTask, serializeRecentScreeningTask } from "./screeningIntegration.js";
-import { buildWorkbenchNotificationGroups, countWorkbenchNotifications } from "./workbenchNotifications.js";
+import { buildWorkbenchNotificationGroups, countWorkbenchNotifications, removeWorkbenchNotification } from "./workbenchNotifications.js";
 
 const navItems = [
   ["工作台", Home],
@@ -296,7 +297,8 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
   const visibleStageMeta = stageMeta.map((name, index) => [name, activeWorkbenchJob?.stages[name]?.count || 0, stages[index].length]);
   const emptyTaskGroup = { count: 0, items: [] };
   const workbenchTasks = workbenchState.data?.tasks || { review: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup, passed: emptyTaskGroup };
-  const notificationGroups = useMemo(() => buildWorkbenchNotificationGroups(workbenchTasks, currentRole), [currentRole, workbenchTasks]);
+  const workbenchNotifications = workbenchState.data?.notifications || { review: emptyTaskGroup, interviewPending: emptyTaskGroup, decision: emptyTaskGroup, passed: emptyTaskGroup };
+  const notificationGroups = useMemo(() => buildWorkbenchNotificationGroups(workbenchNotifications, currentRole), [currentRole, workbenchNotifications]);
   const notificationCount = useMemo(() => countWorkbenchNotifications(notificationGroups), [notificationGroups]);
   const allowedNavItems = useMemo(() => new Set(getAllowedNavItems(currentRole)), [currentRole]);
   const allowedSettingsSections = useMemo(() => getAllowedSettingsSections(currentRole), [currentRole]);
@@ -789,6 +791,18 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
     candidate.taskId ? openWorkbenchReviewCandidate(candidate) : openCandidate(candidate);
   }
 
+  function openWorkbenchNotificationCandidate(candidate) {
+    setWorkbenchState((current) => current.data ? {
+      ...current,
+      data: {
+        ...current.data,
+        notifications: removeWorkbenchNotification(current.data.notifications, candidate),
+      },
+    } : current);
+    void workbenchController.markNotificationRead(candidate).catch(() => void loadWorkbench());
+    openWorkbenchTaskCandidate(candidate);
+  }
+
   function backFromCandidateDetail() {
     candidateLoadRef.current?.abort();
     candidateLoadRef.current = null;
@@ -963,7 +977,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
             {!screeningTask && activeNav === "设置" && route.returnTo && <button className="button secondary" type="button" onClick={() => navigate(route.returnTo)}>返回职位编辑</button>}
             {!screeningTask && activeNav === "工作台" && <button className="organization-context" type="button" onClick={() => navigate(settingsPath("组织与权限", "部门"))}><Building2 size={16} /><span>当前组织</span><ChevronDown size={15} /></button>}
             {!screeningTask && activeNav === "工作台" && <label className="global-search"><Search size={17} /><input aria-label="全局搜索候选人或职位" value={globalSearch} onChange={(event) => setGlobalSearch(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && globalSearch.trim()) navigate(candidateListPath({ q: globalSearch })); }} placeholder="搜索职位、候选人或关键字" /><kbd>⌘ K</kbd></label>}
-            {!screeningTask && activeNav === "工作台" && <NotificationMenu groups={notificationGroups} total={notificationCount} onOpenCandidate={openWorkbenchTaskCandidate} onOpenGroup={(stage) => navigate(candidateListPath({ stage }))} />}
+            {!screeningTask && activeNav === "工作台" && <NotificationMenu groups={notificationGroups} total={notificationCount} onOpenCandidate={openWorkbenchNotificationCandidate} onOpenGroup={(stage) => navigate(candidateListPath({ stage }))} />}
             {!screeningTask && activeNav === "工作台" && canPerformAction(currentRole, "导入简历") && <button className="button primary" type="button" onClick={() => setImportOpen(true)}><Import size={17} />导入简历</button>}
             <span className="page-primary-action-host" ref={setPageActionHost} />
             <IconButton label="个人设置" className="mobile-profile-action" onClick={() => setProfileOpen(true)}><UserRound size={18} /></IconButton>
@@ -985,7 +999,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
         {!screeningTask && activeNav === "工作台" && currentRole !== "面试官" && activeWorkbenchJob && <>
         <section className="dashboard-metrics" aria-label="招聘关键指标">
           <button type="button" onClick={() => navigate("/jobs")}><span className="metric-icon blue"><BriefcaseBusiness size={20} /></span><span><small>在招职位</small><strong>{workbenchJobs.length}</strong><em>当前可见职位</em></span></button>
-          <button type="button" onClick={() => navigate(candidateListPath({ stage: "待复核" }))}><span className="metric-icon orange"><FileText size={20} /></span><span><small>待评审</small><strong>{workbenchTasks.review.count}</strong><em>等待用人经理处理</em></span></button>
+          <button type="button" onClick={() => navigate(candidateListPath({ stage: "待复核" }))}><span className="metric-icon orange"><FileText size={20} /></span><span><small>待用人经理评审</small><strong>{workbenchTasks.review.count}</strong><em>等待用人经理处理</em></span></button>
           <button type="button" onClick={() => navigate("/interviews")}><span className="metric-icon green"><CalendarDays size={20} /></span><span><small>今日面试</small><strong>{todayInterviewCount}</strong><em>未来共 {interviewRecords.length} 场</em></span></button>
           <button type="button" onClick={() => navigate(candidateListPath({ stage: "已通过" }))}><span className="metric-icon amber"><UserRound size={20} /></span><span><small>待录用确认</small><strong>{workbenchTasks.passed.count}</strong><em>完成确认即结束流程</em></span></button>
         </section>
@@ -1020,7 +1034,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
                 <div className="kanban" aria-label="候选人招聘阶段">
                   {visibleStageMeta.map(([name, count, loadedCount], index) => (
                     <section className="stage" key={name}>
-                      <header><strong>{name}</strong><span>{count}</span></header>
+                      <header><strong>{applicationStageLabel(name)}</strong><span>{count}</span></header>
                       <div className="stage-list">
                         {stages[index].slice(0, 5).map((candidate) => (
                           <CandidateCard key={candidate.applicationId || candidate.id} candidate={candidate} onOpen={openCandidate} />
@@ -1036,7 +1050,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
                   {stages.flat().slice(0, 10).map((candidate) => (
                     <button type="button" className="list-row" key={candidate.applicationId || candidate.id} onClick={() => openCandidate(candidate)}>
                       <span><span className="avatar-mini"><UserRound size={11} /></span><strong>{candidate.name}</strong></span>
-                      <span>{visibleStageMeta.find((_, stageIndex) => stages[stageIndex].includes(candidate))?.[0]}</span>
+                      <span>{applicationStageLabel(visibleStageMeta.find((_, stageIndex) => stages[stageIndex].includes(candidate))?.[0])}</span>
                       <span>{candidate.lastActivity || candidate.age || candidate.schedule || candidate.note}</span>
                       <ChevronRight size={16} />
                     </button>
@@ -1068,9 +1082,9 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
                 {workbenchTasks.interviewPending.count === 0 && <p>暂无待安排面试</p>}
               </div>}
               {canPerformAction(currentRole, "确认录用决策") && <div className="rail-group compact">
-                <div className="rail-group-title"><span className="status-dot blue" />待决策（{workbenchTasks.decision.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待决策" }))}>查看全部</button></div>
+                <div className="rail-group-title"><span className="status-dot blue" />待用人经理录用决策（{workbenchTasks.decision.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "待决策" }))}>查看全部</button></div>
                 {workbenchTasks.decision.items.slice(0, 3).map((candidate) => <button className="rail-item" type="button" key={candidate.applicationId} onClick={() => openCandidate(candidate)}>{candidate.name}<small>{candidate.position} · {candidate.city}</small></button>)}
-                {workbenchTasks.decision.count === 0 && <p>暂无待决策候选人</p>}
+                {workbenchTasks.decision.count === 0 && <p>暂无待用人经理录用决策候选人</p>}
               </div>}
               {canPerformAction(currentRole, "确认录用结果") && <div className="rail-group compact">
                 <div className="rail-group-title"><span className="status-dot green" />待录用确认（{workbenchTasks.passed.count}）<button type="button" onClick={() => navigate(candidateListPath({ stage: "已通过" }))}>查看全部</button></div>
@@ -1083,7 +1097,7 @@ function AuthenticatedApp({ session, onLogout, accountClient, screeningControlle
               <header><h3>招聘效率</h3><span>实时</span></header>
               <div><small>当前流程候选人</small><strong>{workbenchCandidateCount}</strong><span>覆盖 {visibleStageMeta.filter(([, count]) => count > 0).length} 个阶段</span></div>
               <div><small>面试反馈完成率</small><strong>{feedbackCompletionRate}%</strong><span className="efficiency-progress"><i style={{ width: `${feedbackCompletionRate}%` }} /></span></div>
-              <div><small>已通过待确认</small><strong>{workbenchTasks.passed.count}</strong><span>自动进入录用确认任务</span></div>
+              <div><small>待录用确认</small><strong>{workbenchTasks.passed.count}</strong><span>自动进入录用确认任务</span></div>
             </section>
           </aside>
         </div></>}

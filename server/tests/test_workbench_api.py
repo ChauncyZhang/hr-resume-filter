@@ -231,6 +231,8 @@ def test_workbench_contract_filters_terminal_rows_and_caps_newest_items(tmp_path
     assert body["data"]["tasks"]["interview_pending"]["count"] == 1
     assert body["data"]["tasks"]["decision"]["count"] == 1
     assert body["data"]["tasks"]["passed"]["count"] == 1
+    assert body["data"]["notifications"]["decision"]["count"] == 1
+    assert len(body["data"]["notifications"]["decision"]["items"][0]["notification_version"]) == 64
 
 
 def test_workbench_empty_state_is_stable(tmp_path, monkeypatch) -> None:
@@ -250,6 +252,12 @@ def test_workbench_empty_state_is_stable(tmp_path, monkeypatch) -> None:
         "generated_at": None,
         "jobs": [],
         "tasks": {
+            "review": {"count": 0, "items": []},
+            "interview_pending": {"count": 0, "items": []},
+            "decision": {"count": 0, "items": []},
+            "passed": {"count": 0, "items": []},
+        },
+        "notifications": {
             "review": {"count": 0, "items": []},
             "interview_pending": {"count": 0, "items": []},
             "decision": {"count": 0, "items": []},
@@ -428,9 +436,9 @@ def test_workbench_query_count_is_bounded(tmp_path, monkeypatch) -> None:
 
     assert response.status_code == 200
     selects = [statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]
-    # The workbench uses three base queries plus two bounded batch queries for
-    # workflow templates and completed interview rounds.
-    assert len(selects) <= 5
+    # The workbench uses three base queries, two bounded workflow/interview
+    # queries, and one user-scoped notification-read query.
+    assert len(selects) <= 6
 
 
 def test_workbench_openapi_enforces_bounded_non_sensitive_contract(tmp_path) -> None:
