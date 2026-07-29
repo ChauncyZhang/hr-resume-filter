@@ -14,6 +14,9 @@ PRODUCTION_SMOKE = (
 SHARED_TEMPLATE = (
     ROOT / "deploy" / "tests" / "fixtures" / "shared-production.conf.template"
 ).read_text(encoding="utf-8")
+OPERATIONS_RUNBOOK = (
+    ROOT / "deploy" / "production-operations-runbook.md"
+).read_text(encoding="utf-8")
 
 
 def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
@@ -46,6 +49,20 @@ def test_container_test_gate_excludes_contracts_that_require_host_tools() -> Non
     assert "--ignore=server/tests/test_observability_preflight.py" in POWERSHELL
     assert "--ignore=server/tests/test_production_topology.py" in POWERSHELL
     assert "--ignore=server/tests/test_observability_topology.py" in POWERSHELL
+
+
+def test_runbook_restores_complete_image_refs_in_clean_environment() -> None:
+    rollback = OPERATIONS_RUNBOOK.split(
+        "For an application-only rollback", maxsplit=1
+    )[1]
+
+    assert "APP_IMAGE`, `APP_IMAGE_DIGEST`, `FRONTEND_IMAGE`, and" in rollback
+    assert "`FRONTEND_IMAGE_DIGEST`" in rollback
+    assert (
+        "unset APP_IMAGE APP_IMAGE_DIGEST FRONTEND_IMAGE FRONTEND_IMAGE_DIGEST"
+        in rollback
+    )
+    assert "config --images" in rollback
 
 
 def test_first_machine_bootstrap_is_secret_safe_and_preserves_shared_website() -> None:
