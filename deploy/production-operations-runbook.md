@@ -17,32 +17,34 @@ production traffic. The production traffic decision remains external.
 
 ### Current single-server release command
 
-For the current SSH-managed trial server, run the checked-in PowerShell entrypoint from a clean
-Windows worktree. It builds versioned images locally, transfers a source snapshot and image
+For the current SSH-managed trial server, run the repository-root PowerShell entrypoint from a clean
+Windows worktree. It automatically selects frontend-only or full scope, builds versioned images locally, transfers a source snapshot and image
 archives over SSH, keeps the previous release directory as the rollback point, preserves the
 server-owned `.env` and TLS overlay, uses the fixed `beyondcandidate` Compose project name, and
 verifies container health plus the public HTTPS browser boundary before reporting success.
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File deploy\deploy-remote.ps1 `
-  -RemoteHost root@120.79.184.221 `
-  -Domain hr.aurora-tek.cn `
-  -Scope all
+.\部署到生产.ps1
 ```
 
 For a frontend-only change that requires no backend image or migration:
 
 ```powershell
-PowerShell -ExecutionPolicy Bypass -File deploy\deploy-remote.ps1 -Scope frontend
+.\部署到生产.ps1 -Scope frontend
 ```
 
-The command rejects a dirty worktree by default. `-AllowDirty` is reserved for an explicitly
-approved emergency release and marks the release ID as dirty. `-SkipTests` is also an emergency
-override, not the normal path. `-ValidateOnly` checks local prerequisites and release identity
-without building or changing the server. It runs the shared Nginx release gate: the release
+The command rejects a dirty worktree and commits not published to both repositories' `origin/main`.
+`-AllowDirty` is reserved for an explicitly approved emergency release and marks the release ID as dirty.
+Full product tests are performed during development by `验证代码.ps1`, not repeated by a normal
+deployment. `-RunFullTests` explicitly repeats them when required. `-ValidateOnly` checks local
+prerequisites and release identity without building or changing the server. It runs the shared route safety gate: the release
 validator tests, remote deployment-script tests, and Git Bash syntax check for
 `deploy/shared-nginx-smoke.sh`. This gate runs before any archive creation or SSH upload and
-cannot be skipped by `-SkipTests`.
+always runs before remote changes.
+
+TLS and the shared Nginx template are first-machine configuration. Normal releases inherit the
+server-owned template and only validate it because the versioned proxy container is replaced.
+This safety check is not a request to configure Nginx again.
 
 Before release, configure the required server-only setting
 `AURORA_WEB_SMOKE_MARKER=<stable text from the website homepage>` in the protected deployment

@@ -1,8 +1,8 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('frontend', 'all')]
-    [string]$Scope = 'all',
-    [switch]$SkipTests,
+    [ValidateSet('auto', 'frontend', 'all')]
+    [string]$Scope = 'auto',
+    [switch]$RunFullTests,
     [switch]$ValidateOnly,
     [string]$ConfigPath = (Join-Path $PSScriptRoot 'deploy/target.psd1')
 )
@@ -27,7 +27,7 @@ $deployParameters = @{
     RemoteHost = $config.RemoteHost
     Domain = $config.Domain
     RemoteRoot = $config.RemoteRoot
-    SkipTests = $SkipTests
+    RunFullTests = $RunFullTests
     ValidateOnly = $ValidateOnly
 }
 & "$root/deploy/deploy-remote.ps1" @deployParameters

@@ -32,6 +32,8 @@ Use the narrowest meaningful check first, then broaden according to risk:
 6. `.\部署到生产.ps1 -ValidateOnly` for deployment changes.
 7. Production health and browser smoke only after an explicitly authorized deployment.
 
+Do not treat all seven steps as a command sequence for every production deployment. Development owns steps 1-5. A normal, explicitly authorized release uses the root `部署到生产.ps1`, which performs the release-specific safety and production checks without repeating the full product suite.
+
 ## Finish checklist
 
 1. Run `git diff --check` in every modified repository.

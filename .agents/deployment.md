@@ -16,27 +16,40 @@ Non-secret target values are in `deploy/target.psd1`. Secrets remain on the serv
 
 ## Normal release
 
-Run from the private repository `main` branch with a clean private worktree and clean `product` submodule:
+When the user explicitly asks to deploy, run exactly this from the private repository root:
 
 ```powershell
-.\验证代码.ps1
-.\部署到生产.ps1 -ValidateOnly
 .\部署到生产.ps1
 ```
 
-Use a frontend-only release only when there is no backend, dependency, worker, migration, or server-contract change:
+Do not mechanically run `验证代码.ps1`, `-ValidateOnly`, and the real deployment in sequence. Product validation belongs to development and release-candidate preparation; deployment does not repeat the full product suite by default. The entrypoint requires clean commits published at both repositories' `origin/main`, detects whether this is a first-machine bootstrap, and compares the active product commit to select `frontend` or `all` automatically.
+
+Only override automatic scope when diagnosing the release mechanism:
 
 ```powershell
 .\部署到生产.ps1 -Scope frontend
+.\部署到生产.ps1 -Scope all
 ```
 
-Do not use `-SkipTests` or dirty-release overrides in the normal path.
+Use `-RunFullTests` only when the user explicitly asks to repeat the complete product suite during deployment or when existing validation evidence is not trustworthy:
+
+```powershell
+.\部署到生产.ps1 -RunFullTests
+```
+
+`-ValidateOnly` is for changes to deployment scripts and route protection. It is not a required step before every normal deployment. Do not use dirty-release overrides in the normal path.
+
+## Nginx lifecycle
+
+TLS files and the shared production Nginx template are configured once during first-machine bootstrap. A normal release does not ask the operator to configure Nginx again and does not replace the server-owned template.
+
+Every release still performs a short route safety check because the application proxy container is versioned and replaced. The check copies the already active server-owned template into the candidate release, runs parser and shell tests, executes `nginx -t`, verifies the HR domain and both website domains, and confirms that `aurora-web` retained its container ID. This is validation of the existing configuration, not repeated configuration work. Do not tell the user that Nginx needs to be configured unless bootstrap prerequisites are genuinely missing or the inherited configuration fails validation.
 
 ## What the release script does
 
 1. Resolves the private commit and pinned public product commit.
-2. Runs the shared Nginx release gate.
-3. Installs locked frontend dependencies and runs required tests unless explicitly overridden.
+2. Runs the short shared-route safety gate without changing the active Nginx configuration.
+3. Installs locked frontend dependencies; full product tests run only with `-RunFullTests`.
 4. Builds versioned frontend and backend images locally.
 5. Creates a product source archive and overlays reviewed private release scripts.
 6. Uploads archives through SSH to a unique staging directory.
@@ -65,6 +78,21 @@ Copy-Item deploy\target.psd1 deploy\target.local.psd1
 ```
 
 On an apt-based Linux server, bootstrap installs Docker and Compose when missing, generates cryptographically random production credentials, uploads TLS materials with restricted permissions, creates the initial Aurora system administrator, and then enters the normal versioned release path. The initial password is displayed once and must be changed after first login.
+
+After bootstrap succeeds, future deployments use the normal one-command path. Do not upload certificates or edit Nginx again during ordinary application releases.
+
+## Agent decision table
+
+| Situation | Required action |
+| --- | --- |
+| User says only "deploy" | Run `部署到生产.ps1` from the private repository root. |
+| Pure frontend product diff | Let `-Scope auto` select `frontend`; do not force `all`. |
+| Backend, worker, dependency, migration, or mixed diff | Let `-Scope auto` select `all`. |
+| Deployment scripts were edited | Run focused deployment tests and optionally `-ValidateOnly`, then the root entrypoint after authorization. |
+| First deployment or replacement machine | Prepare DNS, 443, TLS files, SSH, and `aurora-web`; let the root entrypoint invoke bootstrap. |
+| Existing production server | Never rerun bootstrap or manually change Nginx/TLS. |
+| Full tests already passed during development | Do not repeat them during deployment. |
+| Validation is missing or suspect | Run `验证代码.ps1` before deployment, or explicitly deploy with `-RunFullTests`. |
 
 ## Release acceptance
 

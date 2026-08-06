@@ -5,6 +5,8 @@ import subprocess
 ROOT = Path(__file__).parents[2]
 BASH = r"C:\Program Files\Git\bin\bash.exe"
 POWERSHELL = (ROOT / "deploy" / "deploy-remote.ps1").read_text(encoding="utf-8")
+ENTRYPOINT = (ROOT / "部署到生产.ps1").read_text(encoding="utf-8")
+VERIFY_SCRIPT = (ROOT / "验证代码.ps1").read_text(encoding="utf-8")
 BOOTSTRAP_POWERSHELL = (ROOT / "deploy" / "bootstrap-remote.ps1").read_text(encoding="utf-8")
 REMOTE_SHELL = (ROOT / "deploy" / "remote-release.sh").read_text(encoding="utf-8")
 REMOTE_ROLLBACK = (ROOT / "deploy" / "remote-rollback.sh").read_text(encoding="utf-8")
@@ -21,7 +23,8 @@ OPERATIONS_RUNBOOK = (
 
 def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "Refusing to deploy a dirty worktree" in POWERSHELL
-    assert '[ValidateSet("frontend", "all")]' in POWERSHELL
+    assert '[ValidateSet("auto", "frontend", "all")]' in POWERSHELL
+    assert '[string]$Scope = "auto"' in POWERSHELL
     assert 'beyondcandidate-frontend:$releaseId' in POWERSHELL
     assert 'beyondcandidate-server:$releaseId' in POWERSHELL
     assert 'beyondcandidate-deploy-$releaseId' in POWERSHELL
@@ -42,6 +45,31 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "Production browser smoke failed; requesting release rollback" in POWERSHELL
     assert "remote-rollback.sh" in POWERSHELL
     assert "Invoke-Native npm.cmd ci --no-audit --no-fund" in POWERSHELL
+    assert "Assert-PublishedMainCommit" in POWERSHELL
+    assert "-AllowPinnedAncestor" in POWERSHELL
+    assert "merge-base --is-ancestor" in POWERSHELL
+    assert "Resolve-DeploymentScope" in POWERSHELL
+
+
+def test_full_product_tests_are_explicit_in_release_mode() -> None:
+    assert "[switch]$RunFullTests" in POWERSHELL
+    assert "if ($RunFullTests)" in POWERSHELL
+    assert "[switch]$SkipTests" not in POWERSHELL
+    assert "full product tests are not repeated" in POWERSHELL
+
+
+def test_root_entrypoint_defaults_to_auto_scope_and_forwards_full_test_opt_in() -> None:
+    assert "[ValidateSet('auto', 'frontend', 'all')]" in ENTRYPOINT
+    assert "[string]$Scope = 'auto'" in ENTRYPOINT
+    assert "[switch]$RunFullTests" in ENTRYPOINT
+    assert "RunFullTests = $RunFullTests" in ENTRYPOINT
+    assert "SkipTests" not in ENTRYPOINT
+
+
+def test_development_validation_owns_the_complete_backend_suite() -> None:
+    assert "docker build --target test" in VERIFY_SCRIPT
+    assert "docker run --rm $testImage python -m pytest server/tests" in VERIFY_SCRIPT
+    assert "当前提交可以进入快速发布流程" in VERIFY_SCRIPT
 
 
 def test_container_test_gate_excludes_contracts_that_require_host_tools() -> None:

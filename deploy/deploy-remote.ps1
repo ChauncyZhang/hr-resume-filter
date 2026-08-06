@@ -1,12 +1,12 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("frontend", "all")]
-    [string]$Scope = "all",
+    [ValidateSet("auto", "frontend", "all")]
+    [string]$Scope = "auto",
     [string]$RemoteHost = "root@120.79.184.221",
     [string]$Domain = "hr.aurora-tek.cn",
     [string]$RemoteRoot = "/opt/beyondcandidate",
     [switch]$AllowDirty,
-    [switch]$SkipTests,
+    [switch]$RunFullTests,
     [switch]$KeepArtifacts,
     [switch]$ValidateOnly
 )
@@ -29,6 +29,68 @@ function Assert-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "$Name is required"
     }
+}
+
+function Assert-PublishedMainCommit(
+    [string]$RepositoryRoot,
+    [string]$Commit,
+    [string]$RepositoryLabel,
+    [switch]$AllowPinnedAncestor
+) {
+    & git -C $RepositoryRoot fetch --quiet origin main
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to resolve origin/main for $RepositoryLabel"
+    }
+    $remoteCommit = (& git -C $RepositoryRoot rev-parse FETCH_HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $remoteCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "Unable to resolve the fetched origin/main commit for $RepositoryLabel"
+    }
+    if ($AllowPinnedAncestor) {
+        & git -C $RepositoryRoot merge-base --is-ancestor $Commit $remoteCommit
+        if ($LASTEXITCODE -ne 0) {
+            throw "$RepositoryLabel HEAD is not published in origin/main history. Push the reviewed commit before deployment."
+        }
+    } elseif ($remoteCommit -ne $Commit) {
+        throw "$RepositoryLabel HEAD is not published at origin/main. Push the reviewed commit before deployment."
+    }
+}
+
+function Resolve-DeploymentScope(
+    [string]$RequestedScope,
+    [string]$ProductRoot,
+    [string]$ProductCommit,
+    [string]$RemoteHost,
+    [string]$RemoteRoot
+) {
+    if ($RequestedScope -ne "auto") { return $RequestedScope }
+
+    $metadataPath = "$RemoteRoot/current/deploy/release-info.txt"
+    $remoteCommand = "if [ -f '$metadataPath' ]; then sed -n 's/^git_commit=//p' '$metadataPath' | head -1; fi"
+    $currentCommitLines = @(& ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost $remoteCommand)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Unable to inspect the active release; using full deployment scope"
+        return "all"
+    }
+    $currentCommit = if ($currentCommitLines.Count -gt 0) { ([string]$currentCommitLines[0]).Trim() } else { "" }
+    if ($currentCommit -notmatch '^[0-9a-f]{40}$') {
+        Write-Host "[deploy] no comparable active product commit; selected scope=all"
+        return "all"
+    }
+
+    & git -C $ProductRoot cat-file -e "$currentCommit^{commit}" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Active product commit is unavailable locally; using full deployment scope"
+        return "all"
+    }
+    $changedFiles = @(& git -C $ProductRoot diff --name-only "$currentCommit..$ProductCommit" --)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Unable to compare product commits; using full deployment scope"
+        return "all"
+    }
+    $backendChanges = @($changedFiles | Where-Object { $_ -notlike 'frontend/*' })
+    $resolvedScope = if ($backendChanges.Count -eq 0) { "frontend" } else { "all" }
+    Write-Host "[deploy] auto scope=$resolvedScope changed_files=$($changedFiles.Count)"
+    return $resolvedScope
 }
 
 function Copy-RemoteArtifact([string]$Source, [string]$Destination) {
@@ -55,10 +117,10 @@ function Remove-SafeStagingDirectory([string]$Path) {
     Remove-Item -LiteralPath $resolvedPath -Recurse -Force
 }
 
-function Invoke-SharedNginxReleaseGate([string]$RepositoryRoot) {
+function Invoke-SharedRouteSafetyGate([string]$RepositoryRoot) {
     $gitBash = "C:\Program Files\Git\bin\bash.exe"
     if (-not (Test-Path -LiteralPath $gitBash -PathType Leaf)) {
-        throw "Git Bash is required for the shared Nginx release gate"
+        throw "Git Bash is required for the shared route safety gate"
     }
 
     Push-Location $RepositoryRoot
@@ -103,6 +165,15 @@ $productDirtyLines = @(& git -C $productRoot status --porcelain --untracked-file
 if ($LASTEXITCODE -ne 0) { throw "Unable to inspect product submodule status" }
 $isDirty = $dirtyLines.Count -gt 0 -or $productDirtyLines.Count -gt 0
 
+if ($isDirty -and -not $AllowDirty) {
+    throw "Refusing to deploy a dirty worktree. Commit the release or use -AllowDirty for an explicit emergency deployment."
+}
+if (-not $AllowDirty) {
+    Assert-PublishedMainCommit $repositoryRoot $internalCommit "internal repository"
+    Assert-PublishedMainCommit $productRoot $commit "product repository" -AllowPinnedAncestor
+}
+$Scope = Resolve-DeploymentScope $Scope $productRoot $commit $RemoteHost $RemoteRoot
+
 $dirtySuffix = if ($isDirty) { "-dirty" } else { "" }
 $releaseId = "{0}-{1}-{2}{3}" -f [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss"), $shortCommit, $shortInternalCommit, $dirtySuffix
 $localStaging = Join-Path ([System.IO.Path]::GetTempPath()) "beyondcandidate-deploy-$releaseId"
@@ -117,13 +188,10 @@ $productArchive = Join-Path $localStaging "product.tar"
 
 Write-Host "[deploy] release=$releaseId scope=$Scope host=$RemoteHost"
 Write-Host "[deploy] product_commit=$commit internal_commit=$internalCommit dirty=$isDirty"
-Invoke-SharedNginxReleaseGate $repositoryRoot
+Invoke-SharedRouteSafetyGate $repositoryRoot
 if ($ValidateOnly) {
-    Write-Host "[deploy] shared Nginx release gate passed; no build or remote change performed"
+    Write-Host "[deploy] shared route safety gate passed; existing Nginx configuration was not changed"
     return
-}
-if ($isDirty -and -not $AllowDirty) {
-    throw "Refusing to deploy a dirty worktree. Commit the release or use -AllowDirty for an explicit emergency deployment."
 }
 
 try {
@@ -137,11 +205,10 @@ try {
         Pop-Location
     }
 
-    if (-not $SkipTests) {
+    if ($RunFullTests) {
         Push-Location $prototypeRoot
         try {
             Invoke-Native npm.cmd test
-            Invoke-Native npm.cmd run build
         } finally {
             Pop-Location
         }
@@ -156,6 +223,8 @@ try {
                 --ignore=server/tests/test_observability_topology.py `
                 -q
         }
+    } else {
+        Write-Host "[deploy] release mode: full product tests are not repeated; use -RunFullTests only when explicitly required"
     }
 
     Invoke-Native docker build -f (Join-Path $productRoot "deploy\nginx\Dockerfile") -t $frontendImage $productRoot

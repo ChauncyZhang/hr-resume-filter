@@ -29,10 +29,23 @@ try {
     Pop-Location
 }
 
+$productCommit = (& git -C "$root/product" rev-parse --short=12 HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw '无法读取公开产品提交。' }
+$testImage = "beyondcandidate-server-test:verify-$productCommit"
+& docker build --target test -t $testImage -f "$root/product/server/Dockerfile" "$root/product"
+if ($LASTEXITCODE -ne 0) { throw '构建后端测试镜像失败。' }
+& docker run --rm $testImage python -m pytest server/tests `
+    --ignore=server/tests/test_backup_restore_contract.py `
+    --ignore=server/tests/test_observability_preflight.py `
+    --ignore=server/tests/test_production_topology.py `
+    --ignore=server/tests/test_observability_topology.py `
+    -q
+if ($LASTEXITCODE -ne 0) { throw '后端完整测试失败。' }
+
 & python -m pytest `
     "$root/deploy/tests/test_shared_nginx_release_validator.py" `
     "$root/deploy/tests/test_remote_deploy_scripts.py" `
     "$root/deploy/tests/test_shared_nginx_smoke.py" -q -p no:cacheprovider
 if ($LASTEXITCODE -ne 0) { throw '企业部署测试失败。' }
 
-Write-Host '公开代码边界、前端和企业部署测试均通过。'
+Write-Host '公开代码边界、前端、后端和企业部署测试均通过。当前提交可以进入快速发布流程。'
