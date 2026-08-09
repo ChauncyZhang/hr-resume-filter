@@ -39,6 +39,8 @@ Use `-RunFullTests` only when the user explicitly asks to repeat the complete pr
 
 `-ValidateOnly` is for changes to deployment scripts and route protection. It is not a required step before every normal deployment. Do not use dirty-release overrides in the normal path.
 
+If the published-commit check fails immediately after a push, let the deployment script's bounded `origin/main` fetch retry run instead of bypassing the publication gate. If the retry still fails, verify the public product and private repository commits against their remotes before deploying.
+
 ## Nginx lifecycle
 
 TLS files and the shared production Nginx template are configured once during first-machine bootstrap. A normal release does not ask the operator to configure Nginx again and does not replace the server-owned template.
@@ -59,6 +61,8 @@ Every release still performs a short route safety check because the application 
 10. Runs a browser smoke test and requests rollback if the final boundary fails.
 
 The release must preserve `aurora-web`. It may connect that container to the shared network, but must not delete, rebuild, stop, or replace it. Shared Nginx validation requires the HR route and both website routes to remain present.
+
+When a product feature adds required production environment variables, update both bootstrap and ordinary release inheritance. New-machine bootstrap must generate or set the variable in its first `.env`, while the normal remote release must backfill a safe value into the inherited `.env` for existing servers before Compose validation. Verify with `deploy/tests/test_remote_deploy_scripts.py`; do not rely only on `.env.example` or public Compose defaults.
 
 ## First deployment to a replacement machine
 

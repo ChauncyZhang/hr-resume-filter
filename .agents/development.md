@@ -64,6 +64,7 @@ The public repository must not contain enterprise domains, IPs, accounts, secret
 - Do not edit an already deployed migration.
 - Verify migration head, application-role grants, and affected API tests.
 - Application rollback must remain compatible with the forward-migrated schema; do not improvise a production database downgrade.
+- Keep Alembic revision identifiers compatible with the deployed `alembic_version.version_num` column. A long revision id can fail while Alembic records the revision, even after the migration body succeeds. Prefer ids that fit the current column, or widen `alembic_version.version_num` before the first long revision is recorded; verify with a PostgreSQL migration smoke that upgrades to the affected revision and inspects the column length.
 
 ## Synchronize public changes into the private repository
 
