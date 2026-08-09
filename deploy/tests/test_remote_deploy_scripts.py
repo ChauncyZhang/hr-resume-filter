@@ -46,6 +46,8 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "remote-rollback.sh" in POWERSHELL
     assert "Invoke-Native npm.cmd ci --no-audit --no-fund" in POWERSHELL
     assert "Assert-PublishedMainCommit" in POWERSHELL
+    assert "Published commit check for $RepositoryLabel failed on attempt $attempt; retrying" in POWERSHELL
+    assert "for ($attempt = 1; $attempt -le 3; $attempt++)" in POWERSHELL
     assert "-AllowPinnedAncestor" in POWERSHELL
     assert "merge-base --is-ancestor" in POWERSHELL
     assert "Resolve-DeploymentScope" in POWERSHELL

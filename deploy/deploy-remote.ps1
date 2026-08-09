@@ -37,8 +37,19 @@ function Assert-PublishedMainCommit(
     [string]$RepositoryLabel,
     [switch]$AllowPinnedAncestor
 ) {
-    & git -C $RepositoryRoot fetch --quiet origin main
-    if ($LASTEXITCODE -ne 0) {
+    $fetched = $false
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        & git -C $RepositoryRoot fetch --quiet origin main
+        if ($LASTEXITCODE -eq 0) {
+            $fetched = $true
+            break
+        }
+        if ($attempt -lt 3) {
+            Write-Warning "Published commit check for $RepositoryLabel failed on attempt $attempt; retrying"
+            Start-Sleep -Seconds (2 * $attempt)
+        }
+    }
+    if (-not $fetched) {
         throw "Unable to resolve origin/main for $RepositoryLabel"
     }
     $remoteCommit = (& git -C $RepositoryRoot rev-parse FETCH_HEAD).Trim()
