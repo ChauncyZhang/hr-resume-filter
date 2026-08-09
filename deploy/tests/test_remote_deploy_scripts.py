@@ -103,6 +103,8 @@ def test_first_machine_bootstrap_is_secret_safe_and_preserves_shared_website() -
     assert "docker rm" not in BOOTSTRAP_POWERSHELL
     assert "docker stop" not in BOOTSTRAP_POWERSHELL
     assert "foreach ($upload in $uploads)" in BOOTSTRAP_POWERSHELL
+    assert "EMAIL_ENCRYPTION_KEY = New-FernetKey" in BOOTSTRAP_POWERSHELL
+    assert "OFFER_PUBLIC_BASE_URL = 'https://' + [string]$config.Domain" in BOOTSTRAP_POWERSHELL
 
 
 def test_remote_release_preserves_project_identity_and_rolls_back_services() -> None:
@@ -116,6 +118,10 @@ def test_remote_release_preserves_project_identity_and_rolls_back_services() -> 
     assert "10-provision-app-role.sh" in REMOTE_SHELL
     assert "shared-nginx-smoke.sh" in REMOTE_SHELL
     assert 'mv -Tf "$app_root/current.new" "$app_root/current"' in REMOTE_SHELL
+    assert 'if not values.get("EMAIL_ENCRYPTION_KEY")' in REMOTE_SHELL
+    assert 'secrets.token_bytes(32)' in REMOTE_SHELL
+    assert 'if not values.get("OFFER_PUBLIC_BASE_URL")' in REMOTE_SHELL
+    assert 'f"https://{domain}"' in REMOTE_SHELL
 
 
 def test_release_writes_rollback_metadata_before_switching_current() -> None:

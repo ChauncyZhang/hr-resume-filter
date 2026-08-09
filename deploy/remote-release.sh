@@ -78,6 +78,36 @@ if [ -z "$aurora_web_smoke_marker" ]; then
 fi
 cp "$previous_env_file" "$env_file"
 chmod 600 "$env_file"
+python3 - "$env_file" "$domain" <<'PY'
+import base64
+import secrets
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+domain = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+values = {}
+for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    values[key.strip()] = value.strip()
+
+updates = []
+if not values.get("EMAIL_ENCRYPTION_KEY"):
+    updates.append(("EMAIL_ENCRYPTION_KEY", base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii")))
+if not values.get("OFFER_PUBLIC_BASE_URL"):
+    updates.append(("OFFER_PUBLIC_BASE_URL", f"https://{domain}"))
+
+if updates:
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        if text and not text.endswith("\n"):
+            stream.write("\n")
+        for key, value in updates:
+            stream.write(f"{key}={value}\n")
+PY
 cp "$configuration_root/compose.server-https.yaml" "$overlay"
 cp "$configuration_template" "$nginx_template"
 python3 "$release_dir/deploy/shared_nginx_release_validator.py" \

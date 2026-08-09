@@ -83,6 +83,8 @@ try {
         CONTACT_LOOKUP_SECRET = New-RandomToken 48
         LLM_CONFIG_ENCRYPTION_KEY = New-FernetKey
         FEISHU_CONFIG_ENCRYPTION_KEY = New-FernetKey
+        EMAIL_ENCRYPTION_KEY = New-FernetKey
+        OFFER_PUBLIC_BASE_URL = 'https://' + [string]$config.Domain
         LLM_PROVIDER_ALLOWLIST_JSON = '{}'
         OBJECT_STORAGE_CONNECT_TIMEOUT_SECONDS = '1'
         OBJECT_STORAGE_READ_TIMEOUT_SECONDS = '3'
