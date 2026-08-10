@@ -15,7 +15,7 @@ $config = Import-PowerShellDataFile $ConfigPath
 if ($LASTEXITCODE -ne 0) { throw '初始化 product 子模块失败。' }
 
 if (-not $ValidateOnly) {
-    & ssh -o BatchMode=yes -o ConnectTimeout=15 $config.RemoteHost "test -L '$($config.RemoteRoot)/current' || test -f '$($config.RemoteRoot)/bootstrap/.env'"
+    & ssh -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $config.RemoteHost "test -L '$($config.RemoteRoot)/current' || test -f '$($config.RemoteRoot)/bootstrap/.env'"
     if ($LASTEXITCODE -ne 0) {
         & "$root/deploy/bootstrap-remote.ps1" -ConfigPath $ConfigPath
         if ($LASTEXITCODE -ne 0) { throw '远端首次初始化失败。' }

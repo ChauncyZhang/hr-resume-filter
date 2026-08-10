@@ -77,7 +77,7 @@ function Resolve-DeploymentScope(
 
     $metadataPath = "$RemoteRoot/current/deploy/release-info.txt"
     $remoteCommand = "if [ -f '$metadataPath' ]; then sed -n 's/^git_commit=//p' '$metadataPath' | head -1; fi"
-    $currentCommitLines = @(& ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost $remoteCommand)
+    $currentCommitLines = @(& ssh -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $RemoteHost $remoteCommand)
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "Unable to inspect the active release; using full deployment scope"
         return "all"
@@ -270,7 +270,7 @@ try {
     Invoke-Native tar -czf $sourceArchive -C $releaseTree .
 
     $sourceSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceArchive).Hash.ToLowerInvariant()
-    Invoke-Native ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost "mkdir -p '$remoteStaging'"
+    Invoke-Native ssh -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $RemoteHost "mkdir -p '$remoteStaging'"
     Copy-RemoteArtifact $sourceArchive "${RemoteHost}:${remoteStaging}/source.tar.gz"
     Copy-RemoteArtifact $frontendArchive "${RemoteHost}:${remoteStaging}/frontend-image.tar"
     if ($Scope -eq "all") {
@@ -298,7 +298,7 @@ chmod 750 "$release_dir/deploy/remote-rollback.sh"
 exec "$release_dir/deploy/remote-release.sh" "$release" "$scope" "$domain" "$app_root" "$staging" "$commit" "$source_sha"
 '@
     $bootstrap = $bootstrap -replace "`r`n", "`n"
-    $bootstrap | & ssh -o BatchMode=yes $RemoteHost "bash -s -- '$releaseId' '$Scope' '$Domain' '$RemoteRoot' '$remoteStaging' '$commit' '$sourceSha'"
+    $bootstrap | & ssh -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $RemoteHost "bash -s -- '$releaseId' '$Scope' '$Domain' '$RemoteRoot' '$remoteStaging' '$commit' '$sourceSha'"
     if ($LASTEXITCODE -ne 0) { throw "Remote release failed with exit code $LASTEXITCODE" }
 
     Push-Location $prototypeRoot
@@ -311,7 +311,7 @@ exec "$release_dir/deploy/remote-release.sh" "$release" "$scope" "$domain" "$app
             Invoke-Native node (Join-Path $PSScriptRoot "production-browser-smoke.cjs")
         } catch {
             Write-Warning "Production browser smoke failed; requesting release rollback"
-            & ssh -o BatchMode=yes -o ConnectTimeout=15 $RemoteHost `
+            & ssh -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $RemoteHost `
                 "'$RemoteRoot/current/deploy/remote-rollback.sh' '$RemoteRoot' '$Domain' '$releaseId'"
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "Automatic rollback failed; inspect release $releaseId immediately"

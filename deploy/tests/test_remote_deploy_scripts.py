@@ -41,6 +41,8 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "$commandName = [string]$args[0]" in POWERSHELL
     assert "function Copy-RemoteArtifact" in POWERSHELL
     assert "ServerAliveInterval=15" in POWERSHELL
+    assert "ConnectionAttempts=3" in POWERSHELL
+    assert "ConnectionAttempts=3" in ENTRYPOINT
     assert "scp failed after 3 attempts" in POWERSHELL
     assert "Production browser smoke failed; requesting release rollback" in POWERSHELL
     assert "remote-rollback.sh" in POWERSHELL
