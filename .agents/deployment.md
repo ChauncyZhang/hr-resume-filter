@@ -24,6 +24,8 @@ When the user explicitly asks to deploy, run exactly this from the private repos
 
 Do not mechanically run `验证代码.ps1`, `-ValidateOnly`, and the real deployment in sequence. Product validation belongs to development and release-candidate preparation; deployment does not repeat the full product suite by default. The entrypoint requires clean commits published at both repositories' `origin/main`, detects whether this is a first-machine bootstrap, and compares the active product commit to select `frontend` or `all` automatically.
 
+The first deployment on a development machine creates an ignored `.venv` containing the pinned pytest version used by the short release-safety gate. Later deployments reuse it, so the global Python installation does not need pytest and the environment is not rebuilt on every release.
+
 Only override automatic scope when diagnosing the release mechanism:
 
 ```powershell

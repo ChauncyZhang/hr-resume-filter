@@ -62,6 +62,11 @@ def test_full_product_tests_are_explicit_in_release_mode() -> None:
     assert "full product tests are not repeated" in POWERSHELL
 
 
+def test_release_gate_prepares_and_reuses_an_isolated_pytest_environment() -> None:
+    assert 'Join-Path $RepositoryRoot "deploy\\ensure_deployment_test_env.py"' in POWERSHELL
+    assert "Invoke-Native $testPython -m pytest" in POWERSHELL
+
+
 def test_root_entrypoint_defaults_to_auto_scope_and_forwards_full_test_opt_in() -> None:
     assert "[ValidateSet('auto', 'frontend', 'all')]" in ENTRYPOINT
     assert "[string]$Scope = 'auto'" in ENTRYPOINT

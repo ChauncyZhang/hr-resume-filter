@@ -136,7 +136,14 @@ function Invoke-SharedRouteSafetyGate([string]$RepositoryRoot) {
 
     Push-Location $RepositoryRoot
     try {
-        Invoke-Native python -m pytest `
+        $testPythonLines = @(& python `
+            (Join-Path $RepositoryRoot "deploy\ensure_deployment_test_env.py") `
+            $RepositoryRoot)
+        if ($LASTEXITCODE -ne 0 -or $testPythonLines.Count -eq 0) {
+            throw "Unable to prepare the deployment test environment"
+        }
+        $testPython = ([string]$testPythonLines[-1]).Trim()
+        Invoke-Native $testPython -m pytest `
             deploy/tests/test_shared_nginx_release_validator.py `
             deploy/tests/test_remote_deploy_scripts.py `
             -q -p no:cacheprovider
