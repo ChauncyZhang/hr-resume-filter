@@ -19,6 +19,9 @@ SHARED_TEMPLATE = (
 OPERATIONS_RUNBOOK = (
     ROOT / "deploy" / "production-operations-runbook.md"
 ).read_text(encoding="utf-8")
+SERVER_DOCKERFILE = (ROOT / "product" / "server" / "Dockerfile").read_text(
+    encoding="utf-8"
+)
 
 
 def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
@@ -53,6 +56,9 @@ def test_local_deploy_fails_closed_and_uses_versioned_artifacts() -> None:
     assert "-AllowPinnedAncestor" in POWERSHELL
     assert "merge-base --is-ancestor" in POWERSHELL
     assert "Resolve-DeploymentScope" in POWERSHELL
+    assert '--build-arg "DEBIAN_MIRROR=$DebianMirror"' in POWERSHELL
+    assert '--build-arg "DEBIAN_SECURITY_MIRROR=$DebianSecurityMirror"' in POWERSHELL
+    assert '--build-arg "PYPI_INDEX_URL=$PypiIndexUrl"' in POWERSHELL
 
 
 def test_full_product_tests_are_explicit_in_release_mode() -> None:
@@ -72,6 +78,9 @@ def test_root_entrypoint_defaults_to_auto_scope_and_forwards_full_test_opt_in() 
     assert "[string]$Scope = 'auto'" in ENTRYPOINT
     assert "[switch]$RunFullTests" in ENTRYPOINT
     assert "RunFullTests = $RunFullTests" in ENTRYPOINT
+    assert "DebianMirror = $config.DebianMirror" in ENTRYPOINT
+    assert "DebianSecurityMirror = $config.DebianSecurityMirror" in ENTRYPOINT
+    assert "PypiIndexUrl = $config.PypiIndexUrl" in ENTRYPOINT
     assert "SkipTests" not in ENTRYPOINT
 
 
@@ -79,6 +88,26 @@ def test_development_validation_owns_the_complete_backend_suite() -> None:
     assert "docker build --target test" in VERIFY_SCRIPT
     assert "docker run --rm $testImage python -m pytest server/tests" in VERIFY_SCRIPT
     assert "当前提交可以进入快速发布流程" in VERIFY_SCRIPT
+
+
+def test_server_runtime_supports_configurable_debian_mirrors() -> None:
+    assert "ARG DEBIAN_MIRROR=http://deb.debian.org/debian" in SERVER_DOCKERFILE
+    assert (
+        "ARG DEBIAN_SECURITY_MIRROR=http://deb.debian.org/debian-security"
+        in SERVER_DOCKERFILE
+    )
+    assert "${DEBIAN_MIRROR}" in SERVER_DOCKERFILE
+    assert "${DEBIAN_SECURITY_MIRROR}" in SERVER_DOCKERFILE
+    assert (
+        "^URIs: http://deb.debian.org/debian-security$|URIs: "
+        "${DEBIAN_SECURITY_MIRROR}"
+    ) in SERVER_DOCKERFILE
+    assert (
+        "^URIs: http://deb.debian.org/debian$|URIs: ${DEBIAN_MIRROR}"
+        in SERVER_DOCKERFILE
+    )
+    assert "ARG PYPI_INDEX_URL=https://pypi.org/simple" in SERVER_DOCKERFILE
+    assert '--index-url "${PYPI_INDEX_URL}"' in SERVER_DOCKERFILE
 
 
 def test_container_test_gate_excludes_contracts_that_require_host_tools() -> None:

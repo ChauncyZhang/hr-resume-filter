@@ -26,6 +26,8 @@ Do not mechanically run `验证代码.ps1`, `-ValidateOnly`, and the real deploy
 
 The first deployment on a development machine creates an ignored `.venv` containing the pinned pytest version used by the short release-safety gate. Later deployments reuse it, so the global Python installation does not need pytest and the environment is not rebuilt on every release.
 
+The Aurora target also provides Debian and Python package mirror URLs through `deploy/target.psd1`. These are Docker build arguments only: they speed up server-image builds on the China-hosted production machine without changing the running host, Docker daemon, Nginx, or application environment. The public Dockerfile keeps Debian and PyPI's official repositories as its defaults.
+
 Only override automatic scope when diagnosing the release mechanism:
 
 ```powershell

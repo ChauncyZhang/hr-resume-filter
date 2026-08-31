@@ -5,6 +5,9 @@ param(
     [string]$RemoteHost = "root@120.79.184.221",
     [string]$Domain = "hr.aurora-tek.cn",
     [string]$RemoteRoot = "/opt/beyondcandidate",
+    [string]$DebianMirror = "http://deb.debian.org/debian",
+    [string]$DebianSecurityMirror = "http://deb.debian.org/debian-security",
+    [string]$PypiIndexUrl = "https://pypi.org/simple",
     [switch]$AllowDirty,
     [switch]$RunFullTests,
     [switch]$KeepArtifacts,
@@ -247,7 +250,11 @@ try {
 
     Invoke-Native docker build -f (Join-Path $productRoot "deploy\nginx\Dockerfile") -t $frontendImage $productRoot
     if ($Scope -eq "all") {
-        Invoke-Native docker build --target runtime -f (Join-Path $productRoot "server\Dockerfile") -t $appImage $productRoot
+        Invoke-Native docker build --target runtime `
+            --build-arg "DEBIAN_MIRROR=$DebianMirror" `
+            --build-arg "DEBIAN_SECURITY_MIRROR=$DebianSecurityMirror" `
+            --build-arg "PYPI_INDEX_URL=$PypiIndexUrl" `
+            -f (Join-Path $productRoot "server\Dockerfile") -t $appImage $productRoot
     }
 
     New-Item -ItemType Directory -Force -Path $localStaging | Out-Null

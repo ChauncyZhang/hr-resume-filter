@@ -27,6 +27,9 @@ $deployParameters = @{
     RemoteHost = $config.RemoteHost
     Domain = $config.Domain
     RemoteRoot = $config.RemoteRoot
+    DebianMirror = $config.DebianMirror
+    DebianSecurityMirror = $config.DebianSecurityMirror
+    PypiIndexUrl = $config.PypiIndexUrl
     RunFullTests = $RunFullTests
     ValidateOnly = $ValidateOnly
 }
