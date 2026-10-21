@@ -43,6 +43,7 @@ if ($LASTEXITCODE -ne 0) { throw '构建后端测试镜像失败。' }
 if ($LASTEXITCODE -ne 0) { throw '后端完整测试失败。' }
 
 & python -m pytest `
+    "$root/deploy/tests/test_git_bash_resolution.py" `
     "$root/deploy/tests/test_shared_nginx_release_validator.py" `
     "$root/deploy/tests/test_remote_deploy_scripts.py" `
     "$root/deploy/tests/test_shared_nginx_smoke.py" -q -p no:cacheprovider

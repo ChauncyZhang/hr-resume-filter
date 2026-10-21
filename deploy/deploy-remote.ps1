@@ -132,9 +132,14 @@ function Remove-SafeStagingDirectory([string]$Path) {
 }
 
 function Invoke-SharedRouteSafetyGate([string]$RepositoryRoot) {
-    $gitBash = "C:\Program Files\Git\bin\bash.exe"
-    if (-not (Test-Path -LiteralPath $gitBash -PathType Leaf)) {
+    $gitCommand = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $gitBashLines = @(& python (Join-Path $RepositoryRoot "deploy\resolve_git_bash.py") $gitCommand.Source)
+    if ($LASTEXITCODE -ne 0 -or $gitBashLines.Count -ne 1) {
         throw "Git Bash is required for the shared route safety gate"
+    }
+    $gitBash = ([string]$gitBashLines[0]).Trim()
+    if (-not (Test-Path -LiteralPath $gitBash -PathType Leaf)) {
+        throw "Resolved Git Bash does not exist: $gitBash"
     }
 
     Push-Location $RepositoryRoot
@@ -147,6 +152,7 @@ function Invoke-SharedRouteSafetyGate([string]$RepositoryRoot) {
         }
         $testPython = ([string]$testPythonLines[-1]).Trim()
         Invoke-Native $testPython -m pytest `
+            deploy/tests/test_git_bash_resolution.py `
             deploy/tests/test_shared_nginx_release_validator.py `
             deploy/tests/test_remote_deploy_scripts.py `
             -q -p no:cacheprovider

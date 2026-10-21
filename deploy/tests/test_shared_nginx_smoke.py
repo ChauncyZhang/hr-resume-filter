@@ -1,10 +1,12 @@
 from pathlib import Path
 import subprocess
 
+from deploy.resolve_git_bash import resolve_git_bash
+
 
 ROOT = Path(__file__).parents[2]
 SMOKE_SCRIPT = ROOT / "deploy" / "shared-nginx-smoke.sh"
-BASH = r"C:\Program Files\Git\bin\bash.exe"
+BASH = resolve_git_bash()
 
 
 def _bash_path(path: Path) -> str:

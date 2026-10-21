@@ -1,9 +1,11 @@
 from pathlib import Path
 import subprocess
 
+from deploy.resolve_git_bash import resolve_git_bash
+
 
 ROOT = Path(__file__).parents[2]
-BASH = r"C:\Program Files\Git\bin\bash.exe"
+BASH = resolve_git_bash()
 POWERSHELL = (ROOT / "deploy" / "deploy-remote.ps1").read_text(encoding="utf-8")
 ENTRYPOINT = (ROOT / "部署到生产.ps1").read_text(encoding="utf-8")
 VERIFY_SCRIPT = (ROOT / "验证代码.ps1").read_text(encoding="utf-8")
@@ -357,7 +359,7 @@ exit 0
 
     result = subprocess.run(
         [
-            r"C:\Program Files\Git\bin\bash.exe",
+            BASH,
             "-c",
             'export PATH="$1:$PATH" COMPOSE_LOG="$2" CURL_LOG="$3"; shift 3; exec "$@"',
             "bash",
