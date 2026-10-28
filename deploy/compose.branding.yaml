@@ -1,0 +1,15 @@
+services:
+  proxy:
+    volumes:
+      - ./branding.json:/usr/share/nginx/html/branding.json:ro
+      - ./branding:/usr/share/nginx/html/branding:ro
+  api:
+    environment:
+      PRODUCT_BRANDING_FILE: /run/product-branding.json
+    volumes:
+      - ./branding.json:/run/product-branding.json:ro
+  worker:
+    environment:
+      PRODUCT_BRANDING_FILE: /run/product-branding.json
+    volumes:
+      - ./branding.json:/run/product-branding.json:ro

@@ -116,12 +116,38 @@ python3 "$release_dir/deploy/shared_nginx_release_validator.py" \
 compose_at() {
     compose_root=$1
     shift
+    if [ -f "$compose_root/deploy/compose.branding.yaml" ]; then
+        set -- -f "$compose_root/deploy/compose.branding.yaml" "$@"
+    fi
     docker compose -p beyondcandidate \
         --env-file "$compose_root/deploy/.env" \
         -f "$compose_root/deploy/compose.yaml" \
         -f "$compose_root/deploy/compose.server-https.yaml" \
         "$@"
 }
+
+branding_sha=
+branding_changed=0
+if [ -f "$release_dir/deploy/compose.branding.yaml" ]; then
+    test -f "$release_dir/deploy/branding.json"
+    test -d "$release_dir/deploy/branding"
+    branding_sha=$(cat "$release_dir/deploy/branding.sha256")
+    case "$branding_sha" in
+        *[!a-f0-9]*|'') printf '%s\n' 'invalid branding digest' >&2; exit 1 ;;
+    esac
+    [ "${#branding_sha}" -eq 64 ] || exit 1
+    previous_branding_sha=
+    if [ -n "$previous_release" ] && [ -f "$previous_release/deploy/release-info.txt" ]; then
+        previous_branding_sha=$(sed -n 's/^branding_sha256=//p' "$previous_release/deploy/release-info.txt")
+    fi
+    if [ "$branding_sha" != "$previous_branding_sha" ]; then
+        branding_changed=1
+        if [ "$scope" != all ]; then
+            printf '%s\n' 'branding changed; scope=all is required to recreate API, worker, and proxy' >&2
+            exit 1
+        fi
+    fi
+fi
 
 rollback_services() {
     if [ "$initial_release" -eq 1 ]; then
@@ -130,7 +156,7 @@ rollback_services() {
         return 0
     fi
     if [ "$scope" = all ]; then
-        compose_at "$previous_release" up -d --no-build api worker proxy
+        compose_at "$previous_release" up -d --no-deps --no-build --force-recreate api worker proxy
     else
         compose_at "$previous_release" up -d --no-deps --force-recreate proxy
     fi
@@ -254,7 +280,9 @@ PY
     unset owner_url
     compose_at "$release_dir" exec -T postgres \
         sh /docker-entrypoint-initdb.d/10-provision-app-role.sh
-    if ! compose_at "$release_dir" up -d --no-build api worker proxy; then
+    recreate_option=
+    if [ "$branding_changed" -eq 1 ]; then recreate_option=--force-recreate; fi
+    if ! compose_at "$release_dir" up -d --no-deps --no-build $recreate_option api worker proxy; then
         restore_previous_and_verify || exit 1
         exit 1
     fi
@@ -288,6 +316,7 @@ frontend_image_id=$(docker image inspect --format '{{.Id}}' "$frontend_image")
     printf 'scope=%s\n' "$scope"
     printf 'git_commit=%s\n' "$commit"
     printf 'source_sha256=%s\n' "$source_sha"
+    printf 'branding_sha256=%s\n' "$branding_sha"
     printf 'frontend_image=%s\n' "$frontend_image"
     printf 'frontend_image_id=%s\n' "$frontend_image_id"
     if [ "$scope" = all ]; then

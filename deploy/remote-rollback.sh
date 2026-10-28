@@ -34,6 +34,9 @@ test -d "$previous_release"
 test -f "$previous_release/deploy/nginx/production.conf.template"
 
 compose_previous() {
+    if [ -f "$previous_release/deploy/compose.branding.yaml" ]; then
+        set -- -f "$previous_release/deploy/compose.branding.yaml" "$@"
+    fi
     docker compose -p beyondcandidate \
         --env-file "$previous_release/deploy/.env" \
         -f "$previous_release/deploy/compose.yaml" \
@@ -85,7 +88,7 @@ aurora_web_before=$(docker inspect --format '{{.Id}}' aurora-web)
 test -n "$aurora_web_before"
 
 if [ "$scope" = all ]; then
-    compose_previous up -d --no-build api worker proxy
+    compose_previous up -d --no-deps --no-build --force-recreate api worker proxy
     wait_for_health beyondcandidate-api-1
     wait_for_health beyondcandidate-worker-1
 else

@@ -69,23 +69,114 @@ function Assert-PublishedMainCommit(
     }
 }
 
+function Get-ProductBrandingHash([string]$DeployRoot) {
+    $configPath = Join-Path $DeployRoot 'branding.json'
+    $document = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($configPath))
+    try {
+        if ($document.RootElement.ValueKind -ne 'Object') { throw 'Branding must be a JSON object' }
+        $values = @{}
+        foreach ($property in $document.RootElement.EnumerateObject()) {
+            if ($property.Name -cnotin @('name', 'short_name', 'logo_url', 'favicon_url') -or $values.ContainsKey($property.Name)) {
+                throw 'Branding contains an unknown or duplicate field'
+            }
+            $values[$property.Name] = $property.Value
+        }
+        foreach ($required in @('name', 'short_name', 'logo_url')) {
+            if (-not $values.ContainsKey($required)) { throw "Branding is missing $required" }
+        }
+        if ($values.name.ValueKind -ne 'String') { throw 'Branding name must be a string' }
+        $name = $values.name.GetString()
+        $nameLength = [regex]::Matches($name.Trim(), '[\uD800-\uDBFF][\uDC00-\uDFFF]|[\s\S]').Count
+        if ($name -match '[\x00-\x1f\x7f]' -or $nameLength -lt 1 -or $nameLength -gt 80) {
+            throw 'Branding name must contain 1-80 trimmed characters'
+        }
+        if ($values.short_name.ValueKind -ne 'String' -or $values.short_name.GetString() -cnotmatch '\A[A-Za-z0-9]{1,8}\z') {
+            throw 'Branding short_name must contain 1-8 ASCII alphanumeric characters'
+        }
+        foreach ($field in @('logo_url', 'favicon_url')) {
+            if (-not $values.ContainsKey($field) -or $values[$field].ValueKind -eq 'Null') { continue }
+            if ($values[$field].ValueKind -ne 'String') { throw "Branding $field must be a root-relative path or null" }
+            $url = $values[$field].GetString()
+            $decoded = $url
+            $validated = $false
+            for ($layer = 0; $layer -lt 8; $layer++) {
+                if (-not $decoded.StartsWith('/') -or $decoded.Contains('//') -or $decoded -match '[\\?#\x00-\x20\x7f]' -or $decoded -match '(^|/)\.\.(/|$)' -or $decoded -match '%(?![0-9A-Fa-f]{2})') {
+                    throw "Branding $field must be a safe root-relative path"
+                }
+                $next = [Uri]::UnescapeDataString($decoded)
+                if ($next -eq $decoded) {
+                    if ($decoded -match '%[0-9A-Fa-f]{2}') { throw "Branding $field contains invalid encoded text" }
+                    $validated = $true
+                    break
+                }
+                $decoded = $next
+            }
+            if (-not $validated) { throw "Branding $field exceeds the supported path encoding depth" }
+            if ($decoded.StartsWith('/branding/') -and -not (Test-Path -LiteralPath (Join-Path $DeployRoot $decoded.TrimStart('/')) -PathType Leaf)) {
+                throw "Branding $field references a missing private asset"
+            }
+        }
+    } finally { $document.Dispose() }
+
+    $assetRoot = Join-Path $DeployRoot 'branding'
+    if (-not (Test-Path -LiteralPath $assetRoot -PathType Container)) { throw 'Private branding asset directory is required' }
+    $assets = @(Get-ChildItem -LiteralPath $assetRoot -Recurse -Force)
+    $entries = @(Get-Item -LiteralPath $configPath, $assetRoot) + $assets
+    if (@($entries | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) {
+        throw 'Branding files must not be symbolic links or junctions'
+    }
+    $imageExtensions = @('.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.avif', '.bmp')
+    if (@($assets | Where-Object { -not $_.PSIsContainer -and $_.Extension -notin $imageExtensions }).Count) {
+        throw 'Branding assets must use an allowed image extension'
+    }
+    $hash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    try {
+        $files = @($entries | Where-Object { -not $_.PSIsContainer } | Sort-Object FullName -CaseSensitive)
+        foreach ($file in $files) {
+            $relative = [IO.Path]::GetRelativePath($DeployRoot, $file.FullName).Replace('\', '/')
+            $hash.AppendData([Text.Encoding]::UTF8.GetBytes($relative + "`0"))
+            $hash.AppendData([IO.File]::ReadAllBytes($file.FullName))
+            $hash.AppendData([byte[]]@(0))
+        }
+        return [Convert]::ToHexString($hash.GetHashAndReset()).ToLowerInvariant()
+    } finally { $hash.Dispose() }
+}
+
+function Copy-ProductBranding([string]$DeployRoot, [string]$Destination) {
+    $digest = Get-ProductBrandingHash $DeployRoot
+    foreach ($name in @('branding.json', 'branding', 'compose.branding.yaml')) {
+        Copy-Item -LiteralPath (Join-Path $DeployRoot $name) -Destination $Destination -Recurse -Force
+    }
+    if ((Get-ProductBrandingHash $Destination) -ne $digest) { throw 'Branding changed while packaging; retry the release' }
+    [IO.File]::WriteAllText((Join-Path $Destination 'branding.sha256'), $digest + "`n", [Text.UTF8Encoding]::new($false))
+}
+
 function Resolve-DeploymentScope(
     [string]$RequestedScope,
     [string]$ProductRoot,
     [string]$ProductCommit,
     [string]$RemoteHost,
-    [string]$RemoteRoot
+    [string]$RemoteRoot,
+    [string]$BrandingSha256
 ) {
-    if ($RequestedScope -ne "auto") { return $RequestedScope }
+    if ($RequestedScope -eq "all") { return "all" }
 
     $metadataPath = "$RemoteRoot/current/deploy/release-info.txt"
-    $remoteCommand = "if [ -f '$metadataPath' ]; then sed -n 's/^git_commit=//p' '$metadataPath' | head -1; fi"
+    $remoteCommand = "if [ -f '$metadataPath' ]; then sed -n 's/^git_commit=//p' '$metadataPath' | head -1; sed -n 's/^branding_sha256=//p' '$metadataPath' | head -1; fi"
     $currentCommitLines = @(& ssh -o BatchMode=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 $RemoteHost $remoteCommand)
     if ($LASTEXITCODE -ne 0) {
+        if ($RequestedScope -eq 'frontend') { throw 'Cannot verify active branding for frontend-only deployment; use scope=all' }
         Write-Warning "Unable to inspect the active release; using full deployment scope"
         return "all"
     }
     $currentCommit = if ($currentCommitLines.Count -gt 0) { ([string]$currentCommitLines[0]).Trim() } else { "" }
+    $currentBranding = if ($currentCommitLines.Count -gt 1) { ([string]$currentCommitLines[1]).Trim() } else { '' }
+    if ($BrandingSha256 -notmatch '^[0-9a-f]{64}$' -or $currentBranding -ne $BrandingSha256) {
+        if ($RequestedScope -eq 'frontend') { throw 'Branding changed or active branding is unknown; frontend-only deployment would leave stale API/worker branding. Use scope=all.' }
+        Write-Host '[deploy] branding changed or active branding is unknown; selected scope=all to recreate API, worker, and proxy'
+        return 'all'
+    }
+    if ($RequestedScope -eq 'frontend') { return 'frontend' }
     if ($currentCommit -notmatch '^[0-9a-f]{40}$') {
         Write-Host "[deploy] no comparable active product commit; selected scope=all"
         return "all"
@@ -155,6 +246,7 @@ function Invoke-SharedRouteSafetyGate([string]$RepositoryRoot) {
             deploy/tests/test_git_bash_resolution.py `
             deploy/tests/test_shared_nginx_release_validator.py `
             deploy/tests/test_remote_deploy_scripts.py `
+            deploy/tests/test_product_branding_deployment.py `
             -q -p no:cacheprovider
         Invoke-Native $gitBash -n deploy/shared-nginx-smoke.sh
     } finally {
@@ -199,7 +291,8 @@ if (-not $AllowDirty) {
     Assert-PublishedMainCommit $repositoryRoot $internalCommit "internal repository"
     Assert-PublishedMainCommit $productRoot $commit "product repository" -AllowPinnedAncestor
 }
-$Scope = Resolve-DeploymentScope $Scope $productRoot $commit $RemoteHost $RemoteRoot
+$brandingSha256 = Get-ProductBrandingHash $PSScriptRoot
+$Scope = Resolve-DeploymentScope $Scope $productRoot $commit $RemoteHost $RemoteRoot $brandingSha256
 
 $dirtySuffix = if ($isDirty) { "-dirty" } else { "" }
 $releaseId = "{0}-{1}-{2}{3}" -f [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss"), $shortCommit, $shortInternalCommit, $dirtySuffix
@@ -287,6 +380,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $privateFile) `
             -Destination (Join-Path $releaseTree "deploy\$privateFile") -Force
     }
+    Copy-ProductBranding $PSScriptRoot (Join-Path $releaseTree 'deploy')
     Invoke-Native tar -czf $sourceArchive -C $releaseTree .
 
     $sourceSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $sourceArchive).Hash.ToLowerInvariant()

@@ -45,6 +45,25 @@ Use `-RunFullTests` only when the user explicitly asks to repeat the complete pr
 
 If the published-commit check fails immediately after a push, let the deployment script's bounded `origin/main` fetch retry run instead of bypassing the publication gate. If the retry still fails, verify the public product and private repository commits against their remotes before deploying.
 
+## Product Display Branding
+
+The private runtime identity is in `deploy/branding.json`; logo files are under
+`deploy/branding/`. Public product source retains its community defaults. These
+files change the recruiting product's display name and mark, not Aurora's legal
+identity, SMTP sender configuration, repositories, database names or encryption
+identifiers. See `deploy/branding.md` for the schema and asset rules.
+
+The release must package the private JSON/assets and apply its branding overlay
+after the inherited production overlay. Proxy, API and worker consume the same
+JSON read-only. A branding change requires all app containers to be recreated,
+even when the product commit is unchanged; frontend-only scope must not leave
+old Feishu branding in the worker. Rollback must use the selected release's own
+branding, while older releases without a branding overlay remain compatible.
+
+Publish generic branding support in the public repository and update the pinned
+product submodule before release. Never copy enterprise branding into the public
+default or bypass clean/published-commit gates for an unsynchronized submodule.
+
 ## Nginx lifecycle
 
 TLS files and the shared production Nginx template are configured once during first-machine bootstrap. A normal release does not ask the operator to configure Nginx again and does not replace the server-owned template.
