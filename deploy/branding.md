@@ -1,7 +1,7 @@
 # Product Branding Assets
 
 Edit `branding.json` for the deployed product display identity. The current
-configuration is `jiguang`, short name `JG`, with `/branding/logo.svg` as the
+configuration is `Ji Guang`, short name `JG`, with `/branding/logo.svg` as the
 logo and favicon. This does not rename Aurora, its email sender identity, any
 database, deployment directory, repository or cryptographic identifier.
 

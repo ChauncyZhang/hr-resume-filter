@@ -17,6 +17,12 @@ SCRIPT = ROOT / "deploy/deploy-remote.ps1"
 PWSH = shutil.which("pwsh")
 
 
+def test_deployed_display_name_matches_requested_capitalization():
+    config = json.loads((ROOT / "deploy/branding.json").read_text(encoding="utf-8"))
+    assert config["name"] == "Ji Guang"
+    assert config["short_name"] == "JG"
+
+
 @pytest.fixture
 def ps_helpers(tmp_path):
     harness = tmp_path / "helpers.ps1"
